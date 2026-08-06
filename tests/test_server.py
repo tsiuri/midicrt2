@@ -86,6 +86,19 @@ async def test_subscribe_streams_latest_snapshot(tmp_path):
     eng.stop(); await task; await srv.close()
 
 
+async def test_subscribe_rejects_non_positive_max_rate(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    r = await c.request("subscribe", topics=["page.eventlog"], max_rate=0)
+    assert r["ok"] is False
+    r = await c.request("subscribe", topics=["page.eventlog"], max_rate=20.0)
+    assert r["ok"] is True
+    assert r["data"]["topics"] == ["page.eventlog"]
+    eng.stop(); await task; await srv.close()
+
+
 async def test_action_roundtrip_and_errors(tmp_path):
     eng, srv, task = await make(tmp_path)
     eng.pages["eventlog"].handle(MidiEvent(0, "t", "note_on", 0, 60, 1, "x"))

@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import logging
+import math
 import os
 
 from midicrt import proto
@@ -117,7 +118,15 @@ class ProtocolServer:
         elif cmd == "status":
             conn.send(proto.response(id, self.engine.status() | {"clients": self.clients}))
         elif cmd == "subscribe":
-            conn.max_rate = float(msg.get("max_rate", 10.0))
+            try:
+                rate = float(msg.get("max_rate", 10.0))
+            except (ValueError, TypeError):
+                conn.send(proto.error_response(id, "max_rate must be > 0"))
+                return
+            if not math.isfinite(rate) or rate <= 0:
+                conn.send(proto.error_response(id, "max_rate must be > 0"))
+                return
+            conn.max_rate = rate
             conn.topics |= set(msg.get("topics", []))
             for topic in conn.topics:
                 snap = self.engine.snapshot_now(topic)
