@@ -1,29 +1,20 @@
 """midicrt — protocol client CLI (also the debugging tool)."""
 import argparse
 import json
-import socket
 
-from midicrt import proto
+from midicrt import config as config_mod
+from midicrt.clients.base import ClientError, EngineClient
 
 
 def request(socket_path: str, cmd: str, **kw) -> dict:
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client = EngineClient(socket_path)
     try:
-        sock.connect(socket_path)
-    except OSError as exc:
-        raise SystemExit(f"midicrt: cannot connect to {socket_path}: {exc}") from exc
-    with sock, sock.makefile("rwb") as f:
-        json.loads(f.readline())                                    # server hello
-        f.write(proto.encode({"id": 1, "cmd": "hello", "proto_version": proto.PROTO_VERSION}))
-        f.flush()
-        if not json.loads(f.readline()).get("ok"):
-            raise SystemExit("midicrt: protocol version rejected by engine")
-        f.write(proto.encode({"id": 2, "cmd": cmd, **kw}))
-        f.flush()
-        while True:
-            resp = json.loads(f.readline())
-            if resp.get("id") == 2:
-                break
+        client.connect()
+        resp = client.request(cmd, **kw)
+    except ClientError as exc:
+        raise SystemExit(f"midicrt: {exc}") from exc
+    finally:
+        client.close()
     if not resp.get("ok"):
         raise SystemExit(f"midicrt: {resp.get('error', 'request failed')}")
     return resp["data"]
@@ -41,7 +32,7 @@ def _parse_args(pairs: list[str]) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(prog="midicrt")
-    ap.add_argument("--socket", default="/run/midicrt/ctl.sock")
+    ap.add_argument("--socket", default=None)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("status")
     sub.add_parser("describe")
@@ -51,13 +42,15 @@ def main() -> None:
     sub.add_parser("tui")
     args = ap.parse_args()
 
+    socket_path = args.socket or config_mod.load(None).socket_path
+
     if args.cmd == "tui":
         from midicrt.clients.tui import run_tui  # lazy: needs blessed
-        raise SystemExit(run_tui(args.socket))
+        raise SystemExit(run_tui(socket_path))
     if args.cmd == "action":
-        data = request(args.socket, "action", name=args.name, args=_parse_args(args.arg))
+        data = request(socket_path, "action", name=args.name, args=_parse_args(args.arg))
     else:
-        data = request(args.socket, args.cmd)
+        data = request(socket_path, args.cmd)
     print(json.dumps(data, indent=2))
 
 

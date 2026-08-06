@@ -1,6 +1,7 @@
 """Unix-socket protocol server: request/response + latest-wins snapshot push."""
 import asyncio
 import contextlib
+import json
 import logging
 import math
 import os
@@ -76,7 +77,13 @@ class ProtocolServer:
         conn.send(proto.hello())
         try:
             while data := await reader.read(65536):
-                for msg in conn.decoder.feed(data):
+                try:
+                    msgs = conn.decoder.feed(data)
+                except json.JSONDecodeError:
+                    _LOG.warning("malformed JSON from client, dropping connection")
+                    await self._drop(conn)
+                    break
+                for msg in msgs:
                     await self._dispatch(conn, msg)
                 await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
