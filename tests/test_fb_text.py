@@ -1,9 +1,10 @@
+import struct
 from pathlib import Path
 
 from PIL import Image
 
 from midicrt.clients.fb.surface import Surface
-from midicrt.clients.fb.text import draw_text, load_font
+from midicrt.clients.fb.text import PSF2_MAGIC, Font, draw_text, load_font
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GOLDEN_PATH = FIXTURES / "fb_text_golden.png"
@@ -83,3 +84,68 @@ def test_draw_text_golden_matches_frozen_fixture():
     golden = Image.open(GOLDEN_PATH).convert("RGB")
     assert golden.size == GOLDEN_SURFACE_SIZE
     assert surf.image.tobytes() == golden.tobytes()
+
+
+def _build_synthetic_psf2(tmp_path: Path) -> Path:
+    """Write a tiny synthetic PSF2 font to `tmp_path` and return its path.
+
+    width=12, height=2 -> bytes_per_row=ceil(12/8)=2, so each glyph row
+    spans two bytes — v1's vendored default font is 8x8 (one byte per
+    row) and never exercises the multi-byte-per-row path. The unicode
+    table below also includes a 0xFE sequence-start marker followed by
+    bytes that a naive UTF-8 decoder would misparse as a 4-byte sequence
+    (consuming the terminating 0xFF and desyncing the following glyph
+    mapping) if 0xFE isn't special-cased before UTF-8 decoding.
+    """
+    width, height = 12, 2
+    bytes_per_row = (width + 7) // 8  # 2
+    bytes_per_glyph = height * bytes_per_row  # 4
+    header = struct.pack(
+        "<IIIIIIII",
+        PSF2_MAGIC,
+        0,              # version
+        32,             # headersize
+        0x01,           # flags: has unicode table
+        2,              # numglyph
+        bytes_per_glyph,
+        height,
+        width,
+    )
+    # Glyph 0: bits set at (col=0,row=0), (col=11,row=0) [byte1 bit4],
+    # (col=5,row=1) [byte0 bit2], (col=8,row=1) [byte1 bit7] — deliberately
+    # spans both bytes of each 2-byte row.
+    glyph0 = bytes([0x80, 0x10, 0x04, 0x80])
+    # Glyph 1: content doesn't matter — it only needs to exist so the
+    # unicode table below can map a second, distinguishable glyph index.
+    glyph1 = bytes([0x10, 0x00, 0x10, 0x00])
+
+    # 'A'(0x41) -> glyph 0, then a 0xFE sequence marker + bytes that would
+    # be misdecoded as a 4-byte UTF-8 sequence (swallowing the real 0xFF
+    # terminator) under the pre-fix parser, then 'B'(0x42) -> glyph 1.
+    unicode_table = bytes([0x41, 0xFE, 0xCC, 0x81, 0xFF, 0x42, 0xFF])
+
+    path = tmp_path / "synthetic.psf2"
+    path.write_bytes(header + glyph0 + glyph1 + unicode_table)
+    return path
+
+
+def test_psf2_multibyte_glyph_rows_and_unicode_sequence_marker(tmp_path):
+    font = Font(_build_synthetic_psf2(tmp_path))
+    assert font.width == 12
+    assert font.height == 2
+
+    # --- multi-byte-per-row glyph bit indexing (previously raised
+    # ValueError: negative shift count for col >= 8) ---
+    img = font.glyph_image(0, (0, 255, 80))
+    px = img.load()
+    fg = (0, 255, 80, 255)
+    bg = (0, 0, 0, 0)
+    lit = {(0, 0), (11, 0), (5, 1), (8, 1)}
+    for x in range(12):
+        for y in range(2):
+            assert px[x, y] == (fg if (x, y) in lit else bg)
+
+    # --- 0xFE sequence marker must not desync `pos` in the unicode table
+    # ---
+    assert font.glyph_index("A") == 0
+    assert font.glyph_index("B") == 1

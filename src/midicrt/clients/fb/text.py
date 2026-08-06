@@ -125,6 +125,17 @@ class Font:
                 glyph_idx += 1
                 pos += 1
                 continue
+            if b == 0xFE:
+                # Start-of-sequence marker: everything up to the next 0xFF
+                # separator is an alternate multi-codepoint sequence for
+                # this glyph (beyond the first codepoint, already mapped
+                # above). Skip it as raw bytes — NOT as UTF-8 — so a lead
+                # byte >= 0xF0 in there can't be misdecoded as a 4-byte
+                # sequence and consume the terminating 0xFF, desyncing pos.
+                pos += 1
+                while pos < len(table) and table[pos] != 0xFF:
+                    pos += 1
+                continue
             if b < 0x80:
                 cp = b
                 pos += 1
@@ -161,6 +172,10 @@ class Font:
         Foreground pixels get full alpha, background pixels alpha 0, so
         `Surface.image.paste(stamp, (x, y), mask=stamp)` only overwrites
         foreground bits — background pixels are left untouched.
+
+        Each glyph row is `bytes_per_row = ceil(width / 8)` bytes wide
+        (PSF1's 8-wide glyphs are the `bytes_per_row == 1` special case);
+        column `col`'s bit lives in byte `col // 8`, bit `7 - (col % 8)`.
         """
         key = (idx, fg)
         img = self._glyph_cache.get(key)
@@ -168,9 +183,13 @@ class Font:
             img = Image.new("RGBA", (self.width, self.height), (0, 0, 0, 0))
             px = img.load()
             r, g, b = fg
-            for row, byte in enumerate(self._glyphs[idx][:self.height]):
+            bytes_per_row = (self.width + 7) // 8
+            glyph_data = self._glyphs[idx]
+            for row in range(self.height):
+                row_data = glyph_data[row * bytes_per_row:(row + 1) * bytes_per_row]
                 for col in range(self.width):
-                    if (byte >> (7 - col)) & 1:
+                    byte = row_data[col // 8]
+                    if (byte >> (7 - (col % 8))) & 1:
                         px[col, row] = (r, g, b, 255)
             self._glyph_cache[key] = img
         return img
