@@ -83,6 +83,8 @@ class EngineClient:
             resp = self._read_until_sync(req_id)
         if resp is None:
             raise ClientError("engine connection lost")
+        if not resp.get("ok"):
+            raise ClientError(resp.get("error", f"{cmd} failed"))
         return resp
 
     def _request_via_reader(self, req_id: int, cmd: str, kw: dict) -> dict | None:

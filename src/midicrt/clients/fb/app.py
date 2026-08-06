@@ -22,6 +22,7 @@ mode against a real (but socket-only) daemon.
 """
 import argparse
 import logging
+import math
 import queue
 import threading
 from pathlib import Path
@@ -237,6 +238,26 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
         client.close()
 
 
+def _fps_type(value: str) -> float:
+    """argparse `type=` for --fps: must parse as a finite, positive float.
+    Rejecting here (before connect()) keeps a bad value off the wire --
+    the server rejects non-positive/non-finite max_rate too, but the
+    client never checked that response, so a rejected subscribe() left
+    `run()` blocked forever in `_wait_first_snapshot` (connection alive,
+    no snapshot ever coming). See EngineClient.request()/subscribe() for
+    the other half of this fix -- callers should no longer get a silent
+    ok:false response either way, but validating here means a bad --fps
+    never has to round-trip to find that out.
+    """
+    try:
+        fps = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(fps) or fps <= 0:
+        raise argparse.ArgumentTypeError(f"--fps must be a finite number > 0, got {value!r}")
+    return fps
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
     ap = argparse.ArgumentParser(prog="midicrt-fb")
@@ -245,7 +266,7 @@ def main() -> None:
     ap.add_argument("--out", default=None, metavar="PATH",
                      help="render one frame to this PNG and exit (headless test mode)")
     ap.add_argument("--no-input", action="store_true")
-    ap.add_argument("--fps", type=float, default=30.0)
+    ap.add_argument("--fps", type=_fps_type, default=30.0)
     args = ap.parse_args()
 
     socket_path = args.socket or config_mod.load(None).socket_path

@@ -167,3 +167,28 @@ def test_out_mode_renders_one_frame_and_exits_against_real_daemon(tmp_path):
     finally:
         daemon.terminate()
         daemon.wait(timeout=5)
+
+
+def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
+    # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
+    # rejected by the server's max_rate check, and then hang forever in
+    # _wait_first_snapshot because nobody checked subscribe()'s response.
+    # A *real* daemon is running here (like the golden-frame test above) so
+    # that, pre-fix, connect() would succeed and the hang would actually
+    # happen; argparse must now reject --fps before a socket is ever opened.
+    # The short timeout is the hang detector: a regression makes this test
+    # error out with TimeoutExpired instead of failing a clean assertion.
+    sock = str(tmp_path / "ctl.sock")
+    out_png = tmp_path / "frame.png"
+    daemon = _start_daemon(sock)
+    try:
+        result = subprocess.run(
+            [VENVPY, "-m", "midicrt.clients.fb.app",
+             "--socket", sock, "--fps", "0", "--out", str(out_png), "--no-input"],
+            capture_output=True, text=True, timeout=10, check=False)
+        assert result.returncode != 0
+        assert "fps" in result.stderr.lower()
+        assert not out_png.exists()
+    finally:
+        daemon.terminate()
+        daemon.wait(timeout=5)

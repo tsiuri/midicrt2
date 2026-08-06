@@ -109,6 +109,21 @@ async def test_request_eof_mid_request_raises_client_error(tmp_path):
         await asyncio.to_thread(client.close)
 
 
+async def test_subscribe_rejects_non_positive_max_rate(tmp_path):
+    # Regression for the fps=0 hang: the server rejects non-positive/
+    # non-finite max_rate with ok:false, and subscribe() must surface that
+    # as a ClientError rather than returning the error envelope silently
+    # (which left callers blocked forever waiting on a snapshot that would
+    # never arrive).
+    eng, srv, task = await make(tmp_path)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    with pytest.raises(ClientError):
+        await asyncio.to_thread(client.subscribe, ["page.eventlog"], 0.0)
+    await asyncio.to_thread(client.close)
+    eng.stop(); await task; await srv.close()
+
+
 async def test_malformed_json_drops_only_that_client(tmp_path):
     eng, srv, task = await make(tmp_path)
 
