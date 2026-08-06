@@ -99,6 +99,45 @@ async def test_subscribe_rejects_non_positive_max_rate(tmp_path):
     eng.stop(); await task; await srv.close()
 
 
+async def test_malformed_proto_version_rejected_and_closes(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    c = Client()
+    await c.connect(srv.socket_path)
+    c.writer.write(proto.encode({"id": 1, "cmd": "hello", "proto_version": "abc"}))
+    await c.writer.drain()
+
+    # Note: deliberately not using Client.request()/read_msgs() here -- that helper
+    # re-creates an asyncio.wait_for()/Task on every poll iteration, which pathologically
+    # stalls (rather than cleanly timing out) when no response ever arrives. A single
+    # outer wait_for around one continuous read loop avoids that.
+    async def drain_until_eof():
+        while True:
+            data = await c.reader.read(65536)
+            c.inbox.extend(c.decoder.feed(data))
+            if data == b"":
+                return
+
+    await asyncio.wait_for(drain_until_eof(), timeout=5.0)
+    responses = [m for m in c.inbox if m.get("id") == 1]
+    assert responses and responses[0]["ok"] is False
+    # connection is dropped by the server -> further reads keep returning EOF
+    data = await asyncio.wait_for(c.reader.read(65536), timeout=1.0)
+    assert data == b""
+    eng.stop(); await task; await srv.close()
+
+
+async def test_subscribe_clamps_max_rate(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    r = await c.request("subscribe", topics=["page.eventlog"], max_rate=1000000.0)
+    assert r["ok"] is True
+    matching = [conn for conn in srv._conns if conn.max_rate == 60.0]
+    assert matching, "expected the subscribing connection's max_rate clamped to 60.0"
+    eng.stop(); await task; await srv.close()
+
+
 async def test_action_roundtrip_and_errors(tmp_path):
     eng, srv, task = await make(tmp_path)
     eng.pages["eventlog"].handle(MidiEvent(0, "t", "note_on", 0, 60, 1, "x"))

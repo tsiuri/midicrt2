@@ -42,6 +42,15 @@ async def test_engine_publishes_dirty_snapshots():
     assert snaps[-1]["seq"] >= 1
 
 
+async def test_zero_tick_hz_does_not_crash():
+    eng = Engine(Config(tick_hz=0.0))
+    task = asyncio.create_task(eng.run())
+    await asyncio.sleep(0.05)
+    assert not task.done()
+    eng.stop()
+    await task  # must not raise (e.g. ZeroDivisionError)
+
+
 async def test_clear_action_and_status():
     eng = Engine(Config())
     eng.pages["eventlog"].handle(ev())

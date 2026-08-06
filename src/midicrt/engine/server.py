@@ -98,7 +98,14 @@ class ProtocolServer:
                 conn.send(proto.error_response(id, "hello required"))
                 return
             client_ver = str(msg.get("proto_version", ""))
-            if proto.major(client_ver or "0") != proto.major(proto.PROTO_VERSION):
+            try:
+                client_major = proto.major(client_ver or "0")
+            except ValueError:
+                conn.send(proto.error_response(id, f"bad proto_version: {client_ver!r}"))
+                await conn.writer.drain()
+                await self._drop(conn)
+                return
+            if client_major != proto.major(proto.PROTO_VERSION):
                 conn.send(proto.error_response(id, f"proto major mismatch: {client_ver}"))
                 await conn.writer.drain()
                 await self._drop(conn)
@@ -126,7 +133,7 @@ class ProtocolServer:
             if not math.isfinite(rate) or rate <= 0:
                 conn.send(proto.error_response(id, "max_rate must be > 0"))
                 return
-            conn.max_rate = rate
+            conn.max_rate = min(max(rate, 0.1), 60.0)
             conn.topics |= set(msg.get("topics", []))
             for topic in conn.topics:
                 snap = self.engine.snapshot_now(topic)

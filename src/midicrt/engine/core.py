@@ -79,7 +79,7 @@ class Engine:
 
     async def run(self) -> None:
         self._running = True
-        tick = 1.0 / self.config.tick_hz
+        tick = 1.0 / max(self.config.tick_hz, 1.0)
         while self._running:
             try:
                 ev = await asyncio.wait_for(self.queue.get(), timeout=tick)

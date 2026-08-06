@@ -38,3 +38,22 @@ async def test_errors():
         await reg.dispatch("zoom.set", {"level": "x"})  # uncoercible
     with pytest.raises(ActionError):
         await reg.dispatch("zoom.set", {"level": 1, "bogus": 2})  # unknown arg
+
+
+async def test_bool_coercion_from_strings():
+    reg = ActionRegistry()
+    seen = []
+    reg.register("toggle.set", lambda enabled: seen.append(enabled),
+                  args={"enabled": "bool"})
+
+    await reg.dispatch("toggle.set", {"enabled": "false"})
+    assert seen[-1] is False
+
+    await reg.dispatch("toggle.set", {"enabled": "true"})
+    assert seen[-1] is True
+
+    await reg.dispatch("toggle.set", {"enabled": True})
+    assert seen[-1] is True
+
+    with pytest.raises(ActionError):
+        await reg.dispatch("toggle.set", {"enabled": "maybe"})

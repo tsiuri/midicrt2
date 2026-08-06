@@ -2,7 +2,19 @@
 import inspect
 from collections.abc import Callable
 
-_COERCERS = {"int": int, "float": float, "str": str, "bool": bool}
+
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    if text in {"false", "0", "no", "off"}:
+        return False
+    raise ValueError(f"not a bool: {value!r}")
+
+
+_COERCERS = {"int": int, "float": float, "str": str, "bool": _parse_bool}
 
 
 class ActionError(Exception):
