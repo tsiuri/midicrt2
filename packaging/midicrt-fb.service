@@ -1,0 +1,17 @@
+[Unit]
+Description=midicrt2 framebuffer CRT client
+After=midicrtd.service
+Wants=midicrtd.service
+Conflicts=getty@tty1.service
+
+[Service]
+User=billie
+Group=video
+SupplementaryGroups=input
+ExecStart=/home/billie/midicrt2-venv/bin/midicrt-fb
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
