@@ -1,0 +1,15 @@
+[Unit]
+Description=midicrt2 engine daemon
+After=network.target sound.target
+
+[Service]
+User=billie
+Group=audio
+RuntimeDirectory=midicrt
+ExecStart=/home/billie/midicrt2-venv/bin/midicrtd
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
