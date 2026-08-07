@@ -233,7 +233,7 @@ class ProtocolServer:
         elif cmd == "action":
             try:
                 data = await self.engine.actions.dispatch(
-                    msg.get("name", ""), msg.get("args", {}) or {})
+                    msg.get("name", ""), msg.get("args", {}) or {}, origin="client")
                 conn.send(proto.response(id, data))
             except ActionError as exc:
                 conn.send(proto.error_response(id, str(exc)))

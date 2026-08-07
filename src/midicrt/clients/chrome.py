@@ -23,7 +23,18 @@ OVERLAY_STATUS_TOPIC = "overlay.status"
 # ProtocolServer._push_loop) -- matches TransportAnalyzer's own initial
 # view_model() exactly, so there is no visible "flash" once the real one
 # lands.
-DEFAULT_STATUS_VM = {"bpm": None, "bar": 0, "beat": 1, "running": False, "source": None}
+DEFAULT_STATUS_VM = {"bpm": None, "bar": 0, "beat": 1, "running": False, "source": None,
+                     "rec": False}
+
+# Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md): a plain
+# `.get("rec")` (not a required key) below means a caller passing an OLDER
+# vm dict shape with no "rec" key at all (any pre-phase-5 test literal, or
+# a pre-phase-5 recorded fixture) renders IDENTICALLY to before -- adding
+# this marker required zero golden-string updates anywhere in
+# test_tui_render.py/test_fb_render.py (verified: both already build their
+# `vm` dicts fresh per test and only ever substring-check `status_text()`'s
+# output, never a hardcoded exact status line).
+REC_MARKER = "● REC  "
 
 
 def format_bpm(bpm: float | None) -> str:
@@ -203,7 +214,8 @@ def status_text(vm: dict) -> str:
     beat = vm.get("beat", 1)
     state = "RUN" if vm.get("running") else "STOP"
     source = vm.get("source") or "no clock"
+    marker = REC_MARKER if vm.get("rec") else ""
     return (
-        f"BAR {bar:04d}  BEAT {beat:02d}   {format_bpm(vm.get('bpm'))} BPM   "
+        f"{marker}BAR {bar:04d}  BEAT {beat:02d}   {format_bpm(vm.get('bpm'))} BPM   "
         f"{state}   clock: {source}"
     )

@@ -236,13 +236,31 @@ class BindingDispatcher:
         self._last_cc_value: dict[tuple[str, str, int | None], int] = {}
 
     def handle(self, ev) -> list[tuple[str, dict]]:
+        return [(action, args) for _, action, args in self._evaluate_all(ev)]
+
+    def handle_with_origin(self, ev) -> list[tuple[str, str, dict]]:
+        """Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+        same matching/evaluation as `handle()` above, but each intent keeps
+        the ORIGINATING `Binding.id` alongside it -- `handle()` itself
+        can't just grow a third tuple element without breaking every
+        existing `== [("page.next", {})]`-shaped assertion in
+        test_bindings.py, so this is a separate, additive method built on
+        the SAME shared `_evaluate_all` -- `Engine._handle` uses this one
+        (not `handle()`) so `Engine._dispatch_bindings` can stamp a capture
+        action mark's `origin` as `f"binding:{binding_id}"` (phase5-notes.md's
+        decided provenance design: "record raw MIDI + action marks WITH
+        PROVENANCE")."""
+        return self._evaluate_all(ev)
+
+    def _evaluate_all(self, ev) -> list[tuple[str, str, dict]]:
         intents = []
         for binding in self._bindings:
             if not self._matches(binding, ev):
                 continue
             intent = self._evaluate(binding, ev)
             if intent is not None:
-                intents.append(intent)
+                action, args = intent
+                intents.append((binding.id, action, args))
         return intents
 
     def _matches(self, binding: Binding, ev) -> bool:

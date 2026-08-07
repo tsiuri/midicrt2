@@ -101,6 +101,16 @@ class TransportAnalyzer:
         self._beats: int = 0          # clock_tick count since the last "start"
         self._running: bool = False
         self._source: str | None = None
+        # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+        # NOT derived from any MidiEvent -- `Engine._capture_start_action`/
+        # `_capture_stop_action` call `set_rec` directly (the same
+        # "engine calls a setter on a page/analyzer it owns" precedent
+        # `SendNotesPage`'s device-open state and `PageHooks.bind_info`
+        # providers already use elsewhere), since a capture session is
+        # engine-level state with no MIDI event of its own. Chrome's shared
+        # `clients/chrome.py::status_text()` reads this off `overlay.status`
+        # to show a "REC" indicator identically in both clients.
+        self._rec: bool = False
 
     def handle(self, ev: MidiEvent) -> bool:
         if ev.type not in _SOURCE_TRACKED_TYPES:
@@ -151,6 +161,17 @@ class TransportAnalyzer:
     def beat(self) -> int:
         return (self._beats % BEATS_PER_BAR) + 1
 
+    def set_rec(self, rec: bool) -> None:
+        """Engine-driven setter (see `__init__`'s own comment) -- does NOT
+        return whether this was a change nor mark anything dirty itself;
+        `Engine._capture_start_action`/`_capture_stop_action` mark
+        `overlay.status` dirty directly right after calling this, mirroring
+        how `_sendnotes_key`'s own engine-level state changes mark their
+        page dirty themselves rather than through a `handle(ev)`-shaped
+        return value (there is no `MidiEvent` here to return `True`/`False`
+        against)."""
+        self._rec = bool(rec)
+
     def view_model(self) -> dict:
         return {
             "bpm": self._bpm,
@@ -158,4 +179,5 @@ class TransportAnalyzer:
             "beat": self.beat,
             "running": self._running,
             "source": self._source,
+            "rec": self._rec,
         }

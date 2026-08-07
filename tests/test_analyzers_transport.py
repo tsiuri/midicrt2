@@ -29,7 +29,7 @@ def transport(kind, ts=0.0, source="USB MIDI"):
 def test_initial_view_model_is_all_unknown():
     a = TransportAnalyzer()
     assert a.view_model() == {
-        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None,
+        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None, "rec": False,
     }
 
 
@@ -41,7 +41,7 @@ def test_clock_tick_before_any_start_is_ignored_like_v1_tempo_map():
     changed = a.handle(clock_tick(ts=1.0, batch_start=0.5))
     assert changed is False
     assert a.view_model() == {
-        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None,
+        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None, "rec": False,
     }
 
 
@@ -195,7 +195,7 @@ def test_unrelated_event_types_are_a_pure_no_op():
     changed = a.handle(note_on)
     assert changed is False
     assert a.view_model() == {
-        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None,
+        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None, "rec": False,
     }
 
 
@@ -210,3 +210,39 @@ def test_handle_never_reads_a_clock_or_does_io():
     changed = a.handle(clock_tick(ts=10_000_001.0, batch_start=10_000_000.5))
     assert changed is True
     assert a.view_model()["bpm"] == pytest.approx(120.0)
+
+
+# -- rec flag (Phase 5 Task 1, docs/phase5-notes.md) -------------------------
+#
+# NOT derived from any MidiEvent -- set directly by `Engine.
+# _capture_start_action`/`_capture_stop_action` (see analyzers/transport.py's
+# own `set_rec` docstring for why this is an engine-driven setter, not a
+# `handle(ev)` branch).
+
+def test_rec_defaults_false():
+    a = TransportAnalyzer()
+    assert a.view_model()["rec"] is False
+
+
+def test_set_rec_true_is_reflected_in_view_model():
+    a = TransportAnalyzer()
+    a.set_rec(True)
+    assert a.view_model()["rec"] is True
+
+
+def test_set_rec_false_after_true_clears_it():
+    a = TransportAnalyzer()
+    a.set_rec(True)
+    a.set_rec(False)
+    assert a.view_model()["rec"] is False
+
+
+def test_set_rec_does_not_disturb_other_transport_fields():
+    a = TransportAnalyzer()
+    a.handle(transport("start", ts=0.0, source="USB MIDI"))
+    before = a.view_model()
+    a.set_rec(True)
+    after = a.view_model()
+    assert after["rec"] is True
+    assert {k: v for k, v in after.items() if k != "rec"} == \
+        {k: v for k, v in before.items() if k != "rec"}

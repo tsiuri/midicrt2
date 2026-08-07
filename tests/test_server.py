@@ -1,4 +1,7 @@
 import asyncio
+import json
+import os
+import time
 
 from midicrt import proto
 from midicrt.config import Config
@@ -625,5 +628,120 @@ async def test_config_reload_with_wrong_shaped_keys_keeps_connection_alive(tmp_p
     d2 = await c.request("describe")
     assert d2["ok"] is True
     assert d2["data"]["keymap"] == good_keymap
+
+    eng.stop(); await task; await srv.close()
+
+
+# -- event-sourced capture (Phase 5 Task 1, docs/phase5-notes.md) -----------
+#
+# `CaptureSink`'s own contract is test_capture.py's job; provenance origins
+# for bindings/behaviors/sysex are exercised directly on a bare `Engine` in
+# test_engine_core.py. This is the "lifecycle over the wire" evidence the
+# task brief asks for -- a real client, over a real unix socket, driving
+# capture.start/.status/.stop and observing capture_started/capture_stopped
+# -- plus the "client" origin's own wire-level proof (the other three
+# origins never reach `ActionRegistry.dispatch` via a wire client at all).
+
+def _read_session_lines(eng, session_id):
+    with open(eng._capture.session_path(session_id), encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _read_capture_index(eng):
+    with open(f"{eng._capture.dir}/index.json", encoding="utf-8") as f:
+        return json.load(f)
+
+
+async def test_capture_lifecycle_over_the_wire(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+
+    idle = await c.request("action", name="capture.status", args={})
+    assert idle["data"]["recording"] is False
+
+    start = await c.request("action", name="capture.start", args={})
+    assert start["ok"] is True
+    session_id = start["data"]["session_id"]
+    assert start["data"]["recording"] is True
+
+    live = await c.request("action", name="capture.status", args={})
+    assert live["data"]["recording"] is True
+    assert live["data"]["session_id"] == session_id
+
+    await c.read_msgs(0.2)
+    started = [m for m in c.inbox if m.get("kind") == "event" and m.get("name") == "capture_started"]
+    assert started and started[-1]["data"]["id"] == session_id
+
+    eng.queue.put_nowait(MidiEvent(ts=time.time(), source="t", type="note_on", channel=0,
+                                   data1=60, data2=100, summary="note_on ch1 n60 v100"))
+    await asyncio.sleep(0.1)
+
+    stop = await c.request("action", name="capture.stop", args={})
+    assert stop["ok"] is True
+    assert stop["data"]["session_id"] == session_id
+    assert stop["data"]["counts"].get("note_on") == 1
+
+    await c.read_msgs(0.2)
+    stopped = [m for m in c.inbox if m.get("kind") == "event" and m.get("name") == "capture_stopped"]
+    assert stopped and stopped[-1]["data"]["id"] == session_id
+    assert stopped[-1]["data"]["counts"].get("note_on") == 1
+
+    idle_again = await c.request("action", name="capture.status", args={})
+    assert idle_again["data"]["recording"] is False
+
+    lines = _read_session_lines(eng, session_id)
+    assert lines[0]["kind"] == "header"
+    assert lines[0]["session_id"] == session_id
+    assert any(line["kind"] == "event" and line["type"] == "note_on" for line in lines)
+
+    eng.stop(); await task; await srv.close()
+
+
+async def test_capture_records_client_origin_action_mark_over_the_wire(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    await c.request("action", name="capture.start", args={})
+    await c.request("action", name="page.next", args={})
+    stop = await c.request("action", name="capture.stop", args={})
+    session_id = stop["data"]["session_id"]
+
+    lines = _read_session_lines(eng, session_id)
+    marks = [line for line in lines if line["kind"] == "action" and line["name"] == "page.next"]
+    assert marks and marks[0]["origin"] == "client"
+
+    eng.stop(); await task; await srv.close()
+
+
+async def test_capture_pin_and_retention_over_the_wire(tmp_path):
+    eng, srv, task = await make(tmp_path, capture_retention=1)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+
+    first = await c.request("action", name="capture.start", args={})
+    first_id = first["data"]["session_id"]
+    await c.request("action", name="capture.stop", args={})
+    pin = await c.request("action", name="capture.pin", args={"id": first_id})
+    assert pin["data"] == {"pinned": True, "id": first_id}
+
+    for _ in range(2):
+        await c.request("action", name="capture.start", args={})
+        await c.request("action", name="capture.stop", args={})
+
+    # retention=1: the pinned first session must survive regardless; the
+    # unpinned ones settle at exactly 1 resident (see engine/capture.py's
+    # own `_sweep_retention` docstring for why the target is `retention -
+    # 1` before each new session is created).
+    assert os.path.exists(eng._capture.session_path(first_id))
+    rows = _read_capture_index(eng)
+    unpinned = [r for r in rows if not r["pinned"]]
+    assert len(unpinned) == 1
+    assert any(r["id"] == first_id and r["pinned"] for r in rows)
+
+    eng.stop(); await task; await srv.close()
 
     eng.stop(); await task; await srv.close()

@@ -137,6 +137,7 @@ from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config, ConfigError
 from midicrt.engine import bindings as bindings_mod
+from midicrt.engine import capture as capture_mod
 from midicrt.engine import keymap as keymap_mod
 from midicrt.engine import sysex as sysex_mod
 from midicrt.engine.actions import ActionError, ActionRegistry
@@ -536,7 +537,13 @@ class Engine:
         # right after `_handle` returns -- see the module docstring's
         # "dispatch context decision" and `_dispatch_bindings`'s own
         # docstring for why `_handle` itself can never dispatch directly).
-        self._pending_binding_dispatches: list[tuple[str, dict]] = []
+        # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+        # widened from `(name, args)` to `(binding_id, name, args)` --
+        # `_handle` now calls `self._binding_dispatcher.handle_with_origin(ev)`
+        # (an ADDITIVE method, `handle()` itself is untouched -- see
+        # engine/bindings.py's own docstring) so `_dispatch_bindings` can
+        # stamp a capture action mark's `origin` as `f"binding:{binding_id}"`.
+        self._pending_binding_dispatches: list[tuple[str, str, dict]] = []
         self._running = False
         # Important perf fix (2026-08-07 fix wave, finding 1): see
         # set_topic_refcount_provider's own docstring and _flush_dirty's.
@@ -695,6 +702,46 @@ class Engine:
             args={"action": "str", "mode": "str", "args": "dict"})
         self.actions.register("bind.cancel", self._bind_cancel,
                               description="Cancel the currently armed learn slot, if any")
+        # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+        # registered here (before `config.reload`, same "must exist before
+        # `self.keymap`'s construction computes THIS build's complete
+        # action vocabulary" reasoning `bind.learn`/`bind.cancel`'s own
+        # comment above already gives). `CaptureSink` itself is
+        # constructed first -- see engine/capture.py's own module
+        # docstring for the full design (writer queueing/loss window,
+        # index/retention, storage resolution). `self.analyzers["status"]`
+        # already exists by this point (built at the very top of
+        # `__init__`), which `_capture_start_action`/`_capture_stop_action`
+        # below need for the `rec` chrome flag.
+        self._capture = capture_mod.CaptureSink(
+            capture_dir=config.capture_dir,
+            retention=config.capture_retention,
+            engine_version=__import__("midicrt").__version__,
+            instruments=list(config.instruments),
+        )
+        # The dispatch-hook seam (docs/phase5-notes.md's decided design,
+        # point 1: "record raw MIDI + action marks WITH PROVENANCE") --
+        # covers 3 of the 4 origins (bindings/behaviors/client) uniformly;
+        # the 4th (sysex) never reaches `ActionRegistry.dispatch` at all
+        # (see `_handle_sysex`'s own sysex handlers, which call
+        # `self._capture.record_action(..., origin="sysex")` directly).
+        self.actions.set_dispatch_hook(self._on_action_dispatched)
+        self.actions.register("capture.start", self._capture_start_action,
+                              description="Start a new event-sourced capture session")
+        self.actions.register("capture.stop", self._capture_stop_action,
+                              description="Stop the active capture session")
+        self.actions.register("capture.status", self._capture_status_action,
+                              description="Report the active capture session's status")
+        self.actions.register("capture.pin", self._capture_pin_action,
+                              description="Pin a stopped capture session so retention "
+                                          "never deletes it",
+                              args={"id": "str"})
+        if config.capture_auto_start:
+            # v1's OWN deployed default is manual-start-only (verified,
+            # not invented -- see config.py's own comment on
+            # `capture_auto_start`) -- this branch only ever fires when a
+            # config.toml explicitly opts in.
+            self._capture_start_action()
         # Phase 4 Task 1 (config-served keymap, docs/phase4-notes.md):
         # registered LAST, after every other action above (engine-owned
         # AND page-declared) -- both because `config.reload` itself is a
@@ -989,6 +1036,62 @@ class Engine:
             self.emit_event("learn_cancelled", {"reason": "cancelled"})
         return {"cancelled": was_armed}
 
+    # -- capture.start / .stop / .status / .pin (Phase 5 Task 1,
+    # docs/phase5-notes.md) -------------------------------------------------
+
+    def _on_action_dispatched(self, name: str, args: dict, origin: str, result: dict) -> None:
+        """`ActionRegistry`'s dispatch-hook (wired in `__init__` right
+        after `self._capture` is constructed) -- fires after every
+        SUCCESSFUL dispatch through the registry (bindings/behaviors/
+        client; sysex bypasses the registry entirely, see
+        `_handle_sysex`'s own handlers). `CaptureSink.record_action` is
+        itself a no-op when not recording, so this is cheap even outside a
+        capture session."""
+        self._capture.record_action(name, args, origin)
+
+    def _capture_start_action(self) -> dict:
+        """`capture.start` action handler (also called directly from
+        `__init__` for `config.capture_auto_start`, and internally by
+        `_capture_stop_action`'s sibling docstring note -- see
+        `CaptureSink.start`'s own "implicitly stops a running session
+        first" behavior). Stamps the `rec` chrome flag on the ALWAYS-
+        present "status" analyzer and marks `overlay.status` dirty
+        directly (mirrors `_sendnotes_key`'s own "engine-level state
+        change marks its page dirty itself" precedent -- there is no
+        `MidiEvent` here for `TransportAnalyzer.handle()` to react to)."""
+        result = self._capture.start()
+        self.analyzers["status"].set_rec(True)
+        self._dirty.add("overlay.status")
+        self.emit_event("capture_started", {"id": result["session_id"]})
+        return {"recording": True, **result}
+
+    def _capture_stop_action(self) -> dict:
+        """`capture.stop` action handler. A no-op-shaped result (mirrors
+        `CaptureSink.stop`'s own "stopping nothing is harmless" precedent)
+        when nothing was recording -- no `capture_stopped` event in that
+        case either, matching `bind.cancel`'s own "no event for a no-op"
+        precedent right above."""
+        result = self._capture.stop()
+        self.analyzers["status"].set_rec(False)
+        self._dirty.add("overlay.status")
+        if result.get("session_id"):
+            self.emit_event("capture_stopped",
+                            {"id": result["session_id"], "counts": result.get("counts", {})})
+        return {"recording": False, **result}
+
+    def _capture_status_action(self) -> dict:
+        return self._capture.status()
+
+    def _capture_pin_action(self, id: str) -> dict:
+        """`capture.pin {id}` action handler -- translates `CaptureSink.
+        pin`'s `ValueError` (unknown/not-yet-stopped session id) into
+        `ActionError`, same "unknown named resource is a genuine caller
+        error" precedent `_bind_remove` already sets."""
+        try:
+            return self._capture.pin(id)
+        except ValueError as exc:
+            raise ActionError(str(exc)) from exc
+
     def _new_binding_id(self) -> str:
         """A short, stable, TOML-table-key-safe id for a freshly learned
         binding (`Binding.id`'s own contract, see that dataclass's
@@ -1093,8 +1196,8 @@ class Engine:
 
     async def _dispatch_bindings(self) -> None:
         """Dispatch every binding-triggered action intent collected by
-        `_handle` (via `self._binding_dispatcher.handle(ev)`) since the
-        last call -- the async half of the dispatch-context split
+        `_handle` (via `self._binding_dispatcher.handle_with_origin(ev)`)
+        since the last call -- the async half of the dispatch-context split
         docs/phase4-notes.md calls for (`_handle` is synchronous and
         cannot itself await `ActionRegistry.dispatch`; `behaviors/
         pagecycle.py`'s own `tick()` -> `_tick_behaviors` split is the
@@ -1125,9 +1228,16 @@ class Engine:
         swallow -- a MIDI-triggered failure is much harder to notice/
         diagnose otherwise than an idle timer's occasional skip)."""
         pending, self._pending_binding_dispatches = self._pending_binding_dispatches, []
-        for name, args in pending:
+        for binding_id, name, args in pending:
             try:
-                await self.actions.dispatch(name, args)
+                # Phase 5 Task 1 (event-sourced capture, docs/phase5-
+                # notes.md): `origin=f"binding:{binding_id}"` -- picked up
+                # by `ActionRegistry`'s dispatch hook (`Engine.
+                # _on_action_dispatched`) ONLY on a successful dispatch,
+                # never for the `ActionError` case caught right below (a
+                # skipped/stale binding never fired, so it must not leave
+                # an action mark behind).
+                await self.actions.dispatch(name, args, origin=f"binding:{binding_id}")
             except ActionError as exc:
                 _LOG.warning("binding dispatch skipped: action %r: %s", name, exc)
             except Exception:  # noqa: BLE001 -- see docstring: MIDI-driven, must never kill run()
@@ -1262,6 +1372,14 @@ class Engine:
 
     def _set_current_page(self, name: str) -> dict:
         self.current_page = name
+        # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+        # the single funnel point for EVERY page transition regardless of
+        # cause (page.next/.prev/.goto actions, a sysex CMD_SWITCH_PAGE/
+        # CMD_SCREENSAVER-force, an idle pagecycle/screensaver behavior) --
+        # a `page_changed` mark here is complete with no per-origin
+        # plumbing of its own, unlike action marks. No-op when not
+        # recording (`CaptureSink.record_page_changed`'s own guard).
+        self._capture.record_page_changed(name)
         self.emit_event("page_changed", {"page": name})
         return {"page": name}
 
@@ -1382,6 +1500,13 @@ class Engine:
         # our configured port name in backend-specific client/port framing.
         if ev.source and self._midi_out.port_name in ev.source:
             return
+        # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+        # raw MIDI is ground truth (decided design, point 1) -- recorded
+        # unconditionally here, before any learn/binding/analyzer/page
+        # branching below, so a capture reflects EXACTLY what the rest of
+        # the engine saw, regardless of what (if anything) later consumed
+        # it. `record_event` is a no-op when not recording.
+        self._capture.record_event(ev)
         # Phase 4 Task 3 (DAW-style MIDI learn, docs/phase4-notes.md): an
         # armed learn slot CONSUMES the next qualifying event -- it must
         # NOT also reach the binding dispatcher below, or a learn capture
@@ -1413,7 +1538,8 @@ class Engine:
             # harmless, since `BindingDispatcher._matches` only ever matches
             # `note_on`/`control_change` types, so every other event type is
             # a guaranteed no-op pass-through here.
-            self._pending_binding_dispatches.extend(self._binding_dispatcher.handle(ev))
+            self._pending_binding_dispatches.extend(
+                self._binding_dispatcher.handle_with_origin(ev))
         self.events_total += 1
         if ev.type in _ACTIVITY_EVENT_TYPES:
             self._last_activity_ts = ev.ts
@@ -1516,6 +1642,15 @@ class Engine:
                     sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x01, (page_id,)))
             return
         self._page_goto(name)
+        # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+        # sysex never goes through `ActionRegistry.dispatch` (it calls
+        # `_page_goto` directly, above) so it can't rely on the dispatch
+        # hook every OTHER origin uses -- this is the 4th of the "four
+        # dispatch sites" instrumented directly, calling the SAME
+        # `CaptureSink.record_action` primitive the hook itself calls,
+        # with the equivalent action name/args a `page.goto` action call
+        # would have carried.
+        self._capture.record_action("page.goto", {"name": name}, "sysex")
         if version is not None:
             self._midi_out.send_sysex(
                 sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x00, (page_id,)))
@@ -1550,6 +1685,10 @@ class Engine:
             return
         if args[0] != 0 and "screensaver" in self.pages:
             self._page_goto("screensaver")
+            # Phase 5 Task 1: see `_sysex_switch_page`'s own comment --
+            # same "sysex bypasses the dispatch hook, call the primitive
+            # directly" reasoning.
+            self._capture.record_action("page.goto", {"name": "screensaver"}, "sysex")
         if version is not None:
             self._midi_out.send_sysex(sysex_mod.build_reply(
                 version, sysex_mod.CMD_SCREENSAVER, 0x00, (int(args[0] != 0),)))
@@ -1564,6 +1703,10 @@ class Engine:
                     sysex_mod.build_reply(version, sysex_mod.CMD_PAGE_CYCLE, 0x01))
             return
         self._pagecycle_enable(bool(args[0]))
+        # Phase 5 Task 1: see `_sysex_switch_page`'s own comment -- same
+        # "sysex bypasses the dispatch hook, call the primitive directly"
+        # reasoning.
+        self._capture.record_action("pagecycle.enable", {"enabled": bool(args[0])}, "sysex")
         if version is not None:
             self._midi_out.send_sysex(sysex_mod.build_reply(
                 version, sysex_mod.CMD_PAGE_CYCLE, 0x00, (int(bool(args[0])),)))
@@ -1623,6 +1766,20 @@ class Engine:
 
     def stop(self) -> None:
         self._running = False
+        # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md): a
+        # clean shutdown (SIGTERM/SIGINT -- see daemon.py's own
+        # `run()`/signal handling) finalizes any still-active capture
+        # session (flush + write its index.json row) rather than silently
+        # orphaning it -- see engine/capture.py's module docstring's
+        # "Writer design" section for what an UNCLEAN shutdown (a crash)
+        # still loses (up to ~flush_interval_s of buffered events/marks,
+        # plus the index row itself). A no-op when nothing is recording
+        # (`CaptureSink.stop`'s own guard). Reuses `_capture_stop_action`
+        # itself (not a hand-rolled duplicate) so shutdown gets the exact
+        # same `rec`-flag/dirty-marking/`capture_stopped` event behavior a
+        # normal `capture.stop` action gets.
+        if self._capture.is_recording:
+            self._capture_stop_action()
         # Phase-3 task 12 fix (Important, live-reproduced): flush any
         # still-gated Send Notes BEFORE closing midi_out -- a routine
         # restart mid-note used to just close the port out from under
@@ -1724,7 +1881,11 @@ class Engine:
                 continue
             name, args = intent
             try:
-                await self.actions.dispatch(name, args)
+                # Phase 5 Task 1 (event-sourced capture, docs/phase5-
+                # notes.md): origin="behavior" -- an idle-triggered
+                # page.next/page.goto has no more specific provenance to
+                # report (unlike a binding's own id).
+                await self.actions.dispatch(name, args, origin="behavior")
             except ActionError:
                 # e.g. a custom config removed the "screensaver" page a
                 # behavior tries to `page.goto` -- an unattended internal
@@ -1777,4 +1938,16 @@ class Engine:
             # `_flush_dirty` (a `learn_cancelled` event this call emits
             # should reach clients in the same tick it fires).
             self._tick_learn(now)
+            # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+            # the writer's flush cadence gate -- see `CaptureSink.
+            # maybe_flush`'s own docstring for why this tick-driven cadence
+            # (piggybacking on `run()`'s existing per-iteration wall clock,
+            # not a dedicated thread/asyncio task) is the deliberate,
+            # disclosed choice here: `run()` already drains a whole queued
+            # burst of events before reaching this point (the `while not
+            # self.queue.empty()` loop above), so a MIDI storm doesn't
+            # starve the flush cadence, and `tick_hz`'s default 30Hz
+            # (~33ms) comfortably services a ~1s cadence without a second
+            # concurrency domain to reason about.
+            self._capture.maybe_flush(now)
             self._flush_dirty()

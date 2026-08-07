@@ -793,3 +793,43 @@ def test_learn_timeout_s_is_thirty_seconds():
     # own wait-timeout default (engine timeout + slack) both read the SAME
     # number instead of two independently-maintained literals.
     assert LEARN_TIMEOUT_S == 30.0
+
+
+# -- handle_with_origin (Phase 5 Task 1, docs/phase5-notes.md) ---------------
+#
+# Additive -- `handle()` itself (tested exhaustively above) is completely
+# unchanged; this is the SAME matching/evaluation, just with the
+# originating binding's id kept alongside each intent, for
+# `Engine._dispatch_bindings` to stamp a capture action mark's
+# `origin=f"binding:{binding_id}"`.
+
+def test_handle_with_origin_returns_the_matching_bindings_id():
+    b = trigger_binding(id="my-binding", match={"type": "note_on", "number": 60})
+    d = BindingDispatcher([b])
+    assert d.handle_with_origin(ev(data1=60)) == [("my-binding", "page.next", {})]
+
+
+def test_handle_with_origin_returns_empty_list_for_no_match():
+    b = trigger_binding(match={"type": "note_on", "number": 60})
+    d = BindingDispatcher([b])
+    assert d.handle_with_origin(ev(data1=61)) == []
+
+
+def test_handle_with_origin_tags_each_intent_with_its_own_binding_id_when_several_match():
+    b1 = trigger_binding(id="b1", action="page.next", match={"type": "note_on", "number": 60})
+    b2 = trigger_binding(id="b2", action="page.prev", match={"type": "note_on", "number": 60,
+                                                             "channel": 0})
+    d = BindingDispatcher([b1, b2])
+    intents = d.handle_with_origin(ev(data1=60, channel=0))
+    assert sorted(intents, key=lambda t: t[0]) == [
+        ("b1", "page.next", {}), ("b2", "page.prev", {}),
+    ]
+
+
+def test_handle_and_handle_with_origin_agree_modulo_the_binding_id():
+    b = trigger_binding(id="b1", match={"type": "note_on", "number": 60})
+    d = BindingDispatcher([b])
+    e = ev(data1=60)
+    plain = d.handle(e)
+    with_origin = d.handle_with_origin(e)
+    assert [(name, args) for _, name, args in with_origin] == plain

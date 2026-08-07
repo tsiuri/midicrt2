@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 
 import pytest
@@ -322,7 +323,7 @@ def test_snapshot_now_serves_overlay_topic():
     assert snap is not None
     assert snap["topic"] == "overlay.status"
     assert snap["data"] == {
-        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None,
+        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None, "rec": False,
     }
 
 
@@ -713,9 +714,9 @@ async def test_tick_behaviors_pagecycle_dispatch_is_observable_via_a_spy():
     calls = []
     original_dispatch = eng.actions.dispatch
 
-    async def spy(name, args):
+    async def spy(name, args, **kwargs):
         calls.append((name, args))
-        return await original_dispatch(name, args)
+        return await original_dispatch(name, args, **kwargs)
 
     eng.actions.dispatch = spy
     await eng._tick_behaviors(0.0)
@@ -860,9 +861,9 @@ async def test_pagecycle_does_not_immediately_override_a_manual_screensaver_esca
     calls = []
     original_dispatch = eng.actions.dispatch
 
-    async def spy(name, args):
+    async def spy(name, args, **kwargs):
         calls.append((name, args))
-        return await original_dispatch(name, args)
+        return await original_dispatch(name, args, **kwargs)
 
     eng.actions.dispatch = spy
 
@@ -2430,3 +2431,208 @@ async def test_learn_capture_does_not_remove_an_overlapping_wildcard_port_bindin
     assert len(eng._bindings_file.bindings) == 2
     bound_events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_bound"]
     assert bound_events[-1]["data"]["replaced"] == []
+
+
+# -- event-sourced capture (Phase 5 Task 1, docs/phase5-notes.md) -----------
+#
+# `engine/capture.py::CaptureSink`'s own contract (writer queueing, header
+# versioning, retention, malformed-index recovery) is tested directly, in
+# isolation, in test_capture.py -- everything below is registry/engine-aware
+# WIRING: the four dispatch-site provenance origins, the `rec` chrome flag,
+# `capture.*` actions, `capture_started`/`capture_stopped` events, and
+# `config.capture_auto_start`. "client" origin is exercised again, over a
+# real wire connection, in test_server.py.
+
+def _read_session_lines(eng, session_id):
+    with open(eng._capture.session_path(session_id), encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _read_capture_index(eng):
+    with open(f"{eng._capture.dir}/index.json", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def test_capture_auto_start_defaults_off_matching_v1s_deployed_behavior():
+    # v1's OWN deployed `~/codex/midicrt/config/settings.json` has no
+    # arm-at-boot flag at all for its memory-capture system -- see
+    # config.py's own comment on `capture_auto_start`.
+    eng = Engine(Config())
+    assert eng._capture.is_recording is False
+    assert eng.analyzers["status"].view_model()["rec"] is False
+
+
+def test_capture_auto_start_true_arms_recording_at_construction():
+    eng = Engine(Config(capture_auto_start=True))
+    assert eng._capture.is_recording is True
+    assert eng.analyzers["status"].view_model()["rec"] is True
+
+
+def test_capture_start_action_sets_rec_flag_marks_dirty_and_emits_event():
+    eng = Engine(Config())
+    got = []
+    eng.add_listener(got.append)
+    result = eng._capture_start_action()
+    assert result["recording"] is True
+    assert eng.analyzers["status"].view_model()["rec"] is True
+    assert "overlay.status" in eng._dirty
+    events = [m for m in got if m.get("kind") == "event" and m.get("name") == "capture_started"]
+    assert events and events[-1]["data"]["id"] == result["session_id"]
+
+
+def test_capture_stop_action_clears_rec_flag_and_emits_event_with_counts():
+    eng = Engine(Config())
+    eng._capture_start_action()
+    eng._handle(ev(type="note_on"))
+    got = []
+    eng.add_listener(got.append)
+    result = eng._capture_stop_action()
+    assert eng.analyzers["status"].view_model()["rec"] is False
+    events = [m for m in got if m.get("kind") == "event" and m.get("name") == "capture_stopped"]
+    assert events
+    assert events[-1]["data"]["id"] == result["session_id"]
+    assert events[-1]["data"]["counts"] == result["counts"]
+
+
+def test_capture_stop_action_when_nothing_recording_is_a_noop_no_event():
+    eng = Engine(Config())
+    got = []
+    eng.add_listener(got.append)
+    result = eng._capture_stop_action()
+    assert result["session_id"] is None
+    events = [m for m in got if m.get("kind") == "event" and m.get("name") == "capture_stopped"]
+    assert events == []
+
+
+async def test_capture_status_action_reports_live_recording_state():
+    eng = Engine(Config())
+    assert (await eng.actions.dispatch("capture.status", {}))["recording"] is False
+    await eng.actions.dispatch("capture.start", {})
+    assert (await eng.actions.dispatch("capture.status", {}))["recording"] is True
+
+
+async def test_capture_pin_unknown_id_raises_action_error():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="unknown capture session"):
+        await eng.actions.dispatch("capture.pin", {"id": "nope"})
+
+
+async def test_capture_pin_a_stopped_session_over_the_action_registry():
+    eng = Engine(Config())
+    await eng.actions.dispatch("capture.start", {})
+    stop_result = await eng.actions.dispatch("capture.stop", {})
+    result = await eng.actions.dispatch("capture.pin", {"id": stop_result["session_id"]})
+    assert result == {"pinned": True, "id": stop_result["session_id"]}
+
+
+def test_capture_header_carries_engine_version_and_configured_instruments():
+    import midicrt
+    eng = Engine(Config(instruments=["Foo", "Bar"]))
+    result = eng._capture_start_action()
+    header = _read_session_lines(eng, result["session_id"])[0]
+    assert header["kind"] == "header"
+    assert header["instruments"] == ["Foo", "Bar"]
+    assert header["engine_version"] == midicrt.__version__
+
+
+async def test_capture_records_page_changed_mark_on_page_transition():
+    eng = Engine(Config())
+    eng._capture_start_action()
+    await eng.actions.dispatch("page.next", {}, origin="client")
+    landed_on = eng.current_page
+    result = eng._capture_stop_action()
+    lines = _read_session_lines(eng, result["session_id"])
+    marks = [line for line in lines if line["kind"] == "page_changed"]
+    assert marks and marks[-1]["page"] == landed_on
+
+
+async def test_engine_stop_finalizes_an_active_capture_session():
+    eng = Engine(Config())
+    result = eng._capture_start_action()
+    eng._handle(ev(type="note_on"))
+    eng.stop()
+    assert eng._capture.is_recording is False
+    assert eng.analyzers["status"].view_model()["rec"] is False
+    rows = _read_capture_index(eng)
+    assert any(r["id"] == result["session_id"] for r in rows)
+
+
+async def test_capture_records_no_action_mark_for_a_binding_dispatch_that_raises_actionerror(
+        tmp_path):
+    # Marks are stamped ONLY on a SUCCESSFUL dispatch (docs/phase5-notes.md:
+    # "capture stamps marks at DISPATCH time") -- a binding referencing an
+    # action absent from this roster is the SAME graceful-skip case
+    # test_dispatch_bindings_skips_roster_absent_action_and_logs_without_crashing
+    # already covers; it must not leave an action mark behind either.
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="sendnotes.key", args_toml='key = "z"')
+    eng = Engine(Config(pages=["eventlog"]), bindings_path=str(p))
+    eng._capture_start_action()
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    await eng._dispatch_bindings()
+    result = eng._capture_stop_action()
+    lines = _read_session_lines(eng, result["session_id"])
+    assert not [line for line in lines if line["kind"] == "action"]
+
+
+async def test_capture_records_provenance_for_all_four_dispatch_origins(tmp_path):
+    """The headline proof (task brief): fire a binding, an idle behavior, a
+    client action, and a sysex command while capturing, then confirm all
+    FOUR origins land as distinct `"kind": "action"` marks in the same
+    session file -- `binding:<id>`/`behavior`/`client`/`sysex`."""
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, binding_id="b1", action="page.next", number=60)
+    eng = Engine(Config(pagecycle_enabled=True, screensaver_enabled=False),
+                bindings_path=str(p))
+    eng._capture_start_action()
+
+    # 1. binding origin
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    await eng._dispatch_bindings()
+
+    # 2. behavior origin -- force a huge idle gap so PageCycleBehavior fires.
+    # Two calls needed (same shape as test_tick_behaviors_pagecycle_
+    # dispatch_is_observable_via_a_spy above): the FIRST tick only ARMS
+    # `_idle_since` (a freshly constructed behavior always treats its very
+    # first tick as "activity moved forward", see behaviors/pagecycle.py's
+    # own `tick()` docstring); the SECOND tick, far enough past `idle_s`,
+    # actually fires `page.next`. No real wall-clock wait needed -- `now`
+    # is injected, same "inject now" precedent every other behavior/
+    # analyzer tick test uses.
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(now=0.0)
+    await eng._tick_behaviors(now=eng.config.pagecycle_idle_s + 100.0)
+
+    # 3. client origin -- exactly what engine/server.py's own action
+    # dispatch branch does.
+    await eng.actions.dispatch("page.prev", {}, origin="client")
+
+    # 4. sysex origin -- CMD_SWITCH_PAGE to page id 13 ("voices"), version
+    # None so no real MIDI reply send is attempted.
+    eng._sysex_switch_page(version=None, args=(13,))
+
+    result = eng._capture_stop_action()
+    lines = _read_session_lines(eng, result["session_id"])
+    origins = {line["origin"] for line in lines if line["kind"] == "action"}
+    assert any(o == "binding:b1" for o in origins)
+    assert "behavior" in origins
+    assert "client" in origins
+    assert "sysex" in origins
+
+
+async def test_run_loop_flushes_capture_to_disk_on_its_own_cadence():
+    # Integration proof that `Engine.run()` actually calls `CaptureSink.
+    # maybe_flush` each tick (unit-level cadence/gating logic itself is
+    # test_capture.py's job) -- speeds the cadence up via the private
+    # attribute so this doesn't need a real ~1s wall-clock wait.
+    eng = Engine(Config(tick_hz=200.0))
+    eng._capture_start_action()
+    eng._capture._flush_interval_s = 0.01
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100))
+    await asyncio.sleep(0.2)
+    session_id = eng._capture.status()["session_id"]
+    lines = _read_session_lines(eng, session_id)
+    eng.stop()
+    await task
+    assert any(line["kind"] == "event" and line["type"] == "note_on" for line in lines)

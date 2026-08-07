@@ -64,6 +64,36 @@ def test_status_text_is_a_single_line():
     assert "\n" not in status_text(DEFAULT_STATUS_VM)
 
 
+# -- rec flag / chrome indicator (Phase 5 Task 1, docs/phase5-notes.md) ------
+
+def test_default_status_vm_defaults_rec_false():
+    assert DEFAULT_STATUS_VM["rec"] is False
+
+
+def test_status_text_shows_no_rec_marker_when_not_recording():
+    text = status_text(DEFAULT_STATUS_VM)
+    assert "REC" not in text
+
+
+def test_status_text_shows_rec_marker_when_recording():
+    vm = dict(DEFAULT_STATUS_VM, rec=True)
+    text = status_text(vm)
+    assert "REC" in text
+
+
+def test_status_text_rec_marker_does_not_change_line_count():
+    vm = dict(DEFAULT_STATUS_VM, rec=True)
+    assert "\n" not in status_text(vm)
+
+
+def test_status_text_omits_rec_marker_when_vm_has_no_rec_key_at_all():
+    # Backward-compat: an older vm dict shape (no "rec" key) must render
+    # IDENTICALLY to before this task -- `.get("rec")` on a missing key is
+    # falsy, so this is the same code path as "rec": False, not a KeyError.
+    vm = {"bpm": 120.0, "bar": 1, "beat": 2, "running": True, "source": "USB MIDI"}
+    assert "REC" not in status_text(vm)
+
+
 # -- stuck-notes alerts + time-signature (phase-3 task 6) --------------------
 
 def test_overlay_alerts_and_timesig_topics_match_engine_convention():

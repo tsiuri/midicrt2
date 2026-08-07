@@ -14,6 +14,14 @@ After=user@1000.service
 User=billie
 Group=audio
 RuntimeDirectory=midicrt
+# Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md): creates
+# /var/lib/midicrt (owned by this unit's own User=/Group=, same convention
+# as RuntimeDirectory=midicrt above for /run/midicrt) before the daemon
+# starts -- engine/capture.py::CaptureSink writes session .jsonl files +
+# index.json under /var/lib/midicrt/sessions. Unlike RuntimeDirectory,
+# StateDirectory persists across reboots (systemd never clears it), which
+# is the whole point -- captured sessions must survive a restart.
+StateDirectory=midicrt
 ExecStart=/home/billie/midicrt2-venv/bin/midicrtd
 Restart=on-failure
 RestartSec=2

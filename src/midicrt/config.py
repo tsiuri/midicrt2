@@ -130,6 +130,24 @@ class Config:
     pagecycle_idle_s: float = 300.0
     screensaver_enabled: bool = True
     screensaver_after_s: float = 60.0
+    # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
+    # `capture_dir` (default `None`) explicitly overrides `engine/
+    # capture.py::resolve_capture_dir`'s own StateDirectory-vs-dev-fallback
+    # resolution -- see that function's docstring. `capture_retention`
+    # (default 50) is `CaptureSink`'s unpinned-session cap swept at every
+    # `capture.start`. `capture_auto_start` defaults `False`, matching v1's
+    # OWN deployed behavior verified on the Pi (`~/codex/midicrt/config/
+    # settings.json`'s `memory`/`capture` sections have no arm-at-boot
+    # flag at all -- v1's `engine/memory/capture.py::MemoryCaptureManager`
+    # only ever arms via an explicit `memory_start()` call bound to a
+    # pianoroll-page keystroke, `pages/pianoroll_exp.py`, never
+    # automatically) -- v2 does not change that out-of-the-box behavior,
+    # it just adds the knob (same "add the config the brief requires
+    # without changing shipped behavior" precedent as `screensaver_enabled`
+    # above).
+    capture_dir: str | None = None
+    capture_retention: int = 50
+    capture_auto_start: bool = False
 
 
 def load(path: str | None = None) -> Config:

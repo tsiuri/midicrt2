@@ -36,10 +36,23 @@ LIFO stack, with no double-teardown or ordering hazard.
 `Engine.__init__` never reads `config.toml` at all (a `Config()` dataclass
 is passed in directly); only `config_mod.load(path)` reads it, and every
 call site either takes an explicit path or is a daemon-startup path outside
-the test suite's reach."""
+the test suite's reach.
+
+Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md) extends the
+SAME fixture to `engine/capture.py`'s own `DEFAULT_STATE_DIR`/
+`DEV_FALLBACK_STATE_DIR` -- without this, a bare `Engine(Config())` in the
+suite would resolve `CaptureSink`'s session directory via
+`resolve_capture_dir()`'s real production/dev-fallback logic, which on a
+CI runner or this exact live Pi (where the daemon and the repo share a
+home directory) could point at a REAL `~/.local/state/midicrt/sessions`
+directory -- the identical contamination risk the keymap/bindings fixture
+above was written to close, just for a directory instead of two files.
+Patching BOTH constants (not just `DEFAULT_STATE_DIR`) means a test can
+never fall through to the real dev-fallback path either."""
 import pytest
 
 from midicrt.engine import bindings as bindings_mod
+from midicrt.engine import capture as capture_mod
 from midicrt.engine import keymap as keymap_mod
 
 
@@ -48,3 +61,6 @@ def _isolate_default_midicrt_config_paths(tmp_path, monkeypatch):
     fake_dir = tmp_path / "midicrt-config-isolated"
     monkeypatch.setattr(keymap_mod, "DEFAULT_PATH", str(fake_dir / "keymap.toml"))
     monkeypatch.setattr(bindings_mod, "DEFAULT_PATH", str(fake_dir / "bindings.toml"))
+    monkeypatch.setattr(capture_mod, "DEFAULT_STATE_DIR", str(fake_dir / "sessions"))
+    monkeypatch.setattr(capture_mod, "DEV_FALLBACK_STATE_DIR",
+                        str(fake_dir / "sessions-dev-fallback"))

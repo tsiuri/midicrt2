@@ -50,9 +50,29 @@ class ActionError(Exception):
 class ActionRegistry:
     def __init__(self):
         self._actions: dict[str, tuple[Callable, str, dict[str, str]]] = {}
+        # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md): an
+        # OPTIONAL hook, set at most once (`Engine.__init__` wires it to
+        # `Engine._on_action_dispatched`) and fired after every SUCCESSFUL
+        # dispatch (never for one that raised `ActionError` -- see below).
+        # This is how three of capture's four provenance origins
+        # ("binding:<id>", "behavior", "client") get their action marks
+        # stamped without every dispatch call site needing to know
+        # `CaptureSink` exists at all -- only the NEW `origin` kwarg. The
+        # fourth origin ("sysex") never reaches here at all (sysex mutates
+        # engine state through private methods directly, bypassing this
+        # registry entirely -- see engine/core.py's sysex handlers, which
+        # call `Engine._capture.record_action(..., origin="sysex")`
+        # themselves). `None` (the default, e.g. any test constructing a
+        # bare `ActionRegistry()`) means no hook is called at all -- this
+        # method's existing callers/behavior are completely unchanged when
+        # no hook is wired.
+        self._on_dispatch: Callable[[str, dict, str, dict], None] | None = None
 
     def register(self, name, handler, description="", args=None):
         self._actions[name] = (handler, description, dict(args or {}))
+
+    def set_dispatch_hook(self, callback: Callable[[str, dict, str, dict], None] | None) -> None:
+        self._on_dispatch = callback
 
     def describe(self) -> dict:
         return {
@@ -60,7 +80,7 @@ class ActionRegistry:
             for name, (_, desc, args) in sorted(self._actions.items())
         }
 
-    async def dispatch(self, name: str, args: dict) -> dict:
+    async def dispatch(self, name: str, args: dict, *, origin: str = "unknown") -> dict:
         if name not in self._actions:
             raise ActionError(f"unknown action: {name}")
         handler, _, schema = self._actions[name]
@@ -77,4 +97,7 @@ class ActionRegistry:
         result = handler(**coerced)
         if inspect.isawaitable(result):
             result = await result
-        return result if isinstance(result, dict) else {}
+        result = result if isinstance(result, dict) else {}
+        if self._on_dispatch is not None:
+            self._on_dispatch(name, coerced, origin, result)
+        return result
