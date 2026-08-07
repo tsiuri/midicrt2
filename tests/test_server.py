@@ -482,3 +482,39 @@ async def test_config_reload_round_trip_over_the_wire(tmp_path):
     assert events[-1]["data"]["keymap"]["n"] == "page.prev"
 
     eng.stop(); await task; await srv.close()
+
+
+async def test_config_reload_with_malformed_keymap_toml_keeps_connection_alive(tmp_path):
+    """Bindings review, live-reproduced Critical finding: an unguarded
+    `load_keymap` inside `_config_reload` used to raise straight out of
+    the action handler -- an uncaught exception escaping `ActionRegistry.
+    dispatch` here is NOT caught by `ProtocolServer._dispatch`'s own
+    `except ActionError` narrowing, so it propagated further and tore
+    down the requesting connection. Reproduces that exact shape over a
+    REAL socket: the response must still carry `ok: true` with a warning
+    (not an error response, and definitely not a dropped connection), the
+    keymap must be unchanged, and the SAME connection must still work
+    for a subsequent request afterward."""
+    keymap_path = tmp_path / "keymap.toml"
+    keymap_path.write_text('[keys]\nv = "eventlog.clear"\n')
+    eng, srv, task = await make(tmp_path, keymap_path=str(keymap_path))
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+
+    d = await c.request("describe")
+    good_keymap = d["data"]["keymap"]
+    assert good_keymap["v"] == "eventlog.clear"
+
+    keymap_path.write_text("this is not valid toml {{{ [[[ ===\n")
+    r = await c.request("action", name="config.reload", args={})
+    assert r["ok"] is True   # not an error response -- malformed file is disclosed, not fatal
+    assert r["data"]["keymap"] == good_keymap   # unchanged -- last-good kept
+    assert any("keymap.toml" in w.lower() for w in r["data"]["warnings"])
+
+    # Connection alive: a further request over the SAME connection still works.
+    d2 = await c.request("describe")
+    assert d2["ok"] is True
+    assert d2["data"]["keymap"] == good_keymap
+
+    eng.stop(); await task; await srv.close()

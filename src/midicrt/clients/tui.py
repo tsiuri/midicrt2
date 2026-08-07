@@ -73,6 +73,7 @@ again unchanged, invoked with `term.height - 3`) and subscribes to both
 new overlay topics alongside the existing three.
 """
 import json
+import time
 
 from midicrt.behaviors.screensaver import SCREENSAVER_PAGE
 from midicrt.clients import chrome
@@ -787,6 +788,52 @@ RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "chordkey": render_chordkey_lines, "sendnotes": render_sendnotes_lines}
 
 _SUBSCRIBE_RATE = 10.0
+# How long a rejected-action message stays on the status row (bindings
+# review fix, below) -- long enough for a human watching the CRT to
+# actually read it, short enough that it doesn't linger forever over
+# unrelated later status updates.
+_ERROR_DISPLAY_S = 3.0
+
+
+def _handle_key_press(client, key: str, state: dict) -> bool:
+    """Resolve `key` against `state["keymap"]` and dispatch it -- the ONE
+    place `run_tui`'s main loop must distinguish an action-dispatch
+    failure from a lost connection (bindings review, live-reproduced
+    Critical finding). `dispatch_key` (`clients/base.py`) raises
+    `ClientError` for BOTH a rejected action (bad/missing args, unknown
+    action -- e.g. a keymap.toml entry that somehow slipped past
+    `engine/keymap.py::filter_known_actions`'s own args-schema check, or a
+    roster mismatch after a `config.reload`) AND a genuinely dead
+    connection, with no reliable way to tell them apart by TYPE or by
+    parsing the message text. This function therefore treats EVERY
+    `ClientError` caught here as "an action failed, not fatal" -- recorded
+    into `state["last_error"]`/`state["last_error_until"]` as a transient
+    status-line message (`_active_error_text` renders it) -- and always
+    returns `False` (never signals quit) in that case. A genuine
+    disconnect is still caught, just not HERE: it's detected
+    AUTHORITATIVELY via the reader thread's own EOF/None sentinel,
+    surfacing through `drain_latest`'s/`wait_first_snapshot`'s OWN
+    `ClientError` in `run_tui`'s main loop below -- unaffected by this
+    function ever swallowing one. Returns `True` only for the
+    `client.quit` pseudo-action (`dispatch_key`'s own return value, never
+    raises for that case)."""
+    try:
+        return dispatch_key(client, key, state["keymap"])
+    except ClientError as exc:
+        state["last_error"] = str(exc)
+        state["last_error_until"] = time.time() + _ERROR_DISPLAY_S
+        return False
+
+
+def _active_error_text(state: dict) -> str | None:
+    """The transient status-line error message recorded by
+    `_handle_key_press`, if still within its `_ERROR_DISPLAY_S`-second
+    display window -- `None` once expired (or if none was ever recorded),
+    so `run_tui`'s repaint falls back to the normal status text with no
+    explicit clearing step needed."""
+    if state.get("last_error") and time.time() < state.get("last_error_until", 0):
+        return state["last_error"]
+    return None
 
 
 def run_tui(socket_path: str) -> int:
@@ -915,6 +962,14 @@ def run_tui(socket_path: str) -> int:
                         print("".join(out), end="", flush=True)
                     else:
                         status_line = render_status_row(state["status_vm"], term.width)
+                        error_text = _active_error_text(state)
+                        if error_text:
+                            # Bindings review fix: a rejected key-dispatch
+                            # (see `_handle_key_press`) shows here instead
+                            # of the normal transport status, transiently
+                            # -- overwrites, never appends, so it can never
+                            # push the line past `term.width`.
+                            status_line = _fit(f"ERROR: {error_text}", term.width)
                         secondary_line = render_secondary_row(
                             state["alerts_vm"], state["timesig_vm"], term.width)
                         beatprogress_line = render_beatprogress_row(
@@ -942,12 +997,13 @@ def run_tui(socket_path: str) -> int:
                         print("".join(out), end="", flush=True)
                     dirty = False
                 key = term.inkey(timeout=0.05)
-                try:
-                    if dispatch_key(client, str(key), state["keymap"]):
-                        return 0
-                except ClientError:
-                    lost = True
-                    return 1
+                if _handle_key_press(client, str(key), state):
+                    return 0
+                if _active_error_text(state):
+                    # Keep repainting while the transient error message is
+                    # still within its display window, even with no other
+                    # state change (see _handle_key_press/_active_error_text).
+                    dirty = True
     finally:
         client.close()
         if lost:

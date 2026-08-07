@@ -79,13 +79,16 @@ def test_load_keymap_default_path_used_when_none_given(monkeypatch, tmp_path):
 
 def test_filter_known_actions_keeps_known_real_action():
     keymap = {"n": "page.next"}
-    assert filter_known_actions(keymap, {"page.next", "page.prev"}) == {"n": "page.next"}
+    actions = {"page.next": {"description": "", "args": {}},
+              "page.prev": {"description": "", "args": {}}}
+    assert filter_known_actions(keymap, actions) == {"n": "page.next"}
 
 
 def test_filter_known_actions_drops_unknown_real_action_and_logs(caplog):
     keymap = {"z": "sendnotes.key"}
+    actions = {"page.next": {"description": "", "args": {}}}
     with caplog.at_level(logging.WARNING):
-        result = filter_known_actions(keymap, {"page.next"})
+        result = filter_known_actions(keymap, actions)
     assert result == {}
     assert "sendnotes.key" in caplog.text
     assert "z" in caplog.text
@@ -93,11 +96,104 @@ def test_filter_known_actions_drops_unknown_real_action_and_logs(caplog):
 
 def test_filter_known_actions_passes_through_client_pseudo_action_even_if_unknown():
     keymap = {"q": "client.quit", "x": "client.made_up"}
-    result = filter_known_actions(keymap, set())   # empty registry -- nothing is "known"
+    result = filter_known_actions(keymap, {})   # empty registry -- nothing is "known"
     assert result == {"q": "client.quit", "x": "client.made_up"}
 
 
 def test_filter_known_actions_mixed_keeps_known_and_client_drops_unknown():
     keymap = {"q": "client.quit", "n": "page.next", "z": "bogus.action"}
-    result = filter_known_actions(keymap, {"page.next"})
+    actions = {"page.next": {"description": "", "args": {}}}
+    result = filter_known_actions(keymap, actions)
     assert result == {"q": "client.quit", "n": "page.next"}
+
+
+# -- args-requiring actions are not bindable via a single keypress ----------
+# (Critical, bindings review -- live-reproduced: six shipping actions
+# require args -- sendnotes.key, page.goto, pianoroll.zoom/.projection/
+# .channels, pagecycle.enable -- and `dispatch_key` (clients/base.py) has no
+# way to supply an argument VALUE for a keypress. Binding one anyway used to
+# crash the TUI (ActionError -> ClientError -> the client's own
+# connection-loss exit path) or silently no-op forever on fb. Caught here,
+# at the SAME "log + skip, never raise" point as an unknown action name.
+
+def test_filter_known_actions_drops_action_that_requires_args_and_logs(caplog):
+    keymap = {"v": "page.goto"}
+    actions = {"page.goto": {"description": "Jump to a named page", "args": {"name": "str"}}}
+    with caplog.at_level(logging.WARNING):
+        result = filter_known_actions(keymap, actions)
+    assert result == {}
+    assert "page.goto" in caplog.text
+    assert "args" in caplog.text.lower()
+
+
+def test_filter_known_actions_keeps_a_real_action_with_no_args():
+    keymap = {"n": "page.next"}
+    actions = {"page.next": {"description": "", "args": {}}}
+    assert filter_known_actions(keymap, actions) == {"n": "page.next"}
+
+
+def test_filter_known_actions_client_pseudo_action_bypasses_args_check():
+    # client.* names have no registry entry/args schema at all -- must
+    # never be rejected on an "args" basis, only unknown REAL actions are.
+    keymap = {"q": "client.quit"}
+    assert filter_known_actions(keymap, {}) == {"q": "client.quit"}
+
+
+def test_filter_known_actions_drops_every_shipping_args_requiring_action():
+    # The exact six the review named -- verified together so a future
+    # action's args schema shrinking to {} (making it newly bindable)
+    # doesn't silently make this test meaningless for the others.
+    actions = {
+        "sendnotes.key": {"description": "", "args": {"key": "str"}},
+        "page.goto": {"description": "", "args": {"name": "str"}},
+        "pianoroll.zoom": {"description": "", "args": {"delta": "float"}},
+        "pianoroll.projection": {"description": "", "args": {"mode": "str"}},
+        "pianoroll.channels": {"description": "", "args": {"spec": "str"}},
+        "pagecycle.enable": {"description": "", "args": {"enabled": "bool"}},
+    }
+    keymap = {k: name for k, name in zip("uiopjk", actions, strict=True)}
+    assert filter_known_actions(keymap, actions) == {}
+
+
+# -- malformed keymap.toml must never propagate an exception -----------------
+# (Critical, bindings review -- live-reproduced: an unguarded `load_keymap`
+# crashed daemon startup on a malformed file, and tore down the requesting
+# connection on a `config.reload`. `load_keymap_or_warn` is the ONE shared
+# safe wrapper both call sites in engine/core.py use.)
+
+def test_load_keymap_or_warn_success_returns_keymap_and_no_warning(tmp_path):
+    from midicrt.engine.keymap import load_keymap_or_warn
+
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys]\nv = "eventlog.clear"\n')
+    keymap, warning = load_keymap_or_warn(str(p))
+    assert warning is None
+    assert keymap["v"] == "eventlog.clear"
+
+
+def test_load_keymap_or_warn_missing_file_returns_defaults_and_no_warning(tmp_path):
+    from midicrt.engine.keymap import load_keymap_or_warn
+
+    keymap, warning = load_keymap_or_warn(str(tmp_path / "nope.toml"))
+    assert warning is None
+    assert keymap == DEFAULT_KEYMAP
+
+
+def test_load_keymap_or_warn_malformed_toml_returns_none_and_a_warning(tmp_path):
+    from midicrt.engine.keymap import load_keymap_or_warn
+
+    p = tmp_path / "keymap.toml"
+    p.write_text("this is not valid toml {{{ [[[ ===\n")
+    keymap, warning = load_keymap_or_warn(str(p))
+    assert keymap is None
+    assert warning is not None
+    assert "keymap.toml" in warning.lower()
+
+
+def test_load_keymap_or_warn_never_raises_on_malformed_toml(tmp_path):
+    from midicrt.engine.keymap import load_keymap_or_warn
+
+    p = tmp_path / "keymap.toml"
+    p.write_text("[keys\nn = \n")   # unterminated table header -- real TOMLDecodeError
+    # Must not raise -- this is the entire point of the wrapper.
+    load_keymap_or_warn(str(p))

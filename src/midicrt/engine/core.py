@@ -631,8 +631,18 @@ class Engine:
         self.actions.register("config.reload", self._config_reload,
                               description="Re-read keymap.toml (and, best-effort, "
                                           "config.toml's instruments) without a restart")
+        # Bindings review fix (live-reproduced Critical finding): a
+        # malformed keymap.toml must never prevent boot -- `load_keymap_
+        # or_warn` (engine/keymap.py) never raises; a parse failure here
+        # falls back to `DEFAULT_KEYMAP` (there is no earlier "last-good"
+        # keymap to keep at construction time, unlike `_config_reload`
+        # below) and is logged loudly rather than silently swallowed.
+        initial_keymap, warning = keymap_mod.load_keymap_or_warn(self._keymap_path)
+        if warning:
+            _LOG.warning("startup: %s; falling back to built-in defaults", warning)
+            initial_keymap = dict(keymap_mod.DEFAULT_KEYMAP)
         self.keymap: dict[str, str] = keymap_mod.filter_known_actions(
-            keymap_mod.load_keymap(self._keymap_path), set(self.actions.describe()))
+            initial_keymap, self.actions.describe())
 
     def _config_reload(self) -> dict:
         """`config.reload` action handler (Phase 4 Task 1, docs/phase4-
@@ -666,11 +676,24 @@ class Engine:
         contract) never blocks the keymap half above: this method's return
         value's `warnings` list is the only place either failure surfaces,
         never an exception.
+
+        Bindings review fix (live-reproduced Critical finding): a
+        malformed `keymap.toml` at reload time used to raise straight out
+        of this handler -- an uncaught exception escaping
+        `ActionRegistry.dispatch` here tears down the REQUESTING
+        CONNECTION (`ProtocolServer._dispatch`'s own `except ActionError`
+        narrowing does not catch it). `load_keymap_or_warn` never raises;
+        a parse failure here keeps `self.keymap` exactly as it was BEFORE
+        this call (the real "last-good" value, unlike startup) and adds a
+        `warnings` entry instead.
         """
-        known_actions = set(self.actions.describe())
-        self.keymap = keymap_mod.filter_known_actions(
-            keymap_mod.load_keymap(self._keymap_path), known_actions)
         warnings: list[str] = []
+        new_keymap, keymap_warning = keymap_mod.load_keymap_or_warn(self._keymap_path)
+        if keymap_warning:
+            warnings.append(f"{keymap_warning}; keeping last-good keymap")
+            _LOG.warning("config.reload: %s; keeping last-good keymap", keymap_warning)
+        else:
+            self.keymap = keymap_mod.filter_known_actions(new_keymap, self.actions.describe())
         try:
             new_config = config_mod.load(self._config_path)
         except (OSError, ValueError) as exc:

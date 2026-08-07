@@ -74,6 +74,7 @@ import logging
 import math
 import queue
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -1108,20 +1109,61 @@ def _build_evdev_char_table(evdev) -> dict[int, str]:
     return table
 
 
+# How often `_dispatch_evdev_key` is allowed to log a rejected-action
+# warning, PER `rate_state` dict (one per `_input_loop` call, i.e. one per
+# process lifetime -- see that function's own docstring) -- a stuck/
+# repeating key hammering the same rejected action many times a second
+# must not flood the journal (Important finding, bindings review).
+_KEY_ERROR_LOG_INTERVAL_S = 1.0
+
+
+def _dispatch_evdev_key(client: EngineClient, key: str, keymap: dict[str, str],
+                        rate_state: dict) -> bool:
+    """The per-keypress body of `_input_loop`'s read loop, extracted so the
+    fix below is directly unit-testable without a real evdev device
+    (bindings review, live-reproduced Important finding: the OLD `except
+    ClientError: pass` here was a SILENT, PERMANENT no-op with zero
+    diagnostic -- unlike the TUI's own exit bug, nothing ever surfaced
+    this failure at all, forever).
+
+    Resolves `key` via the SAME `dispatch_key` (`clients/base.py`) the TUI
+    client uses. A `ClientError` (a rejected action -- bad/missing args,
+    unknown action -- indistinguishable BY TYPE from a lost connection,
+    same ambiguity `clients/tui.py::_handle_key_press` documents at
+    length) is ALWAYS treated as "an action failed, not fatal": logged as
+    a warning (rate-capped via `rate_state["last_warn_ts"]`, a plain
+    mutable dict `_input_loop` keeps ONE of across its whole
+    `read_loop()`, not a fresh one per call) and this function returns
+    `False` -- never signals quit for an action failure. A genuine
+    disconnect is still caught, just not here: it surfaces via the render
+    loop's own EOF check on the main thread, unaffected by this always
+    absorbing the exception. Returns `True` only for the `client.quit`
+    pseudo-action (`dispatch_key`'s own return value, never raises for
+    that case)."""
+    try:
+        return dispatch_key(client, key, keymap)
+    except ClientError as exc:
+        now = time.time()
+        if now - rate_state.get("last_warn_ts", 0.0) >= _KEY_ERROR_LOG_INTERVAL_S:
+            _LOG.warning("action dispatch failed for key %r: %s", key, exc)
+            rate_state["last_warn_ts"] = now
+        return False
+
+
 def _input_loop(client: EngineClient, quit_event: threading.Event,
                  get_keymap: Callable[[], dict[str, str]]) -> None:
     """Background-thread evdev reader (brief: "Input runs in a thread").
     Every keydown is translated through `_build_evdev_char_table` into a
-    single char, then resolved via the SAME `dispatch_key` (`clients/
-    base.py`) the TUI client uses -- `get_keymap()` is a zero-arg callable
-    (not a frozen dict) so a `keymap_changed` refetch landing on the MAIN
-    thread mid-read-loop (via `_make_page_switcher`'s `on_event`, which
-    reassigns `state["keymap"]` rather than mutating it in place) is picked
-    up on this thread's very next keypress -- same "callable, not a frozen
-    snapshot" pattern `drain_latest`/`wait_first_snapshot` already use for
-    `topics`/`topic` elsewhere in this module. `dispatch_key` returning
-    `True` (the `client.quit` pseudo-action) sets `quit_event` for a clean
-    exit, exactly like the old hardcoded `KEY_Q` branch did. Any discovery/
+    single char, then resolved via `_dispatch_evdev_key` -- `get_keymap()`
+    is a zero-arg callable (not a frozen dict) so a `keymap_changed`
+    refetch landing on the MAIN thread mid-read-loop (via
+    `_make_page_switcher`'s `on_event`, which reassigns `state["keymap"]`
+    rather than mutating it in place) is picked up on this thread's very
+    next keypress -- same "callable, not a frozen snapshot" pattern
+    `drain_latest`/`wait_first_snapshot` already use for `topics`/`topic`
+    elsewhere in this module. `_dispatch_evdev_key` returning `True` (the
+    `client.quit` pseudo-action) sets `quit_event` for a clean exit,
+    exactly like the old hardcoded `KEY_Q` branch did. Any discovery/
     permission/IO failure logs one line and returns -- input is a
     nice-to-have, never fatal to the render loop.
     """
@@ -1136,6 +1178,7 @@ def _input_loop(client: EngineClient, quit_event: threading.Event,
         _LOG.info("no input device with KEY_Q capability found; continuing without input")
         return
     char_table = _build_evdev_char_table(evdev)
+    rate_state: dict = {}   # one shared "last warned" timestamp for this whole read_loop
     try:
         for event in dev.read_loop():
             if event.type != evdev.ecodes.EV_KEY or event.value != 1:  # key-down only
@@ -1143,12 +1186,9 @@ def _input_loop(client: EngineClient, quit_event: threading.Event,
             key = char_table.get(event.code)
             if key is None:
                 continue
-            try:
-                if dispatch_key(client, key, get_keymap()):
-                    quit_event.set()
-                    return
-            except ClientError:
-                pass  # connection loss surfaces via the render loop's EOF check
+            if _dispatch_evdev_key(client, key, get_keymap(), rate_state):
+                quit_event.set()
+                return
     except OSError as exc:
         _LOG.info("input device error (%s); continuing without input", exc)
 

@@ -1416,6 +1416,36 @@ def test_engine_keymap_keeps_client_pseudo_action_regardless_of_roster(tmp_path)
     assert eng.keymap["x"] == "client.quit"
 
 
+def test_engine_keymap_filters_out_an_action_requiring_args(tmp_path, caplog):
+    # Bindings review, live-reproduced Critical finding: "page.goto" is
+    # registered unconditionally (always reachable regardless of roster)
+    # but needs a "name" arg `dispatch_key` can never supply from a single
+    # keypress -- must be dropped at construction, not left as a landmine.
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys]\nv = "page.goto"\n')
+    with caplog.at_level("WARNING"):
+        eng = Engine(Config(), keymap_path=str(p))
+    assert "v" not in eng.keymap
+    assert "page.goto" in caplog.text
+    assert "args" in caplog.text.lower()
+
+
+def test_engine_keymap_falls_back_to_defaults_when_keymap_toml_is_malformed_at_startup(
+        tmp_path, caplog):
+    # Bindings review, live-reproduced Critical finding: a malformed
+    # keymap.toml must never crash daemon startup -- the appliance ethos
+    # (a bad OPTIONAL config file is never fatal) already established by
+    # `config.py`'s own "no file -> defaults" contract, extended here to
+    # "unparseable file -> defaults, loudly logged" rather than raising.
+    p = tmp_path / "keymap.toml"
+    p.write_text("this is not valid toml {{{ [[[ ===\n")
+    with caplog.at_level("WARNING"):
+        eng = Engine(Config(), keymap_path=str(p))   # must not raise
+    from midicrt.engine import keymap as keymap_mod
+    assert eng.keymap == keymap_mod.DEFAULT_KEYMAP
+    assert "keymap.toml" in caplog.text.lower()
+
+
 def test_engine_default_keymap_path_is_the_real_config_dir_path():
     # No keymap_path override -- must fall back to keymap.DEFAULT_PATH
     # (~/.config/midicrt/keymap.toml), the same default `config.py`'s own
@@ -1457,6 +1487,30 @@ async def test_config_reload_with_no_keymap_file_stays_at_defaults(tmp_path):
     eng = Engine(Config(), keymap_path=str(tmp_path / "nope.toml"))
     result = await eng.actions.dispatch("config.reload", {})
     assert result["keymap"] == keymap_mod.DEFAULT_KEYMAP
+
+
+async def test_config_reload_malformed_keymap_toml_keeps_last_good_and_warns(tmp_path, caplog):
+    # Bindings review, live-reproduced Critical finding: an unguarded
+    # `load_keymap` call here used to raise `tomllib.TOMLDecodeError`
+    # straight out of the action handler -- an uncaught exception that
+    # tears down the REQUESTING CONNECTION (escapes `ActionRegistry.
+    # dispatch`'s own `except ActionError` narrowing entirely). Must
+    # instead surface as a `warnings` entry, keep the keymap from BEFORE
+    # this call untouched, and never raise.
+    keymap_path = tmp_path / "keymap.toml"
+    keymap_path.write_text('[keys]\nv = "eventlog.clear"\n')
+    eng = Engine(Config(), keymap_path=str(keymap_path))
+    good_keymap = dict(eng.keymap)
+    assert good_keymap["v"] == "eventlog.clear"
+
+    keymap_path.write_text("this is not valid toml {{{ [[[ ===\n")
+    with caplog.at_level("WARNING"):
+        result = await eng.actions.dispatch("config.reload", {})   # must not raise
+
+    assert eng.keymap == good_keymap   # unchanged -- last-good kept
+    assert result["keymap"] == good_keymap
+    assert any("keymap.toml" in w.lower() for w in result["warnings"])
+    assert "keymap.toml" in caplog.text.lower()
 
 
 async def test_config_reload_warns_when_config_toml_pages_roster_changed(tmp_path, caplog):

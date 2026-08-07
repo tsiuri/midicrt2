@@ -3,6 +3,7 @@ end-to-end path (the acceptance path for this task -- real device writes are
 coded but NOT exercised here; v1 owns /dev/fb0 until Task 4's supervised
 smoke window).
 """
+import logging
 import queue
 import subprocess
 import sys
@@ -1839,6 +1840,73 @@ def test_build_evdev_char_table_values_are_all_single_lowercase_chars():
 
     table = app._build_evdev_char_table(evdev)
     assert all(len(ch) == 1 and ch == ch.lower() for ch in table.values())
+
+
+# -- action-dispatch failure is logged, not silently swallowed forever ------
+# (Important, bindings review -- covered by/alongside the TUI's own Critical
+# fix: `_input_loop`'s old `except ClientError: pass` was a SILENT,
+# PERMANENT no-op with zero diagnostic -- unlike the TUI's exit bug, nothing
+# ever surfaced this failure at all. `_dispatch_evdev_key` is the per-
+# keypress body extracted from `_input_loop` so this is directly testable
+# without a real evdev device.)
+
+class _RejectingClient:
+    def __init__(self, message="missing arg: name"):
+        self.message = message
+        self.calls: list[str] = []
+
+    def action(self, name):
+        self.calls.append(name)
+        raise ClientError(self.message)
+
+
+class _RecordingClient:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def action(self, name):
+        self.calls.append(name)
+
+
+def test_dispatch_evdev_key_client_quit_returns_true():
+    assert app._dispatch_evdev_key(_RecordingClient(), "q", {"q": "client.quit"}, {}) is True
+
+
+def test_dispatch_evdev_key_sends_a_real_action_and_returns_false():
+    client = _RecordingClient()
+    assert app._dispatch_evdev_key(client, "c", {"c": "eventlog.clear"}, {}) is False
+    assert client.calls == ["eventlog.clear"]
+
+
+def test_dispatch_evdev_key_logs_a_rejected_action_and_returns_false(caplog):
+    client = _RejectingClient("missing arg: name")
+    rate_state: dict = {}
+    with caplog.at_level(logging.WARNING):
+        result = app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state)
+    assert result is False   # never treated as "quit"
+    assert "missing arg" in caplog.text
+    assert "g" in caplog.text
+
+
+def test_dispatch_evdev_key_rate_caps_repeated_failures(caplog):
+    # A stuck/repeating key firing the SAME rejected action many times a
+    # second must not flood the journal -- at most one warning per
+    # _KEY_ERROR_LOG_INTERVAL_S seconds, using ONE shared rate_state dict
+    # across calls (mirrors how _input_loop keeps one for its whole
+    # read_loop).
+    client = _RejectingClient("boom")
+    rate_state: dict = {}
+    with caplog.at_level(logging.WARNING):
+        app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state)
+        app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state)
+    assert len(client.calls) == 2                     # the action IS retried every press...
+    assert caplog.text.count("action dispatch failed") == 1   # ...but only logged once
+
+
+def test_dispatch_evdev_key_unmapped_key_is_a_noop():
+    client = _RecordingClient()
+    assert app._dispatch_evdev_key(client, "z", {}, {}) is False
+    assert client.calls == []
 
 
 def test_run_device_refetches_keymap_on_keymap_changed_event(tmp_path, monkeypatch):

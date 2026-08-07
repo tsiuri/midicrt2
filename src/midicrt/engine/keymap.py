@@ -66,10 +66,23 @@ separate, second step that DOES have a registry to check against --
 `Engine.__init__` (engine/core.py) calls it right after every action
 (engine-owned AND page-declared) has been registered, so a stale
 keymap.toml entry referencing an action absent from THIS build's roster
-is logged and dropped at ENGINE CONSTRUCTION time, never at TOML-parse
-time -- exactly the "action vocabulary is roster-dependent ... fail
-gracefully ... never at load" contract docs/phase4-notes.md's
-architecture-facts section calls for.
+-- OR one requiring args a single keypress can never supply, see that
+function's own docstring -- is logged and dropped at ENGINE CONSTRUCTION
+time, never at TOML-parse time -- exactly the "action vocabulary is
+roster-dependent ... fail gracefully ... never at load" contract
+docs/phase4-notes.md's architecture-facts section calls for.
+
+Malformed-file resilience (bindings review, live-reproduced Critical
+finding)
+-------------------------------------------------------------------------
+`load_keymap` itself still RAISES on a syntactically invalid TOML file
+(`tomllib.TOMLDecodeError`, a `ValueError` subclass) -- it stays a small,
+pure, raising function, matching `config.py::load()`'s own precedent of
+letting a parse error propagate. `load_keymap_or_warn` is the separate
+safe wrapper `engine/core.py`'s two production call sites (`__init__` and
+`_config_reload`) actually use -- a bad optional config file must never
+crash daemon startup nor tear down a `config.reload` requester's
+connection; see that function's own docstring for the full incident.
 """
 import logging
 import os
@@ -119,18 +132,72 @@ def load_keymap(path: str | None = None) -> dict[str, str]:
     return merged
 
 
-def filter_known_actions(keymap: dict[str, str], known_actions) -> dict[str, str]:
+def filter_known_actions(keymap: dict[str, str], actions: dict[str, dict]) -> dict[str, str]:
     """Drop any entry whose action is neither a `client.*` pseudo-action
-    NOR present in `known_actions` (the engine's real, roster-dependent
-    `ActionRegistry.describe()` keys at the moment this is called) --
-    logged, not raised, matching docs/phase4-notes.md's "fail gracefully
-    ... never at load" contract for roster-dependent action names.
-    `known_actions` is checked with plain `in`, so any container (a
-    `dict.keys()` view, a `set`, a list) works."""
+    NOR present in `actions` (`ActionRegistry.describe()`'s own shape --
+    `{name: {"description": ..., "args": {...}}}` -- at the moment this is
+    called, which is what makes it roster-aware) -- logged, not raised,
+    matching docs/phase4-notes.md's "fail gracefully ... never at load"
+    contract for roster-dependent action names.
+
+    ALSO drops (bindings review, live-reproduced Critical finding) any
+    entry whose action requires args (`actions[action]["args"]` non-empty)
+    -- `dispatch_key` (`clients/base.py`) sends an action with NO argument
+    values at all, since it has no mechanism to supply one from a single
+    keypress. Six shipping actions need this guard today: `sendnotes.key`,
+    `page.goto`, `pianoroll.zoom`/`.projection`/`.channels`, and
+    `pagecycle.enable`. Before this check, binding one of these anyway
+    reached the engine's `ActionRegistry.dispatch` (`engine/actions.py`),
+    which raises `ActionError("missing arg: ...")` -- surfaced to a client
+    as `ClientError` from `EngineClient.action()`. The TUI's OLD handling
+    of that treated ANY `ClientError` from a key-dispatch as "connection
+    lost" and exited the whole client; fb's OLD handling silently
+    swallowed it forever with no diagnostic at all. Both are real, but
+    THIS function closing the door at validation time is the primary,
+    load-bearing fix -- the client-side handling (`clients/tui.py`'s
+    `_handle_key_press`, `clients/fb/app.py`'s `_dispatch_evdev_key`) is a
+    defense-in-depth backstop for any binding that somehow slips through
+    (e.g. a future action whose args schema changes after a keymap.toml
+    was already validated against an older build)."""
     filtered = {}
     for key, action in keymap.items():
-        if action.startswith("client.") or action in known_actions:
+        if action.startswith("client."):
             filtered[key] = action
-        else:
+            continue
+        info = actions.get(action)
+        if info is None:
             _LOG.warning("keymap: key %r maps to unknown action %r, skipping", key, action)
+            continue
+        if info.get("args"):
+            _LOG.warning(
+                "keymap: key %r maps to action %r, which requires args %s and is not "
+                "bindable via a single keypress -- skipping",
+                key, action, sorted(info["args"]))
+            continue
+        filtered[key] = action
     return filtered
+
+
+def load_keymap_or_warn(path: str | None = None) -> tuple[dict[str, str] | None, str | None]:
+    """Safe wrapper around `load_keymap` (bindings review, live-reproduced
+    Critical finding): a malformed/unreadable `keymap.toml` -- most
+    realistically a TOML syntax error from hand-editing the file --
+    otherwise raised `tomllib.TOMLDecodeError` (a `ValueError` subclass)
+    straight out of `load_keymap`, past BOTH of `engine/core.py`'s call
+    sites. At `Engine.__init__` time that crashed daemon STARTUP entirely
+    on a bad optional config file -- exactly the appliance-ethos violation
+    `config.py`'s own `ConfigError` docstring already calls out for a
+    different failure mode. At `config.reload` time it tore down the
+    REQUESTING CONNECTION (an uncaught exception escaping an action
+    handler propagates past `ActionRegistry.dispatch`'s own `except
+    ActionError` narrowing, which does not catch this).
+
+    Returns `(keymap, None)` on success, or `(None, warning_message)` on
+    failure -- deliberately NEVER raises. Callers decide what "keep the
+    old value" means for their own call site: `Engine.__init__` has
+    nothing to fall back to yet but `DEFAULT_KEYMAP`; `_config_reload` has
+    the previous `self.keymap` to leave untouched."""
+    try:
+        return load_keymap(path), None
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        return None, f"keymap.toml failed to load ({path or DEFAULT_PATH}): {exc}"

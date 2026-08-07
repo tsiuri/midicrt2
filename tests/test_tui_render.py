@@ -1,7 +1,9 @@
 import queue
 import threading
+import time
 
 from midicrt.clients import tui
+from midicrt.clients.base import ClientError
 from midicrt.clients.chrome import (
     DEFAULT_ALERTS_VM,
     DEFAULT_BEATFLASH_VM,
@@ -77,6 +79,82 @@ def test_key_actions_are_now_keymap_driven_not_a_hardcoded_module_dict():
     # below for the resolution path itself, and test_client_base.py's
     # `dispatch_key`/`fetch_keymap` tests for the shared machinery).
     assert not hasattr(tui, "_KEY_ACTIONS")
+
+
+# -- action-dispatch failure vs. connection loss (bindings review,           -
+# live-reproduced Critical finding) -------------------------------------
+#
+# `dispatch_key` (clients/base.py) raises `ClientError` for BOTH a
+# genuinely dead connection AND a rejected action (bad/missing args,
+# unknown action). The OLD `run_tui` key-handling treated any such
+# `ClientError` as "connection lost" and exited the whole client -- latent
+# since the old hardcoded `_KEY_ACTIONS` only ever held zero-arg actions,
+# newly REACHABLE now that a keymap.toml can name literally any action.
+# `_handle_key_press` isolates the fix: it must ALWAYS absorb a
+# `ClientError` (recording it as a transient status message) and never
+# propagate/exit, no matter what the exception says -- a genuine
+# disconnect is detected authoritatively elsewhere (the reader thread's
+# own EOF/None sentinel via `drain_latest`'s/`wait_first_snapshot`'s OWN
+# `ClientError`), never by interpreting THIS one's text.
+
+class _RejectingClient:
+    """Fake client whose `action()` always raises ClientError -- the exact
+    shape a real rejected action (missing/bad args, unknown action) takes
+    at this layer, indistinguishable BY TYPE from a lost connection."""
+
+    def __init__(self, message="missing arg: name"):
+        self.message = message
+        self.calls: list[str] = []
+
+    def action(self, name):
+        self.calls.append(name)
+        raise ClientError(self.message)
+
+
+class _RecordingClient:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def action(self, name):
+        self.calls.append(name)
+
+
+def test_handle_key_press_returns_true_only_for_client_quit():
+    state = {"keymap": {"q": "client.quit"}}
+    assert tui._handle_key_press(_RecordingClient(), "q", state) is True
+
+
+def test_handle_key_press_absorbs_a_rejected_action_without_exiting():
+    # THE fix: a `page.goto`-shaped binding (needs an arg dispatch_key can
+    # never supply) getting rejected by the engine must not propagate.
+    state = {"keymap": {"g": "page.goto"}}
+    client = _RejectingClient("missing arg: name")
+    result = tui._handle_key_press(client, "g", state)
+    assert result is False   # never signals "quit" for an action failure
+    assert client.calls == ["page.goto"]
+    assert "missing arg" in state["last_error"]
+
+
+def test_handle_key_press_unmapped_key_does_not_touch_last_error():
+    state = {"keymap": {"q": "client.quit"}}
+    client = _RecordingClient()
+    assert tui._handle_key_press(client, "z", state) is False
+    assert client.calls == []
+    assert state.get("last_error") is None
+
+
+def test_active_error_text_none_when_no_error_recorded():
+    assert tui._active_error_text({}) is None
+
+
+def test_active_error_text_visible_within_display_window():
+    state = {"last_error": "boom", "last_error_until": time.time() + 10}
+    assert tui._active_error_text(state) == "boom"
+
+
+def test_active_error_text_expires_after_display_window():
+    state = {"last_error": "boom", "last_error_until": time.time() - 1}
+    assert tui._active_error_text(state) is None
 
 
 def test_render_unknown_fallback_has_no_crash_on_bare_vm():
