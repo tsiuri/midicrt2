@@ -20,6 +20,23 @@ async def _start_bridge(srv, subscribe_rate=50.0):
     return bridge
 
 
+async def _wait_for_topic(sink, topic, timeout=2.0):
+    """Both `page.eventlog` and `overlay.status` get seeded at subscribe
+    time (phase2-notes.md: "never assume ordering" between topics), and a
+    WebSink's maxsize=1 drop-and-replace queue means whichever snapshot
+    lands last before a slow consumer reads is the one that survives --
+    legitimately racy, not a bridge bug. Tests that care about ONE topic's
+    content must loop past unrelated messages instead of assuming the
+    first thing in the queue is theirs (mirrors test_web_app.py's own
+    `_wait_for_eventlog` helper)."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        msg = await asyncio.wait_for(sink.queue.get(), timeout=timeout)
+        if msg is not None and msg.get("topic") == topic:
+            return msg
+    raise AssertionError(f"no message for topic {topic!r} within {timeout}s")
+
+
 async def test_bridge_start_subscribes_current_page_and_overlay(tmp_path):
     eng, srv, task = await make(tmp_path, tick_hz=100.0)
     bridge = await _start_bridge(srv)
@@ -40,11 +57,10 @@ async def test_bridge_fans_out_snapshot_to_multiple_sinks(tmp_path):
 
     await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 60, 1, "n0"))
 
-    msg_a = await asyncio.wait_for(sink_a.queue.get(), timeout=2.0)
-    msg_b = await asyncio.wait_for(sink_b.queue.get(), timeout=2.0)
-    assert msg_a["topic"] == "page.eventlog"
+    msg_a = await _wait_for_topic(sink_a, "page.eventlog")
+    msg_b = await _wait_for_topic(sink_b, "page.eventlog")
     assert msg_a["data"]["lines"][-1]["text"] == "n0"
-    assert msg_b == msg_a  # both sinks see the identical fanned-out message
+    assert msg_b["data"]["lines"][-1]["text"] == "n0"
 
     await asyncio.to_thread(bridge.stop)
     eng.stop(); await task; await srv.close()
@@ -56,11 +72,11 @@ async def test_bridge_late_joining_sink_gets_replayed_latest_snapshot(tmp_path):
     early = WebSink()
     bridge.add_sink(early)
     await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 60, 1, "n0"))
-    await asyncio.wait_for(early.queue.get(), timeout=2.0)
+    await _wait_for_topic(early, "page.eventlog")
 
     late = WebSink()
     bridge.add_sink(late)  # joins AFTER the snapshot already landed
-    replayed = await asyncio.wait_for(late.queue.get(), timeout=2.0)
+    replayed = await _wait_for_topic(late, "page.eventlog")
     assert replayed["data"]["lines"][-1]["text"] == "n0"
 
     await asyncio.to_thread(bridge.stop)
