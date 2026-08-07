@@ -702,7 +702,13 @@ class Engine:
         """Append `page` to the live roster under `name`. Production pages
         register via `_PAGE_FACTORIES` + `config.pages`; this hook exists
         for pages with no factory yet (tests today; dynamically-arriving
-        overlays later)."""
+        overlays later). Re-discovers `PageHooks` (tick/drain_outputs/
+        bind_info) for `page` same as the initial roster build, but does
+        NOT register any `actions()` it declares -- that loop only ever
+        runs once, over the roster `__init__` builds; a future bindings
+        task wiring pages in dynamically after construction will need its
+        own call into the same action-registration loop shape if it wants
+        those actions to be dispatchable too."""
         self.pages[name] = page
         self._discover_page_hooks(name, page)
 
@@ -1090,7 +1096,7 @@ class Engine:
         describes for `analyzers/stucknotes.py`'s escalation).
 
         Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md): both
-        loops below now read `self._page_hooks` (built once, at
+        passes below now read `self._page_hooks` (built once, at
         construction, by the `PageHooks` discovery pass in `__init__` --
         see that dataclass's own docstring) instead of re-checking
         `hasattr(page, "tick")` on every single tick, and `drain_outputs`
@@ -1104,10 +1110,28 @@ class Engine:
         note_off` here -- the one place in this whole method that does
         I/O, mirroring `_tick_analyzers`'s own `drain_alerts()` ->
         `emit_event` split (pure module reports, engine acts).
+
+        Ordering contract (fix, code-review finding): this is deliberately
+        TWO SEPARATE passes over `self._page_hooks` -- every page's
+        `tick()` runs first, THEN every page's `drain_outputs()` runs --
+        not one merged per-page loop. The shipped default roster happens
+        to have "sendnotes" (the only `drain_outputs()` implementer today)
+        LAST, so a single merged loop (tick-then-drain for each page
+        before moving to the next) would look identical to this for as
+        long as that stays true -- but it would silently interleave a
+        LATER page's tick with an EARLIER page's drain the moment any
+        roster puts a draining page before a ticking page (e.g. a custom
+        `config.pages` order, or a future page registered via
+        `register_page` -- see
+        test_tick_pages_drains_strictly_after_all_ticks_even_when_drain_page_precedes_ticker_in_roster
+        in test_engine_core.py, which reproduces exactly that). Two passes
+        make the ordering guarantee hold regardless of roster order, at no
+        real cost (`self._page_hooks` is small, already materialized).
         """
         for name, hooks in self._page_hooks.items():
             if hooks.tick is not None and hooks.tick(now):
                 self._dirty.add(f"page.{name}")
+        for name, hooks in self._page_hooks.items():
             if hooks.drain_outputs is not None:
                 for note, ch in hooks.drain_outputs(now):
                     self._dirty.add(f"page.{name}")

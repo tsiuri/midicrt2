@@ -1062,6 +1062,67 @@ def test_tick_pages_is_a_no_op_when_sendnotes_is_not_in_the_roster():
     eng._tick_pages(1000.0)   # must not raise (no "sendnotes" key in self.pages)
 
 
+# -- tick-then-drain ordering contract (fix, code-review finding) -----------
+#
+# `_tick_pages` must run ALL pages' tick() first, then ALL drain_outputs()
+# second -- never interleaved -- regardless of roster order. The shipped
+# default roster happens to have "sendnotes" (the only drain_outputs()
+# implementer today) LAST, so a single merged per-page loop (tick-then-drain
+# for each page before moving to the next) looks identical to the correct
+# two-pass behavior there -- it only diverges under a roster where a
+# draining page precedes a ticking page, which is exactly what this test
+# constructs via register_page().
+
+class _FakeOrderedDrainingPage:
+    """Registered FIRST (so it would run first in a naive single merged
+    loop) -- exposes ONLY drain_outputs(), records into a list shared with
+    the ticking page below."""
+
+    def __init__(self, call_log: list[str]):
+        self._call_log = call_log
+
+    def handle(self, ev) -> bool:
+        return False
+
+    def view_model(self) -> dict:
+        return {}
+
+    def drain_outputs(self, now: float) -> list[tuple[int, int]]:
+        self._call_log.append("drain")
+        return []
+
+
+class _FakeOrderedTickingPage:
+    """Registered SECOND (after the draining page above) -- exposes ONLY
+    tick(), records into the SAME shared list."""
+
+    def __init__(self, call_log: list[str]):
+        self._call_log = call_log
+
+    def handle(self, ev) -> bool:
+        return False
+
+    def view_model(self) -> dict:
+        return {}
+
+    def tick(self, now: float) -> bool:
+        self._call_log.append("tick")
+        return False
+
+
+def test_tick_pages_drains_strictly_after_all_ticks_even_when_drain_page_precedes_ticker_in_roster():
+    eng = Engine(Config())
+    call_log: list[str] = []
+    eng.register_page("drainer", _FakeOrderedDrainingPage(call_log))
+    eng.register_page("ticker", _FakeOrderedTickingPage(call_log))
+    eng._tick_pages(1.0)
+    # "drainer" is EARLIER in roster order than "ticker" -- if tick/drain
+    # were interleaved per-page (the bug), "drain" would be logged first.
+    # The contract is roster-order-independent: every tick() everywhere
+    # runs before any drain_outputs() anywhere.
+    assert call_log == ["tick", "drain"]
+
+
 def test_engine_stop_closes_midi_out():
     eng = Engine(Config())
     fake = _FakeMidiOut()
