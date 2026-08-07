@@ -124,7 +124,111 @@ def render_voices_lines(vm: dict, width: int, height: int) -> list[str]:
     return [_fit(header, width)] + body
 
 
-RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines}
+# -- harmony page (phase-3 task 5) -------------------------------------------
+#
+# Layout mirrors v1's Notes-page harmony section (docs/evidence-phase2-
+# smoke/after.png): "Chord:"/"Scale:" each get a "Last/2nd/3rd/4th" label
+# row + a values row (v1's `_render_slots`), then "Inside:"/"Outside:"
+# (v2's adapted list-shaped fields, see pages/harmony.py's v1-field
+# mapping docstring), "Chord conf:"/"Scale conf:" (v1's confidence+
+# missing-tones line, only ever populated for the CURRENT/index-0
+# candidate), "Key:", a tension bar (v1's exact block characters, "█"
+# filled / "░" empty -- distinct from `_voices_bar`'s own "▓"/"░" choice
+# above; per that function's own comment, per-page body widgets are NOT
+# required to share a look, only the page-agnostic chrome status bar is),
+# "Harm.rhy:", and "Motif:". Fixed 12 body rows (unlike eventlog's
+# scrolling tail or voices' 16 channel rows) -- padded/cut exactly like
+# `render_voices_lines` when `height` doesn't match.
+_HARMONY_LABELS = ("Last", "2nd", "3rd", "4th")
+_HARMONY_TENSION_BAR_SEGMENTS = 20   # matches v1's zharmony.py notes.py `bar_max = 20`
+
+
+def _harmony_header_text(vm: dict) -> str:
+    return f"{vm['title']}  (key: {vm['key'] or '?'})  [n]ext page [q]uit"
+
+
+def _harmony_slot_lines(prefix: str, items: list[dict], width: int) -> tuple[str, str]:
+    slot_w = max(8, (width - len(prefix) - 1) // 4)
+    label_row = prefix + " " + "".join(lbl.ljust(slot_w) for lbl in _HARMONY_LABELS)
+    values = []
+    for i in range(4):
+        name = items[i]["name"] if i < len(items) else None
+        values.append((name or "--")[:slot_w].ljust(slot_w))
+    value_row = prefix + " " + "".join(values)
+    return label_row, value_row
+
+
+def _harmony_list_line(prefix: str, names: list[str]) -> str:
+    return f"{prefix} {' '.join(names) if names else '-'}"
+
+
+def _harmony_conf_missing_line(prefix: str, items: list[dict]) -> str:
+    if items and items[0]["conf"] is not None:
+        missing = " ".join(items[0]["missing"]) or "-"
+        return f"{prefix} {items[0]['conf']:0.2f}  missing: {missing}"
+    return f"{prefix} --  missing: -"
+
+
+def _harmony_key_line(vm: dict) -> str:
+    line = f"Key: {vm['key'] or '?'}"
+    if vm.get("key_alternatives"):
+        line += f"  (alts: {', '.join(vm['key_alternatives'])})"
+    return line
+
+
+def _harmony_tension_line(vm: dict) -> str:
+    filled = round(vm["tension"] * _HARMONY_TENSION_BAR_SEGMENTS)
+    bar = "█" * filled + "░" * (_HARMONY_TENSION_BAR_SEGMENTS - filled)
+    worst = vm.get("tension_worst_interval") or ""
+    worst_str = f"  [{worst}]" if worst else ""
+    return f"Tension: {bar}  {vm['tension']:.2f}  {vm.get('tension_label', '')}{worst_str}"
+
+
+def _harmony_rhythm_line(vm: dict) -> str:
+    hr = vm["harmonic_rhythm"]
+    if hr and hr.get("changes_per_bar") is not None:
+        return f"Harm.rhy: {hr['changes_per_bar']:.1f} ch/bar  {hr['label']}"
+    return "Harm.rhy: --"
+
+
+def _harmony_motif_line(vm: dict) -> str:
+    motif = vm["motif"]
+    if motif and motif.get("found"):
+        return f"Motif: {motif['pattern']}  [x{motif['count']}]"
+    return "Motif: --"
+
+
+def _harmony_body_lines(vm: dict, width: int) -> list[str]:
+    chord_hdr, chord_vals = _harmony_slot_lines("Chord:", vm["chords"], width)
+    scale_hdr, scale_vals = _harmony_slot_lines("Scale:", vm["scales"], width)
+    return [
+        chord_hdr,
+        chord_vals,
+        scale_hdr,
+        scale_vals,
+        _harmony_list_line("Inside:", vm["inside"]),
+        _harmony_list_line("Outside:", vm["outside"]),
+        _harmony_conf_missing_line("Chord conf:", vm["chords"]),
+        _harmony_conf_missing_line("Scale conf:", vm["scales"]),
+        _harmony_key_line(vm),
+        _harmony_tension_line(vm),
+        _harmony_rhythm_line(vm),
+        _harmony_motif_line(vm),
+    ]
+
+
+def render_harmony_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_harmony_header_text(vm), width)
+    body_h = height - 1
+    rows = [_fit(ln, width) for ln in _harmony_body_lines(vm, width)]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [header] + body
+
+
+RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
+             "harmony": render_harmony_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}

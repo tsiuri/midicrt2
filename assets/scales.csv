@@ -1,0 +1,56 @@
+name,intervals,aka
+Ionian,1-2-3-4-5-6-7,"I, N.M. III, Major"
+1-2-b3-4-5-6-b7,"II, N.M. IV",
+1-b2-b3-4-5-b6-b7,"III, N.M. V",
+1-2-3-#4-5-6-7,"IV, N.M. VI",
+1-2-3-4-5-6-b7,"V, N.M. VII",
+1-2-b3-4-5-b6-b7,"VI, N.M. I, Minor, Natural Minor, Pure Minor",
+1-b2-b3-4-b5-b6-b7,"VII, N.M. II",
+Aeolian 7,1-2-b3-4-5-b6-7,"H.M. I, Harmonic Minor"
+1-b2-b3-4-b5-6-b7,"H.M. II, Locrian #6",
+1-2-3-4-#5-6-7,"H.M. III, Ionian Augmented",
+1-2-b3-#4-5-6-b7,H.M. IV,
+1-b2-3-4-5-b6-b7,"H.M. V, Phrygian Dominant, Phrygian Major, Spanish, Spanish Gypsy",
+1-#2-3-#4-5-6-7,H.M. VI,
+1-b2-b3-b4-b5-b6-bb7,H.M. VII,
+Aeolian 6 7,1-2-b3-4-5-6-7,"M.M. I, Melodic Minor, Jazz Minor"
+1-b2-b3-4-5-6-b7,"M.M. II, Dorian b2, Phrygian #6",
+1-2-3-#4-#5-6-7,"M.M. III, Lydian Augmented",
+1-2-3-#4-5-6-b7,"M.M. IV, Lydian Dominant, Mixolydian #11, Mixolydian #4, Overtone, Acoustic",
+1-2-3-4-5-b6-b7,"M.M. V, Aeolian Dominant, Mixolydian b13, Mixolydian b6",
+1-2-b3-4-b5-b6-b7,"M.M. VI, Locrian #2",
+1-b2-b3-b4-b5-b6-b7,"M.M. VII, Altered, Altered Dominant, Diminished Whole-Tone, Dominant Whole-Tone",
+Bebop Dominant,1-2-3-4-5-6-#6-7,-
+1-2-3-4-5-b6-6-7,-,
+1-2-b3-3-4-5-6-b7,-,
+1-2-b3-4-5-b6-6-7,-,
+Blues Major,1-2-b3-3-5-6,-
+1-b3-4-b5-5-b7,Blues,
+1-b2-b3-3-b5-5-6-b7,"(Auxiliary) Diminished Blues, Half-Whole",
+1-b3-4-5-b7,Minor Pentatonic,
+1-2-b3-3-4-b5-5-6-b7,-,
+Gypsy Major,1-b2-3-4-5-b6-7,Byzantine
+1-2-b3-b5-5-b6-7,Hungarian Minor,
+1-2-b3-#4-5-b6-b7,-,
+1-b2-3-4-5-b6-b7,"Spanish, Phrygian 3",
+Major Pentatonic,1-2-3-5-6,Diatonic
+1-2-4-5-b7,Egyptian,
+1-b3-4-#5-b7,-,
+1-2-4-5-6,-,
+1-b3-4-5-b7,Blues Pentatonic,
+Whole,1-2-3-#4-#5-#6,Auxiliary Augmented
+1-2-b3-4-#4-#5-6-7,"W-H, Diminished, Dim Whole",
+1-b2-b3-3-b5-5-6-b7,"Blues Diminished, (Auxiliary) Diminished Dominant, Dim Half, H-W",
+Augmented,1-#2-3-5-#5-7,-
+1-b2-3-4-5-b6-7,Gypsy Major,
+1-#1-2-#2-3-4-#4-5-#5-6-#6-7,-,
+1-b2-3-#4-#5-#6-7,Verdi's Enigmatic (Ascending),
+1-b2-3-4-b6-b7-7,Verdi's Enigmatic (Descending),
+1-b3-3-b5-5-6-b7,-,
+1-2-b3-b5-5-b6-7,Gypsy Minor,
+1-b2-b3-4-5-6-7,-,
+1-b2-b3-4-5-b6-7,-,
+1-2-3-#4-5-6-b7,"Acoustic, Lydian b7",
+1-2-3-b5-6-b7,Mystic,
+1-b2-3-b5-6-b7,-,
+1-b2-b3-3-4-b5-b6-b7,-,

@@ -92,13 +92,13 @@ async def test_clear_action_and_status():
 
 # -- multi-page roster (phase-3 task 1) --------------------------------------
 
-def test_default_roster_from_config_is_eventlog_then_voices():
-    # Phase-3 task 4: "voices" is the first second page, live by default
-    # (config.py's Config.pages default) so it's reachable with no
-    # config.toml on a stock deploy. "eventlog" stays first/current -- order
-    # is preserved from config.pages.
+def test_default_roster_from_config_is_eventlog_voices_then_harmony():
+    # Phase-3 task 4 added "voices"; task 5 appends "harmony" the same way
+    # -- both live by default (config.py's Config.pages default) so they're
+    # reachable with no config.toml on a stock deploy. "eventlog" stays
+    # first/current -- order is preserved from config.pages.
     eng = Engine(Config())
-    assert list(eng.pages) == ["eventlog", "voices"]
+    assert list(eng.pages) == ["eventlog", "voices", "harmony"]
     assert eng.current_page == "eventlog"
 
 
@@ -106,25 +106,28 @@ def test_register_page_appends_to_live_roster():
     eng = Engine(Config())
     fake = _FakePage()
     eng.register_page("second", fake)
-    assert list(eng.pages) == ["eventlog", "voices", "second"]
+    assert list(eng.pages) == ["eventlog", "voices", "harmony", "second"]
     assert eng.pages["second"] is fake
 
 
 def test_engine_topics_reflects_roster_order():
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
-    assert eng.topics == ["page.eventlog", "page.voices", "page.second", "overlay.status"]
+    assert eng.topics == [
+        "page.eventlog", "page.voices", "page.harmony", "page.second", "overlay.status",
+    ]
 
 
 def test_handle_marks_dirty_only_for_pages_reporting_true():
-    # `ev()` is a real note_on on channel 1 -- the real "voices" page (live
-    # by default since phase-3 task 4) genuinely reacts to it too, so it's
-    # dirty here alongside eventlog, same as any other real page would be.
+    # `ev()` is a real note_on on channel 1 -- the real "voices" and
+    # "harmony" pages (both live by default) genuinely react to it too, so
+    # they're dirty here alongside eventlog, same as any other real page
+    # would be.
     eng = Engine(Config())
     quiet = _FakePage(dirty=False)
     eng.register_page("quiet", quiet)
     eng._handle(ev())
-    assert eng._dirty == {"page.eventlog", "page.voices"}
+    assert eng._dirty == {"page.eventlog", "page.voices", "page.harmony"}
     assert quiet.seen == 1  # every page still SEES every event...
 
 
@@ -136,7 +139,7 @@ def test_handle_marks_non_current_page_dirty_too():
     eng.register_page("loud", loud)
     assert eng.current_page == "eventlog"  # "loud" is NOT current
     eng._handle(ev())
-    assert eng._dirty == {"page.eventlog", "page.voices", "page.loud"}
+    assert eng._dirty == {"page.eventlog", "page.voices", "page.harmony", "page.loud"}
 
 
 # -- transport analyzer / overlay wiring (phase-3 task 3) --------------------
@@ -156,7 +159,7 @@ def test_register_analyzer_appends_to_live_roster():
 
 def test_topics_include_overlay_after_page_topics():
     eng = Engine(Config())
-    assert eng.topics == ["page.eventlog", "page.voices", "overlay.status"]
+    assert eng.topics == ["page.eventlog", "page.voices", "page.harmony", "overlay.status"]
 
 
 def test_handle_marks_overlay_dirty_when_analyzer_reports_true():
@@ -207,8 +210,9 @@ async def test_clock_tick_does_not_dirty_eventlog_but_dirties_overlay_once_runni
 
 
 async def test_page_next_prev_cycle_and_emit_page_changed():
-    # Roster is now 3 deep by default: eventlog, voices (phase-3 task 4's
-    # default page), then the dynamically-registered "second".
+    # Roster is now 4 deep by default: eventlog, voices, harmony
+    # (phase-3 tasks 4 and 5's default pages), then the dynamically-
+    # registered "second".
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
     events = []
@@ -218,13 +222,15 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "voices"
     await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "harmony"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "voices"
+    assert eng.current_page == "harmony"
 
     names = [e["name"] for e in events]
-    assert names == ["page_changed", "page_changed", "page_changed"]
-    assert [e["data"]["page"] for e in events] == ["voices", "second", "voices"]
+    assert names == ["page_changed"] * 4
+    assert [e["data"]["page"] for e in events] == ["voices", "harmony", "second", "harmony"]
 
 
 async def test_page_goto_valid_and_unknown():

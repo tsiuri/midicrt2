@@ -4,6 +4,7 @@ from midicrt.clients.tui import (
     RENDERERS,
     _render_unknown,
     _voices_bar,
+    render_harmony_lines,
     render_lines,
     render_status_row,
     render_voices_lines,
@@ -160,3 +161,100 @@ def test_voices_render_cuts_off_extra_rows_when_height_is_short():
 
 def test_voices_renderers_dispatch_table_has_voices():
     assert RENDERERS["voices"] is render_voices_lines
+
+
+# -- harmony page (phase-3 task 5) --------------------------------------------
+
+HARMONY_VM = {
+    "title": "HARMONY",
+    "chords": [
+        {"name": "C maj", "conf": 1.0, "missing": []},
+        {"name": "A m", "conf": None, "missing": []},
+    ],
+    "scales": [
+        {"name": "C Ionian", "conf": 0.86, "missing": ["D"]},
+        {"name": "A Aeolian 7", "conf": None, "missing": []},
+    ],
+    "inside": ["C", "E", "G"],
+    "outside": ["C#"],
+    "key": "C maj",
+    "key_conf": 0.83,
+    "key_alternatives": ["A min"],
+    "tension": 0.35,
+    "tension_label": "mild",
+    "tension_worst_interval": "M3/m6",
+    "harmonic_rhythm": {"changes_per_bar": 1.2, "label": "moderate"},
+    "motif": {"found": True, "pattern": "+2 -1 +4", "count": 2},
+    "silent": False,
+}
+
+# Frozen against an actual run of render_harmony_lines(HARMONY_VM, 60, 13) --
+# same "freeze from a real run" discipline as GOLDEN_VOICES_FRAME above.
+GOLDEN_HARMONY_FRAME = [
+    "HARMONY  (key: C maj)  [n]ext page [q]uit                   ",
+    "Chord: Last         2nd          3rd          4th           ",
+    "Chord: C maj        A m          --           --            ",
+    "Scale: Last         2nd          3rd          4th           ",
+    "Scale: C Ionian     A Aeolian 7  --           --            ",
+    "Inside: C E G                                               ",
+    "Outside: C#                                                 ",
+    "Chord conf: 1.00  missing: -                                ",
+    "Scale conf: 0.86  missing: D                                ",
+    "Key: C maj  (alts: A min)                                   ",
+    "Tension: ███████░░░░░░░░░░░░░  0.35  mild  [M3/m6]          ",
+    "Harm.rhy: 1.2 ch/bar  moderate                              ",
+    "Motif: +2 -1 +4  [x2]                                       ",
+]
+
+
+def test_harmony_render_matches_frozen_golden_frame():
+    out = render_harmony_lines(HARMONY_VM, width=60, height=13)
+    assert out == GOLDEN_HARMONY_FRAME
+    assert all(len(line) == 60 for line in out)
+
+
+def test_harmony_render_empty_state_shows_placeholders():
+    empty = {
+        "title": "HARMONY", "chords": [], "scales": [], "inside": [], "outside": [],
+        "key": None, "key_conf": 0.0, "key_alternatives": [],
+        "tension": 0.0, "tension_label": "silent", "tension_worst_interval": "",
+        "harmonic_rhythm": {"changes_per_bar": None, "label": ""},
+        "motif": {"found": False, "pattern": None, "count": 0},
+        "silent": True,
+    }
+    out = render_harmony_lines(empty, width=48, height=13)
+    assert out[0].startswith("HARMONY  (key: ?)")
+    assert "-- " in out[2]           # Chord values row: all placeholders
+    assert out[5].strip() == "Inside: -"
+    assert out[6].strip() == "Outside: -"
+    assert "Chord conf: --  missing: -" in out[7]
+    assert "Scale conf: --  missing: -" in out[8]
+    assert out[9].strip() == "Key: ?"
+    assert "░" * 20 in out[10]        # fully-empty tension bar
+    assert out[11].strip() == "Harm.rhy: --"
+    assert out[12].strip() == "Motif: --"
+
+
+def test_harmony_tension_bar_fills_proportionally():
+    from midicrt.clients.tui import _harmony_tension_line
+
+    line = _harmony_tension_line({"tension": 0.5, "tension_label": "mild",
+                                   "tension_worst_interval": ""})
+    assert "█" * 10 in line
+    assert "░" * 10 in line
+
+
+def test_harmony_render_pads_blank_rows_when_height_exceeds_body():
+    out = render_harmony_lines(HARMONY_VM, width=20, height=20)
+    assert len(out) == 20
+    assert out[-1] == " " * 20
+
+
+def test_harmony_render_cuts_off_extra_rows_when_height_is_short():
+    out = render_harmony_lines(HARMONY_VM, width=20, height=3)
+    assert len(out) == 3
+    assert out[1].startswith("Chord: Last")
+
+
+def test_harmony_renderers_dispatch_table_has_harmony():
+    assert RENDERERS["harmony"] is render_harmony_lines

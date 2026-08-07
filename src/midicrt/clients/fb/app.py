@@ -201,7 +201,122 @@ def render_voices_frame(vm: dict, surface: Surface) -> None:
         draw_text(surface, label_x, text_y, f"{row['active']}/{row['peak']}", NORMAL_FG, font)
 
 
-RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame}
+# -- harmony page (phase-3 task 5) -------------------------------------------
+#
+# Layout: same reverse-video header convention as `render_frame`/
+# `render_voices_frame`, then one text row per v1 Notes-page harmony field
+# (Chord/Scale "Last/2nd/3rd/4th" slots -- collapsed to one text line each
+# here rather than the TUI's separate label+values rows, since a pixel
+# surface doesn't need a second row just to spell out "Last 2nd 3rd 4th"
+# -- Inside/Outside, conf+missing, Key), a PRIMITIVES-drawn tension bar
+# (`box` for the outline + `rect` for the live fill, per the task brief:
+# "fb: text rows + tension bar via rect/fill primitives" -- deliberately
+# NOT the TUI's block-character bar), then Harm.rhy/Motif. Row TEXT is
+# generated independently of `clients/tui.py`'s own harmony helpers --
+# same non-sharing convention as `render_voices_frame`/`_voices_bar` vs
+# `render_voices_lines`/`_voices_bar` (a per-page body widget isn't the
+# page-agnostic chrome status text `clients/chrome.py` exists to keep
+# byte-identical across clients). Rows are drawn top-down and simply
+# stop (rather than wrap/scroll) once they'd cross into the reserved
+# bottom status strip, mirroring `render_frame`'s own reservation
+# convention.
+HARMONY_TENSION_BAR_W = 160   # px
+
+
+def _harmony_header_text(vm: dict) -> str:
+    return f"{vm['title']}  (key: {vm['key'] or '?'})"
+
+
+def _harmony_slots_text(prefix: str, items: list[dict]) -> str:
+    names = []
+    for i in range(4):
+        name = items[i]["name"] if i < len(items) else None
+        names.append(name or "--")
+    return f"{prefix} " + "  ".join(names)
+
+
+def _harmony_conf_missing_text(prefix: str, items: list[dict]) -> str:
+    if items and items[0]["conf"] is not None:
+        missing = " ".join(items[0]["missing"]) or "-"
+        return f"{prefix} {items[0]['conf']:.2f}  missing: {missing}"
+    return f"{prefix} --  missing: -"
+
+
+def _harmony_key_text(vm: dict) -> str:
+    text = f"Key: {vm['key'] or '?'}"
+    if vm.get("key_alternatives"):
+        text += f"  (alts: {', '.join(vm['key_alternatives'])})"
+    return text
+
+
+def _harmony_rhythm_text(vm: dict) -> str:
+    hr = vm["harmonic_rhythm"]
+    if hr and hr.get("changes_per_bar") is not None:
+        return f"Harm.rhy: {hr['changes_per_bar']:.1f} ch/bar  {hr['label']}"
+    return "Harm.rhy: --"
+
+
+def _harmony_motif_text(vm: dict) -> str:
+    motif = vm["motif"]
+    if motif and motif.get("found"):
+        return f"Motif: {motif['pattern']}  [x{motif['count']}]"
+    return "Motif: --"
+
+
+def render_harmony_frame(vm: dict, surface: Surface) -> None:
+    """Render the harmony page view-model (pages/harmony.py, wrapping
+    analyzers/harmony.py's HarmonyAnalyzer) onto `surface`. Pure: reads
+    only `vm` and the cached default font, writes only to `surface`'s
+    pixels -- no I/O, no clock, no global state beyond the font's
+    (side-effect-free) glyph cache. See module comment above for layout.
+    """
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _harmony_header_text(vm), BG, font)
+
+    line_h = font.height + LINE_GAP
+    usable_h = surface.height - _status_strip_height(font)
+    y = header_h
+
+    def _row(text: str) -> None:
+        nonlocal y
+        if y + font.height > usable_h:
+            return
+        draw_text(surface, LEFT_MARGIN, y, text, NORMAL_FG, font)
+        y += line_h
+
+    _row(_harmony_slots_text("Chord:", vm["chords"]))
+    _row(_harmony_slots_text("Scale:", vm["scales"]))
+    _row(f"Inside: {' '.join(vm['inside']) or '-'}")
+    _row(f"Outside: {' '.join(vm['outside']) or '-'}")
+    _row(_harmony_conf_missing_text("Chord conf:", vm["chords"]))
+    _row(_harmony_conf_missing_text("Scale conf:", vm["scales"]))
+    _row(_harmony_key_text(vm))
+
+    if y + font.height <= usable_h:
+        bar_h = font.height
+        prefix_w = draw_text(surface, LEFT_MARGIN, y, "Tension:", NORMAL_FG, font)
+        bar_x = LEFT_MARGIN + prefix_w + BAR_GAP
+        surface.box(bar_x, y, HARMONY_TENSION_BAR_W, bar_h, NORMAL_FG)
+        inner_w = max(0, HARMONY_TENSION_BAR_W - 2)
+        fill_w = round(inner_w * min(max(vm["tension"], 0.0), 1.0))
+        if fill_w > 0:
+            fill_color = ACCENT_FG if vm["tension"] > 0.5 else NORMAL_FG
+            surface.rect(bar_x + 1, y + 1, fill_w, bar_h - 2, fill_color)
+        label = f" {vm['tension']:.2f}  {vm.get('tension_label', '')}"
+        draw_text(surface, bar_x + HARMONY_TENSION_BAR_W + BAR_GAP, y, label,
+                  NORMAL_FG, font)
+        y += line_h
+
+    _row(_harmony_rhythm_text(vm))
+    _row(_harmony_motif_text(vm))
+
+
+RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
+             "harmony": render_harmony_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

@@ -57,9 +57,14 @@ async def test_hello_and_describe(tmp_path):
     assert r["ok"] is True
     d = await c.request("describe")
     assert "eventlog.clear" in d["data"]["actions"]
-    # Phase-3 task 4: "voices" is live by default (config.py's Config.pages).
-    assert d["data"]["pages"] == ["eventlog", "voices"]
-    assert d["data"]["topics"] == ["page.eventlog", "page.voices", "overlay.status"]
+    # Phase-3 tasks 4/5: "voices"/"harmony" are live by default
+    # (config.py's Config.pages). "pages" is `sorted()` (display-only,
+    # alphabetical -- see server.py's own comment); "topics" carries the
+    # real roster/cycle order.
+    assert d["data"]["pages"] == ["eventlog", "harmony", "voices"]
+    assert d["data"]["topics"] == [
+        "page.eventlog", "page.voices", "page.harmony", "overlay.status",
+    ]
     eng.stop(); await task; await srv.close()
 
 

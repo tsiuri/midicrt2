@@ -415,6 +415,146 @@ def test_render_voices_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
+# -- harmony page (phase-3 task 5) --------------------------------------------
+
+GOLDEN_HARMONY_FRAME = FIXTURES / "fb_harmony_frame_golden.png"
+HARMONY_SURFACE_SIZE = (420, 114)   # header(12) + 10 rows*9 + status strip(12)
+
+HARMONY_VM = {
+    "title": "HARMONY",
+    "chords": [
+        {"name": "C maj", "conf": 1.0, "missing": []},
+        {"name": "A m", "conf": None, "missing": []},
+    ],
+    "scales": [
+        {"name": "C Ionian", "conf": 0.86, "missing": ["D"]},
+        {"name": "A Aeolian 7", "conf": None, "missing": []},
+    ],
+    "inside": ["C", "E", "G"],
+    "outside": ["C#"],
+    "key": "C maj",
+    "key_conf": 0.83,
+    "key_alternatives": ["A min"],
+    "tension": 0.65,
+    "tension_label": "tense",
+    "tension_worst_interval": "tritone",
+    "harmonic_rhythm": {"changes_per_bar": 1.2, "label": "moderate"},
+    "motif": {"found": True, "pattern": "+2 -1 +4", "count": 2},
+    "silent": False,
+}
+HARMONY_EMPTY_VM = {
+    "title": "HARMONY", "chords": [], "scales": [], "inside": [], "outside": [],
+    "key": None, "key_conf": 0.0, "key_alternatives": [],
+    "tension": 0.0, "tension_label": "silent", "tension_worst_interval": "",
+    "harmonic_rhythm": {"changes_per_bar": None, "label": ""},
+    "motif": {"found": False, "pattern": None, "count": 0},
+    "silent": True,
+}
+HARMONY_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+
+
+def test_harmony_renderers_dispatch_table_has_harmony():
+    assert app.RENDERERS["harmony"] is app.render_harmony_frame
+
+
+def test_render_harmony_frame_header_bar_is_reverse_video():
+    surf = Surface(*HARMONY_SURFACE_SIZE)
+    app.render_harmony_frame(HARMONY_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._harmony_header_text(HARMONY_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+    assert any(
+        px[x, y] == app.BG
+        for x in range(app.LEFT_MARGIN, text_px_end)
+        for y in range(app.HEADER_PAD, app.HEADER_PAD + font.height)
+    )
+
+
+def test_render_harmony_frame_empty_state_does_not_crash():
+    surf = Surface(*HARMONY_SURFACE_SIZE)
+    app.render_harmony_frame(HARMONY_EMPTY_VM, surf)  # must not raise
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    assert px[0, header_h + 2] == app.BG   # body area starts as background
+
+
+def test_render_harmony_frame_draws_a_tension_bar_outline():
+    surf = Surface(*HARMONY_SURFACE_SIZE)
+    app.render_harmony_frame(HARMONY_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    prefix_w = len("Tension:") * font.width
+    bar_x = app.LEFT_MARGIN + prefix_w + app.BAR_GAP
+    bar_y = header_h + 7 * line_h   # 7 text rows precede the tension row
+    assert px[bar_x, bar_y] == app.NORMAL_FG          # top-left outline corner
+    assert px[bar_x + app.HARMONY_TENSION_BAR_W - 1, bar_y] == app.NORMAL_FG
+
+
+def test_render_harmony_frame_tension_fill_reflects_value():
+    surf_low = Surface(*HARMONY_SURFACE_SIZE)
+    app.render_harmony_frame(
+        {**HARMONY_VM, "tension": 0.1, "tension_label": "consonant"}, surf_low)
+    surf_high = Surface(*HARMONY_SURFACE_SIZE)
+    app.render_harmony_frame(HARMONY_VM, surf_high)   # tension 0.65
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    prefix_w = len("Tension:") * font.width
+    bar_x = app.LEFT_MARGIN + prefix_w + app.BAR_GAP
+    bar_y = header_h + 7 * line_h
+    inner_w = app.HARMONY_TENSION_BAR_W - 2
+    # A pixel just past the low-tension fill's edge must be background for
+    # the low-tension surface but filled (ACCENT_FG, since 0.65 > 0.5) for
+    # the high-tension one -- proves the fill width tracks vm["tension"].
+    probe_x = bar_x + 1 + round(inner_w * 0.3)
+    probe_y = bar_y + 1
+    assert surf_low.image.load()[probe_x, probe_y] == app.BG
+    assert surf_high.image.load()[probe_x, probe_y] == app.ACCENT_FG
+
+
+def test_render_harmony_frame_zero_tension_draws_no_fill():
+    surf = Surface(*HARMONY_SURFACE_SIZE)
+    app.render_harmony_frame(HARMONY_EMPTY_VM, surf)   # tension == 0.0
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    prefix_w = len("Tension:") * font.width
+    bar_x = app.LEFT_MARGIN + prefix_w + app.BAR_GAP
+    bar_y = header_h + 7 * line_h
+    px = surf.image.load()
+    assert px[bar_x + 1, bar_y + 1] == app.BG
+
+
+def test_render_harmony_frame_reserves_the_bottom_status_strip_as_background():
+    surf = Surface(*HARMONY_SURFACE_SIZE)
+    app.render_harmony_frame(HARMONY_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    strip_h = app._status_strip_height(font)
+    y_in_strip = surf.height - strip_h + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_render_harmony_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_HARMONY_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-5-report.md"
+    )
+    surf = Surface(*HARMONY_SURFACE_SIZE)
+    app.render_harmony_frame(HARMONY_VM, surf)
+    app._draw_status(surf, HARMONY_STATUS_VM, load_font())
+
+    golden = Image.open(GOLDEN_HARMONY_FRAME).convert("RGB")
+    assert golden.size == HARMONY_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
     # rejected by the server's max_rate check, and then hang forever in

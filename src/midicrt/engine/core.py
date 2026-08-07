@@ -59,6 +59,7 @@ from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.eventlog import EventLogPage
+from midicrt.pages.harmony import HarmonyPage
 from midicrt.pages.voices import VoicesPage
 
 
@@ -107,6 +108,11 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # pages/voices.py + analyzers/voices.py. `config.pages` now defaults to
     # ["eventlog", "voices"] (config.py) so it's live without a config.toml.
     "voices": lambda config: VoicesPage(instruments=config.instruments),
+    # Phase-3 task 5: v1's Notes-page harmony fields (chord/scale/key/
+    # tension/harmonic-rhythm/motif) -- see pages/harmony.py +
+    # analyzers/harmony.py. `config.pages` now defaults to
+    # ["eventlog", "voices", "harmony"] (config.py).
+    "harmony": lambda config: HarmonyPage(),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`

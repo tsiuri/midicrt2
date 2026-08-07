@@ -26,8 +26,9 @@ class Config:
     eventlog_capacity: int = 200
     # "voices" is phase-3 task 4's page -- the first second page, live by
     # default (no config.toml required) so `page.next`/`page.goto` have
-    # somewhere real to go on a stock deploy.
-    pages: list[str] = field(default_factory=lambda: ["eventlog", "voices"])
+    # somewhere real to go on a stock deploy. "harmony" is phase-3 task 5's
+    # page, appended the same way.
+    pages: list[str] = field(default_factory=lambda: ["eventlog", "voices", "harmony"])
     instruments: list[str] = field(default_factory=lambda: list(DEFAULT_INSTRUMENTS))
 
 
