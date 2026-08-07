@@ -135,8 +135,10 @@ from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
+from midicrt.pages.configview import ConfigPage
 from midicrt.pages.eventlog import EventLogPage
 from midicrt.pages.harmony import HarmonyPage
+from midicrt.pages.img2txtviz import Img2TxtVizPage
 from midicrt.pages.pianoroll import PianorollPage
 from midicrt.pages.screensaver import ScreensaverPage
 from midicrt.pages.spectrum import SpectrumPage
@@ -234,6 +236,23 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # (config.py) so it is already instantiated (and therefore goto-able)
     # on a stock deploy, matching v1's screensaver being always-live too.
     "screensaver": lambda config: ScreensaverPage(),
+    # Phase-3 task 10: v1's real-time MIDI-reactive ASCII generator
+    # (pages/img2txtviz.py, "MIDI IMG2TXT") -- see that module's docstring
+    # for the investigation (no image-bank loading in v1 despite the name)
+    # and the disclosed wave-field adaptation. `config.pages` now defaults
+    # to [..., "img2txtviz"] (config.py): a self-contained animation with
+    # no unbuilt dependency, matching the "voices"/"harmony"/"pianoroll"/
+    # "spectrum" precedent, not "tuner"'s.
+    "img2txtviz": lambda config: Img2TxtVizPage(),
+    # Phase-3 task 10: spec §5's read-only config viewer -- see
+    # pages/configview.py's module docstring. `config.pages` now defaults
+    # to [..., "config"] (config.py, the task brief's explicit ask).
+    # Constructed here from `config` alone like every other factory;
+    # `Engine.__init__` wires its LIVE engine-info callback separately
+    # right after `self.pages` is built (see the "config page" section
+    # below) since no page factory here has access to the `Engine` being
+    # built yet.
+    "config": lambda config: ConfigPage(config),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`
@@ -273,6 +292,15 @@ class Engine:
             if name in _PAGE_FACTORIES
         }
         self.current_page = next(iter(self.pages), "eventlog")
+        # Phase-3 task 10: wire the config page's LIVE engine-info callback
+        # (version/uptime/current_page/live pages+analyzers roster) --
+        # see pages/configview.py's own "Engine-info wiring" docstring
+        # section for why this is the one page that needs a reference back
+        # into the engine at all. Guarded on presence like every other
+        # page-specific wiring here (a custom config could drop "config"
+        # from the roster entirely).
+        if "config" in self.pages:
+            self.pages["config"].bind_engine_info(self._config_engine_info)
         self.events_total = 0
         self.started_at = time.monotonic()
         self._listeners: list[Callable[[dict], None]] = []
@@ -351,10 +379,45 @@ class Engine:
                                   description="Set the pianoroll's visible-channel filter "
                                               "(comma/range spec, empty = all)",
                                   args={"spec": "str"})
+        # Phase-3 task 10: img2txtviz's runtime-adjustable controls (spec
+        # §5) -- ported from v1's real keypress()-driven 'c' (charset
+        # cycle) and 'i' (invert toggle), see pages/img2txtviz.py's own
+        # module docstring. Same guarded-registration/hand-marked-dirty
+        # shape as the pianoroll actions above.
+        if "img2txtviz" in self.pages:
+            self.actions.register("img2txtviz.charset", self._img2txtviz_charset,
+                                  description="Cycle the img2txtviz ASCII charset")
+            self.actions.register("img2txtviz.invert", self._img2txtviz_invert,
+                                  description="Toggle the img2txtviz invert flag")
 
     def _clear_eventlog(self):
         self.pages["eventlog"].clear()
         self._dirty.add("page.eventlog")
+
+    def _img2txtviz_charset(self) -> dict:
+        charset = self.pages["img2txtviz"].cycle_charset()
+        self._dirty.add("page.img2txtviz")
+        return {"charset": charset}
+
+    def _img2txtviz_invert(self) -> dict:
+        invert = self.pages["img2txtviz"].toggle_invert()
+        self._dirty.add("page.img2txtviz")
+        return {"invert": invert}
+
+    def _config_engine_info(self) -> dict:
+        """Bound into `pages/configview.py`'s `ConfigPage` at construction
+        (see `__init__` above) -- reuses `status()`'s already-computed
+        version/uptime/current-page facts and layers the live roster names
+        on top, rather than re-deriving any of it a second time."""
+        status = self.status()
+        return {
+            "version": status["engine_version"],
+            "proto_version": status["proto_version"],
+            "uptime_s": status["uptime_s"],
+            "current_page": status["page"],
+            "pages": list(self.pages),
+            "analyzers": list(self.analyzers),
+        }
 
     def _pianoroll_zoom(self, delta: float) -> dict:
         zoom = self.pages["pianoroll"].zoom_by(delta)

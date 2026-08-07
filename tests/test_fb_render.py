@@ -1093,6 +1093,200 @@ def test_render_spectrum_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
+# -- img2txtviz page (phase-3 task 10) ---------------------------------------
+#
+# A tiny hand-picked 2x2 grid (decoupled from the real analyzer's wave math,
+# same style as SPECTRUM_VM above) exercises the per-cell `rect` fill,
+# scaled up to fill the usable body area -- see
+# analyzers/img2txtviz.py's/clients/fb/app.py's own module comments.
+GOLDEN_IMG2TXTVIZ_FRAME = FIXTURES / "fb_img2txtviz_frame_golden.png"
+IMG2TXTVIZ_SURFACE_SIZE = (300, 128)   # same fixed size as SPECTRUM_SURFACE_SIZE
+
+IMG2TXTVIZ_VM = {
+    "title": "IMG2TXT", "active_notes": 3, "invert": False,
+    "grid": [[0.0, 1.0], [0.5, 0.25]],
+}
+IMG2TXTVIZ_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+IMG2TXTVIZ_ALERTS_VM = {"alerts": []}
+IMG2TXTVIZ_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                          "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_img2txtviz_renderers_dispatch_table_has_img2txtviz():
+    assert app.RENDERERS["img2txtviz"] is app.render_img2txtviz_frame
+
+
+def test_render_img2txtviz_frame_header_bar_is_reverse_video():
+    surf = Surface(*IMG2TXTVIZ_SURFACE_SIZE)
+    app.render_img2txtviz_frame(IMG2TXTVIZ_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._img2txtviz_header_text(IMG2TXTVIZ_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+
+
+def test_render_img2txtviz_frame_header_shows_invert_flag_only_when_set():
+    assert "INV" not in app._img2txtviz_header_text(IMG2TXTVIZ_VM)
+    inverted = {**IMG2TXTVIZ_VM, "invert": True}
+    assert "INV" in app._img2txtviz_header_text(inverted)
+
+
+def test_render_img2txtviz_frame_cell_colors_scale_by_value():
+    surf = Surface(*IMG2TXTVIZ_SURFACE_SIZE)
+    app.render_img2txtviz_frame(IMG2TXTVIZ_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
+    cell_w = surf.width // 2
+    cell_h = usable_h // 2
+    # (row 0, col 0) = 0.0 -> pure background (black).
+    assert px[cell_w // 2, header_h + cell_h // 2] == app.BG
+    # (row 0, col 1) = 1.0 -> full ACCENT_FG.
+    assert px[cell_w + cell_w // 2, header_h + cell_h // 2] == app.ACCENT_FG
+    # (row 1, col 0) = 0.5 -> ACCENT_FG scaled by 0.5.
+    expected_half = tuple(round(c * 0.5) for c in app.ACCENT_FG)
+    assert px[cell_w // 2, header_h + cell_h + cell_h // 2] == expected_half
+    # (row 1, col 1) = 0.25 -> ACCENT_FG scaled by 0.25.
+    expected_quarter = tuple(round(c * 0.25) for c in app.ACCENT_FG)
+    assert px[cell_w + cell_w // 2, header_h + cell_h + cell_h // 2] == expected_quarter
+
+
+def test_render_img2txtviz_frame_empty_grid_does_not_crash():
+    surf = Surface(*IMG2TXTVIZ_SURFACE_SIZE)
+    app.render_img2txtviz_frame({**IMG2TXTVIZ_VM, "grid": []}, surf)   # must not raise
+
+
+def test_render_img2txtviz_frame_reserves_the_bottom_chrome_as_background():
+    surf = Surface(*IMG2TXTVIZ_SURFACE_SIZE)
+    app.render_img2txtviz_frame(IMG2TXTVIZ_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    reserved = app._reserved_chrome_height(font)
+    y_in_strip = surf.height - reserved + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_render_img2txtviz_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_IMG2TXTVIZ_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-10-report.md"
+    )
+    surf = Surface(*IMG2TXTVIZ_SURFACE_SIZE)
+    app.render_img2txtviz_frame(IMG2TXTVIZ_VM, surf)
+    app._draw_secondary(surf, IMG2TXTVIZ_ALERTS_VM, IMG2TXTVIZ_TIMESIG_VM, load_font())
+    app._draw_status(surf, IMG2TXTVIZ_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_IMG2TXTVIZ_FRAME).convert("RGB")
+    assert golden.size == IMG2TXTVIZ_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
+# -- config page (phase-3 task 10) -------------------------------------------
+#
+# A plain "label: value" text dump -- see pages/configview.py's module
+# docstring for why this is a fixed flat list rather than v1's recursive
+# JSON tree/editor.
+GOLDEN_CONFIG_FRAME = FIXTURES / "fb_config_frame_golden.png"
+CONFIG_SURFACE_SIZE = (420, 220)
+
+CONFIG_VM = {
+    "title": "CONFIG",
+    "config_rows": [
+        {"label": "socket_path", "value": "/run/midicrt/ctl.sock"},
+        {"label": "midi_sources", "value": "*"},
+        {"label": "tick_hz", "value": "30"},
+        {"label": "pages", "value": "eventlog, voices, harmony"},
+        {"label": "instruments", "value": "16 configured"},
+        {"label": "audio_device", "value": "(default)"},
+        {"label": "spectrum_bins", "value": "96"},
+        {"label": "eventlog_capacity", "value": "200"},
+        {"label": "pagecycle", "value": "on (idle 300s)"},
+        {"label": "screensaver", "value": "on (after 60s)"},
+    ],
+    "engine_rows": [
+        {"label": "engine_version", "value": "2.0.0.dev0"},
+        {"label": "proto_version", "value": "1.0"},
+        {"label": "uptime_s", "value": "12.3"},
+        {"label": "current_page", "value": "eventlog"},
+        {"label": "pages_live", "value": "eventlog, voices, harmony"},
+        {"label": "analyzers_live", "value": "status, alerts, timesig"},
+    ],
+}
+CONFIG_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+CONFIG_ALERTS_VM = {"alerts": []}
+CONFIG_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                      "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_config_renderers_dispatch_table_has_config():
+    assert app.RENDERERS["config"] is app.render_config_frame
+
+
+def test_render_config_frame_header_bar_is_reverse_video():
+    surf = Surface(*CONFIG_SURFACE_SIZE)
+    app.render_config_frame(CONFIG_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._config_header_text(CONFIG_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+
+
+def test_render_config_frame_empty_rows_does_not_crash():
+    surf = Surface(*CONFIG_SURFACE_SIZE)
+    empty_vm = {"title": "CONFIG", "config_rows": [], "engine_rows": []}
+    app.render_config_frame(empty_vm, surf)   # must not raise
+
+
+def test_render_config_frame_draws_text_for_each_row():
+    surf = Surface(*CONFIG_SURFACE_SIZE)
+    app.render_config_frame(CONFIG_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    # The "-- Config --" row (first body row) must have at least one lit
+    # NORMAL_FG pixel -- proves text was actually drawn, not just background.
+    y = header_h
+    assert any(px[x, y] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+    # A later row (the 3rd config row, "tick_hz") likewise.
+    y2 = header_h + 3 * line_h
+    assert any(px[x, y2] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+
+
+def test_render_config_frame_reserves_the_bottom_chrome_as_background():
+    surf = Surface(*CONFIG_SURFACE_SIZE)
+    app.render_config_frame(CONFIG_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    reserved = app._reserved_chrome_height(font)
+    y_in_strip = surf.height - reserved + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_render_config_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_CONFIG_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-10-report.md"
+    )
+    surf = Surface(*CONFIG_SURFACE_SIZE)
+    app.render_config_frame(CONFIG_VM, surf)
+    app._draw_secondary(surf, CONFIG_ALERTS_VM, CONFIG_TIMESIG_VM, load_font())
+    app._draw_status(surf, CONFIG_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_CONFIG_FRAME).convert("RGB")
+    assert golden.size == CONFIG_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
     # rejected by the server's max_rate check, and then hang forever in

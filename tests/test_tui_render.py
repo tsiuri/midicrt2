@@ -11,6 +11,8 @@ from midicrt.clients.chrome import (
 from midicrt.clients.tui import (
     _KEY_ACTIONS,
     RENDERERS,
+    _config_body_lines,
+    _img2txtviz_grid_lines,
     _pianoroll_grid,
     _render_unknown,
     _roll_glyph,
@@ -18,7 +20,9 @@ from midicrt.clients.tui import (
     _spectrum_columns,
     _voices_bar,
     render_beatprogress_row,
+    render_config_lines,
     render_harmony_lines,
+    render_img2txtviz_lines,
     render_lines,
     render_pianoroll_lines,
     render_screensaver_lines,
@@ -659,3 +663,99 @@ def test_spectrum_bar_rows_empty_bins_is_all_blank():
 
 def test_spectrum_renderers_dispatch_table_has_spectrum():
     assert RENDERERS["spectrum"] is render_spectrum_lines
+
+
+# -- img2txtviz page (phase-3 task 10) ---------------------------------------
+#
+# A tiny hand-picked 2x2 grid (decoupled from the real analyzer's wave math
+# -- same "renderer unit-tested against a directly-constructed VM" style as
+# the spectrum tests above) exercises the nearest-neighbor upsample from a
+# small fixed grid onto a wider/taller terminal body -- see
+# analyzers/img2txtviz.py's module docstring for why the grid is fixed-size
+# independent of any client's raster.
+IMG2TXTVIZ_VM = {
+    "title": "IMG2TXT", "active_notes": 3, "energy": 1.23, "vel_splash": 0.45,
+    "invert": False, "charset": " .:#",
+    "grid": [[0.0, 1.0], [0.25, 0.75]],
+}
+
+
+def test_img2txtviz_grid_lines_nearest_neighbor_upsamples_correctly():
+    # width=4 doubles each of the 2 grid columns; body_h=2 maps 1:1 to the
+    # 2 grid rows. charset " .:#" -> index 0=' ', 1='.', 2=':', 3='#'.
+    # Row 0 (0.0, 1.0) -> idx 0, 0, 3, 3 -> "  ##"
+    # Row 1 (0.25, 0.75) -> idx 1, 1, 3, 3 -> "..##" (0.75*4 == 3.0 exactly)
+    lines = _img2txtviz_grid_lines(IMG2TXTVIZ_VM, width=4, body_h=2)
+    assert lines == ["  ##", "..##"]
+
+
+def test_img2txtviz_grid_lines_empty_grid_is_all_blank():
+    vm = {**IMG2TXTVIZ_VM, "grid": []}
+    lines = _img2txtviz_grid_lines(vm, width=5, body_h=3)
+    assert lines == ["     "] * 3
+
+
+def test_render_img2txtviz_lines_header_shows_notes_and_energy():
+    out = render_img2txtviz_lines(IMG2TXTVIZ_VM, width=60, height=5)
+    assert "notes:03" in out[0]
+    assert "energy:1.23" in out[0]
+    assert "splash:0.45" in out[0]
+
+
+def test_render_img2txtviz_lines_header_shows_invert_flag_only_when_set():
+    assert "INV" not in render_img2txtviz_lines(IMG2TXTVIZ_VM, width=60, height=5)[0]
+    inverted = {**IMG2TXTVIZ_VM, "invert": True}
+    assert "INV" in render_img2txtviz_lines(inverted, width=60, height=5)[0]
+
+
+def test_render_img2txtviz_lines_pads_to_exact_dimensions():
+    out = render_img2txtviz_lines(IMG2TXTVIZ_VM, width=10, height=6)
+    assert len(out) == 6
+    assert all(len(ln) == 10 for ln in out)
+
+
+def test_img2txtviz_renderers_dispatch_table_has_img2txtviz():
+    assert RENDERERS["img2txtviz"] is render_img2txtviz_lines
+
+
+# -- config page (phase-3 task 10) -------------------------------------------
+#
+# Plain "label: value" row dump -- see pages/configview.py's module
+# docstring for why this is a fixed flat list rather than v1's recursive
+# JSON tree/editor.
+CONFIG_VM = {
+    "title": "CONFIG",
+    "config_rows": [
+        {"label": "tick_hz", "value": "30"},
+        {"label": "pages", "value": "eventlog, voices"},
+    ],
+    "engine_rows": [
+        {"label": "engine_version", "value": "2.0.0.dev0"},
+        {"label": "current_page", "value": "eventlog"},
+    ],
+}
+
+
+def test_config_body_lines_lists_config_then_engine_sections():
+    lines = _config_body_lines(CONFIG_VM)
+    assert lines[0] == "-- Config --"
+    assert "tick_hz: 30" in lines
+    assert "pages: eventlog, voices" in lines
+    assert "-- Engine --" in lines
+    assert "engine_version: 2.0.0.dev0" in lines
+    assert "current_page: eventlog" in lines
+
+
+def test_render_config_lines_pads_to_exact_dimensions():
+    out = render_config_lines(CONFIG_VM, width=40, height=12)
+    assert len(out) == 12
+    assert all(len(ln) == 40 for ln in out)
+
+
+def test_render_config_lines_cuts_off_extra_rows_when_height_is_short():
+    out = render_config_lines(CONFIG_VM, width=40, height=2)
+    assert len(out) == 2   # header + exactly 1 body row
+
+
+def test_config_renderers_dispatch_table_has_config():
+    assert RENDERERS["config"] is render_config_lines

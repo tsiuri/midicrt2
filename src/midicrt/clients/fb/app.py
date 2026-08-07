@@ -576,10 +576,95 @@ def render_screensaver_frame(vm: dict, surface: Surface) -> None:
     surface.clear(BG)
 
 
+# -- img2txtviz page (phase-3 task 10) ---------------------------------------
+#
+# The engine already emits a FIXED `GRID_ROWS` x `GRID_COLS` grid of final
+# [0,1] brightness values (analyzers/img2txtviz.py's own module docstring)
+# -- this renderer's only job is filling one `rect` per grid cell, scaled up
+# to fill the usable body area, colored by scaling `ACCENT_FG` (this
+# module's CRT-green "bright" tone) by each cell's own value -- 0.0 renders
+# black (BG), 1.0 renders full ACCENT_FG, matching the monochrome-CRT-green
+# palette every other renderer here already uses (no new colors
+# introduced). `invert` is already applied engine-side (the grid's own
+# values are already final), so this renderer never reads that flag itself.
+def _img2txtviz_header_text(vm: dict) -> str:
+    flag = "  INV" if vm.get("invert") else ""
+    return f"{vm['title']}  notes:{vm['active_notes']:02d}{flag}"
+
+
+def _img2txtviz_cell_color(value: float) -> tuple[int, int, int]:
+    v = max(0.0, min(1.0, value))
+    return tuple(round(c * v) for c in ACCENT_FG)
+
+
+def render_img2txtviz_frame(vm: dict, surface: Surface) -> None:
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _img2txtviz_header_text(vm), BG, font)
+
+    usable_h = surface.height - _reserved_chrome_height(font) - header_h
+    if usable_h <= 0:
+        return
+    grid = vm["grid"]
+    gh = len(grid)
+    gw = len(grid[0]) if gh else 0
+    if gh == 0 or gw == 0:
+        return
+    cell_w = max(1, surface.width // gw)
+    cell_h = max(1, usable_h // gh)
+    for ry in range(gh):
+        y = header_h + ry * cell_h
+        row = grid[ry]
+        for rx in range(gw):
+            surface.rect(rx * cell_w, y, cell_w, cell_h, _img2txtviz_cell_color(row[rx]))
+
+
+# -- config page (phase-3 task 10) -------------------------------------------
+#
+# A plain "label: value" text dump -- see pages/configview.py's module
+# docstring for why this is a fixed flat list rather than v1's recursive
+# JSON tree/editor. Same row-stepping `_row` closure convention as
+# `render_harmony_frame`.
+def _config_header_text(vm: dict) -> str:
+    return f"{vm['title']}"
+
+
+def render_config_frame(vm: dict, surface: Surface) -> None:
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _config_header_text(vm), BG, font)
+
+    line_h = font.height + LINE_GAP
+    usable_h = surface.height - _reserved_chrome_height(font)
+    y = header_h
+
+    def _row(text: str) -> None:
+        nonlocal y
+        if y + font.height > usable_h:
+            return
+        draw_text(surface, LEFT_MARGIN, y, text, NORMAL_FG, font)
+        y += line_h
+
+    _row("-- Config --")
+    for r in vm["config_rows"]:
+        _row(f"{r['label']}: {r['value']}")
+    _row("")
+    _row("-- Engine --")
+    for r in vm["engine_rows"]:
+        _row(f"{r['label']}: {r['value']}")
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
              "harmony": render_harmony_frame, "tuner": render_tuner_frame,
              "pianoroll": render_pianoroll_frame, "spectrum": render_spectrum_frame,
-             "screensaver": render_screensaver_frame}
+             "screensaver": render_screensaver_frame,
+             "img2txtviz": render_img2txtviz_frame, "config": render_config_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

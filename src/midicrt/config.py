@@ -52,9 +52,23 @@ class Config:
     # unlike v1 (which has no page concept for it at all) -- harmless (a
     # deliberately blank page a user can also navigate to on purpose), see
     # pages/screensaver.py's own module docstring.
+    # "img2txtviz" (phase-3 task 10): a fully self-contained MIDI + wall-
+    # clock-reactive animation with no unbuilt dependency (unlike "tuner"),
+    # so it joins the default roster by the SAME precedent "voices"/
+    # "harmony"/"pianoroll"/"spectrum" already established -- NOT because
+    # v1's own idle-triggered pagecycle plugin happened to include page ID
+    # 17 in its curated `cycle_pages=[1,6,8,9]` subset (it didn't; see
+    # pages/img2txtviz.py's own module docstring for why that v1 fact isn't
+    # actually the deciding signal for v2's roster, given task 9's own
+    # finding that `behaviors/pagecycle.py` doesn't model that curated-
+    # subset concept at all). "config" (also task 10) is a read-only
+    # viewer with zero dependency of any kind -- the task brief's own
+    # explicit ask ("roster: add 'config'") -- appended last as the newest
+    # addition, same convention every prior task's page followed.
     pages: list[str] = field(
         default_factory=lambda: [
-            "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver"])
+            "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
+            "img2txtviz", "config"])
     instruments: list[str] = field(default_factory=lambda: list(DEFAULT_INSTRUMENTS))
     # Phase-3 task 8 (analyzers/spectrum.py): `audio_device` substring-
     # matches a PortAudio input device name (case-insensitive, v1's

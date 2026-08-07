@@ -74,19 +74,21 @@ async def test_hello_and_describe(tmp_path):
     assert r["ok"] is True
     d = await c.request("describe")
     assert "eventlog.clear" in d["data"]["actions"]
-    # Phase-3 tasks 4/5/7/8/9: "voices"/"harmony"/"pianoroll"/"spectrum"/
-    # "screensaver" are live by default (config.py's Config.pages). "pages"
-    # is `sorted()` (display-only, alphabetical -- see server.py's own
-    # comment); "topics" carries the real roster/cycle order.
+    # Phase-3 tasks 4/5/7/8/9/10: "voices"/"harmony"/"pianoroll"/"spectrum"/
+    # "screensaver"/"img2txtviz"/"config" are live by default (config.py's
+    # Config.pages). "pages" is `sorted()` (display-only, alphabetical --
+    # see server.py's own comment); "topics" carries the real roster/cycle
+    # order.
     assert d["data"]["pages"] == [
-        "eventlog", "harmony", "pianoroll", "screensaver", "spectrum", "voices",
+        "config", "eventlog", "harmony", "img2txtviz", "pianoroll",
+        "screensaver", "spectrum", "voices",
     ]
     # Phase-3 task 6 added "alerts"/"timesig" overlays; task 9 added
     # "beatflash"/"loopprogress" -- see test_engine_core.py::
     # test_topics_include_overlay_after_page_topics.
     assert d["data"]["topics"] == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
-        "page.screensaver",
+        "page.screensaver", "page.img2txtviz", "page.config",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]

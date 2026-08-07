@@ -77,6 +77,20 @@ def translate(msg, source: str, ts: float) -> MidiEvent | None:
     elif msg.type == "control_change":
         data1, data2 = msg.control, msg.value
         summary = f"control_change ch{channel + 1} cc{msg.control} v{msg.value}"
+    elif msg.type == "program_change":
+        # Phase-3 task 10 (analyzers/img2txtviz.py) finding: this branch
+        # previously fell through to the generic `elif channel is not
+        # None` case below, which sets ONLY `summary` -- `data1`/`data2`
+        # stayed None for every program_change event, so no analyzer could
+        # ever recover the actual program number (v1's img2txtviz.py reads
+        # `msg.program` directly; nothing in v2 carried it). Minimal,
+        # additive fix: populate `data1` with the program number, mirroring
+        # the note/cc branches above -- `data2` stays None (program_change
+        # has no second value). No existing caller relied on data1 being
+        # None here (grepped: no prior code branches on `type ==
+        # "program_change"` at all before this task).
+        data1 = msg.program
+        summary = f"program_change ch{channel + 1} p{msg.program}"
     elif channel is not None:
         summary = f"{msg.type} ch{channel + 1}"
     else:

@@ -483,6 +483,83 @@ def render_screensaver_lines(vm: dict, width: int, height: int) -> list[str]:
     return [" " * width for _ in range(max(0, height))]
 
 
+# -- img2txtviz page (phase-3 task 10) ---------------------------------------
+#
+# The engine already emits a FIXED `GRID_ROWS` x `GRID_COLS` grid of final
+# [0,1] brightness values (analyzers/img2txtviz.py's own module docstring:
+# "renderers only quantize" -- docs/phase3-notes.md's rule) -- this
+# renderer's only job is a nearest-neighbor UPSAMPLE from that small grid
+# onto `width` x `body_h` terminal cells (the reverse direction of
+# `_pianoroll_grid`'s continuous-to-bucket quantization above, same "the
+# engine emits one normalized shape, every client quantizes it to its own
+# raster independently" spirit), then an index into `vm["charset"]`
+# (already darkest-to-brightest, `invert` already applied engine-side) to
+# pick each cell's glyph.
+def _img2txtviz_header_text(vm: dict) -> str:
+    flags = "INV " if vm.get("invert") else ""
+    return (f"{vm['title']}  notes:{vm['active_notes']:02d}  "
+            f"energy:{vm['energy']:.2f}  splash:{vm['vel_splash']:.2f}  {flags}"
+            f"[n]ext page [q]uit")
+
+
+def _img2txtviz_grid_lines(vm: dict, width: int, body_h: int) -> list[str]:
+    grid = vm["grid"]
+    charset = vm["charset"]
+    gh = len(grid)
+    gw = len(grid[0]) if gh else 0
+    if gh == 0 or gw == 0 or body_h <= 0 or width <= 0 or not charset:
+        return [" " * width for _ in range(max(0, body_h))]
+    n = len(charset)
+    lines = []
+    for ty in range(body_h):
+        gy = min(gh - 1, ty * gh // body_h)
+        row = grid[gy]
+        chars = []
+        for tx in range(width):
+            gx = min(gw - 1, tx * gw // width)
+            idx = min(n - 1, max(0, int(row[gx] * n)))
+            chars.append(charset[idx])
+        lines.append("".join(chars))
+    return lines
+
+
+def render_img2txtviz_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_img2txtviz_header_text(vm), width)
+    body_h = height - 1
+    if body_h <= 0:
+        return [header]
+    return [header] + _img2txtviz_grid_lines(vm, width, body_h)
+
+
+# -- config page (phase-3 task 10) -------------------------------------------
+#
+# A plain "label: value" dump -- see pages/configview.py's module docstring
+# for why this is a fixed flat list rather than v1's recursive JSON
+# tree/editor. Same pad/cut-to-height convention as
+# `render_harmony_lines`/`render_voices_lines`.
+def _config_header_text(vm: dict) -> str:
+    return f"{vm['title']}  [n]ext page [q]uit"
+
+
+def _config_body_lines(vm: dict) -> list[str]:
+    lines = ["-- Config --"]
+    lines += [f"{r['label']}: {r['value']}" for r in vm["config_rows"]]
+    lines.append("")
+    lines.append("-- Engine --")
+    lines += [f"{r['label']}: {r['value']}" for r in vm["engine_rows"]]
+    return lines
+
+
+def render_config_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_config_header_text(vm), width)
+    body_h = height - 1
+    rows = [_fit(ln, width) for ln in _config_body_lines(vm)]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [header] + body
+
+
 def screensaver_row_texts(header_line: str, body_lines: list[str], width: int) -> list[str]:
     """The FULL blank-frame content for the screensaver page (task-9
     review fix): `header_line`/`body_lines` (already all-blank, from
@@ -500,7 +577,8 @@ def screensaver_row_texts(header_line: str, body_lines: list[str], width: int) -
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "harmony": render_harmony_lines, "tuner": render_tuner_lines,
              "pianoroll": render_pianoroll_lines, "spectrum": render_spectrum_lines,
-             "screensaver": render_screensaver_lines}
+             "screensaver": render_screensaver_lines,
+             "img2txtviz": render_img2txtviz_lines, "config": render_config_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}

@@ -144,13 +144,18 @@ def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll_spectru
     # Phase-3 task 4 added "voices"; task 5 appends "harmony"; task 7
     # appends "pianoroll"; task 8 appends "spectrum"; task 9 appends
     # "screensaver" (see config.py's own comment for why it -- unlike
-    # "tuner" -- joins the default roster) -- all five live by default
+    # "tuner" -- joins the default roster); task 10 appends "img2txtviz"
+    # (same "no unbuilt dependency" precedent, NOT because v1's own
+    # cycle_pages happened to include it -- see pages/img2txtviz.py's own
+    # module docstring) and "config" (the task-10 brief's explicit ask,
+    # a zero-dependency read-only viewer) -- all live by default
     # (config.py's Config.pages default) so they're reachable with no
     # config.toml on a stock deploy. "eventlog" stays first/current --
     # order is preserved from config.pages.
     eng = Engine(Config())
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
+        "img2txtviz", "config",
     ]
     assert eng.current_page == "eventlog"
 
@@ -160,7 +165,8 @@ def test_register_page_appends_to_live_roster():
     fake = _FakePage()
     eng.register_page("second", fake)
     assert list(eng.pages) == [
-        "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver", "second",
+        "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
+        "img2txtviz", "config", "second",
     ]
     assert eng.pages["second"] is fake
 
@@ -170,7 +176,7 @@ def test_engine_topics_reflects_roster_order():
     eng.register_page("second", _FakePage())
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
-        "page.screensaver", "page.second",
+        "page.screensaver", "page.img2txtviz", "page.config", "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
@@ -178,19 +184,21 @@ def test_engine_topics_reflects_roster_order():
 
 def test_handle_marks_dirty_only_for_pages_reporting_true():
     # `ev()` is a real note_on on channel 1 -- the real "voices"/"harmony"/
-    # "pianoroll" pages (all live by default) genuinely react to it too, so
-    # they're dirty here alongside eventlog, same as any other real page
-    # would be. Phase-3 task 6: "alerts" (StuckNotesAnalyzer) is a real
-    # analyzer too, and a fresh note-on genuinely starts tracking it --
-    # dirty for the same reason. "timesig" does NOT react (TimesigAnalyzer
-    # gates note_on on transport being "running", and no "start" was ever
-    # sent here).
+    # "pianoroll"/"img2txtviz" pages (all live by default) genuinely react
+    # to it too, so they're dirty here alongside eventlog, same as any
+    # other real page would be. Phase-3 task 6: "alerts" (StuckNotesAnalyzer)
+    # is a real analyzer too, and a fresh note-on genuinely starts tracking
+    # it -- dirty for the same reason. "timesig" does NOT react
+    # (TimesigAnalyzer gates note_on on transport being "running", and no
+    # "start" was ever sent here). "config" never reacts to MIDI events at
+    # all (a read-only viewer, pages/configview.py's own `handle()`).
     eng = Engine(Config())
     quiet = _FakePage(dirty=False)
     eng.register_page("quiet", quiet)
     eng._handle(ev())
     assert eng._dirty == {
-        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "overlay.alerts",
+        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
+        "page.img2txtviz", "overlay.alerts",
     }
     assert quiet.seen == 1  # every page still SEES every event...
 
@@ -205,7 +213,7 @@ def test_handle_marks_non_current_page_dirty_too():
     eng._handle(ev())
     assert eng._dirty == {
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
-        "page.loud", "overlay.alerts",
+        "page.img2txtviz", "page.loud", "overlay.alerts",
     }
 
 
@@ -235,7 +243,7 @@ def test_topics_include_overlay_after_page_topics():
     eng = Engine(Config())
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
-        "page.screensaver",
+        "page.screensaver", "page.img2txtviz", "page.config",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
@@ -291,9 +299,9 @@ async def test_clock_tick_does_not_dirty_eventlog_but_dirties_overlay_once_runni
 
 
 async def test_page_next_prev_cycle_and_emit_page_changed():
-    # Roster is now 7 deep by default: eventlog, voices, harmony, pianoroll,
-    # spectrum, screensaver (phase-3 tasks 4, 5, 7, 8, and 9's default
-    # pages), then the dynamically-registered "second".
+    # Roster is now 9 deep by default: eventlog, voices, harmony, pianoroll,
+    # spectrum, screensaver, img2txtviz, config (phase-3 tasks 4, 5, 7, 8, 9,
+    # and 10's default pages), then the dynamically-registered "second".
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
     events = []
@@ -311,14 +319,19 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "screensaver"
     await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "img2txtviz"
+    await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "config"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "screensaver"
+    assert eng.current_page == "config"
 
     names = [e["name"] for e in events]
-    assert names == ["page_changed"] * 7
+    assert names == ["page_changed"] * 9
     assert [e["data"]["page"] for e in events] == [
-        "voices", "harmony", "pianoroll", "spectrum", "screensaver", "second", "screensaver",
+        "voices", "harmony", "pianoroll", "spectrum", "screensaver", "img2txtviz",
+        "config", "second", "config",
     ]
 
 
@@ -779,3 +792,87 @@ async def test_pagecycle_does_not_immediately_override_a_manual_screensaver_esca
         "pagecycle overrode the manual escape on the very next tick"
     )
     assert ("page.next", {}) not in calls
+
+
+# -- img2txtviz page (phase-3 task 10) ---------------------------------------
+
+def test_img2txtviz_is_in_the_default_roster():
+    # Unlike "tuner" -- see pages/img2txtviz.py's own module docstring for
+    # why v1's own cycle_pages omission isn't the deciding signal here.
+    eng = Engine(Config())
+    assert "img2txtviz" in eng.pages
+    assert eng.pages["img2txtviz"].view_model()["title"] == "IMG2TXT"
+
+
+def test_img2txtviz_actions_are_registered_when_the_page_is_present():
+    eng = Engine(Config())
+    described = eng.actions.describe()
+    assert {"img2txtviz.charset", "img2txtviz.invert"} <= set(described)
+
+
+def test_img2txtviz_actions_are_absent_when_the_page_is_not_in_the_roster():
+    eng = Engine(Config(pages=["eventlog"]))
+    described = eng.actions.describe()
+    assert not ({"img2txtviz.charset", "img2txtviz.invert"} & set(described))
+
+
+async def test_img2txtviz_charset_action_mutates_and_marks_dirty():
+    eng = Engine(Config())
+    before = eng.pages["img2txtviz"].view_model()["charset"]
+    r = await eng.actions.dispatch("img2txtviz.charset", {})
+    assert r["charset"] != before
+    assert eng.pages["img2txtviz"].view_model()["charset"] == r["charset"]
+    assert "page.img2txtviz" in eng._dirty
+
+
+async def test_img2txtviz_invert_action_mutates_and_marks_dirty():
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("img2txtviz.invert", {})
+    assert r["invert"] is True
+    assert eng.pages["img2txtviz"].view_model()["invert"] is True
+    assert "page.img2txtviz" in eng._dirty
+
+
+def test_run_loop_ticks_img2txtviz_without_crashing():
+    eng = Engine(Config())
+    eng._tick_pages(1.0)
+    assert "page.img2txtviz" in eng._dirty   # always dirty, see analyzer's tick() docstring
+
+
+# -- config page (phase-3 task 10) -------------------------------------------
+
+def test_config_is_in_the_default_roster():
+    eng = Engine(Config())
+    assert "config" in eng.pages
+    assert eng.pages["config"].view_model()["title"] == "CONFIG"
+
+
+def test_config_page_engine_info_is_wired_to_the_real_engine():
+    # Engine.__init__ binds `_config_engine_info` into the page right after
+    # building `self.pages` -- see pages/configview.py's own "Engine-info
+    # wiring" docstring section. Proves it's the REAL live engine, not the
+    # page's own idle fallback.
+    eng = Engine(Config())
+    vm = eng.pages["config"].view_model()
+    rows = {r["label"]: r["value"] for r in vm["engine_rows"]}
+    assert rows["current_page"] == "eventlog"
+    assert "img2txtviz" in rows["pages_live"]
+    assert "config" in rows["pages_live"]
+    assert "status" in rows["analyzers_live"]
+    import midicrt
+    assert rows["engine_version"] == midicrt.__version__
+
+
+def test_config_page_engine_info_tracks_page_navigation():
+    eng = Engine(Config())
+    eng._page_goto("voices")
+    rows = {r["label"]: r["value"]
+            for r in eng.pages["config"].view_model()["engine_rows"]}
+    assert rows["current_page"] == "voices"
+
+
+def test_config_page_is_absent_when_not_in_the_roster_has_no_crash_on_engine_init():
+    # A custom config that drops "config" entirely must not crash
+    # Engine.__init__'s guarded bind_engine_info() call.
+    eng = Engine(Config(pages=["eventlog"]))
+    assert "config" not in eng.pages
