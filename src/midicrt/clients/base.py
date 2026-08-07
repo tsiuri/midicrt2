@@ -101,6 +101,9 @@ class EngineClient:
     def subscribe(self, topics: list[str], max_rate: float) -> dict:
         return self.request("subscribe", topics=topics, max_rate=max_rate)
 
+    def unsubscribe(self, topics: list[str]) -> dict:
+        return self.request("unsubscribe", topics=topics)
+
     def action(self, name: str, args: dict | None = None) -> dict:
         return self.request("action", name=name, args=args or {})
 
@@ -186,3 +189,84 @@ class EngineClient:
     def _alloc_id(self) -> int:
         self._next_id += 1
         return self._next_id
+
+
+# -- shared multi-page client helpers ----------------------------------------
+#
+# TUI (clients/tui.py) and fb (clients/fb/app.py) each poll a background
+# reader thread's queue for a non-blocking "what's new" drain once per
+# render tick, and both need to react to a `page_changed` event by
+# unsubscribing the old page's topic and subscribing the new one. These
+# three helpers are that shared machinery, extracted here instead of kept as
+# near-identical private copies in each client (the phase-2 latent item:
+# "TUI msg['topic'] vs fb msg.get('topic') divergence + duplicated
+# drain-latest loops" -- both now go through `msg.get("topic")` here).
+
+
+def drain_latest(inbox: queue.Queue, topics, on_event=None) -> dict[str, dict]:
+    """Non-blocking drain of every message currently queued on `inbox`.
+
+    For each snapshot whose topic is in `topics`, the returned dict keeps
+    the newest `data` payload (the page view-model) per topic -- latest
+    wins, matching `ProtocolServer._push_loop`'s own coalescing so a client
+    never falls behind processing a burst. Every other message (events, or
+    a snapshot for a topic not in `topics`) is passed to `on_event` if one
+    was given, else silently dropped (this is the pre-existing behaviour of
+    both clients' old private drain loops when `on_event` is omitted).
+
+    Raises `ClientError` on the reader thread's `None` EOF sentinel, same
+    as a failed connect/subscribe -- callers treat a lost connection
+    uniformly everywhere in this module.
+    """
+    snapshots: dict[str, dict] = {}
+    try:
+        while True:
+            msg = inbox.get_nowait()
+            if msg is None:
+                raise ClientError("engine connection lost")
+            if msg.get("kind") == "snapshot" and msg.get("topic") in topics:
+                snapshots[msg["topic"]] = msg["data"]
+            elif on_event is not None:
+                on_event(msg)
+    except queue.Empty:
+        pass
+    return snapshots
+
+
+def wait_first_snapshot(inbox: queue.Queue, topic: str) -> dict:
+    """Block for the first snapshot on `topic`. `subscribe()`'s response is
+    inline but the snapshot itself arrives via the pusher up to
+    `1/max_rate` later (docs/phase2-notes.md) -- never assume it's already
+    queued right after `subscribe()` returns. Messages for other topics or
+    events seen while waiting are discarded (a caller that cares about them
+    should already have handled them before blocking here)."""
+    while True:
+        msg = inbox.get()
+        if msg is None:
+            raise ClientError("engine connection lost")
+        if msg.get("kind") == "snapshot" and msg.get("topic") == topic:
+            return msg["data"]
+
+
+def current_page_topic(client: EngineClient) -> tuple[str, str]:
+    """Ask the engine (via `describe`) which page is current right now, so
+    a freshly-connecting client subscribes to the CURRENT page's topic
+    instead of assuming "eventlog" -- an assumption that broke the moment a
+    second page could exist. Returns `(page_name, topic)`."""
+    page = client.request("describe")["data"]["current_page"]
+    return page, f"page.{page}"
+
+
+def switch_topic(client: EngineClient, old_topic: str, new_topic: str, max_rate: float) -> None:
+    """Resubscribe on a page change: unsubscribe the old page's topic and
+    subscribe the new one, so a client never straddles two pages' worth of
+    live snapshot traffic. Re-subscribing intentionally re-delivers the new
+    topic's current snapshot (`subscribe()` always seeds the connection's
+    latest-snapshot slot from `engine.snapshot_now`), so callers don't need
+    a separate "prime the view" step after a page switch -- the next
+    `wait_first_snapshot`/`drain_latest` call picks it up normally. No-op
+    when the topic didn't actually change."""
+    if old_topic == new_topic:
+        return
+    client.unsubscribe([old_topic])
+    client.subscribe([new_topic], max_rate=max_rate)

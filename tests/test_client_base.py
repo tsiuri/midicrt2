@@ -7,8 +7,27 @@ import pytest
 from test_server import Client, make
 
 from midicrt import proto
-from midicrt.clients.base import ClientError, EngineClient
+from midicrt.clients.base import (
+    ClientError,
+    EngineClient,
+    current_page_topic,
+    drain_latest,
+    switch_topic,
+    wait_first_snapshot,
+)
 from midicrt.engine.core import MidiEvent
+
+
+class _FakePage:
+    """Second-page double, registered directly onto the live roster (no
+    production factory needed) so resubscribe-flow tests have a real second
+    topic to switch to."""
+
+    def handle(self, ev):
+        return True
+
+    def view_model(self):
+        return {"marker": "fake"}
 
 
 async def test_connect_hello_happy_path(tmp_path):
@@ -122,6 +141,116 @@ async def test_subscribe_rejects_non_positive_max_rate(tmp_path):
         await asyncio.to_thread(client.subscribe, ["page.eventlog"], 0.0)
     await asyncio.to_thread(client.close)
     eng.stop(); await task; await srv.close()
+
+
+def test_drain_latest_filters_to_requested_topics_latest_wins():
+    q: queue.Queue = queue.Queue()
+    q.put({"kind": "snapshot", "topic": "page.eventlog", "seq": 1, "data": {"n": 1}})
+    q.put({"kind": "snapshot", "topic": "page.other", "seq": 1, "data": {"n": "ignored"}})
+    q.put({"kind": "snapshot", "topic": "page.eventlog", "seq": 2, "data": {"n": 2}})
+    out = drain_latest(q, {"page.eventlog"})
+    assert out == {"page.eventlog": {"n": 2}}  # latest wins; other topic dropped
+
+
+def test_drain_latest_empty_queue_returns_empty_dict():
+    assert drain_latest(queue.Queue(), {"page.eventlog"}) == {}
+
+
+def test_drain_latest_raises_client_error_on_eof_sentinel():
+    q: queue.Queue = queue.Queue()
+    q.put(None)
+    with pytest.raises(ClientError):
+        drain_latest(q, {"page.eventlog"})
+
+
+def test_drain_latest_hands_non_matching_messages_to_on_event():
+    q: queue.Queue = queue.Queue()
+    seen = []
+    q.put({"kind": "event", "name": "page_changed", "data": {"page": "second"}})
+    q.put({"kind": "snapshot", "topic": "page.other", "seq": 1, "data": {}})  # not requested
+    q.put({"kind": "snapshot", "topic": "page.eventlog", "seq": 1, "data": {"n": 1}})
+    out = drain_latest(q, {"page.eventlog"}, on_event=seen.append)
+    assert out == {"page.eventlog": {"n": 1}}
+    assert seen == [
+        {"kind": "event", "name": "page_changed", "data": {"page": "second"}},
+        {"kind": "snapshot", "topic": "page.other", "seq": 1, "data": {}},
+    ]
+
+
+def test_drain_latest_drops_non_matching_messages_without_on_event():
+    q: queue.Queue = queue.Queue()
+    q.put({"kind": "event", "name": "page_changed", "data": {"page": "second"}})
+    out = drain_latest(q, {"page.eventlog"})
+    assert out == {}  # no on_event given -> silently dropped, as before
+
+
+def test_switch_topic_is_noop_when_topics_match():
+    class _Recorder:
+        def __init__(self):
+            self.calls = []
+
+        def unsubscribe(self, topics):
+            self.calls.append(("unsub", topics))
+
+        def subscribe(self, topics, max_rate):
+            self.calls.append(("sub", topics, max_rate))
+
+    rec = _Recorder()
+    switch_topic(rec, "page.eventlog", "page.eventlog", 10.0)
+    assert rec.calls == []
+
+
+async def test_current_page_topic_reads_describe(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    page, topic = await asyncio.to_thread(current_page_topic, client)
+    assert (page, topic) == ("eventlog", "page.eventlog")
+    await asyncio.to_thread(client.close)
+    eng.stop(); await task; await srv.close()
+
+
+async def test_wait_first_snapshot_blocks_until_matching_topic(tmp_path):
+    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    await asyncio.to_thread(client.subscribe, ["page.eventlog"], 50.0)
+    inbox = client.start_reader()
+    for i in range(3):
+        await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 60, 1, f"n{i}"))
+    vm = await asyncio.to_thread(wait_first_snapshot, inbox, "page.eventlog")
+    assert vm["lines"][-1]["text"] == "n2"
+    eng.stop(); await task; await srv.close()
+    await asyncio.to_thread(client.close)
+
+
+async def test_wait_first_snapshot_raises_on_eof(tmp_path):
+    q: queue.Queue = queue.Queue()
+    q.put(None)
+    with pytest.raises(ClientError):
+        wait_first_snapshot(q, "page.eventlog")
+
+
+async def test_switch_topic_unsubscribes_old_and_subscribes_new(tmp_path):
+    # The resubscribe flow: a fake second page (no production factory needed)
+    # gives us a real second topic to switch to.
+    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    eng.register_page("second", _FakePage())
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    await asyncio.to_thread(client.subscribe, ["page.eventlog"], 50.0)
+    inbox = client.start_reader()
+
+    await asyncio.to_thread(switch_topic, client, "page.eventlog", "page.second", 50.0)
+
+    vm = await asyncio.to_thread(wait_first_snapshot, inbox, "page.second")
+    assert vm == {"marker": "fake"}
+
+    conn = next(iter(srv._conns))
+    assert conn.topics == {"page.second"}  # old topic dropped, new topic in place
+
+    eng.stop(); await task; await srv.close()
+    await asyncio.to_thread(client.close)
 
 
 async def test_malformed_json_drops_only_that_client(tmp_path):

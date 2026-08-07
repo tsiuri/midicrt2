@@ -9,10 +9,11 @@ class EventLogPage:
         self._lines = deque(maxlen=capacity)
         self._count = 0
 
-    def handle(self, ev) -> None:
+    def handle(self, ev) -> bool:
         style = "accent" if ev.type == "note_on" else "normal"
         self._lines.append({"text": ev.summary, "style": style})
         self._count += 1
+        return True
 
     def clear(self) -> None:
         self._lines.clear()

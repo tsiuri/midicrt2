@@ -58,6 +58,7 @@ async def test_hello_and_describe(tmp_path):
     d = await c.request("describe")
     assert "eventlog.clear" in d["data"]["actions"]
     assert d["data"]["pages"] == ["eventlog"]
+    assert d["data"]["topics"] == ["page.eventlog"]
     eng.stop(); await task; await srv.close()
 
 
@@ -151,4 +152,77 @@ async def test_action_roundtrip_and_errors(tmp_path):
     assert r["ok"] is False
     r = await c.request("nonsense")
     assert r["ok"] is False
+    eng.stop(); await task; await srv.close()
+
+
+class _FakePage:
+    """Second-page double so the roster is exercised without a production
+    factory for it (mirrors test_engine_core.py's helper)."""
+
+    def handle(self, ev):
+        return True
+
+    def view_model(self):
+        return {}
+
+
+async def test_page_next_action_emits_page_changed_event(tmp_path):
+    # The first real event producer (phase3-notes.md item 3): dispatching an
+    # action that changes the page must land a `page_changed` event on a
+    # subscribed client's socket.
+    eng, srv, task = await make(tmp_path)
+    eng.register_page("second", _FakePage())
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    await c.request("subscribe", topics=["page.eventlog"], max_rate=50.0)
+
+    r = await c.request("action", name="page.next", args={})
+    assert r["ok"] is True
+
+    await c.read_msgs(0.3)
+    evs = [m for m in c.inbox if m.get("kind") == "event" and m.get("name") == "page_changed"]
+    assert evs, "expected a page_changed event on the wire"
+    assert evs[-1]["data"]["page"] == "second"
+    eng.stop(); await task; await srv.close()
+
+
+class _FakeTransport:
+    def __init__(self, size):
+        self._size = size
+
+    def get_write_buffer_size(self):
+        return self._size
+
+
+class _FakeWriter:
+    def __init__(self, transport):
+        self.transport = transport
+        self.closed = False
+
+    def write(self, data):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+async def test_slow_client_dropped_on_event_write_buffer_high_water(tmp_path):
+    # Events (unlike snapshots) are sent immediately with no latest-wins
+    # coalescing, so a stalled client can pile up an unbounded write buffer.
+    # A fake conn with a transport reporting an oversized buffer stands in
+    # for "deliberately-stalled" per the task brief.
+    from midicrt.engine.server import _ClientConn
+
+    eng, srv, task = await make(tmp_path)
+    fake_writer = _FakeWriter(_FakeTransport(10 * 1024 * 1024))
+    conn = _ClientConn(reader=None, writer=fake_writer)
+    conn.greeted = True
+    srv._conns.add(conn)
+
+    eng.emit_event("page_changed", {"page": "eventlog"})
+    await asyncio.sleep(0.05)  # let the scheduled _drop() task run
+
+    assert conn not in srv._conns
+    assert fake_writer.closed
     eng.stop(); await task; await srv.close()

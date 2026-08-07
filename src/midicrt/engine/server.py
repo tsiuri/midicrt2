@@ -11,6 +11,15 @@ from midicrt.engine.actions import ActionError
 
 _LOG = logging.getLogger(__name__)
 
+# Slow-client policy for the immediate (unbuffered) event-send path: unlike
+# snapshots, which coalesce to latest-wins in `_push_loop`, events are sent
+# the moment they're emitted with no backpressure. A stalled client's kernel
+# socket buffer can grow without bound, so we check the write-buffer
+# high-water mark before every event send and drop the connection outright
+# if it's over budget (simplest correct option: no queueing/retry, just cut
+# a client that can't keep up -- it will reconnect and resubscribe).
+_MAX_EVENT_WRITE_BUFFER = 256 * 1024  # 256 KiB
+
 
 class _ClientConn:
     def __init__(self, reader, writer):
@@ -57,8 +66,12 @@ class ProtocolServer:
             if not conn.greeted:
                 continue
             if msg.get("kind") == "snapshot":
-                if msg["topic"] in conn.topics:
+                if msg.get("topic") in conn.topics:
                     conn.latest[msg["topic"]] = msg          # drop-and-replace
+            elif conn.writer.transport.get_write_buffer_size() > _MAX_EVENT_WRITE_BUFFER:
+                _LOG.warning("dropping slow client: event write buffer exceeded %d bytes",
+                             _MAX_EVENT_WRITE_BUFFER)
+                asyncio.create_task(self._drop(conn))
             else:
                 conn.send(msg)                               # events: immediate
 
@@ -123,7 +136,10 @@ class ProtocolServer:
         elif cmd == "describe":
             conn.send(proto.response(id, {
                 "actions": self.engine.actions.describe(),
+                # `pages`: unchanged from phase 2 (sorted bare names, display
+                # only). `topics` (new, additive) carries roster/cycle order.
                 "pages": sorted(self.engine.pages),
+                "topics": self.engine.topics,
                 "current_page": self.engine.current_page,
                 "keymap": {},
                 "engine_version": self.engine.status()["engine_version"],

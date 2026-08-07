@@ -36,6 +36,15 @@ VM = {
 GOLDEN_SURFACE_SIZE = (220, 60)
 
 
+def test_renderers_dispatch_table_has_eventlog():
+    assert app.RENDERERS["eventlog"] is app.render_frame
+
+
+def test_render_unknown_fallback_does_not_crash_on_bare_vm():
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    app._render_unknown({}, surf)  # must not raise
+
+
 def test_render_frame_reuses_tui_tail_not_a_duplicate():
     # Task brief: "mirrors the TUI's _tail semantics (reuse
     # clients/tui._tail -- import it, do not duplicate)." Assert identity,

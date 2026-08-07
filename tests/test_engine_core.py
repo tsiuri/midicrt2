@@ -1,7 +1,10 @@
 import asyncio
 import time
 
+import pytest
+
 from midicrt.config import Config
+from midicrt.engine.actions import ActionError
 from midicrt.engine.core import Engine, MidiEvent
 
 
@@ -10,6 +13,22 @@ def ev(**kw):
             "channel": 0, "data1": 60, "data2": 100, "summary": "note_on ch1 n60 v100"}
     base.update(kw)
     return MidiEvent(**base)
+
+
+class _FakePage:
+    """Minimal page double for roster/dirty-tracking tests -- no factory
+    registered for it, so tests attach it via `Engine.register_page()`."""
+
+    def __init__(self, dirty=True):
+        self._dirty = dirty
+        self.seen = 0
+
+    def handle(self, ev) -> bool:
+        self.seen += 1
+        return self._dirty
+
+    def view_model(self) -> dict:
+        return {"seen": self.seen}
 
 
 def test_eventlog_page_capacity_and_vm():
@@ -58,3 +77,75 @@ async def test_clear_action_and_status():
     assert eng.pages["eventlog"].view_model()["count"] == 0
     st = eng.status()
     assert st["page"] == "eventlog" and "uptime_s" in st and st["events_total"] == 0
+
+
+# -- multi-page roster (phase-3 task 1) --------------------------------------
+
+def test_default_roster_from_config_is_eventlog_only():
+    eng = Engine(Config())
+    assert list(eng.pages) == ["eventlog"]
+    assert eng.current_page == "eventlog"
+
+
+def test_register_page_appends_to_live_roster():
+    eng = Engine(Config())
+    fake = _FakePage()
+    eng.register_page("second", fake)
+    assert list(eng.pages) == ["eventlog", "second"]
+    assert eng.pages["second"] is fake
+
+
+def test_engine_topics_reflects_roster_order():
+    eng = Engine(Config())
+    eng.register_page("second", _FakePage())
+    assert eng.topics == ["page.eventlog", "page.second"]
+
+
+def test_handle_marks_dirty_only_for_pages_reporting_true():
+    eng = Engine(Config())
+    quiet = _FakePage(dirty=False)
+    eng.register_page("quiet", quiet)
+    eng._handle(ev())
+    assert eng._dirty == {"page.eventlog"}
+    assert quiet.seen == 1  # every page still SEES every event...
+
+
+def test_handle_marks_non_current_page_dirty_too():
+    # This is the phase-2 latent bug: previously only page.<current_page>
+    # was ever marked dirty even though every page consumed every event.
+    eng = Engine(Config())
+    loud = _FakePage(dirty=True)
+    eng.register_page("loud", loud)
+    assert eng.current_page == "eventlog"  # "loud" is NOT current
+    eng._handle(ev())
+    assert eng._dirty == {"page.eventlog", "page.loud"}
+
+
+async def test_page_next_prev_cycle_and_emit_page_changed():
+    eng = Engine(Config())
+    eng.register_page("second", _FakePage())
+    events = []
+    eng.add_listener(lambda m: events.append(m) if m.get("kind") == "event" else None)
+
+    assert eng.current_page == "eventlog"
+    await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "second"
+    await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "eventlog"  # wrapped around
+    await eng.actions.dispatch("page.prev", {})
+    assert eng.current_page == "second"
+
+    names = [e["name"] for e in events]
+    assert names == ["page_changed", "page_changed", "page_changed"]
+    assert [e["data"]["page"] for e in events] == ["second", "eventlog", "second"]
+
+
+async def test_page_goto_valid_and_unknown():
+    eng = Engine(Config())
+    eng.register_page("second", _FakePage())
+    r = await eng.actions.dispatch("page.goto", {"name": "second"})
+    assert eng.current_page == "second"
+    assert r["page"] == "second"
+    with pytest.raises(ActionError):
+        await eng.actions.dispatch("page.goto", {"name": "nonexistent"})
+    assert eng.current_page == "second"  # unchanged on error

@@ -12,6 +12,7 @@ class Config:
     midi_sources: list[str] = field(default_factory=lambda: ["*"])
     tick_hz: float = 30.0
     eventlog_capacity: int = 200
+    pages: list[str] = field(default_factory=lambda: ["eventlog"])
 
 
 def load(path: str | None = None) -> Config:

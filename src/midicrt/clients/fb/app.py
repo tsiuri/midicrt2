@@ -28,7 +28,14 @@ import threading
 from pathlib import Path
 
 from midicrt import config as config_mod
-from midicrt.clients.base import ClientError, EngineClient
+from midicrt.clients.base import (
+    ClientError,
+    EngineClient,
+    current_page_topic,
+    drain_latest,
+    switch_topic,
+    wait_first_snapshot,
+)
 from midicrt.clients.fb.surface import Surface
 from midicrt.clients.fb.text import draw_text, load_font
 from midicrt.clients.tui import _tail
@@ -83,6 +90,18 @@ def render_frame(vm: dict, surface: Surface) -> None:
         draw_text(surface, LEFT_MARGIN, header_h + i * line_h, line["text"], color, font)
 
 
+def _render_unknown(vm: dict, surface: Surface) -> None:
+    """Fallback for a page name this client build has no renderer for --
+    see clients/tui.py's `_render_unknown` for the rationale (wire compat
+    is additive-only, so an older client can meet a newer server's extra
+    page without crashing). Just clears to background; no text drawn since
+    an unrecognised vm shape may not have a "title"/"count" to show."""
+    surface.clear(BG)
+
+
+RENDERERS = {"eventlog": render_frame}
+
+
 # -- real-device geometry (coded here, exercised only in Task 4) -----------
 
 def _read_fb_geometry() -> tuple[int, int, int]:
@@ -114,9 +133,11 @@ def _find_input_device():
 
 def _input_loop(client: EngineClient, quit_event: threading.Event) -> None:
     """Background-thread evdev reader (brief: "Input runs in a thread").
-    `q` sets `quit_event` for a clean exit; `c` fires `eventlog.clear`.
-    Any discovery/permission/IO failure logs one line and returns -- input
-    is a nice-to-have, never fatal to the render loop.
+    `q` sets `quit_event` for a clean exit; `c` fires `eventlog.clear`; `n`
+    fires `page.next` (the resulting `page_changed` event and resubscribe
+    are handled by the render loop's `drain_latest(on_event=...)`, not
+    here). Any discovery/permission/IO failure logs one line and returns --
+    input is a nice-to-have, never fatal to the render loop.
     """
     try:
         import evdev
@@ -140,70 +161,70 @@ def _input_loop(client: EngineClient, quit_event: threading.Event) -> None:
                     client.action("eventlog.clear")
                 except ClientError:
                     pass  # connection loss surfaces via the render loop's EOF check
+            if event.code == evdev.ecodes.KEY_N:
+                try:
+                    client.action("page.next")
+                except ClientError:
+                    pass  # connection loss surfaces via the render loop's EOF check
     except OSError as exc:
         _LOG.info("input device error (%s); continuing without input", exc)
 
 
 # -- run loops ---------------------------------------------------------------
-
-def _drain_latest(inbox: queue.Queue, vm: dict) -> tuple[dict, bool]:
-    """Non-blocking drain of pending eventlog snapshots (mirrors
-    `tui.run_tui`'s drain-then-render pattern). Returns the newest vm seen
-    (or the input `vm` unchanged) and whether anything new arrived. Raises
-    `ClientError` on the reader thread's EOF sentinel, so callers treat a
-    lost connection the same way a failed connect/subscribe is treated.
-    """
-    dirty = False
-    try:
-        while True:
-            msg = inbox.get_nowait()
-            if msg is None:
-                raise ClientError("engine connection lost")
-            if msg.get("kind") == "snapshot" and msg.get("topic") == "page.eventlog":
-                vm, dirty = msg["data"], True
-    except queue.Empty:
-        pass
-    return vm, dirty
+#
+# Page dispatch mirrors clients/tui.py: `RENDERERS` maps page name -> its
+# `(vm, Surface) -> None` renderer, connect asks `describe` for the CURRENT
+# page instead of assuming "eventlog" (`current_page_topic`), and a
+# `page_changed` event triggers `switch_topic` (unsubscribe old, subscribe
+# new) via `drain_latest`'s `on_event` callback. `_drain_latest`/
+# `_wait_first_snapshot` used to be private copies of this exact logic --
+# now shared with the TUI client via `clients/base.py`.
 
 
-def _wait_first_snapshot(inbox: queue.Queue) -> dict:
-    """Block for the first page.eventlog snapshot. subscribe()'s response
-    is inline but the snapshot itself arrives via the pusher up to
-    1/max_rate later (docs/phase2-notes.md) -- never assume it's already
-    queued right after subscribe() returns.
-    """
-    while True:
-        msg = inbox.get()
-        if msg is None:
-            raise ClientError("engine connection lost")
-        if msg.get("kind") == "snapshot" and msg.get("topic") == "page.eventlog":
-            return msg["data"]
+def _make_page_switcher(client: EngineClient, state: dict, max_rate: float):
+    """Return a `drain_latest(on_event=...)` callback that reacts to
+    `page_changed` by resubscribing and updating `state["page"]`/`
+    state["topic"]` in place."""
+
+    def on_event(msg: dict) -> None:
+        if msg.get("kind") == "event" and msg.get("name") == "page_changed":
+            new_page = msg["data"]["page"]
+            new_topic = f"page.{new_page}"
+            switch_topic(client, state["topic"], new_topic, max_rate)
+            state["page"], state["topic"] = new_page, new_topic
+
+    return on_event
 
 
 def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
-                 no_input: bool, fps: float) -> int:
+                 no_input: bool, fps: float, page: str, topic: str) -> int:
     """Real-/dev/fb0 render loop. Coded per the task brief's geometry spec
     but NOT exercised by this task's tests -- v1 owns the CRT until Task
     4's supervised smoke window runs this path for real.
     """
     width, height, stride = _read_fb_geometry()
     surface = Surface(width, height)
-    vm = {"title": "EVENT LOG", "count": 0, "lines": []}
+    state = {"page": page, "topic": topic}
+    on_event = _make_page_switcher(client, state, fps)
 
     quit_event = threading.Event()
     if not no_input:
         threading.Thread(target=_input_loop, args=(client, quit_event), daemon=True).start()
 
-    render_frame(vm, surface)
+    vm = wait_first_snapshot(inbox, state["topic"])
+    renderer = RENDERERS.get(state["page"], _render_unknown)
+    renderer(vm, surface)
     surface.write_fb(fb_path, stride=stride)
 
     period = 1.0 / fps
     while not quit_event.is_set():
         if quit_event.wait(period):
             break
-        vm, dirty = _drain_latest(inbox, vm)
-        if dirty:
-            render_frame(vm, surface)
+        drained = drain_latest(inbox, {state["topic"]}, on_event=on_event)
+        if state["topic"] in drained:
+            vm = drained[state["topic"]]
+            renderer = RENDERERS.get(state["page"], _render_unknown)
+            renderer(vm, surface)
             surface.write_fb(fb_path, stride=stride)
     return 0
 
@@ -213,7 +234,8 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
     client = EngineClient(socket_path)
     try:
         client.connect()
-        client.subscribe(["page.eventlog"], max_rate=fps)
+        page, topic = current_page_topic(client)
+        client.subscribe([topic], max_rate=fps)
     except ClientError as exc:
         print(f"midicrt-fb: {exc}")
         client.close()
@@ -225,12 +247,13 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
             # Headless test/acceptance mode: render exactly one frame from
             # the first snapshot and exit -- never touches evdev or a real
             # fb device regardless of --no-input/--fb.
-            vm = _wait_first_snapshot(inbox)
+            vm = wait_first_snapshot(inbox, topic)
             surface = Surface(*OUT_SIZE)
-            render_frame(vm, surface)
+            renderer = RENDERERS.get(page, _render_unknown)
+            renderer(vm, surface)
             surface.save_png(out_path)
             return 0
-        return _run_device(client, inbox, fb_path, no_input, fps)
+        return _run_device(client, inbox, fb_path, no_input, fps, page, topic)
     except ClientError as exc:
         print(f"midicrt-fb: {exc}")
         return 1
