@@ -27,8 +27,12 @@ class Config:
     # "voices" is phase-3 task 4's page -- the first second page, live by
     # default (no config.toml required) so `page.next`/`page.goto` have
     # somewhere real to go on a stock deploy. "harmony" is phase-3 task 5's
-    # page, appended the same way.
-    pages: list[str] = field(default_factory=lambda: ["eventlog", "voices", "harmony"])
+    # page, appended the same way. "pianoroll" (phase-3 task 7) shows real
+    # data with just a running daemon + MIDI input too, same as those two --
+    # unlike "tuner" (task 6), which stays out of this default list since it
+    # can only ever show its idle state until a future audio-capture task
+    # lands (see pages/tuner.py's own docstring).
+    pages: list[str] = field(default_factory=lambda: ["eventlog", "voices", "harmony", "pianoroll"])
     instruments: list[str] = field(default_factory=lambda: list(DEFAULT_INSTRUMENTS))
 
 

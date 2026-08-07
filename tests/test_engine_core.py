@@ -59,6 +59,26 @@ class _FakeTickingAnalyzer:
         return {}
 
 
+class _FakeTickingPage:
+    """Page double for `_tick_pages` wiring tests (phase-3 task 7) -- same
+    shape as `_FakeTickingAnalyzer` minus `drain_alerts` (a page-only
+    concept doesn't exist; `_tick_pages` never looks for it)."""
+
+    def __init__(self, tick_dirty=True):
+        self._tick_dirty = tick_dirty
+        self.ticked_with: list[float] = []
+
+    def handle(self, ev) -> bool:
+        return False
+
+    def tick(self, now: float) -> bool:
+        self.ticked_with.append(now)
+        return self._tick_dirty
+
+    def view_model(self) -> dict:
+        return {}
+
+
 def test_eventlog_page_capacity_and_vm():
     eng = Engine(Config(eventlog_capacity=2))
     page = eng.pages["eventlog"]
@@ -120,13 +140,14 @@ async def test_clear_action_and_status():
 
 # -- multi-page roster (phase-3 task 1) --------------------------------------
 
-def test_default_roster_from_config_is_eventlog_voices_then_harmony():
-    # Phase-3 task 4 added "voices"; task 5 appends "harmony" the same way
-    # -- both live by default (config.py's Config.pages default) so they're
-    # reachable with no config.toml on a stock deploy. "eventlog" stays
-    # first/current -- order is preserved from config.pages.
+def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll():
+    # Phase-3 task 4 added "voices"; task 5 appends "harmony"; task 7
+    # appends "pianoroll" the same way -- all three live by default
+    # (config.py's Config.pages default) so they're reachable with no
+    # config.toml on a stock deploy. "eventlog" stays first/current --
+    # order is preserved from config.pages.
     eng = Engine(Config())
-    assert list(eng.pages) == ["eventlog", "voices", "harmony"]
+    assert list(eng.pages) == ["eventlog", "voices", "harmony", "pianoroll"]
     assert eng.current_page == "eventlog"
 
 
@@ -134,7 +155,7 @@ def test_register_page_appends_to_live_roster():
     eng = Engine(Config())
     fake = _FakePage()
     eng.register_page("second", fake)
-    assert list(eng.pages) == ["eventlog", "voices", "harmony", "second"]
+    assert list(eng.pages) == ["eventlog", "voices", "harmony", "pianoroll", "second"]
     assert eng.pages["second"] is fake
 
 
@@ -142,24 +163,27 @@ def test_engine_topics_reflects_roster_order():
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
     assert eng.topics == [
-        "page.eventlog", "page.voices", "page.harmony", "page.second",
+        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
     ]
 
 
 def test_handle_marks_dirty_only_for_pages_reporting_true():
-    # `ev()` is a real note_on on channel 1 -- the real "voices"/"harmony"
-    # pages (both live by default) genuinely react to it too, so they're
-    # dirty here alongside eventlog, same as any other real page would be.
-    # Phase-3 task 6: "alerts" (StuckNotesAnalyzer) is a real analyzer too,
-    # and a fresh note-on genuinely starts tracking it -- dirty for the
-    # same reason. "timesig" does NOT react (TimesigAnalyzer gates note_on
-    # on transport being "running", and no "start" was ever sent here).
+    # `ev()` is a real note_on on channel 1 -- the real "voices"/"harmony"/
+    # "pianoroll" pages (all live by default) genuinely react to it too, so
+    # they're dirty here alongside eventlog, same as any other real page
+    # would be. Phase-3 task 6: "alerts" (StuckNotesAnalyzer) is a real
+    # analyzer too, and a fresh note-on genuinely starts tracking it --
+    # dirty for the same reason. "timesig" does NOT react (TimesigAnalyzer
+    # gates note_on on transport being "running", and no "start" was ever
+    # sent here).
     eng = Engine(Config())
     quiet = _FakePage(dirty=False)
     eng.register_page("quiet", quiet)
     eng._handle(ev())
-    assert eng._dirty == {"page.eventlog", "page.voices", "page.harmony", "overlay.alerts"}
+    assert eng._dirty == {
+        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "overlay.alerts",
+    }
     assert quiet.seen == 1  # every page still SEES every event...
 
 
@@ -172,7 +196,8 @@ def test_handle_marks_non_current_page_dirty_too():
     assert eng.current_page == "eventlog"  # "loud" is NOT current
     eng._handle(ev())
     assert eng._dirty == {
-        "page.eventlog", "page.voices", "page.harmony", "page.loud", "overlay.alerts",
+        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
+        "page.loud", "overlay.alerts",
     }
 
 
@@ -198,7 +223,7 @@ def test_register_analyzer_appends_to_live_roster():
 def test_topics_include_overlay_after_page_topics():
     eng = Engine(Config())
     assert eng.topics == [
-        "page.eventlog", "page.voices", "page.harmony",
+        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
         "overlay.status", "overlay.alerts", "overlay.timesig",
     ]
 
@@ -251,8 +276,8 @@ async def test_clock_tick_does_not_dirty_eventlog_but_dirties_overlay_once_runni
 
 
 async def test_page_next_prev_cycle_and_emit_page_changed():
-    # Roster is now 4 deep by default: eventlog, voices, harmony
-    # (phase-3 tasks 4 and 5's default pages), then the dynamically-
+    # Roster is now 5 deep by default: eventlog, voices, harmony, pianoroll
+    # (phase-3 tasks 4, 5, and 7's default pages), then the dynamically-
     # registered "second".
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
@@ -265,13 +290,17 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "harmony"
     await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "pianoroll"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "harmony"
+    assert eng.current_page == "pianoroll"
 
     names = [e["name"] for e in events]
-    assert names == ["page_changed"] * 4
-    assert [e["data"]["page"] for e in events] == ["voices", "harmony", "second", "harmony"]
+    assert names == ["page_changed"] * 5
+    assert [e["data"]["page"] for e in events] == [
+        "voices", "harmony", "pianoroll", "second", "pianoroll",
+    ]
 
 
 # -- analyzer wall-clock tick + alert events (phase-3 task 6) ---------------
@@ -364,6 +393,55 @@ async def test_run_loop_calls_tick_analyzers_and_publishes_stucknotes_alert_end_
     assert alert_snaps and alert_snaps[-1]["data"]["alerts"][0]["note"] == 60
 
 
+# -- page wall-clock tick (phase-3 task 7) -----------------------------------
+
+def test_tick_pages_calls_tick_with_the_injected_now_and_marks_dirty():
+    eng = Engine(Config())
+    fake = _FakeTickingPage(tick_dirty=True)
+    eng.register_page("fake", fake)
+    eng._tick_pages(12345.0)
+    assert fake.ticked_with == [12345.0]
+    assert "page.fake" in eng._dirty
+
+
+def test_tick_pages_does_not_mark_dirty_when_tick_reports_false():
+    eng = Engine(Config())
+    fake = _FakeTickingPage(tick_dirty=False)
+    eng.register_page("fake", fake)
+    eng._tick_pages(1.0)
+    assert "page.fake" not in eng._dirty
+
+
+def test_tick_pages_ignores_pages_with_no_tick_method():
+    # "eventlog"/"voices"/"harmony" have no tick() -- must not raise.
+    eng = Engine(Config(pages=["eventlog", "voices", "harmony"]))
+    eng._tick_pages(1.0)   # must not raise
+    assert eng._dirty == set()
+
+
+def test_tick_pages_ticks_the_real_pianoroll_page():
+    eng = Engine(Config())
+    eng._tick_pages(1.0)
+    # Nothing has ever played -- PianorollState.tick() reports not-dirty
+    # (see pages/pianoroll.py's own test coverage for that contract).
+    assert "page.pianoroll" not in eng._dirty
+    eng._handle(ev())   # a real note_on -- pianoroll now has an active note
+    eng._dirty.clear()
+    eng._tick_pages(2.0)
+    assert "page.pianoroll" in eng._dirty
+
+
+async def test_run_loop_calls_tick_pages_without_crashing():
+    # End-to-end: the real run() loop must call _tick_pages every cycle
+    # alongside _tick_analyzers with no page in the default roster raising.
+    eng = Engine(Config(tick_hz=200.0))
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev())
+    await asyncio.sleep(0.05)
+    eng.stop()
+    await task   # must not raise
+
+
 # -- tuner page (phase-3 task 6) ---------------------------------------------
 
 def test_tuner_is_not_in_the_default_roster():
@@ -391,3 +469,60 @@ async def test_page_goto_valid_and_unknown():
     with pytest.raises(ActionError):
         await eng.actions.dispatch("page.goto", {"name": "nonexistent"})
     assert eng.current_page == "second"  # unchanged on error
+
+
+# -- pianoroll page (phase-3 task 7) -----------------------------------------
+
+def test_pianoroll_is_in_the_default_roster():
+    eng = Engine(Config())
+    assert "pianoroll" in eng.pages
+    assert eng.pages["pianoroll"].view_model()["title"] == "PIANOROLL"
+
+
+def test_pianoroll_actions_are_registered_when_the_page_is_present():
+    eng = Engine(Config())
+    described = eng.actions.describe()
+    assert {"pianoroll.zoom", "pianoroll.projection", "pianoroll.channels"} <= set(described)
+
+
+def test_pianoroll_actions_are_absent_when_the_page_is_not_in_the_roster():
+    # Mirrors "eventlog.clear" always assuming eventlog exists -- guarded
+    # registration means a build without "pianoroll" in config.pages simply
+    # never advertises these actions (no KeyError at dispatch time either).
+    eng = Engine(Config(pages=["eventlog"]))
+    described = eng.actions.describe()
+    assert not ({"pianoroll.zoom", "pianoroll.projection", "pianoroll.channels"} & set(described))
+
+
+async def test_pianoroll_zoom_action_mutates_and_marks_dirty():
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("pianoroll.zoom", {"delta": "1.0"})
+    assert r["zoom"] == pytest.approx(2.0)
+    assert "page.pianoroll" in eng._dirty
+
+
+async def test_pianoroll_projection_action_mutates_and_marks_dirty():
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("pianoroll.projection", {"mode": "tempo"})
+    assert r["mode"] == "tempo"
+    assert eng.pages["pianoroll"].view_model()["window"]["mode"] == "tempo"
+    assert "page.pianoroll" in eng._dirty
+
+
+async def test_pianoroll_projection_action_rejects_unknown_mode():
+    eng = Engine(Config())
+    with pytest.raises(ActionError):
+        await eng.actions.dispatch("pianoroll.projection", {"mode": "bogus"})
+
+
+async def test_pianoroll_channels_action_mutates_and_marks_dirty():
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("pianoroll.channels", {"spec": "1,2,3"})
+    assert r["channels"] == [1, 2, 3]
+    assert "page.pianoroll" in eng._dirty
+
+
+async def test_pianoroll_channels_action_rejects_malformed_spec():
+    eng = Engine(Config())
+    with pytest.raises(ActionError):
+        await eng.actions.dispatch("pianoroll.channels", {"spec": "not-a-channel"})

@@ -68,6 +68,16 @@ applies here unchanged, no new backpressure code needed). Analyzers
 themselves stay "no I/O": `now` is always INJECTED by this method, never
 read by an analyzer internally -- see analyzers/stucknotes.py's own
 docstring for the full rationale.
+
+Page wall-clock tick (phase-3 task 7)
+--------------------------------------
+`_tick_pages(now)` is the same mechanism, one level up: `pages/pianoroll.py`'s
+scrolling roll must keep advancing purely from wall-clock progress (a
+sustained chord sliding toward the window's edge) even with zero new MIDI
+events, which no page previously needed (every other page is fully
+event-driven). `run()` calls it right after `_tick_analyzers(now)`, same
+injected `now`, same duck-typed OPTIONAL `tick(now) -> bool` convention,
+minus `drain_alerts()` (analyzer-only, no page needs it).
 """
 import asyncio
 import time
@@ -83,6 +93,7 @@ from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.eventlog import EventLogPage
 from midicrt.pages.harmony import HarmonyPage
+from midicrt.pages.pianoroll import PianorollPage
 from midicrt.pages.tuner import TunerPage
 from midicrt.pages.voices import VoicesPage
 
@@ -144,6 +155,13 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # only ever show v1's idle state until a separate, not-yet-built audio-
     # capture task feeds it real pitch samples.
     "tuner": lambda config: TunerPage(),
+    # Phase-3 task 7: v1's flagship two-projection-mode scrolling note
+    # display -- see pages/pianoroll.py's module docstring for the full
+    # port. `config.pages` now defaults to [..., "pianoroll"] (config.py):
+    # unlike "tuner", it shows real data with just a running daemon + MIDI
+    # input, matching the "voices"/"harmony" precedent for default-roster
+    # inclusion.
+    "pianoroll": lambda config: PianorollPage(),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`
@@ -189,10 +207,53 @@ class Engine:
                               description="Go back to the previous page in the roster")
         self.actions.register("page.goto", self._page_goto,
                               description="Jump to a named page", args={"name": "str"})
+        # Phase-3 task 7: pianoroll-specific actions, mirroring the
+        # "eventlog.clear" precedent above (a page-specific action
+        # registered directly here, its handler reaching into
+        # self.pages[...] and hand-marking that page's topic dirty since
+        # these mutations happen outside the normal handle(ev) dirty-flow).
+        # Guarded on the page actually being in the roster (like "tuner",
+        # "pianoroll" is reachable via config.toml/register_page even when
+        # not in the default roster) so dispatching these against a build
+        # with pianoroll disabled fails with a clear "unknown action"
+        # rather than a KeyError.
+        if "pianoroll" in self.pages:
+            self.actions.register("pianoroll.zoom", self._pianoroll_zoom,
+                                  description="Adjust the pianoroll's zoom level",
+                                  args={"delta": "float"})
+            self.actions.register("pianoroll.projection", self._pianoroll_projection,
+                                  description="Switch the pianoroll's projection mode "
+                                              "(wallclock|tempo)",
+                                  args={"mode": "str"})
+            self.actions.register("pianoroll.channels", self._pianoroll_channels,
+                                  description="Set the pianoroll's visible-channel filter "
+                                              "(comma/range spec, empty = all)",
+                                  args={"spec": "str"})
 
     def _clear_eventlog(self):
         self.pages["eventlog"].clear()
         self._dirty.add("page.eventlog")
+
+    def _pianoroll_zoom(self, delta: float) -> dict:
+        zoom = self.pages["pianoroll"].zoom_by(delta)
+        self._dirty.add("page.pianoroll")
+        return {"zoom": zoom}
+
+    def _pianoroll_projection(self, mode: str) -> dict:
+        try:
+            applied = self.pages["pianoroll"].set_projection(mode)
+        except ValueError as exc:
+            raise ActionError(str(exc)) from exc
+        self._dirty.add("page.pianoroll")
+        return {"mode": applied}
+
+    def _pianoroll_channels(self, spec: str) -> dict:
+        try:
+            channels = self.pages["pianoroll"].set_channels(spec)
+        except ValueError as exc:
+            raise ActionError(str(exc)) from exc
+        self._dirty.add("page.pianoroll")
+        return {"channels": channels}
 
     def register_page(self, name: str, page: Page) -> None:
         """Append `page` to the live roster under `name`. Production pages
@@ -295,6 +356,22 @@ class Engine:
                 for alert in drain():
                     self.emit_event("alert", alert)
 
+    def _tick_pages(self, now: float) -> None:
+        """Mirrors `_tick_analyzers` above but for PAGES (phase-3 task 7):
+        added so `pages/pianoroll.py`'s scrolling display keeps advancing
+        from wall-clock progress alone -- a sustained chord must visibly
+        slide toward the window's left edge even with ZERO new MIDI events,
+        which a pure `handle(ev)` can never produce on its own (same
+        "needs an injected clock" problem `_tick_analyzers`'s own docstring
+        describes for `analyzers/stucknotes.py`'s escalation). No page
+        needs `drain_alerts()` (an analyzer-only, phase-3 task 6 concept),
+        so this is the strict `tick()`-only subset of `_tick_analyzers`,
+        applied to `self.pages` instead of `self.analyzers`."""
+        for name, page in self.pages.items():
+            tick_fn = getattr(page, "tick", None)
+            if tick_fn is not None and tick_fn(now):
+                self._dirty.add(f"page.{name}")
+
     async def run(self) -> None:
         self._running = True
         tick = 1.0 / max(self.config.tick_hz, 1.0)
@@ -306,7 +383,9 @@ class Engine:
                     self._handle(self.queue.get_nowait())
             except TimeoutError:
                 pass
-            self._tick_analyzers(time.time())
+            now = time.time()
+            self._tick_analyzers(now)
+            self._tick_pages(now)
             for topic in sorted(self._dirty):
                 snap = self.snapshot_now(topic)
                 if snap:
