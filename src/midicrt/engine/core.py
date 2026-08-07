@@ -138,8 +138,10 @@ from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.configview import ConfigPage
 from midicrt.pages.eventlog import EventLogPage
 from midicrt.pages.harmony import HarmonyPage
+from midicrt.pages.help import HelpPage
 from midicrt.pages.img2txtviz import Img2TxtVizPage
 from midicrt.pages.pianoroll import PianorollPage
+from midicrt.pages.progchanges import ProgChangesPage
 from midicrt.pages.screensaver import ScreensaverPage
 from midicrt.pages.spectrum import SpectrumPage
 from midicrt.pages.tuner import TunerPage
@@ -253,6 +255,18 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # below) since no page factory here has access to the `Engine` being
     # built yet.
     "config": lambda config: ConfigPage(config),
+    # Phase-3 task 12 (gap ports, v1 page 0 "Help / Keys"): see
+    # pages/help.py's own module docstring for why this is a
+    # v2-appropriate-equivalent (describe-data reference), not a literal
+    # port of v1's static keybinding list. `config.pages` now defaults to
+    # [..., "help"] (config.py): a self-contained page with no unbuilt
+    # dependency, matching the "img2txtviz"/"config" precedent.
+    "help": lambda config: HelpPage(),
+    # Phase-3 task 12 (gap ports, v1 page 7 "Program Changes"): see
+    # pages/progchanges.py's own module docstring for the full v1
+    # (`pages/proglog.py`) behavioral synthesis -- a rolling program-change
+    # log reusing eventlog's own `{title, count, lines}` VM shape.
+    "progchanges": lambda config: ProgChangesPage(),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`
@@ -301,6 +315,11 @@ class Engine:
         # from the roster entirely).
         if "config" in self.pages:
             self.pages["config"].bind_engine_info(self._config_engine_info)
+        # Phase-3 task 12: same "engine facts no page can derive from its
+        # own constructor args alone" wiring as the config page above --
+        # see pages/help.py's own "Engine-info wiring" docstring section.
+        if "help" in self.pages:
+            self.pages["help"].bind_info(self._help_info)
         self.events_total = 0
         self.started_at = time.monotonic()
         self._listeners: list[Callable[[dict], None]] = []
@@ -418,6 +437,13 @@ class Engine:
             "pages": list(self.pages),
             "analyzers": list(self.analyzers),
         }
+
+    def _help_info(self) -> dict:
+        """Bound into `pages/help.py`'s `HelpPage` at construction (see
+        `__init__` above) -- the live page roster (cycle order) plus the
+        full action registry, exactly what `describe` already reports over
+        the wire (see `engine/server.py`), just rendered on-screen."""
+        return {"pages": list(self.pages), "actions": self.actions.describe()}
 
     def _pianoroll_zoom(self, delta: float) -> dict:
         zoom = self.pages["pianoroll"].zoom_by(delta)

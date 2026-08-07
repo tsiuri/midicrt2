@@ -1290,6 +1290,166 @@ def test_render_config_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
+# -- help page (phase-3 task 12, gap ports) -----------------------------------
+#
+# Same "-- Section --" + "label: value" text-dump convention as
+# `render_config_frame` -- see pages/help.py's own module docstring for why
+# this describe-data reference IS the v1 Help page's parity port.
+GOLDEN_HELP_FRAME = FIXTURES / "fb_help_frame_golden.png"
+HELP_SURFACE_SIZE = (420, 220)
+
+HELP_VM = {
+    "title": "HELP",
+    "page_rows": [
+        {"label": "pages (page.goto <name>)", "value": "eventlog, voices, harmony"},
+    ],
+    "action_rows": [
+        {"label": "eventlog.clear", "value": "Clear the event log"},
+        {"label": "page.goto", "value": "Jump to a named page  (name:str)"},
+        {"label": "page.next", "value": "Advance to the next page in the roster"},
+    ],
+}
+HELP_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+HELP_ALERTS_VM = {"alerts": []}
+HELP_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                    "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_help_renderers_dispatch_table_has_help():
+    assert app.RENDERERS["help"] is app.render_help_frame
+
+
+def test_render_help_frame_header_bar_is_reverse_video():
+    surf = Surface(*HELP_SURFACE_SIZE)
+    app.render_help_frame(HELP_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._help_header_text(HELP_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+
+
+def test_render_help_frame_empty_rows_does_not_crash():
+    surf = Surface(*HELP_SURFACE_SIZE)
+    empty_vm = {"title": "HELP", "page_rows": [], "action_rows": []}
+    app.render_help_frame(empty_vm, surf)   # must not raise
+
+
+def test_render_help_frame_draws_text_for_each_row():
+    surf = Surface(*HELP_SURFACE_SIZE)
+    app.render_help_frame(HELP_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    # The "-- Pages --" row (first body row) must have at least one lit
+    # NORMAL_FG pixel -- proves text was actually drawn, not just background.
+    y = header_h
+    assert any(px[x, y] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+    # A later row (the "-- Actions --" section header) likewise.
+    y2 = header_h + 3 * line_h
+    assert any(px[x, y2] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+
+
+def test_render_help_frame_reserves_the_bottom_chrome_as_background():
+    surf = Surface(*HELP_SURFACE_SIZE)
+    app.render_help_frame(HELP_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    reserved = app._reserved_chrome_height(font)
+    y_in_strip = surf.height - reserved + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_render_help_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_HELP_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-12-report.md"
+    )
+    surf = Surface(*HELP_SURFACE_SIZE)
+    app.render_help_frame(HELP_VM, surf)
+    app._draw_secondary(surf, HELP_ALERTS_VM, HELP_TIMESIG_VM, load_font())
+    app._draw_status(surf, HELP_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_HELP_FRAME).convert("RGB")
+    assert golden.size == HELP_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
+# -- program changes page (phase-3 task 12, gap ports) ------------------------
+#
+# Byte-for-byte the same layout as `render_frame` -- see pages/
+# progchanges.py's own module docstring for why it reuses eventlog's exact
+# `{title, count, lines}` VM shape.
+GOLDEN_PROGCHANGES_FRAME = FIXTURES / "fb_progchanges_frame_golden.png"
+PROGCHANGES_SURFACE_SIZE = (260, 72)   # wider than eventlog's own golden -- "PROGRAM
+                                        # CHANGES  (N events)" is a longer header string
+
+PROGCHANGES_VM = {
+    "title": "PROGRAM CHANGES",
+    "count": 3,
+    "lines": [
+        {"text": "[10:00:00]  Ch01 → Program 000", "style": "normal"},
+        {"text": "[10:00:05]  Ch02 → Program 012", "style": "normal"},
+        {"text": "[10:00:09]  Ch10 → Program 127", "style": "normal"},
+    ],
+}
+PROGCHANGES_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+PROGCHANGES_ALERTS_VM = {"alerts": []}
+PROGCHANGES_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                           "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_progchanges_renderers_dispatch_table_has_progchanges():
+    assert app.RENDERERS["progchanges"] is app.render_progchanges_frame
+
+
+def test_render_progchanges_frame_header_bar_is_reverse_video():
+    surf = Surface(*PROGCHANGES_SURFACE_SIZE)
+    app.render_progchanges_frame(PROGCHANGES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._progchanges_header_text(PROGCHANGES_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+
+
+def test_render_progchanges_frame_empty_lines_does_not_crash():
+    surf = Surface(*PROGCHANGES_SURFACE_SIZE)
+    empty_vm = {"title": "PROGRAM CHANGES", "count": 0, "lines": []}
+    app.render_progchanges_frame(empty_vm, surf)   # must not raise
+
+
+def test_render_progchanges_frame_draws_text_for_a_line():
+    surf = Surface(*PROGCHANGES_SURFACE_SIZE)
+    app.render_progchanges_frame(PROGCHANGES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    assert any(px[x, header_h] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+
+
+def test_render_progchanges_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_PROGCHANGES_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-12-report.md"
+    )
+    surf = Surface(*PROGCHANGES_SURFACE_SIZE)
+    app.render_progchanges_frame(PROGCHANGES_VM, surf)
+    app._draw_secondary(surf, PROGCHANGES_ALERTS_VM, PROGCHANGES_TIMESIG_VM, load_font())
+    app._draw_status(surf, PROGCHANGES_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_PROGCHANGES_FRAME).convert("RGB")
+    assert golden.size == PROGCHANGES_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
     # rejected by the server's max_rate check, and then hang forever in

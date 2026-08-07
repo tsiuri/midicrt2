@@ -65,10 +65,24 @@ class Config:
     # viewer with zero dependency of any kind -- the task dispatch's own
     # explicit ask ("roster: add 'config'") -- appended last as the newest
     # addition, same convention every prior task's page followed.
+    # Phase-3 task 12 (gap ports): "help" (pages/help.py), "progchanges"
+    # (pages/progchanges.py), "ccmonitor"/"ccdashboard" (pages/ccmonitor.py
+    # + pages/ccdashboard.py, analyzers/ccmonitor.py), "chordkey"
+    # (pages/chordkey.py), and "sendnotes" (pages/sendnotes.py) all join
+    # the default roster too -- every one is self-contained with no
+    # unbuilt dependency (the "voices"/"harmony"/.../"config" precedent),
+    # unlike "tuner" (excluded: permanently idle until a future
+    # audio-capture task). "sendnotes" shows real, useful status (dev/ch/
+    # octave/velocity/gate/active) even though the actual note-trigger
+    # keys have no client-side keyboard binding yet (same Phase-4 gap as
+    # every other page's own unbound interactive keys, e.g. pianoroll's
+    # channel-visibility editor) -- reachable via `midicrt action
+    # sendnotes.key`, matching the "img2txtviz.charset"/.invert precedent.
     pages: list[str] = field(
         default_factory=lambda: [
             "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
-            "img2txtviz", "config"])
+            "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
+            "chordkey", "sendnotes"])
     instruments: list[str] = field(default_factory=lambda: list(DEFAULT_INSTRUMENTS))
     # Phase-3 task 8 (analyzers/spectrum.py): `audio_device` substring-
     # matches a PortAudio input device name (case-insensitive, v1's

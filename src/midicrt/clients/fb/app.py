@@ -660,11 +660,79 @@ def render_config_frame(vm: dict, surface: Surface) -> None:
         _row(f"{r['label']}: {r['value']}")
 
 
+# -- help page (phase-3 task 12, gap ports) -----------------------------------
+#
+# Same "-- Section --" + "label: value" row-dump convention as
+# `render_config_frame` (pages/help.py's view_model is deliberately the same
+# `{page_rows, action_rows}`-shaped list-of-dicts). See pages/help.py's own
+# module docstring for why this describe-data reference IS the v1 Help page's
+# parity port, not a literal keybinding-list transcription.
+def _help_header_text(vm: dict) -> str:
+    return f"{vm['title']}"
+
+
+def render_help_frame(vm: dict, surface: Surface) -> None:
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _help_header_text(vm), BG, font)
+
+    line_h = font.height + LINE_GAP
+    usable_h = surface.height - _reserved_chrome_height(font)
+    y = header_h
+
+    def _row(text: str) -> None:
+        nonlocal y
+        if y + font.height > usable_h:
+            return
+        draw_text(surface, LEFT_MARGIN, y, text, NORMAL_FG, font)
+        y += line_h
+
+    _row("-- Pages --")
+    for r in vm["page_rows"]:
+        _row(f"{r['label']}: {r['value']}")
+    _row("")
+    _row("-- Actions --")
+    for r in vm["action_rows"]:
+        _row(f"{r['label']}: {r['value']}")
+
+
+# -- program changes page (phase-3 task 12, gap ports) ------------------------
+#
+# Byte-for-byte the same layout as `render_frame` (eventlog's own renderer):
+# reverse-video header + tailed lines, one text row per line, since
+# pages/progchanges.py deliberately reuses eventlog's own `{title, count,
+# lines}` VM shape (see that module's docstring). No accent styling -- v1's
+# proglog.py has no per-line color distinction, every line uses
+# `"style": "normal"`.
+def _progchanges_header_text(vm: dict) -> str:
+    return f"{vm['title']}  ({vm['count']} events)"
+
+
+def render_progchanges_frame(vm: dict, surface: Surface) -> None:
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _progchanges_header_text(vm), BG, font)
+
+    line_h = font.height + LINE_GAP
+    usable_h = surface.height - _reserved_chrome_height(font)
+    body_h = max(0, (usable_h - header_h) // line_h)
+    for i, line in enumerate(_tail(vm["lines"], body_h)):
+        color = ACCENT_FG if line["style"] == "accent" else NORMAL_FG
+        draw_text(surface, LEFT_MARGIN, header_h + i * line_h, line["text"], color, font)
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
              "harmony": render_harmony_frame, "tuner": render_tuner_frame,
              "pianoroll": render_pianoroll_frame, "spectrum": render_spectrum_frame,
              "screensaver": render_screensaver_frame,
-             "img2txtviz": render_img2txtviz_frame, "config": render_config_frame}
+             "img2txtviz": render_img2txtviz_frame, "config": render_config_frame,
+             "help": render_help_frame, "progchanges": render_progchanges_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

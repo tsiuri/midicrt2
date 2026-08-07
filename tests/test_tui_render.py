@@ -16,6 +16,7 @@ from midicrt.clients.tui import (
     _KEY_ACTIONS,
     RENDERERS,
     _config_body_lines,
+    _help_body_lines,
     _img2txtviz_grid_lines,
     _pianoroll_grid,
     _render_unknown,
@@ -26,6 +27,7 @@ from midicrt.clients.tui import (
     render_beatprogress_row,
     render_config_lines,
     render_harmony_lines,
+    render_help_lines,
     render_img2txtviz_lines,
     render_lines,
     render_pianoroll_lines,
@@ -764,6 +766,81 @@ def test_render_config_lines_cuts_off_extra_rows_when_height_is_short():
 
 def test_config_renderers_dispatch_table_has_config():
     assert RENDERERS["config"] is render_config_lines
+
+
+# -- help page (phase-3 task 12, gap ports) -----------------------------------
+#
+# Same "-- Section --" + "label: value" row dump convention as
+# `render_config_lines` -- see pages/help.py's own module docstring for why
+# this describe-data reference IS the v1 Help page's parity port, not a
+# literal keybinding-list transcription.
+HELP_VM = {
+    "title": "HELP",
+    "page_rows": [
+        {"label": "pages (page.goto <name>)", "value": "eventlog, voices"},
+    ],
+    "action_rows": [
+        {"label": "page.goto", "value": "Jump to a named page  (name:str)"},
+        {"label": "page.next", "value": "Advance to the next page in the roster"},
+    ],
+}
+
+
+def test_help_body_lines_lists_pages_then_actions_sections():
+    lines = _help_body_lines(HELP_VM)
+    assert lines[0] == "-- Pages --"
+    assert "pages (page.goto <name>): eventlog, voices" in lines
+    assert "-- Actions --" in lines
+    assert "page.goto: Jump to a named page  (name:str)" in lines
+    assert "page.next: Advance to the next page in the roster" in lines
+
+
+def test_render_help_lines_pads_to_exact_dimensions():
+    out = render_help_lines(HELP_VM, width=40, height=12)
+    assert len(out) == 12
+    assert all(len(ln) == 40 for ln in out)
+
+
+def test_render_help_lines_cuts_off_extra_rows_when_height_is_short():
+    out = render_help_lines(HELP_VM, width=40, height=2)
+    assert len(out) == 2   # header + exactly 1 body row
+
+
+def test_help_renderers_dispatch_table_has_help():
+    assert RENDERERS["help"] is render_help_lines
+
+
+# -- program changes page (phase-3 task 12, gap ports) ------------------------
+#
+# Byte-for-byte the same layout as `render_lines` -- see pages/
+# progchanges.py's own module docstring for why it reuses eventlog's exact
+# `{title, count, lines}` VM shape.
+PROGCHANGES_VM = {
+    "title": "PROGRAM CHANGES",
+    "count": 2,
+    "lines": [
+        {"text": "[10:00:00]  Ch01 → Program 000", "style": "normal"},
+        {"text": "[10:00:05]  Ch02 → Program 012", "style": "normal"},
+    ],
+}
+
+
+def test_render_progchanges_lines_geometry_and_content():
+    out = tui.RENDERERS["progchanges"](PROGCHANGES_VM, width=40, height=5)
+    assert len(out) == 5
+    assert all(len(line) == 40 for line in out)
+    assert "Ch02 → Program 012" in out[-1]
+
+
+def test_render_progchanges_lines_tails_to_the_newest_when_short():
+    out = tui.RENDERERS["progchanges"](PROGCHANGES_VM, width=40, height=2)
+    assert len(out) == 2   # header + exactly 1 body row
+    assert "Ch02 → Program 012" in out[-1]
+
+
+def test_progchanges_renderers_dispatch_table_has_progchanges():
+    from midicrt.clients.tui import render_progchanges_lines
+    assert RENDERERS["progchanges"] is render_progchanges_lines
 
 
 def test_run_tui_survives_page_switch_before_new_topics_snapshot_arrives(monkeypatch):

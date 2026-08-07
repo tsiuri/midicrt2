@@ -80,15 +80,17 @@ async def test_hello_and_describe(tmp_path):
     # see server.py's own comment); "topics" carries the real roster/cycle
     # order.
     assert d["data"]["pages"] == [
-        "config", "eventlog", "harmony", "img2txtviz", "pianoroll",
-        "screensaver", "spectrum", "voices",
+        "config", "eventlog", "harmony", "help", "img2txtviz", "pianoroll",
+        "progchanges", "screensaver", "spectrum", "voices",
     ]
     # Phase-3 task 6 added "alerts"/"timesig" overlays; task 9 added
     # "beatflash"/"loopprogress" -- see test_engine_core.py::
-    # test_topics_include_overlay_after_page_topics.
+    # test_topics_include_overlay_after_page_topics. Phase-3 task 12 (gap
+    # ports) added "help" right after "config" -- see config.py's own
+    # comment for the full default-roster ordering.
     assert d["data"]["topics"] == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
-        "page.screensaver", "page.img2txtviz", "page.config",
+        "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]

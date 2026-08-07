@@ -575,11 +575,58 @@ def screensaver_row_texts(header_line: str, body_lines: list[str], width: int) -
     return [header_line, *body_lines, blank_row, blank_row, blank_row]
 
 
+# -- help page (phase-3 task 12, gap ports) -----------------------------------
+#
+# Same "-- Section --" + "label: value" dump convention as
+# `render_config_lines` (pages/help.py's view_model is deliberately the same
+# `{page_rows, action_rows}`-shaped list-of-dicts). See pages/help.py's own
+# module docstring for why this describe-data reference IS the v1 Help
+# page's parity port, not a literal keybinding-list transcription.
+def _help_header_text(vm: dict) -> str:
+    return f"{vm['title']}  [n]ext page [q]uit"
+
+
+def _help_body_lines(vm: dict) -> list[str]:
+    lines = ["-- Pages --"]
+    lines += [f"{r['label']}: {r['value']}" for r in vm["page_rows"]]
+    lines.append("")
+    lines.append("-- Actions --")
+    lines += [f"{r['label']}: {r['value']}" for r in vm["action_rows"]]
+    return lines
+
+
+def render_help_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_help_header_text(vm), width)
+    body_h = height - 1
+    rows = [_fit(ln, width) for ln in _help_body_lines(vm)]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [header] + body
+
+
+# -- program changes page (phase-3 task 12, gap ports) ------------------------
+#
+# Byte-for-byte the same layout as `render_lines` (eventlog's own renderer):
+# scrolling tail of text lines, since pages/progchanges.py deliberately
+# reuses eventlog's own `{title, count, lines}` VM shape (see that module's
+# docstring).
+def render_progchanges_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = f"{vm['title']}  ({vm['count']} events)  [n]ext page [q]uit"
+    body_h = height - 1
+    tail = _tail(vm["lines"], body_h)
+    body = [_fit(" " + ln["text"], width) for ln in tail]
+    while len(body) < body_h:
+        body.insert(0, " " * width)
+    return [_fit(header, width)] + body
+
+
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "harmony": render_harmony_lines, "tuner": render_tuner_lines,
              "pianoroll": render_pianoroll_lines, "spectrum": render_spectrum_lines,
              "screensaver": render_screensaver_lines,
-             "img2txtviz": render_img2txtviz_lines, "config": render_config_lines}
+             "img2txtviz": render_img2txtviz_lines, "config": render_config_lines,
+             "help": render_help_lines, "progchanges": render_progchanges_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
