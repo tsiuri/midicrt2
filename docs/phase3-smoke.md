@@ -145,6 +145,17 @@ injections across every test run in this session). Saved to
 `tui-spotcheck-{1,2,3}-*.txt` in the evidence dir. No crash, confirming the
 fix holds for the TUI client too.
 
+**Disclosed, not fixed — a separate minor edge case found while setting
+this check up:** an earlier attempt drove `midicrt tui` via `script -qc`
+over a non-interactive ssh invocation (no real pty), and `term.height`
+resolved to something degenerate (likely 0); `renderer(vm, width,
+height-3)` returned an empty list and `header_line, body_lines =
+page_lines[0], page_lines[1:]` raised `IndexError: list index out of
+range`. Root-caused as an artifact of that invalid zero-size-terminal
+setup, not a realistic path (real SSH clients always report a real
+terminal size) — recorded here for durability, not fixed, given the much
+lower likelihood versus the page/vm race above.
+
 ## Verdict
 
 `midicrt-fb`'s real-`/dev/fb0` path now cycles cleanly through the entire

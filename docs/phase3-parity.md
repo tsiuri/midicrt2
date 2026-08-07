@@ -15,6 +15,14 @@ trusted individually:
    loader (`midicrt.py::load_pages`/`load_plugins`, both a sorted
    `glob.glob("*.py")` over `pages/`/`plugins/` — anything with a different
    suffix, e.g. `.py.bak`/`.pybak`/no extension, never loads and is dead).
+   Nuance: the glob check proves DEATH (wrong suffix → definitely never
+   loads) but not the full shape of LIFE — `plugins/polydisplay.py` IS
+   matched by `load_plugins()`'s glob (so it does get the standard
+   `handle()`/`draw()` plugin treatment too), but v1's own README Plugins
+   table separately annotates it "not a plugin": it's ALSO directly
+   imported by name (`pages/notes.py:10`, `from plugins import
+   polydisplay`) as a shared-state module, confirmed via grep, not
+   inferred from the glob alone.
 2. **The phase-3 ledger** — `progress.md` and all eleven `task-N-report.md`
    files in `.superpowers/sdd/2026-08-06-midicrt2-phase3-parity/`
    (motherbase), which record what each task actually ported, what it
@@ -51,7 +59,7 @@ all; found only by this task's inventory sweep).
 | 8 | Piano Roll (`pianoroll.py`) | `pages/pianoroll.py` (page `pianoroll`) | **Ported**, Task 7. Both v1 projection concepts (`pianoroll.py`'s "beat" mode and `pianoroll_exp.py`'s tempo-relative math — see ID 16) merged into one page with a `pianoroll.projection {mode}` action toggling `"tempo-relative"`/`"wallclock"`. |
 | 9 | Audio Spectrum (`audiospectrum.py`) | `pages/spectrum.py` (page `spectrum`) | **Ported**, Task 8, against **real hardware** (USB C-Media audio interface, live PipeWire capture) — not a placeholder. v1's interactive retuning keys (bins/gain/smoothing/floor/ceil/freq-scale/agg-mode/lowcut/HPF-toggle/device-cycle) not ported — no v2 keybinding-table infra yet (same Phase-4 gap as ID 0); only `audio_device`/`spectrum_bins` are config-adjustable. Peak-hold is a disclosed v2 *addition* (v1 has none). |
 | 10 | Tuner (`tuner.py`) | `pages/tuner.py` (page `tuner`) | **Ported (math only), inert pending audio wiring**, Task 6, assessed viable Task 8. Pure post-detection math (`freq_to_note`, `tuning_meter`, smoothing/gating) ported; the audio→pitch pipeline is NOT wired (`on_pitch_sample()` has no caller yet). Task 8 confirmed `aubio` installs cleanly on this exact Pi and a working `AudioCapture` now exists, but activating it needs a second consumer tap on that capture — small, scoped, explicitly NOT done. Registered but deliberately excluded from the default page roster (would only ever show "Listening..." until wired). |
-| 11 | Chord+Key (`chordkey.py`) | `pages/harmony.py` (page `harmony`) — partial | **Not separately ported — consolidated.** `chordkey.py` is a second, more compact display of the same `zharmony.py`/`harmony.py` chord+key data that `notes.py` (ID 1) already shows in full; v2 ports the primary (`notes.py` → `harmony` page). `chordkey.py`'s own distinct compact layout has no v2 equivalent. |
+| 11 | Chord+Key (`chordkey.py`) | — | **Not ported — gap.** `chordkey.py` is a second, more compact display of the same `zharmony.py`/`harmony.py` chord+key data that `notes.py` (ID 1) already shows in full — v2's `harmony` page (Task 5) ports the primary (`notes.py`); `chordkey.py`'s own distinct compact layout was never separately built. Underlying analyzer data is available (no new analyzer work needed), just no page presents it in this layout. |
 | 12 | Stuck Heatmap (`stuckheat.py`) | — | **Not ported — disclosed**, Task 6. Lifetime pitch-class/note histogram fed by `zstucknotes.get_stuck_stats()` — a historical-stats feature outside the `overlay.alerts` VM contract Task 6 built. Flagged there as a future page opportunity, not lost logic. |
 | 13 | Voice Monitor (`voicemon.py`) | `pages/voices.py` (page `voices`) | **Ported**, Task 4. Displays the merge of `zvoicemonitor.py` + `polydisplay.py` (see §2). |
 | 14 | Config (`configui.py`) | `pages/configview.py` (page `config`) | **Ported, narrowed by design.** v1's is an *interactive editor* (writes `settings.json`). v2's is a **read-only viewer** of effective config + engine facts (version/uptime/roster) — deliberate, per spec §5 and the never-writes-config rule (§7 of the design doc: a runtime settings-rewrite once clobbered the user's instrument names in v1; v2 structurally cannot repeat that). No capture-section rows yet (Phase 5 unbuilt). |
@@ -78,9 +86,9 @@ of today's `pianoroll.py`).
 | `pagecycle.py` | `behaviors/pagecycle.py` | **Ported, re-interpreted**, Task 9 (disclosed, not a literal port — the task brief's own explicit contract). v1: unconditional interval-based rotation through a *curated subset* (`cycle_pages=[1,6,8,9]`), suppressed only by a recent **keypress**. v2: idle-*triggered* (no MIDI activity for `pagecycle_idle_s`) cycling through the **whole roster**, since MIDI activity is the only engine-observable "someone's using this" signal and v2's roster has no page-ID subset to hardcode against. `cycle_pages`/`user_pause` have no v2 analog. |
 | `polydisplay.py` | `analyzers/voices.py` | **Merged**, Task 4 (see `zvoicemonitor.py` row — both merge into one analyzer). |
 | `polydisplay.py.bak` | — | **Dead code**, never loaded (co-exists with the live `polydisplay.py`; found during this sweep, harmless). |
-| `sysex.py` | — | **Not ported — gap.** A real, actively-used production feature: a SysEx command receiver enabling remote control from the Cirklon sequencer (page switch, screensaver on/off, pagecycle enable/disable, capture-dump, capability query over a versioned SysEx frame format) — confirmed live via `sysex.d/` containing real captured message files, not vestigial. No phase-3 task addressed it; v2's action-API architecture is a natural transport target for this (every capability is already a named action) but **no SysEx binding layer is planned in the Phase 4 design** (`bindings.toml` covers note/CC match specs only) — flagged here explicitly as something the user should decide on, not silently assumed to be covered by Phase 4's MIDI-learn work. |
+| `sysex.py` | — | **Not ported — gap.** A real, actively-used production feature: a SysEx command receiver enabling remote control from the Cirklon sequencer (page switch, screensaver on/off, pagecycle enable/disable, capture-dump, capability query over a versioned SysEx frame format) — confirmed live via `sysex.d/` containing real captured message files, not vestigial. No phase-3 task addressed it; v2's action-API architecture is a natural transport target for this (every capability is already a named action), but **no SysEx binding layer exists in the current Phase 4 design** (`bindings.toml` covers note/CC match specs only) — queued for the phase-3 extension task (see sign-off), not silently assumed to be covered by Phase 4's MIDI-learn work as currently scoped. |
 | `timeclock.py` | `analyzers/transport.py`, `overlay.status` | **Ported**, Task 3. BPM computed exactly (`60/(ts - clock_batch_start)`, no smoothing) rather than v1's smoothed estimate — a disclosed improvement, not a regression. |
-| `zharmony.py` (+ top-level `harmony.py` matching engine) | `analyzers/harmony.py`, `analyzers/theory.py` | **Ported**, Task 5. `config/chords.csv`/`config/scales.csv` copied verbatim to `assets/chords.csv`/`assets/scales.csv`, byte-diffed to confirm. Several deliberate simplifications disclosed inline in `analyzers/harmony.py`'s docstring (anti-flicker tension-hold timing, dead legacy-entry filtering). |
+| `zharmony.py` (+ top-level `harmony.py` matching engine) | `analyzers/harmony.py`, `analyzers/theory.py` | **Ported**, Task 5. `config/chords.csv`/`config/scales.csv` copied verbatim to `assets/chords.csv`/`assets/scales.csv`, byte-diffed to confirm. Several deliberate simplifications disclosed inline in `analyzers/harmony.py`'s docstring (anti-flicker tension-hold timing, dead legacy-entry filtering). **Not ported — disclosed:** harmonic-rhythm timing uses a fixed `HARMONIC_RHYTHM_BPM = 120.0` (`analyzers/harmony.py:186`) rather than v1's live-bpm read (`getattr(midicrt, "bpm", 120.0)`) — v2's analyzers have no cross-analyzer read access yet (transport's live bpm lives in a sibling analyzer, `engine/core.py`'s own docstring calls this a currently-latent gap, not something Task 5's scope extended to close), so harmonic-rhythm always assumes 4/4-at-120bpm, matching v1's own fallback exactly but never updating from it. Cross-wiring transport bpm into pages is flagged as a small future task. |
 | `zscreensaver.py` | `behaviors/screensaver.py`, `pages/screensaver.py` | **Ported, re-architected**, Task 9. v1 writes raw zeros directly into `/dev/fb0`, bypassing the compositor entirely; v2 behaviors act only through actions, so this becomes `page.goto screensaver` (a real blank page) plus manual-override/restore bookkeeping v1 never needed because it never "left" a page. `IDLE_TIMEOUT` (60s) carried over unchanged. Activity filter (`note_on`/`note_off`/`control_change` only, **not** `clock_tick`) reproduced exactly. |
 | `zstucknotes.py` | `analyzers/stucknotes.py`, `overlay.alerts` | **Ported (detection only)**, Task 6. WARN_AFTER/CRIT_AFTER age tracking, retrigger-resets-age, CC64 sustain suspension, CC120/123/121 clears all ported. **Not ported (disclosed):** `PANIC_ON_CRIT` (auto all-notes-off MIDI send — real output actuation, excluded by the "no I/O" analyzer rule); `HOLD_AFTER`'s 15s "STUCK CLEARED" message retention (no field in the VM contract); v1's `_fmt_note` octave-offset formatting (raw note numbers used instead, matching `voices.py`'s convention). |
 | `ztimesig.py` | `analyzers/timesig.py`, `overlay.timesig` | **Ported**, Task 6, including a from-scratch sub-beat tick reconstruction (v2's clock granularity is coarser than v1's raw 24-ppqn) verified against synthetic click tracks at 3/4, 4/4, 5/4, 7/4. A stop/continue beat-boundary staleness bug found and fixed in the same task's review round. |
@@ -169,7 +177,6 @@ design; no future task is planned to revisit these):
 - `plugins/bootlogo.py.bak`, `plugins/meters.py.bak`, `plugins/polydisplay.py.bak`,
   `pages/*.bak`/`.pybak`/extensionless — all confirmed dead in v1 itself, never loaded.
 - `plugins/beat_counter.py` — confirmed dead no-op stub in v1.
-- `pages/sendnotes.py` (ID 2) — interactive MIDI-send tool, not a monitor.
 - Page 12 Stuck Heatmap, Page 15 TimeSig Exp (`ztimesig_exp.py`) — historical/experimental features, disclosed as future opportunities not lost logic.
 - v1's interactive per-page retuning keys (spectrum's bins/gain/etc., pianoroll's channel-visibility editor, img2txtviz's gamma/ramp keys) — blocked on the Phase 4 keymap table, not silently lost; will return once that infrastructure lands, if desired.
 - `zstucknotes.py`'s `PANIC_ON_CRIT` auto-MIDI-panic-send, `zvoicemonitor.py`'s poly-limit-exceeded warning log, `loopprogress.py`'s scheduler-health/SysEx diagnostic text — analyzer purity ("no I/O") and missing VM contract fields, all disclosed at the task that made the call.
@@ -178,8 +185,25 @@ design; no future task is planned to revisit these):
 
 **Accept as DEFERRED** (real gaps or later-phase work, on an explicit future plan):
 
-- Pages 0, 4, 5, 7, 11 (Help, CC Monitor, CC Dashboard, Program Changes, Chord+Key) — found by this task's inventory sweep, addressed by **no** phase-3 task. Real gaps, not yet scheduled.
-- `plugins/sysex.py` — the Cirklon SysEx remote-control receiver. Real, actively-used v1 feature with **no v2 equivalent and no plan to build one** in the current phase roadmap. Needs an explicit decision (build a SysEx binding layer alongside Phase 4's MIDI-learn work, or accept the loss of Cirklon remote control at cutover).
+- Pages 0, 2, 4, 5, 7, 11 (Help, Send Notes, CC Monitor, CC Dashboard,
+  Program Changes, Chord+Key) — found by this task's inventory sweep,
+  addressed by **no** phase-3 task. Since the user's stated scope is full
+  parity, these are **queued for the phase-3 extension task**, not open
+  questions — including `pages/sendnotes.py` (ID 2), which an earlier
+  draft of this checklist incorrectly filed under DROPPED alongside
+  genuinely dead/excluded items; it's a real, working v1 feature (an
+  interactive MIDI-output page) with no v2 equivalent, structurally the
+  same situation as `sysex.py` below, not a design-based exclusion.
+- `plugins/sysex.py` — the Cirklon SysEx remote-control receiver. Real,
+  actively-used v1 feature (page switch, screensaver/pagecycle toggle,
+  capture-dump, capability query over a versioned SysEx frame) with no v2
+  equivalent yet. **Queued for the phase-3 extension task** alongside the
+  gap pages above, not left as an open decision — v2's action-API
+  architecture is a natural transport target for it.
+- Harmonic rhythm's fixed `HARMONIC_RHYTHM_BPM = 120.0` (Task 5, §2 above)
+  — v1's common case reads live bpm; v2 can't yet because analyzers have
+  no cross-analyzer read access. Cross-wiring transport bpm into pages is
+  a small future task, not scheduled.
 - Tuner audio wiring (page 10) — math ported, capture path proven working (Task 8), just not connected; small scoped follow-up.
 - Web client (`midicrt-web`) — fully built (221 tests) on an isolated branch, review/merge deferred to Phase 6.
 - Capture/replay, MIDI-learn/keymap — Phase 5 and Phase 4 respectively, per the original design spec's phasing; untouched by design, not oversight.
