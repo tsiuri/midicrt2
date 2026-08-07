@@ -823,13 +823,81 @@ def render_ccdashboard_frame(vm: dict, surface: Surface) -> None:
         draw_text(surface, age_x, text_y, _ccdashboard_age_text(entry), age_color, font)
 
 
+# -- chord+key page (phase-3 task 12, gap ports) -------------------------------
+#
+# Layout: reverse-video header, then text rows -- "Recent PCs:", up to 3
+# ranked chord-candidate lines, a "Stabilized key:" section (either
+# "Key= <label> NN% (thr NN%)"/"Key~ ..." when ambiguous, or a "Key: ?
+# top:<label> NN%" fallback when nothing has stabilized yet, plus an
+# "alts:" line), and "Function:" -- mirroring v1's own `chordkey.py`
+# text-row layout (see pages/chordkey.py's module docstring for the full
+# v1-field mapping). Same `_row` closure convention as
+# `render_harmony_frame`/`render_config_frame`.
+def _chordkey_header_text(vm: dict) -> str:
+    return f"{vm['title']}"
+
+
+def _chordkey_key_lines(key: dict) -> tuple[str, str]:
+    if not key["label"]:
+        top = key["top"]
+        line1 = f"Key: ?  top:{top['label']} {top['pct']}%" if top else "Key: ?"
+    else:
+        tag = "~" if key["ambiguous"] else "="
+        line1 = f"Key{tag} {key['label']}  {key['pct']}% (thr {key['threshold_pct']}%)"
+    if key["alternatives"]:
+        alt_txt = " | ".join(f"{a['label']} {a['pct']}%" for a in key["alternatives"][:2])
+        line2 = f"alts: {alt_txt}"
+    elif key["ambiguous"]:
+        line2 = "alts: near-threshold / ambiguous"
+    else:
+        line2 = "alts: -"
+    return line1, line2
+
+
+def render_chordkey_frame(vm: dict, surface: Surface) -> None:
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _chordkey_header_text(vm), BG, font)
+
+    line_h = font.height + LINE_GAP
+    usable_h = surface.height - _reserved_chrome_height(font)
+    y = header_h
+
+    def _row(text: str) -> None:
+        nonlocal y
+        if y + font.height > usable_h:
+            return
+        draw_text(surface, LEFT_MARGIN, y, text, NORMAL_FG, font)
+        y += line_h
+
+    _row(f"Recent PCs: {' '.join(vm['recent_pcs']) or '(none)'}")
+    _row("Chord candidates:")
+    if not vm["chords"]:
+        _row("(no chord match yet)")
+    else:
+        for i, c in enumerate(vm["chords"]):
+            miss = " ".join(c["missing"]) or "-"
+            _row(f"{i + 1}) {c['label']}  {c['pct']:3d}%  missing:{miss}")
+
+    _row("")
+    _row("Stabilized key:")
+    k1, k2 = _chordkey_key_lines(vm["key"])
+    _row(k1)
+    _row(k2)
+    _row(f"Function: {vm['function'] or '?'}")
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
              "harmony": render_harmony_frame, "tuner": render_tuner_frame,
              "pianoroll": render_pianoroll_frame, "spectrum": render_spectrum_frame,
              "screensaver": render_screensaver_frame,
              "img2txtviz": render_img2txtviz_frame, "config": render_config_frame,
              "help": render_help_frame, "progchanges": render_progchanges_frame,
-             "ccmonitor": render_ccmonitor_frame, "ccdashboard": render_ccdashboard_frame}
+             "ccmonitor": render_ccmonitor_frame, "ccdashboard": render_ccdashboard_frame,
+             "chordkey": render_chordkey_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

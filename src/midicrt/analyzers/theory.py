@@ -186,3 +186,131 @@ def detect_harmony_info(pcs: set[int], min_chord_notes: int = 2, min_scale_notes
         scale = _make_info_list(hits, SCALES, pcs=pcs)
 
     return chord, scale
+
+
+# -- phase-3 task 12 (gap ports, v1 page 11 "Chord+Key") --------------------
+#
+# `pages/chordkey.py`'s OWN chord-candidate scoring, ported verbatim from
+# `~/codex/midicrt/pages/chordkey.py::_chord_candidates` -- a SEPARATE
+# algorithm from `detect_harmony_info` above, not a wrapper around it.
+# Confirmed by reading both v1 sources: `detect_harmony_info`/
+# `_best_matches` (this file, backing `analyzers/harmony.py`'s "Chord:"
+# ticker) requires the root to already be IN `pcs`
+# (`require_root_in_pcs=True`), enforces a minimum match RATIO
+# (`chord_min_ratio`), and reports "no match" outright when more than
+# `max_ties` candidates tie (an ambiguous chord becomes `None`, not a
+# guess). `chordkey.py`'s own `_chord_candidates` does none of that: every
+# root 0-11 is tried regardless of whether it's actually sounding, there is
+# no ratio floor (score is purely for RANKING, not gating), and it always
+# returns up to `top_n` candidates with no ambiguity cutoff -- genuinely
+# different selection semantics, not just a different presentation of the
+# same computation, so this is its own function rather than a thin
+# adapter over `_best_matches`.
+def chord_candidates_all_roots(pcs: set[int], top_n: int = 3) -> list[dict]:
+    """Rank every (root, chord-shape) combination in `CHORDS` against `pcs`
+    by `(ratio, match, -extra, -len(pattern-missing))`, deduplicated by
+    label, and return the top `top_n` — pure port of v1's
+    `pages/chordkey.py::_chord_candidates`."""
+    pcs_set = set(pcs)
+    if not pcs_set:
+        return []
+    seen: set[str] = set()
+    results: list[dict] = []
+    for item in CHORDS:
+        base = item["pcs"]
+        for root in range(12):
+            pattern = {(root + p) % 12 for p in base}
+            match = len(pcs_set & pattern)
+            if match < 2:
+                continue
+            label = f"{_note_name(root)} {item['name']}"
+            if label in seen:
+                continue
+            missing = sorted(pattern - pcs_set)
+            extra = len(pcs_set - pattern)
+            ratio = match / max(1, len(pattern))
+            seen.add(label)
+            results.append({
+                "label": label, "ratio": ratio, "match": match,
+                "missing": missing, "extra": extra,
+                "score": (ratio, match, -extra, -len(missing)),
+            })
+    results.sort(key=lambda r: r["score"], reverse=True)
+    return results[:top_n]
+
+
+# Roman-numeral scale degrees, ported verbatim from v1's `plugins/
+# zharmony.py::ROMAN_DEGREES` — used by `roman_numeral_for_chord` below to
+# label a chord's harmonic function relative to a key (v1's "Fn: I (T)"
+# suffix on the Chord+Key page, `_update_function_label`/`_roman_for_chord`
+# — NOT ported into `analyzers/harmony.py` itself, since that module's task
+# 5 VM contract has no field for it; `pages/chordkey.py` is the one page
+# that actually shows it).
+ROMAN_DEGREES = {
+    0: "I", 1: "bII", 2: "II", 3: "bIII", 4: "III", 5: "IV", 6: "#IV",
+    7: "V", 8: "bVI", 9: "VI", 10: "bVII", 11: "VII",
+}
+_ROMAN_FUNCTION_BY_INTERVAL = {0: "T", 5: "S", 7: "D"}   # Tonic/Subdominant/Dominant
+
+
+def roman_numeral_for_chord(chord_info: list[dict] | dict | None,
+                             key_label: str | None) -> str | None:
+    """Pure port of v1's `plugins/zharmony.py::_roman_for_chord` — the
+    chord's root expressed as a roman numeral relative to `key_label`
+    ("C maj"/"A min"), lower-cased for a minor chord, with `°`/`+`
+    suffixes for diminished/augmented and a "(T)"/"(S)"/"(D)"
+    tonic/subdominant/dominant function tag where one applies (the minor
+    v7 chord, interval 10, is treated as dominant in a minor key — v1's
+    own special case for the natural/harmonic-minor dominant substitute).
+    Returns `None` if either input is missing/unparseable, exactly
+    matching v1's own early-return guards.
+
+    A real, faithfully-ported v1 quirk (verified against the actual
+    deployed CHORDS asset, not assumed): the lowercase gate is `"min" in
+    chord_name or chord_name.startswith("m")` — and this file's OWN major
+    triad entry (`assets/chords.csv`, byte-diffed against v1's
+    `config/chords.csv`) is literally named `"maj"`, which also starts
+    with `"m"`. So a MAJOR chord's numeral gets lower-cased too (e.g. the
+    tonic in C major renders `"i (T)"`, not `"I (T)"`) — this is v1's own
+    real, observable behavior (confirmed by reading `_roman_for_chord`
+    byte-for-byte, not a porting mistake), preserved here rather than
+    "corrected" to conventional roman-numeral capitalization. Separately,
+    the `"dim" in chord_name` diminished-suffix check never actually fires
+    for THIS asset's own diminished row either — its `name` column is the
+    symbol `"°"`, not the word `"dim"` — so on real, shipped chord data
+    from `CHORDS`, no roman numeral here ever gets a `°` suffix; the
+    suffix logic is exercised only by a hand-built `chord_info` dict
+    naming a chord `"dim"`/`"aug"` explicitly (which `detect_harmony_info`
+    could never actually hand back from THIS asset, but the function
+    itself still honors correctly, matching v1's own generic string check
+    rather than a CHORDS-asset-specific one).
+    """
+    if not chord_info or not key_label:
+        return None
+    if isinstance(chord_info, list):
+        chord_info = chord_info[0] if chord_info else None
+    if not isinstance(chord_info, dict):
+        return None
+    try:
+        key_root_name, key_mode = key_label.split(" ", 1)
+        key_root = NOTE_NAMES.index(key_root_name)
+    except Exception:  # noqa: BLE001 -- verbatim fidelity to v1's own blind `except Exception`
+        return None
+    chord_root = chord_info.get("root")
+    chord_name = (chord_info.get("name") or "").lower()
+    if chord_root is None:
+        return None
+    interval = (int(chord_root) - int(key_root)) % 12
+    roman = ROMAN_DEGREES.get(interval, "?")
+    if "min" in chord_name or chord_name.startswith("m"):
+        roman = roman.lower()
+    if "dim" in chord_name:
+        roman += "°"
+    elif "aug" in chord_name:
+        roman += "+"
+    func = _ROMAN_FUNCTION_BY_INTERVAL.get(interval)
+    if key_mode.strip() == "min" and interval == 10:
+        func = "D"
+    if func:
+        return f"{roman} ({func})"
+    return roman

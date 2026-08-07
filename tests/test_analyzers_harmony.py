@@ -381,3 +381,72 @@ def test_no_motif_with_too_short_an_interval_history():
         a.handle(note_on(0, n))
     vm = a.view_model()
     assert vm["motif"] == {"found": False, "pattern": None, "count": 0}
+
+
+# -- phase-3 task 12 accessors (recent_pcs / chord_info / key_detail) -------
+#
+# Additive, read-only accessors for pages/chordkey.py -- see
+# analyzers/harmony.py's own docstring section for why these exist
+# alongside (not instead of) the task-5 view_model() contract.
+
+def test_recent_pcs_matches_the_current_note_on_window():
+    a = HarmonyAnalyzer()
+    a.handle(note_on(0, 60))   # C
+    a.handle(note_on(0, 64))   # E
+    assert a.recent_pcs == {0, 4}
+
+
+def test_recent_pcs_is_empty_before_any_note():
+    a = HarmonyAnalyzer()
+    assert a.recent_pcs == set()
+
+
+def test_chord_info_matches_the_current_chord_detection():
+    a = HarmonyAnalyzer()
+    a.handle(note_on(0, 60))
+    a.handle(note_on(0, 64))
+    a.handle(note_on(0, 67))   # C major triad
+    info = a.chord_info
+    assert info is not None
+    assert any(c["label"] == "C maj" for c in info)
+
+
+def test_chord_info_is_none_before_any_note():
+    a = HarmonyAnalyzer()
+    assert a.chord_info is None
+
+
+def test_key_detail_shape_before_any_note():
+    a = HarmonyAnalyzer()
+    detail = a.key_detail()
+    assert detail == {
+        "label": None, "confidence": 0.0, "threshold": 0.72,
+        "alternatives": [], "top": None, "ambiguous": True,
+    }
+
+
+def test_key_detail_reports_top_and_confidence_for_a_single_note():
+    # Mirrors test_a_single_note_trivially_meets_v1s_key_confidence_
+    # threshold's own finding: one note snaps _stable_key immediately, and
+    # key_detail()'s "top" candidate agrees with it exactly.
+    a = HarmonyAnalyzer()
+    a.handle(note_on(0, 60))
+    detail = a.key_detail()
+    assert detail["label"] == "C maj"
+    assert detail["confidence"] == 1.0
+    assert detail["top"] == {"label": "C maj", "ratio": 1.0}
+    assert detail["ambiguous"] is False
+
+
+def test_key_detail_matches_view_models_own_key_fields_once_established():
+    a = HarmonyAnalyzer()
+    scale = [60, 62, 64, 65, 67, 69, 71]
+    for _ in range(6):
+        for n in scale:
+            a.handle(note_on(0, n))
+            a.handle(note_off(0, n))
+    vm = a.view_model()
+    detail = a.key_detail()
+    assert detail["label"] == vm["key"]
+    assert detail["confidence"] == vm["key_conf"]
+    assert [alt["label"] for alt in detail["alternatives"]] == vm["key_alternatives"]

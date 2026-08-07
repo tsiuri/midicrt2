@@ -137,6 +137,7 @@ from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.ccdashboard import CCDashboardPage
 from midicrt.pages.ccmonitor import CCMonitorPage
+from midicrt.pages.chordkey import ChordKeyPage
 from midicrt.pages.configview import ConfigPage
 from midicrt.pages.eventlog import EventLogPage
 from midicrt.pages.harmony import HarmonyPage
@@ -276,6 +277,13 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # same precedent as pages/chordkey.py below).
     "ccmonitor": lambda config: CCMonitorPage(),
     "ccdashboard": lambda config: CCDashboardPage(),
+    # Phase-3 task 12 (gap ports, v1 page 11 "Chord+Key"): a second,
+    # compact chord/key display distinct from "harmony" (v1 page 1's own
+    # port, Task 5) -- see pages/chordkey.py's own module docstring for
+    # what's genuinely new here vs already covered by "harmony". Owns its
+    # OWN HarmonyAnalyzer instance, same "no cross-page analyzer sharing
+    # yet" precedent as "ccmonitor"/"ccdashboard" above.
+    "chordkey": lambda config: ChordKeyPage(),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`

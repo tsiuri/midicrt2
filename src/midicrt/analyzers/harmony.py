@@ -449,6 +449,51 @@ class HarmonyAnalyzer:
             if abs(cand["ratio"] - conf) <= margin:
                 self._stable_key_alt.append(cand)
 
+    # -- phase-3 task 12 (gap ports) accessors: additive, for pages/
+    # chordkey.py only -- see that module's docstring for why it wraps its
+    # OWN HarmonyAnalyzer instance rather than sharing this page's, and
+    # why these are plain read accessors on already-existing state rather
+    # than new fields added to `view_model()` itself (view_model()'s own
+    # contract, task 5's brief, is unchanged by this task). Pure, safe to
+    # call anytime -- same "no mutation" rule as `_harmonic_rhythm()`/
+    # `_motif_info()` below.
+    @property
+    def recent_pcs(self) -> set[int]:
+        """`zharmony.py::get_recent_pcs()` -- the pitch-class set of the
+        current `_recent_notes` window (chord/scale/key detection input)."""
+        return set(self._recent_pcs)
+
+    @property
+    def chord_info(self) -> list[dict] | dict | None:
+        """`zharmony.py`'s own `chord` local (the CURRENT detection result,
+        before history-dedup) -- what `_update_function_label(chord)` is
+        called with on every chord-label change. Exposed for
+        `theory.roman_numeral_for_chord`, which needs the SAME shape
+        `detect_harmony_info` returns (a dict or a tied-candidate list)."""
+        return self._chord_info
+
+    def key_detail(self) -> dict:
+        """`zharmony.py::get_stable_key()` — re-derives the FULL key
+        picture (including `top`/`ambiguous`, which task 5's `view_model()`
+        deliberately does not surface, see this class's module docstring)
+        from the same `_key_counts` histogram `_update_stable_key()` already
+        maintains. Pure re-derivation, not new mutable state: `cands` is
+        recomputed fresh each call via the same `_key_candidates` staticmethod
+        `_update_stable_key()` itself calls."""
+        cands = self._key_candidates(self._key_counts, sum(self._key_counts))
+        top = cands[0] if cands else None
+        near = bool(top and top["ratio"] < KEY_CONFIDENCE_THRESHOLD + KEY_ALT_MARGIN
+                    and self._stable_key_alt)
+        return {
+            "label": self._stable_key,
+            "confidence": round(self._stable_key_conf, 4),
+            "threshold": KEY_CONFIDENCE_THRESHOLD,
+            "alternatives": [{"label": c["label"], "ratio": round(c["ratio"], 4)}
+                              for c in self._stable_key_alt],
+            "top": {"label": top["label"], "ratio": round(top["ratio"], 4)} if top else None,
+            "ambiguous": near or self._stable_key is None,
+        }
+
     # -- pure derived views (safe to (re)compute inside view_model(): no
     # mutation, unlike the state above which only ever changes in handle())
 

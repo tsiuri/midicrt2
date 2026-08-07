@@ -906,6 +906,72 @@ def test_ccdashboard_renderers_dispatch_table_has_ccdashboard():
     assert RENDERERS["ccdashboard"] is render_ccdashboard_lines
 
 
+# -- chord+key page (phase-3 task 12, gap ports) -------------------------------
+CHORDKEY_VM = {
+    "title": "CHORD+KEY",
+    "recent_pcs": ["C", "E", "G"],
+    "chords": [
+        {"label": "C maj", "pct": 100, "missing": []},
+        {"label": "A m", "pct": 67, "missing": ["A"]},
+    ],
+    "key": {
+        "label": "C maj", "pct": 92, "threshold_pct": 72, "ambiguous": False,
+        "top": {"label": "C maj", "pct": 92},
+        "alternatives": [{"label": "G maj", "pct": 70}],
+    },
+    "function": "i (T)",
+}
+CHORDKEY_EMPTY_VM = {
+    "title": "CHORD+KEY", "recent_pcs": [], "chords": [],
+    "key": {"label": None, "pct": None, "threshold_pct": 72, "ambiguous": True,
+            "top": None, "alternatives": []},
+    "function": None,
+}
+
+
+def test_chordkey_body_lines_full_layout():
+    lines = tui._chordkey_body_lines(CHORDKEY_VM)
+    assert lines[0] == "Recent PCs: C E G"
+    assert lines[1] == "Chord candidates:"
+    assert "1) C maj  100%  missing:-" in lines
+    assert "2) A m   67%  missing:A" in lines
+    assert "Stabilized key:" in lines
+    assert "Key= C maj  92% (thr 72%)" in lines
+    assert "alts: G maj 70%" in lines
+    assert "Function: i (T)" in lines
+
+
+def test_chordkey_body_lines_no_stable_key_shows_top_fallback():
+    lines = tui._chordkey_body_lines(CHORDKEY_EMPTY_VM)
+    assert "(no chord match yet)" in lines
+    assert "Key: ?" in lines
+    assert "alts: near-threshold / ambiguous" in lines   # no key yet -> ambiguous=True
+    assert "Function: ?" in lines
+
+
+def test_chordkey_body_lines_ambiguous_key_uses_tilde_tag():
+    vm = dict(CHORDKEY_VM)
+    vm["key"] = dict(CHORDKEY_VM["key"], ambiguous=True)
+    lines = tui._chordkey_body_lines(vm)
+    assert "Key~ C maj  92% (thr 72%)" in lines
+
+
+def test_render_chordkey_lines_pads_to_exact_dimensions():
+    out = tui.RENDERERS["chordkey"](CHORDKEY_VM, width=40, height=12)
+    assert len(out) == 12
+    assert all(len(ln) == 40 for ln in out)
+
+
+def test_render_chordkey_lines_cuts_off_extra_rows_when_height_is_short():
+    out = tui.RENDERERS["chordkey"](CHORDKEY_VM, width=40, height=2)
+    assert len(out) == 2   # header + exactly 1 body row
+
+
+def test_chordkey_renderers_dispatch_table_has_chordkey():
+    from midicrt.clients.tui import render_chordkey_lines
+    assert RENDERERS["chordkey"] is render_chordkey_lines
+
+
 def test_run_tui_survives_page_switch_before_new_topics_snapshot_arrives(monkeypatch):
     """TUI's twin of fb/app.py::_run_device's regression (same phase-3 task
     11 finding, found live against the real daemon): a page_changed event

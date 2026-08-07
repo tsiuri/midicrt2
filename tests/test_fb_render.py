@@ -1582,6 +1582,81 @@ def test_render_ccdashboard_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
+# -- chord+key page (phase-3 task 12, gap ports) -------------------------------
+GOLDEN_CHORDKEY_FRAME = FIXTURES / "fb_chordkey_frame_golden.png"
+CHORDKEY_SURFACE_SIZE = (300, 150)
+
+CHORDKEY_VM = {
+    "title": "CHORD+KEY",
+    "recent_pcs": ["C", "E", "G"],
+    "chords": [
+        {"label": "C maj", "pct": 100, "missing": []},
+        {"label": "A m", "pct": 67, "missing": ["A"]},
+    ],
+    "key": {
+        "label": "C maj", "pct": 92, "threshold_pct": 72, "ambiguous": False,
+        "top": {"label": "C maj", "pct": 92},
+        "alternatives": [{"label": "G maj", "pct": 70}],
+    },
+    "function": "i (T)",
+}
+CHORDKEY_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+CHORDKEY_ALERTS_VM = {"alerts": []}
+CHORDKEY_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                        "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_chordkey_renderers_dispatch_table_has_chordkey():
+    assert app.RENDERERS["chordkey"] is app.render_chordkey_frame
+
+
+def test_render_chordkey_frame_header_bar_is_reverse_video():
+    surf = Surface(*CHORDKEY_SURFACE_SIZE)
+    app.render_chordkey_frame(CHORDKEY_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._chordkey_header_text(CHORDKEY_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+
+
+def test_render_chordkey_frame_empty_does_not_crash():
+    surf = Surface(*CHORDKEY_SURFACE_SIZE)
+    empty_vm = {
+        "title": "CHORD+KEY", "recent_pcs": [], "chords": [],
+        "key": {"label": None, "pct": None, "threshold_pct": 72, "ambiguous": True,
+                "top": None, "alternatives": []},
+        "function": None,
+    }
+    app.render_chordkey_frame(empty_vm, surf)   # must not raise
+
+
+def test_render_chordkey_frame_draws_text_for_a_row():
+    surf = Surface(*CHORDKEY_SURFACE_SIZE)
+    app.render_chordkey_frame(CHORDKEY_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    assert any(px[x, header_h] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+
+
+def test_render_chordkey_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_CHORDKEY_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-12-report.md"
+    )
+    surf = Surface(*CHORDKEY_SURFACE_SIZE)
+    app.render_chordkey_frame(CHORDKEY_VM, surf)
+    app._draw_secondary(surf, CHORDKEY_ALERTS_VM, CHORDKEY_TIMESIG_VM, load_font())
+    app._draw_status(surf, CHORDKEY_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_CHORDKEY_FRAME).convert("RGB")
+    assert golden.size == CHORDKEY_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
     # rejected by the server's max_rate check, and then hang forever in

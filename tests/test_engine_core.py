@@ -155,7 +155,7 @@ def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll_spectru
     eng = Engine(Config())
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
-        "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
+        "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard", "chordkey",
     ]
     assert eng.current_page == "eventlog"
 
@@ -166,7 +166,8 @@ def test_register_page_appends_to_live_roster():
     eng.register_page("second", fake)
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
-        "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard", "second",
+        "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
+        "chordkey", "second",
     ]
     assert eng.pages["second"] is fake
 
@@ -177,7 +178,7 @@ def test_engine_topics_reflects_roster_order():
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
-        "page.ccmonitor", "page.ccdashboard", "page.second",
+        "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
@@ -189,17 +190,19 @@ def test_handle_marks_dirty_only_for_pages_reporting_true():
     # to it too, so they're dirty here alongside eventlog, same as any
     # other real page would be. Phase-3 task 6: "alerts" (StuckNotesAnalyzer)
     # is a real analyzer too, and a fresh note-on genuinely starts tracking
-    # it -- dirty for the same reason. "timesig" does NOT react
-    # (TimesigAnalyzer gates note_on on transport being "running", and no
-    # "start" was ever sent here). "config" never reacts to MIDI events at
-    # all (a read-only viewer, pages/configview.py's own `handle()`).
+    # it -- dirty for the same reason. Phase-3 task 12: "chordkey" wraps its
+    # own HarmonyAnalyzer instance (same class as "harmony"'s), so it reacts
+    # to a real note-on too. "timesig" does NOT react (TimesigAnalyzer gates
+    # note_on on transport being "running", and no "start" was ever sent
+    # here). "config" never reacts to MIDI events at all (a read-only
+    # viewer, pages/configview.py's own `handle()`).
     eng = Engine(Config())
     quiet = _FakePage(dirty=False)
     eng.register_page("quiet", quiet)
     eng._handle(ev())
     assert eng._dirty == {
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
-        "page.img2txtviz", "overlay.alerts",
+        "page.img2txtviz", "page.chordkey", "overlay.alerts",
     }
     assert quiet.seen == 1  # every page still SEES every event...
 
@@ -214,7 +217,7 @@ def test_handle_marks_non_current_page_dirty_too():
     eng._handle(ev())
     assert eng._dirty == {
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
-        "page.img2txtviz", "page.loud", "overlay.alerts",
+        "page.img2txtviz", "page.chordkey", "page.loud", "overlay.alerts",
     }
 
 
@@ -245,7 +248,7 @@ def test_topics_include_overlay_after_page_topics():
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
-        "page.ccmonitor", "page.ccdashboard",
+        "page.ccmonitor", "page.ccdashboard", "page.chordkey",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
@@ -333,15 +336,18 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "ccdashboard"
     await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "chordkey"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "ccdashboard"
+    assert eng.current_page == "chordkey"
 
     names = [e["name"] for e in events]
-    assert names == ["page_changed"] * 13
+    assert names == ["page_changed"] * 14
     assert [e["data"]["page"] for e in events] == [
         "voices", "harmony", "pianoroll", "spectrum", "screensaver", "img2txtviz",
-        "config", "help", "progchanges", "ccmonitor", "ccdashboard", "second", "ccdashboard",
+        "config", "help", "progchanges", "ccmonitor", "ccdashboard", "chordkey",
+        "second", "chordkey",
     ]
 
 

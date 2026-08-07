@@ -677,13 +677,68 @@ def render_ccdashboard_lines(vm: dict, width: int, height: int) -> list[str]:
     return [_fit(header, width)] + body
 
 
+# -- chord+key page (phase-3 task 12, gap ports) -------------------------------
+#
+# Same text-row layout as fb/app.py's `render_chordkey_frame` -- see that
+# module and pages/chordkey.py's own docstrings for the full v1
+# (`pages/chordkey.py`) field mapping.
+def _chordkey_header_text(vm: dict) -> str:
+    return f"{vm['title']}  [n]ext page [q]uit"
+
+
+def _chordkey_key_lines(key: dict) -> tuple[str, str]:
+    if not key["label"]:
+        top = key["top"]
+        line1 = f"Key: ?  top:{top['label']} {top['pct']}%" if top else "Key: ?"
+    else:
+        tag = "~" if key["ambiguous"] else "="
+        line1 = f"Key{tag} {key['label']}  {key['pct']}% (thr {key['threshold_pct']}%)"
+    if key["alternatives"]:
+        alt_txt = " | ".join(f"{a['label']} {a['pct']}%" for a in key["alternatives"][:2])
+        line2 = f"alts: {alt_txt}"
+    elif key["ambiguous"]:
+        line2 = "alts: near-threshold / ambiguous"
+    else:
+        line2 = "alts: -"
+    return line1, line2
+
+
+def _chordkey_body_lines(vm: dict) -> list[str]:
+    lines = [f"Recent PCs: {' '.join(vm['recent_pcs']) or '(none)'}", "Chord candidates:"]
+    if not vm["chords"]:
+        lines.extend(["(no chord match yet)", "", ""])
+    else:
+        for i, c in enumerate(vm["chords"]):
+            miss = " ".join(c["missing"]) or "-"
+            lines.append(f"{i + 1}) {c['label']}  {c['pct']:3d}%  missing:{miss}")
+        for _ in range(len(vm["chords"]), 3):
+            lines.append("")
+    lines.append("")
+    lines.append("Stabilized key:")
+    k1, k2 = _chordkey_key_lines(vm["key"])
+    lines.extend([k1, k2])
+    lines.append(f"Function: {vm['function'] or '?'}")
+    return lines
+
+
+def render_chordkey_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_chordkey_header_text(vm), width)
+    body_h = height - 1
+    rows = [_fit(ln, width) for ln in _chordkey_body_lines(vm)]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [header] + body
+
+
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "harmony": render_harmony_lines, "tuner": render_tuner_lines,
              "pianoroll": render_pianoroll_lines, "spectrum": render_spectrum_lines,
              "screensaver": render_screensaver_lines,
              "img2txtviz": render_img2txtviz_lines, "config": render_config_lines,
              "help": render_help_lines, "progchanges": render_progchanges_lines,
-             "ccmonitor": render_ccmonitor_lines, "ccdashboard": render_ccdashboard_lines}
+             "ccmonitor": render_ccmonitor_lines, "ccdashboard": render_ccdashboard_lines,
+             "chordkey": render_chordkey_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
