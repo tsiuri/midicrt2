@@ -134,6 +134,7 @@ from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config
+from midicrt.engine import sysex as sysex_mod
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.engine.midi_out import MidiOutput
 from midicrt.pages.ccdashboard import CCDashboardPage
@@ -177,6 +178,14 @@ class MidiEvent:
     # None for every other event type, and for the first batch after a
     # start/stop/continue reset (no prior boundary exists yet).
     clock_batch_start: float | None = None
+    # `type == "sysex"` only (phase-3 task 12, gap ports): the raw SysEx
+    # payload bytes WITHOUT the F0/F7 framing (mido's own `msg.data`
+    # convention) -- `data1`/`data2` (single-byte ints) can't carry an
+    # arbitrary-length byte sequence, so this is a new field rather than
+    # overloading either. None for every other event type. See
+    # engine/sysex.py's module docstring for the frame format this feeds
+    # (`Engine._handle_sysex`'s own parse/dispatch).
+    sysex_data: tuple[int, ...] | None = None
 
 
 class Page(Protocol):
@@ -318,6 +327,25 @@ _ANALYZER_FACTORIES: dict[str, AnalyzerFactory] = {
     "loopprogress": lambda config: LoopProgressAnalyzer(),
 }
 
+# Phase-3 task 12 (gap ports): v1 numeric page ID (per README's Pages
+# table, IDs 0-17) -> v2 page NAME, for `engine/sysex.py`'s CMD_SWITCH_PAGE
+# (`Engine._sysex_switch_page`). v2 has no page-ID concept at all (pages
+# are named, not numbered) -- this is the ONE place that vocabulary needs
+# to be bridged, so a Cirklon operator can keep using the numeric IDs
+# their existing patch/sequencer config already sends. Every v2 page this
+# phase-3 pass has ever built is covered; the four IDs with no v2 home at
+# all (3 Transport -- folded into chrome, no page; 12 Stuck Heatmap, 15
+# TimeSig Exp -- not ported; 16 Piano Roll Exp -- merged into "pianoroll")
+# are deliberately absent, matching docs/phase3-parity.md's own
+# ported/folded/dropped dispositions -- `_sysex_switch_page` replies with
+# an error status for any ID not in this map, exactly like v1's own
+# `switch_page()` returning `ok=False` for an invalid page.
+_SYSEX_PAGE_ID_MAP: dict[int, str] = {
+    0: "help", 1: "harmony", 2: "sendnotes", 4: "ccmonitor", 5: "ccdashboard",
+    6: "eventlog", 7: "progchanges", 8: "pianoroll", 9: "spectrum", 10: "tuner",
+    11: "chordkey", 13: "voices", 14: "config", 17: "img2txtviz",
+}
+
 
 class Engine:
     def __init__(self, config: Config):
@@ -407,6 +435,18 @@ class Engine:
         self._behaviors: list = [self._pagecycle_behavior, self._screensaver_behavior]
         self.actions.register("eventlog.clear", self._clear_eventlog,
                               description="Clear the event log")
+        # Phase-3 task 12 (gap ports): registered UNCONDITIONALLY --
+        # `_pagecycle_behavior` always exists regardless of `config.pages`
+        # (unlike page-specific actions below, which guard on their own
+        # page being in the roster). Gives `engine/sysex.py`'s
+        # CMD_PAGE_CYCLE (v1's own `03 <0|1>` command) a real action to
+        # dispatch through, and is independently reachable via `midicrt
+        # action pagecycle.enable` too -- one capability, two entry points,
+        # matching "page.goto"'s own dual reachability (a normal client
+        # action AND CMD_SWITCH_PAGE's own dispatch target).
+        self.actions.register("pagecycle.enable", self._pagecycle_enable,
+                              description="Enable or disable idle page cycling",
+                              args={"enabled": "bool"})
         self.actions.register("page.next", self._page_next,
                               description="Advance to the next page in the roster")
         self.actions.register("page.prev", self._page_prev,
@@ -617,12 +657,209 @@ class Engine:
         self.events_total += 1
         if ev.type in _ACTIVITY_EVENT_TYPES:
             self._last_activity_ts = ev.ts
+        # Phase-3 task 12: sysex is handled BEFORE the generic analyzer/page
+        # loop below (mirrors this method's own activity-stamp ordering) --
+        # its dispatch can itself change `self.current_page`/mutate
+        # behaviors, and the analyzer/page loop right after should see that
+        # NEW state for the rest of this same event (harmless either way
+        # today, since no analyzer/page branches on ev.type=="sysex", but
+        # keeps engine-level side effects grouped at the top of _handle,
+        # matching the activity-stamp's own placement).
+        if ev.type == "sysex":
+            self._handle_sysex(ev)
         for name, analyzer in self.analyzers.items():
             if analyzer.handle(ev):
                 self._dirty.add(f"overlay.{name}")
         for name, page in self.pages.items():
             if page.handle(ev):
                 self._dirty.add(f"page.{name}")
+
+    # -- sysex remote control (phase-3 task 12, gap ports) -----------------
+    #
+    # DISPATCH half of v1's `plugins/sysex.py` -- see engine/sysex.py's own
+    # module docstring for the PARSE half (pure, no side effects) this
+    # calls into. Every method below is a thin, testable wrapper: parse ->
+    # (maybe) mutate engine state through the SAME methods a normal client
+    # action would use -> (maybe) send a reply through self._midi_out.
+
+    def _handle_sysex(self, ev: MidiEvent) -> None:
+        if ev.sysex_data is None:
+            return
+        parsed = sysex_mod.parse_command(ev.sysex_data)
+        if parsed is None:
+            return   # not addressed to midicrt at all -- true no-op, matches v1
+        # Any matched-prefix frame counts as activity, however it parses
+        # from here -- mirrors v1's own unconditional `ss.deactivate()`
+        # (screensaver wake) on ANY valid-prefix SysEx command, checked
+        # BEFORE marker/version parsing even begins. v2 has no direct
+        # "wake" primitive on the screensaver behavior (see
+        # `_sysex_screensaver`'s own docstring) -- bumping the SAME
+        # activity clock every OTHER wake path already uses lets
+        # `ScreensaverBehavior.tick()`'s own real-activity-advance branch
+        # do the restore on the very next tick, exactly as if a note had
+        # arrived.
+        self._last_activity_ts = ev.ts
+        # v2 addition (disclosed): v1's only observability for arriving
+        # commands is a transient footer message + file logging
+        # (`_log()`/`sysex.log`/`sysex.d/`, none of which this task ports
+        # -- see engine/sysex.py's module docstring). An `alert`-shaped
+        # engine EVENT (the same `emit_event` path `_tick_analyzers`'s own
+        # `drain_alerts()` already uses) gives any connected client
+        # real-time visibility for free, with no new transport machinery.
+        self.emit_event("sysex_command", {
+            "version": parsed["version"], "cmd": parsed["cmd"],
+            "args": list(parsed["args"]), "error": parsed["error"],
+        })
+        if parsed["error"] == "missing-cmd":
+            return   # no cmd byte to reply about -- matches v1 (logs, no reply)
+        if parsed["error"] == "unsupported-version":
+            # v1's own reply quirk, preserved: the REPLY's version byte is
+            # the highest SUPPORTED version, not the (unsupported) one that
+            # was requested.
+            reply = sysex_mod.build_reply(
+                max(sysex_mod.SUPPORTED_PROTOCOL_VERSIONS), parsed["cmd"], 0x01,
+                sysex_mod.SUPPORTED_PROTOCOL_VERSIONS)
+            self._midi_out.send_sysex(reply)
+            return
+        self._dispatch_sysex_command(parsed["version"], parsed["cmd"], parsed["args"])
+
+    def _dispatch_sysex_command(self, version: int | None, cmd: int, args: tuple[int, ...]) -> None:
+        if cmd == sysex_mod.CMD_SWITCH_PAGE:
+            self._sysex_switch_page(version, args)
+        elif cmd == sysex_mod.CMD_SCREENSAVER:
+            self._sysex_screensaver(version, args)
+        elif cmd == sysex_mod.CMD_PAGE_CYCLE:
+            self._sysex_page_cycle(version, args)
+        elif cmd == sysex_mod.CMD_CAPTURE_RECENT:
+            self._sysex_capture_recent(version)
+        elif cmd == sysex_mod.CMD_CAPABILITIES:
+            self._sysex_capabilities(version)
+        elif version is not None:
+            self._midi_out.send_sysex(sysex_mod.build_reply(version, cmd, 0x01))
+
+    def _sysex_switch_page(self, version: int | None, args: tuple[int, ...]) -> None:
+        """CMD_SWITCH_PAGE (`01 <page>`): v1 numeric page ID -> v2 page
+        name via `_SYSEX_PAGE_ID_MAP`, dispatched through the SAME
+        `_page_goto` a normal `page.goto` action uses (so it emits the
+        same `page_changed` event, marks the same dirty topic -- no
+        parallel page-switch code path)."""
+        if not args:
+            if version is not None:
+                self._midi_out.send_sysex(
+                    sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x01))
+            return
+        page_id = args[0]
+        name = _SYSEX_PAGE_ID_MAP.get(page_id)
+        if name is None or name not in self.pages:
+            if version is not None:
+                self._midi_out.send_sysex(
+                    sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x01, (page_id,)))
+            return
+        self._page_goto(name)
+        if version is not None:
+            self._midi_out.send_sysex(
+                sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x00, (page_id,)))
+
+    def _sysex_screensaver(self, version: int | None, args: tuple[int, ...]) -> None:
+        """CMD_SCREENSAVER (`02 <0|1>`): `0`=wake, `1`=force on immediately.
+
+        "Wake" needs no code here at all -- `_handle_sysex`'s own
+        unconditional activity-bump (see its docstring) already lets
+        `ScreensaverBehavior.tick()`'s real restore path fire on the very
+        next tick, exactly like a note arriving would.
+
+        "Force on immediately" dispatches `page.goto screensaver` directly,
+        bypassing `ScreensaverBehavior`'s own idle-timer state machine
+        entirely -- a disclosed limitation this INHERITS, not introduces:
+        `ScreensaverBehavior.tick()`'s "not active" branch already treats
+        `current_page == screensaver_page` as "already there, nothing to
+        latch" without ever setting its own `_active`/`_previous_page`
+        bookkeeping (see that module's own `tick()`), so ANY direct
+        `page.goto screensaver` -- from this command, from a raw `midicrt
+        action` call, from any other client -- leaves automatic restore-on-
+        activity unarmed until a later idle/active cycle re-latches it
+        normally. Fixing that general interaction is out of this task's
+        scope (porting sysex control, not auditing every existing
+        `page.goto screensaver` call site); v1 has no equivalent case at
+        all (no page concept to leave "unrestored").
+        """
+        if not args:
+            if version is not None:
+                self._midi_out.send_sysex(
+                    sysex_mod.build_reply(version, sysex_mod.CMD_SCREENSAVER, 0x01))
+            return
+        if args[0] != 0 and "screensaver" in self.pages:
+            self._page_goto("screensaver")
+        if version is not None:
+            self._midi_out.send_sysex(sysex_mod.build_reply(
+                version, sysex_mod.CMD_SCREENSAVER, 0x00, (int(args[0] != 0),)))
+
+    def _sysex_page_cycle(self, version: int | None, args: tuple[int, ...]) -> None:
+        """CMD_PAGE_CYCLE (`03 <0|1>`): dispatches through the SAME
+        `_pagecycle_enable` the `pagecycle.enable` action uses (see its own
+        registration comment)."""
+        if not args:
+            if version is not None:
+                self._midi_out.send_sysex(
+                    sysex_mod.build_reply(version, sysex_mod.CMD_PAGE_CYCLE, 0x01))
+            return
+        self._pagecycle_enable(bool(args[0]))
+        if version is not None:
+            self._midi_out.send_sysex(sysex_mod.build_reply(
+                version, sysex_mod.CMD_PAGE_CYCLE, 0x00, (int(bool(args[0])),)))
+
+    def _sysex_capture_recent(self, version: int | None) -> None:
+        """CMD_CAPTURE_RECENT (`04 [bars]`): NOT ported -- capture/replay
+        is Phase 5, unbuilt (docs/phase3-parity.md's sign-off section).
+        A versioned frame gets an honest error reply (status 0x01) rather
+        than silently claiming success; a legacy frame has no reply
+        channel at all, matching v1 exactly."""
+        if version is not None:
+            self._midi_out.send_sysex(
+                sysex_mod.build_reply(version, sysex_mod.CMD_CAPTURE_RECENT, 0x01))
+
+    def _sysex_capabilities(self, version: int | None) -> None:
+        """CMD_CAPABILITIES (`10`, versioned-only -- matches v1's own
+        "requires-versioned-frame" rule; a legacy frame has no reply
+        channel to answer on regardless)."""
+        if version is None:
+            return
+        payload = self._sysex_capabilities_payload(version)
+        self._midi_out.send_sysex(
+            sysex_mod.build_reply(version, sysex_mod.CMD_CAPABILITIES, 0x00, payload))
+
+    def _sysex_capabilities_payload(self, version: int) -> tuple[int, ...]:
+        """Adapted from v1's `_capabilities_payload` -- v1's `profile`/
+        `backend` bytes have no v2 analog (fb/tui are separate client
+        BINARIES here, not engine-side profiles the way v1's `run_tui`/
+        `run_pixel` were), disclosed as `0` (unknown/not-applicable)
+        rather than guessing a mapping. `feature_flags` reports v2's REAL
+        capabilities (capture is Phase 5, unbuilt; screensaver/pagecycle
+        are always-available behaviors here, not optional plugins).
+        `pages` reports the v1 numeric IDs THIS build can actually reach
+        (`_SYSEX_PAGE_ID_MAP` filtered to `self.pages`), letting a Cirklon
+        operator's existing numeric-ID vocabulary double as a capability
+        probe."""
+        reachable_ids = sorted(pid for pid, name in _SYSEX_PAGE_ID_MAP.items()
+                               if name in self.pages)
+        feature_flags = [
+            0,   # capture -- Phase 5, unbuilt
+            1,   # screensaver -- always available (behaviors/screensaver.py)
+            1,   # pagecycle -- always available (behaviors/pagecycle.py)
+        ]
+        payload = [
+            version,
+            0,   # profile -- no v2 analog, disclosed 0
+            0,   # backend -- no v2 analog, disclosed 0
+            len(sysex_mod.SUPPORTED_PROTOCOL_VERSIONS), *sysex_mod.SUPPORTED_PROTOCOL_VERSIONS,
+            len(feature_flags), *feature_flags,
+            len(reachable_ids), *reachable_ids,
+        ]
+        return tuple(max(0, min(127, int(v))) for v in payload)
+
+    def _pagecycle_enable(self, enabled: bool) -> dict:
+        self._pagecycle_behavior.enabled = enabled
+        return {"enabled": enabled}
 
     def stop(self) -> None:
         self._running = False

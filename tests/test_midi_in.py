@@ -26,6 +26,31 @@ def test_translate_ignores_active_sensing():
     assert translate(mido.Message("active_sensing"), "USB", 1.0) is None
 
 
+def test_translate_sysex_carries_raw_payload_bytes():
+    # Phase-3 task 12 (gap ports): sysex_data carries msg.data verbatim
+    # (no F0/F7 framing, matching mido's own convention) since data1/data2
+    # (single-byte ints) can't hold an arbitrary-length sequence.
+    msg = mido.Message("sysex", data=(0x7D, 0x6D, 0x63, 0x01, 0x08))
+    ev = translate(msg, "USB", 1.0)
+    assert ev.type == "sysex"
+    assert ev.channel is None
+    assert ev.data1 is None and ev.data2 is None
+    assert ev.sysex_data == (0x7D, 0x6D, 0x63, 0x01, 0x08)
+    assert ev.summary == "sysex (5 bytes)"
+
+
+def test_translate_sysex_empty_payload():
+    msg = mido.Message("sysex", data=())
+    ev = translate(msg, "USB", 1.0)
+    assert ev.sysex_data == ()
+    assert ev.summary == "sysex (0 bytes)"
+
+
+def test_translate_non_sysex_events_have_no_sysex_data():
+    ev = translate(mido.Message("note_on", channel=0, note=60, velocity=100), "USB", 1.0)
+    assert ev.sysex_data is None
+
+
 def test_matches():
     assert matches("NetMIDI:Network 128:0", ["NetMIDI*"])
     assert not matches("Midi Through:0", ["NetMIDI*", "USB*"])

@@ -91,6 +91,19 @@ def translate(msg, source: str, ts: float) -> MidiEvent | None:
         # "program_change"` at all before this task).
         data1 = msg.program
         summary = f"program_change ch{channel + 1} p{msg.program}"
+    elif msg.type == "sysex":
+        # Phase-3 task 12 (gap ports, engine/sysex.py's Cirklon
+        # remote-control receiver): `msg.data` is the payload bytes
+        # WITHOUT F0/F7 framing -- neither `data1`/`data2` (single-byte
+        # ints) can hold that, so `MidiEvent.sysex_data` carries it
+        # instead (see that field's own comment in engine/core.py). mido
+        # sysex messages have no `.channel` attribute, matching the
+        # `channel = getattr(msg, "channel", None)` -> None already
+        # computed above.
+        sysex_data = tuple(msg.data)
+        summary = f"sysex ({len(sysex_data)} bytes)"
+        return MidiEvent(ts=ts, source=source, type=msg.type, channel=channel,
+                         data1=None, data2=None, summary=summary, sysex_data=sysex_data)
     elif channel is not None:
         summary = f"{msg.type} ch{channel + 1}"
     else:
