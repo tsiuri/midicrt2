@@ -518,3 +518,34 @@ async def test_config_reload_with_malformed_keymap_toml_keeps_connection_alive(t
     assert d2["data"]["keymap"] == good_keymap
 
     eng.stop(); await task; await srv.close()
+
+
+async def test_config_reload_with_wrong_shaped_keys_keeps_connection_alive(tmp_path):
+    """Re-review, live-reproduced: `keys = "oops"` (and `keys = 5` /
+    `keys = ["a"]`) is syntactically VALID TOML that still crashed
+    `load_keymap` with an uncaught `AttributeError` -- invisible to the
+    previous fix's `(OSError, ValueError, TOMLDecodeError)` catch tuple.
+    Same wire-level contract as the malformed-TOML test above: `ok: true`
+    with a warning, keymap unchanged, connection alive for a subsequent
+    request."""
+    keymap_path = tmp_path / "keymap.toml"
+    keymap_path.write_text('[keys]\nv = "eventlog.clear"\n')
+    eng, srv, task = await make(tmp_path, keymap_path=str(keymap_path))
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+
+    d = await c.request("describe")
+    good_keymap = d["data"]["keymap"]
+
+    keymap_path.write_text('keys = "oops"\n')
+    r = await c.request("action", name="config.reload", args={})
+    assert r["ok"] is True
+    assert r["data"]["keymap"] == good_keymap
+    assert any("keys" in w.lower() for w in r["data"]["warnings"])
+
+    d2 = await c.request("describe")
+    assert d2["ok"] is True
+    assert d2["data"]["keymap"] == good_keymap
+
+    eng.stop(); await task; await srv.close()

@@ -1446,6 +1446,23 @@ def test_engine_keymap_falls_back_to_defaults_when_keymap_toml_is_malformed_at_s
     assert "keymap.toml" in caplog.text.lower()
 
 
+def test_engine_keymap_falls_back_to_defaults_when_keys_is_wrong_shaped_at_startup(
+        tmp_path, caplog):
+    # Re-review, live-reproduced: `keys = "oops"` is SYNTACTICALLY VALID
+    # TOML -- the previous fix (widening load_keymap_or_warn's catch
+    # tuple) did NOT cover this, since the failure was an uncaught
+    # AttributeError, not a ValueError/TOMLDecodeError. "The daemon won't
+    # start after I edited keymap.toml" is one bug class regardless of
+    # syntax-vs-shape typo.
+    p = tmp_path / "keymap.toml"
+    p.write_text('keys = "oops"\n')
+    with caplog.at_level("WARNING"):
+        eng = Engine(Config(), keymap_path=str(p))   # must not raise
+    from midicrt.engine import keymap as keymap_mod
+    assert eng.keymap == keymap_mod.DEFAULT_KEYMAP
+    assert "keymap.toml" in caplog.text.lower()
+
+
 def test_engine_default_keymap_path_is_the_real_config_dir_path():
     # No keymap_path override -- must fall back to keymap.DEFAULT_PATH
     # (~/.config/midicrt/keymap.toml), the same default `config.py`'s own
@@ -1511,6 +1528,25 @@ async def test_config_reload_malformed_keymap_toml_keeps_last_good_and_warns(tmp
     assert result["keymap"] == good_keymap
     assert any("keymap.toml" in w.lower() for w in result["warnings"])
     assert "keymap.toml" in caplog.text.lower()
+
+
+async def test_config_reload_keys_wrong_shaped_keeps_last_good_and_warns(tmp_path, caplog):
+    # Re-review, live-reproduced: `keys = "oops"` at reload time is the
+    # SAME uncaught-AttributeError shape the startup test above covers,
+    # just through `_config_reload` instead of `__init__` -- must surface
+    # as a `warnings` entry (ok:true, connection alive), never raise.
+    keymap_path = tmp_path / "keymap.toml"
+    keymap_path.write_text('[keys]\nv = "eventlog.clear"\n')
+    eng = Engine(Config(), keymap_path=str(keymap_path))
+    good_keymap = dict(eng.keymap)
+
+    keymap_path.write_text('keys = "oops"\n')
+    with caplog.at_level("WARNING"):
+        result = await eng.actions.dispatch("config.reload", {})   # must not raise
+
+    assert eng.keymap == good_keymap
+    assert result["keymap"] == good_keymap
+    assert any("keys" in w.lower() for w in result["warnings"])
 
 
 async def test_config_reload_warns_when_config_toml_pages_roster_changed(tmp_path, caplog):

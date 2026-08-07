@@ -120,15 +120,53 @@ def load_keymap(path: str | None = None) -> dict[str, str]:
     overrides -- returns the pure defaults. Returns raw (key, action)
     pairs with NO validation against the engine's action registry -- see
     module docstring's "Validation timing" section for why that's
-    `filter_known_actions`'s separate job."""
+    `filter_known_actions`'s separate job.
+
+    Structure validation (re-review, live-reproduced Critical finding):
+    a syntactically VALID TOML file can still have the WRONG SHAPE at
+    "keys" -- `keys = "oops"`, `keys = 5`, `keys = ["a"]` are all legal
+    TOML, but none is a table, so a naive `.items()` call on it raises an
+    uncaught `AttributeError` (NOT a `ValueError`/`TOMLDecodeError`,
+    invisible to `load_keymap_or_warn`'s catch tuple). "The daemon won't
+    start after I edited keymap.toml" is one bug class regardless of
+    whether the edit was a syntax typo or a shape typo -- so this function
+    validates explicitly instead of ever reaching that attribute access:
+      - `raw["keys"]` (if present) must itself be a table (a Python
+        `dict`, once parsed) -- anything else raises `ValueError` with a
+        readable message, letting `load_keymap_or_warn`'s EXISTING catch
+        tuple handle it exactly like a syntax error (boot -> defaults +
+        warning; reload -> last-good + warning, connection alive).
+      - Within a valid table, an individual entry whose key or action
+        ISN'T a string (e.g. `n = 5`, a bare int value) is skipped with
+        its own logged warning -- same "log + skip this one entry, keep
+        going" precedent `filter_known_actions` already sets for an
+        unknown action name, rather than failing the WHOLE file over one
+        bad line."""
     path = path or DEFAULT_PATH
     if not os.path.exists(path):
         return dict(DEFAULT_KEYMAP)
     with open(path, "rb") as f:
         raw = tomllib.load(f)
     overrides = raw.get("keys", {})
+    if not isinstance(overrides, dict):
+        # Deliberately ValueError, not TypeError (ruff TRY004 would prefer
+        # the latter for a plain type-mismatch) -- `load_keymap_or_warn`'s
+        # catch tuple is `(OSError, ValueError, tomllib.TOMLDecodeError)`,
+        # matching `config.py`'s own "bad config data is a ValueError"
+        # convention (`ConfigError` is itself a `ValueError` subclass); a
+        # `TypeError` here would NOT be caught there, reopening exactly
+        # the uncaught-exception hole this fix exists to close.
+        raise ValueError(  # noqa: TRY004
+            f"keymap.toml's top-level 'keys' must be a table of key=action "
+            f"pairs, got {type(overrides).__name__}: {overrides!r}")
     merged = dict(DEFAULT_KEYMAP)
-    merged.update({str(k): str(v) for k, v in overrides.items()})
+    for key, action in overrides.items():
+        if not isinstance(key, str) or not isinstance(action, str):
+            _LOG.warning(
+                "keymap: skipping [keys] entry %r = %r -- both the key and the "
+                "action must be strings", key, action)
+            continue
+        merged[key] = action
     return merged
 
 

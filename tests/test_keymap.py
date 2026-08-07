@@ -10,6 +10,8 @@
 """
 import logging
 
+import pytest
+
 from midicrt.engine.keymap import (
     CLIENT_QUIT_ACTION,
     DEFAULT_KEYMAP,
@@ -197,3 +199,65 @@ def test_load_keymap_or_warn_never_raises_on_malformed_toml(tmp_path):
     p.write_text("[keys\nn = \n")   # unterminated table header -- real TOMLDecodeError
     # Must not raise -- this is the entire point of the wrapper.
     load_keymap_or_warn(str(p))
+
+
+# -- wrong-SHAPED (but syntactically valid) keymap.toml -----------------------
+# (re-review, live-reproduced: finding 2 was only PARTIALLY fixed by widening
+# the except tuple -- `keys = "oops"` / `keys = 5` / `keys = ["a"]` are all
+# valid TOML that still crashed `load_keymap` with an uncaught
+# `AttributeError: '...' object has no attribute 'items'` on `overrides.
+# items()`, propagating straight through `load_keymap_or_warn`'s catch
+# tuple untouched since AttributeError isn't ValueError/OSError/
+# TOMLDecodeError. Per the re-review: "one bug class regardless of
+# syntax-vs-shape typo" -- fixed by VALIDATING structure explicitly (never
+# producing the AttributeError at all), not by widening the catch again.
+
+def test_load_keymap_raises_valueerror_when_keys_is_a_string(tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text('keys = "oops"\n')
+    with pytest.raises(ValueError, match="keys"):
+        load_keymap(str(p))
+
+
+def test_load_keymap_raises_valueerror_when_keys_is_a_list(tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text('keys = ["a"]\n')
+    with pytest.raises(ValueError, match="keys"):
+        load_keymap(str(p))
+
+
+def test_load_keymap_raises_valueerror_when_keys_is_an_int(tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text("keys = 5\n")
+    with pytest.raises(ValueError, match="keys"):
+        load_keymap(str(p))
+
+
+def test_load_keymap_skips_a_non_string_value_entry_and_logs_but_keeps_the_rest(tmp_path, caplog):
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys]\nn = 5\nc = "eventlog.clear"\n')
+    with caplog.at_level(logging.WARNING):
+        result = load_keymap(str(p))
+    assert result["n"] == "page.next"          # bad override skipped -- default preserved
+    assert result["c"] == "eventlog.clear"     # rest of the map still loads
+    assert "n" in caplog.text and "5" in caplog.text
+
+
+def test_load_keymap_or_warn_keys_is_a_string_returns_none_and_a_warning(tmp_path):
+    from midicrt.engine.keymap import load_keymap_or_warn
+
+    p = tmp_path / "keymap.toml"
+    p.write_text('keys = "oops"\n')
+    keymap, warning = load_keymap_or_warn(str(p))
+    assert keymap is None
+    assert warning is not None
+    assert "keys" in warning.lower()
+
+
+def test_load_keymap_or_warn_never_raises_on_wrong_shaped_keys(tmp_path):
+    from midicrt.engine.keymap import load_keymap_or_warn
+
+    for bad in ('keys = "oops"\n', "keys = 5\n", 'keys = ["a"]\n'):
+        p = tmp_path / "keymap.toml"
+        p.write_text(bad)
+        load_keymap_or_warn(str(p))   # must not raise, for any of these shapes
