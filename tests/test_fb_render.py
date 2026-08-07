@@ -663,6 +663,117 @@ def test_render_tuner_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
+# -- pianoroll page (phase-3 task 7) ------------------------------------------
+#
+# Same FIXED synthetic note set as tests/test_tui_render.py's pianoroll
+# section (three notes spread across pitch rows/velocity tiers/an active-
+# vs-closed span), exercised in wallclock mode -- the renderer only ever
+# reads already-projected x0/x1/y/vel floats (clients/fb/app.py's own
+# module comment), so a single golden proves the pixel-roll geometry/
+# color mapping; the mode-specific squish/stretch MATH itself is already
+# covered by tests/test_pages_pianoroll.py's tempo-mode tests.
+GOLDEN_PIANOROLL_FRAME = FIXTURES / "fb_pianoroll_frame_golden.png"
+PIANOROLL_SURFACE_SIZE = (420, 132)   # header(12) + usable(96, 13 pitch rows) + chrome(24)
+
+PIANOROLL_NOTES = [
+    {"ch": 1, "y": 0.0, "x0": 0.1, "x1": 0.9, "vel": 1.0, "active": False},
+    {"ch": 2, "y": 0.5, "x0": 0.4, "x1": 0.6, "vel": 0.5, "active": False},
+    {"ch": 3, "y": 1.0, "x0": 0.7, "x1": 1.0, "vel": 0.2, "active": True},
+]
+PIANOROLL_VM = {
+    "title": "PIANOROLL",
+    "notes": PIANOROLL_NOTES,
+    "window": {"mode": "wallclock", "span_s": 8.0, "span_beats": 16.0, "zoom": 1.0},
+    "range": {"lo": 60, "hi": 72},
+}
+PIANOROLL_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+PIANOROLL_ALERTS_VM = {"alerts": []}
+PIANOROLL_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                         "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_pianoroll_renderers_dispatch_table_has_pianoroll():
+    assert app.RENDERERS["pianoroll"] is app.render_pianoroll_frame
+
+
+def test_render_pianoroll_frame_header_bar_is_reverse_video():
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._pianoroll_header_text(PIANOROLL_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+    assert any(
+        px[x, y] == app.BG
+        for x in range(app.LEFT_MARGIN, text_px_end)
+        for y in range(app.HEADER_PAD, app.HEADER_PAD + font.height)
+    )
+
+
+def test_render_pianoroll_frame_empty_notes_does_not_crash():
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame({**PIANOROLL_VM, "notes": []}, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    assert px[0, header_h + 2] == app.BG   # nothing drawn below the header
+
+
+def test_render_pianoroll_frame_draws_a_rect_per_note_in_its_channel_color():
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
+    note = PIANOROLL_NOTES[0]   # ch1, y=0.0, loud -- top-left-most rect
+    x = round(note["x0"] * surf.width) + 2
+    y = header_h + round(note["y"] * usable_h) + 1
+    assert px[x, y] == app._roll_note_color(note["ch"], note["vel"])
+
+
+def test_roll_note_color_charred_scales_with_velocity():
+    dim = app._roll_note_color(1, 0.0)
+    bright = app._roll_note_color(1, 1.0)
+    hue = app._ROLL_CHANNEL_PALETTE[0]
+    assert bright == hue
+    assert dim == tuple(round(c * app._ROLL_DIM_FRACTION) for c in hue)
+    assert sum(dim) < sum(bright)
+
+
+def test_roll_note_color_cycles_by_channel():
+    colors = {app._roll_note_color(ch, 1.0) for ch in range(1, 9)}
+    assert len(colors) == 8   # 8 distinct palette entries, one per channel 1-8
+    assert app._roll_note_color(1, 1.0) == app._roll_note_color(9, 1.0)   # wraps at 8
+
+
+def test_render_pianoroll_frame_reserves_the_bottom_chrome_as_background():
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    reserved = app._reserved_chrome_height(font)
+    y_in_strip = surf.height - reserved + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_render_pianoroll_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_PIANOROLL_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-7-report.md"
+    )
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf)
+    app._draw_secondary(surf, PIANOROLL_ALERTS_VM, PIANOROLL_TIMESIG_VM, load_font())
+    app._draw_status(surf, PIANOROLL_STATUS_VM, load_font())
+
+    golden = Image.open(GOLDEN_PIANOROLL_FRAME).convert("RGB")
+    assert golden.size == PIANOROLL_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
     # rejected by the server's max_rate check, and then hang forever in

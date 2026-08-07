@@ -382,8 +382,88 @@ def render_tuner_frame(vm: dict, surface: Surface) -> None:
     _row("Tuning: " + tuning_meter(vm["cents"], 40))
 
 
+# -- pianoroll page (phase-3 task 7) ------------------------------------------
+#
+# Layout: same reverse-video header convention as the other pages, then a
+# pixel roll body drawn via `Surface.rect` (task brief: "fb: pixel roll via
+# rect/hline primitives" -- `rect` alone suffices here since every note is
+# already a filled bar, the same choice `render_harmony_frame`'s tension
+# fill makes over a separate hline loop). One rect per note: x0/x1 mapped
+# onto the full surface width, y mapped onto the usable body height sliced
+# into `range.hi - range.lo + 1` equal rows (the same "usable_h // count"
+# convention `render_voices_frame` already uses for its 16 channel rows).
+# v1's real CRT compositor (`fb/compositor_renderer.py`, not read -- out of
+# this task's ported source map, see pages/pianoroll.py's own module
+# docstring) is a separate rendering pipeline this renderer does not need
+# to match pixel-for-pixel; it follows the same "primitives only, never
+# poke surface.image directly" convention every fb renderer here already
+# established.
+#
+# Channel-colored + charred (task brief: "channel-colored/charred per v1's
+# approach"): a real color CRT can combine BOTH of v1's mutually-exclusive
+# TUI alt-styles at once -- `ui/renderers/pixel.py`'s "dense" mode's
+# per-channel hue cycling, AND `ui/renderers/text/renderer.py`'s velocity-
+# ramp "charred" intensity -- unlike the plain-text TUI renderer above
+# (clients/tui.py's `render_pianoroll_lines`, which reproduces only v1's
+# DEFAULT "text" style; see that renderer's own comment for why raw ANSI
+# channel color isn't embedded there instead). `_ROLL_CHANNEL_PALETTE`
+# cycles 8 distinct hues by channel (`(ch - 1) % 8`, mirroring `ui/
+# renderers/pixel.py`'s own `(channel - 1) % len(palette)` cycling);
+# `_roll_note_color` blends each hue from a DIM ("charred", low velocity)
+# tone up to its full BRIGHT tone as velocity rises -- the pixel-color
+# equivalent of the TUI renderer's four-glyph density ramp.
+_ROLL_CHANNEL_PALETTE = [
+    (255, 60, 60), (255, 170, 40), (255, 230, 40), (80, 230, 80),
+    (60, 200, 255), (90, 110, 255), (200, 90, 255), (255, 90, 190),
+]
+_ROLL_DIM_FRACTION = 0.25   # velocity 0.0 -> 25% of the channel's full hue
+
+
+def _roll_note_color(ch: int, vel: float) -> tuple[int, int, int]:
+    hue = _ROLL_CHANNEL_PALETTE[(int(ch) - 1) % len(_ROLL_CHANNEL_PALETTE)]
+    vel = max(0.0, min(1.0, vel))
+    frac = _ROLL_DIM_FRACTION + (1.0 - _ROLL_DIM_FRACTION) * vel
+    return tuple(round(c * frac) for c in hue)
+
+
+def _pianoroll_header_text(vm: dict) -> str:
+    w = vm["window"]
+    rng = vm["range"]
+    return f"{vm['title']}  ({w['mode']} zoom {w['zoom']:.2f}, range {rng['lo']}-{rng['hi']})"
+
+
+def render_pianoroll_frame(vm: dict, surface: Surface) -> None:
+    """Render the pianoroll page view-model (pages/pianoroll.py) onto
+    `surface`. Pure: reads only `vm` and the cached default font, writes
+    only to `surface`'s pixels -- no I/O, no clock, no global state beyond
+    the font's (side-effect-free) glyph cache. See module comment above for
+    the pixel-roll layout / channel-color + charred-velocity convention.
+    """
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _pianoroll_header_text(vm), BG, font)
+
+    usable_h = surface.height - _reserved_chrome_height(font) - header_h
+    if usable_h <= 0:
+        return
+    rng = vm["range"]
+    pitch_span = max(1, rng["hi"] - rng["lo"] + 1)
+    note_h = max(1, usable_h // pitch_span)
+    roll_w = surface.width
+    for note in vm["notes"]:
+        y = header_h + round(note["y"] * max(0, usable_h - note_h))
+        x0 = round(note["x0"] * roll_w)
+        x1 = round(note["x1"] * roll_w)
+        w = max(1, x1 - x0)
+        surface.rect(x0, y, w, note_h, _roll_note_color(note["ch"], note["vel"]))
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
-             "harmony": render_harmony_frame, "tuner": render_tuner_frame}
+             "harmony": render_harmony_frame, "tuner": render_tuner_frame,
+             "pianoroll": render_pianoroll_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

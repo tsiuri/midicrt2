@@ -8,10 +8,13 @@ from midicrt.clients.chrome import (
 from midicrt.clients.tui import (
     _KEY_ACTIONS,
     RENDERERS,
+    _pianoroll_grid,
     _render_unknown,
+    _roll_glyph,
     _voices_bar,
     render_harmony_lines,
     render_lines,
+    render_pianoroll_lines,
     render_secondary_row,
     render_status_row,
     render_tuner_lines,
@@ -363,3 +366,120 @@ def test_tuner_render_cuts_off_extra_rows_when_height_is_short():
 
 def test_tuner_renderers_dispatch_table_has_tuner():
     assert RENDERERS["tuner"] is render_tuner_lines
+
+
+# -- pianoroll page (phase-3 task 7) ------------------------------------------
+#
+# A FIXED synthetic note set (three notes, spread across pitch rows/velocity
+# tiers/an active-vs-closed span) exercised in BOTH projection modes -- the
+# renderer itself is mode-agnostic (it only ever reads the already-projected
+# x0/x1/y/vel floats, see clients/tui.py's own module comment), so "golden
+# per mode" here proves the renderer's HEADER text tracks `window.mode`
+# correctly while the body glyphs stay identical (same input geometry).
+PIANOROLL_NOTES = [
+    {"ch": 1, "y": 0.0, "x0": 0.1, "x1": 0.9, "vel": 1.0, "active": False},
+    {"ch": 2, "y": 0.5, "x0": 0.4, "x1": 0.6, "vel": 0.5, "active": False},
+    {"ch": 3, "y": 1.0, "x0": 0.7, "x1": 1.0, "vel": 0.2, "active": True},
+]
+PIANOROLL_VM_WALLCLOCK = {
+    "title": "PIANOROLL",
+    "notes": PIANOROLL_NOTES,
+    "window": {"mode": "wallclock", "span_s": 8.0, "span_beats": 16.0, "zoom": 1.0},
+    "range": {"lo": 60, "hi": 72},
+}
+PIANOROLL_VM_TEMPO = {
+    **PIANOROLL_VM_WALLCLOCK,
+    "window": {"mode": "tempo", "span_s": 8.0, "span_beats": 16.0, "zoom": 1.0},
+}
+
+# Frozen against an actual run of render_pianoroll_lines(VM, 48, 8) for both
+# VMs above -- same "freeze from a real run" discipline as GOLDEN_VOICES_
+# FRAME/GOLDEN_HARMONY_FRAME/GOLDEN_TUNER_*_FRAME.
+GOLDEN_PIANOROLL_WALLCLOCK_FRAME = [
+    'PIANOROLL  (wallclock zoom 1.00, range 60-72)  [',
+    '    ████████████████████████████████████████    ',
+    '                                                ',
+    '                                                ',
+    '                   ▓▓▓▓▓▓▓▓▓▓                   ',
+    '                                                ',
+    '                                                ',
+    '                                 ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒',
+]
+GOLDEN_PIANOROLL_TEMPO_FRAME = [
+    'PIANOROLL  (tempo zoom 1.00, range 60-72)  [n]ex',
+    '    ████████████████████████████████████████    ',
+    '                                                ',
+    '                                                ',
+    '                   ▓▓▓▓▓▓▓▓▓▓                   ',
+    '                                                ',
+    '                                                ',
+    '                                 ▒▒▒▒▒▒▒▒▒▒▒▒▒▒▒',
+]
+
+
+def test_pianoroll_render_matches_frozen_golden_frame_in_wallclock_mode():
+    out = render_pianoroll_lines(PIANOROLL_VM_WALLCLOCK, width=48, height=8)
+    assert out == GOLDEN_PIANOROLL_WALLCLOCK_FRAME
+    assert all(len(line) == 48 for line in out)
+
+
+def test_pianoroll_render_matches_frozen_golden_frame_in_tempo_mode():
+    out = render_pianoroll_lines(PIANOROLL_VM_TEMPO, width=48, height=8)
+    assert out == GOLDEN_PIANOROLL_TEMPO_FRAME
+    assert all(len(line) == 48 for line in out)
+
+
+def test_pianoroll_body_glyphs_are_identical_across_projection_modes():
+    # The renderer only ever consumes already-projected coordinates -- see
+    # module comment above clients/tui.py's render_pianoroll_lines.
+    wallclock = render_pianoroll_lines(PIANOROLL_VM_WALLCLOCK, width=48, height=8)[1:]
+    tempo = render_pianoroll_lines(PIANOROLL_VM_TEMPO, width=48, height=8)[1:]
+    assert wallclock == tempo
+
+
+def test_pianoroll_render_empty_notes_is_all_blank_body():
+    empty = {**PIANOROLL_VM_WALLCLOCK, "notes": []}
+    out = render_pianoroll_lines(empty, width=20, height=5)
+    assert out[1:] == [" " * 20] * 4
+
+
+def test_pianoroll_render_pads_to_exactly_height_rows():
+    out = render_pianoroll_lines(PIANOROLL_VM_WALLCLOCK, width=20, height=10)
+    assert len(out) == 10
+    assert all(len(line) == 20 for line in out)
+
+
+def test_pianoroll_render_zero_body_height_returns_only_header():
+    out = render_pianoroll_lines(PIANOROLL_VM_WALLCLOCK, width=20, height=1)
+    assert len(out) == 1
+
+
+def test_roll_glyph_thresholds_match_v1s_text_renderer_exactly():
+    # Ported byte-for-byte from ui/renderers/text/renderer.py::
+    # TextRenderer._velocity_char's raw-velocity thresholds (96/127, 48/127).
+    assert _roll_glyph(0.0) == " "
+    assert _roll_glyph(1 / 127) == "▒"
+    assert _roll_glyph(47 / 127) == "▒"
+    assert _roll_glyph(48 / 127) == "▓"
+    assert _roll_glyph(95 / 127) == "▓"
+    assert _roll_glyph(96 / 127) == "█"
+    assert _roll_glyph(1.0) == "█"
+
+
+def test_pianoroll_grid_picks_highest_velocity_on_overlap():
+    notes = [
+        {"ch": 1, "y": 0.0, "x0": 0.0, "x1": 1.0, "vel": 0.2, "active": False},
+        {"ch": 2, "y": 0.0, "x0": 0.0, "x1": 1.0, "vel": 0.9, "active": False},
+    ]
+    grid = _pianoroll_grid({"notes": notes}, width=4, body_h=2)
+    assert grid[0] == [0.9, 0.9, 0.9, 0.9]
+    assert grid[1] == [0.0, 0.0, 0.0, 0.0]
+
+
+def test_pianoroll_grid_zero_dimensions_do_not_crash():
+    assert _pianoroll_grid({"notes": []}, width=0, body_h=5) == [[]] * 5
+    assert _pianoroll_grid({"notes": []}, width=5, body_h=0) == []
+
+
+def test_pianoroll_renderers_dispatch_table_has_pianoroll():
+    assert RENDERERS["pianoroll"] is render_pianoroll_lines

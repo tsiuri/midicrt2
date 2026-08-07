@@ -286,8 +286,92 @@ def render_tuner_lines(vm: dict, width: int, height: int) -> list[str]:
     return [header] + body
 
 
+# -- pianoroll page (phase-3 task 7) -----------------------------------------
+#
+# Layout: header row (title + projection mode/zoom + fixed pitch range),
+# then a QUANTIZED note grid body -- the ENGINE already produced normalized
+# [0,1] x0/x1/y/vel coordinates (pages/pianoroll.py's module docstring),
+# this renderer's only job is bucketing them onto `width` columns x
+# `body_h` rows (docs/phase3-notes.md's "renderers only quantize" rule).
+#
+# Unlike v1's fixed one-row-per-semitone grid (`pitch_high` computed FROM
+# the terminal's own available rows, `ui/renderers/text/renderer.py`'s
+# PianoRollWidget branch), the engine's `range.lo`/`range.hi` here is a
+# FIXED span independent of any client's terminal size -- so a single row
+# may bucket more than one semitone when `height` is short, or sit blank
+# when it's tall. A per-row note-name label (v1's `f"{note_name:>7} │"`
+# prefix) would often be misleading under that many-semitones-per-row
+# bucketing, so this renderer drops it; the fixed range is shown once in
+# the header instead ("range 36-83").
+#
+# Glyph choice ("charred", ported byte-for-byte from v1's actual DEFAULT
+# experience -- `ui/renderers/text/renderer.py::TextRenderer._velocity_
+# char`'s thresholds: >=96/127 "█", >=48/127 "▓", >0 "▒", else " ") --
+# deliberately NOT v1's alternate per-channel "dense" PIXEL_STYLE (channel-
+# cycled shade/ANSI-color glyphs, `ui/renderers/pixel.py::_pixel_char`).
+# Every other v2 TUI renderer returns plain, unstyled text with an exact
+# `len(line) == width` per row -- styling, where it exists at all
+# (eventlog's bold "accent" lines), is applied OUTSIDE the renderer by
+# `run_tui`'s own loop off a separate "style" field, never baked into the
+# returned string itself. Embedding raw ANSI color escapes per-glyph here
+# would be the first renderer in this codebase to vary a line's true
+# rendered width from its Python `len()`. Channel distinction stays
+# available via each note's own `ch` field for a renderer that wants it --
+# the fb pixel renderer below uses it for real per-channel color, which a
+# monochrome-by-default terminal can't do -- this one reproduces v1's
+# actual default (`PIXEL_STYLE="text"`), not its optional "dense" variant.
+_ROLL_VEL_HIGH = 96 / 127
+_ROLL_VEL_MID = 48 / 127
+
+
+def _roll_glyph(vel: float) -> str:
+    if vel >= _ROLL_VEL_HIGH:
+        return "█"
+    if vel >= _ROLL_VEL_MID:
+        return "▓"
+    if vel > 0:
+        return "▒"
+    return " "
+
+
+def _pianoroll_header_text(vm: dict) -> str:
+    w = vm["window"]
+    rng = vm["range"]
+    return (f"{vm['title']}  ({w['mode']} zoom {w['zoom']:.2f}, "
+            f"range {rng['lo']}-{rng['hi']})  [n]ext page [q]uit")
+
+
+def _pianoroll_grid(vm: dict, width: int, body_h: int) -> list[list[float]]:
+    """Quantize `vm['notes']` onto a `body_h` x `width` grid of velocities
+    (0.0 = empty cell), picking the HIGHEST-velocity note covering each
+    cell when two overlap -- matches v1's own `_best_visible_columns`'s
+    identical tie-break for overlapping notes."""
+    grid = [[0.0] * width for _ in range(max(0, body_h))]
+    if width <= 0 or body_h <= 0:
+        return grid
+    for note in vm["notes"]:
+        row = min(body_h - 1, max(0, int(note["y"] * body_h)))
+        c0 = min(width - 1, max(0, int(note["x0"] * width)))
+        c1 = min(width - 1, max(0, int(note["x1"] * width)))
+        c1 = max(c1, c0)
+        for c in range(c0, c1 + 1):
+            grid[row][c] = max(grid[row][c], note["vel"])
+    return grid
+
+
+def render_pianoroll_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_pianoroll_header_text(vm), width)
+    body_h = height - 1
+    if body_h <= 0:
+        return [header]
+    grid = _pianoroll_grid(vm, width, body_h)
+    body = [_fit("".join(_roll_glyph(v) for v in row), width) for row in grid]
+    return [header] + body
+
+
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
-             "harmony": render_harmony_lines, "tuner": render_tuner_lines}
+             "harmony": render_harmony_lines, "tuner": render_tuner_lines,
+             "pianoroll": render_pianoroll_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
