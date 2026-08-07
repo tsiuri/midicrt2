@@ -73,22 +73,113 @@ not feed the engine's event queue at all, it calls straight into
 engine queue involved" shape `analyzers/tuner.py`'s `on_pitch_sample()`
 already established for non-MIDI-driven analyzers).
 
-`AudioCapture` lazily imports `sounddevice` ONLY inside `_run()` (mirroring
-v1's own `_try_imports()`/`_audio_loop()` lazy-import pattern) -- merely
-importing this module, or constructing `SpectrumAnalyzer`/`AudioCapture`/
-`pages.spectrum.SpectrumPage` (as every test in this suite does), NEVER
-touches PortAudio/hardware. The real thread only starts when something
-calls `.start()` -- production code only (`pages/spectrum.py`'s
+`AudioCapture` lazily imports `sounddevice` ONLY inside `_open_and_pump()`
+(mirroring v1's own `_try_imports()`/`_audio_loop()` lazy-import pattern)
+-- merely importing this module, or constructing `SpectrumAnalyzer`/
+`AudioCapture`/`pages.spectrum.SpectrumPage` (as every test in this suite
+does), NEVER touches PortAudio/hardware. The real thread only starts when
+something calls `.start()` -- production code only (`pages/spectrum.py`'s
 `start_capture()`, wired from `daemon.py`'s `run()`) -- so pytest's full
 suite (including on a CI image with no `libportaudio2` installed at all)
 never runs the audio thread; every test here drives the pure math directly
 with synthetic PCM, or drives `AudioCapture` through an injected fake
 backend (mirroring `test_midi_in.py`'s `FakeBackend` for `MidiInput`).
+
+Retry/health-check supervisor (post-review fix -- CRITICAL bug found and
+fixed before sign-off)
+---------------------------------------------------------------------------
+The first version of `AudioCapture._run()` made exactly ONE attempt to
+open the stream, ever: on ANY failure it called `mark_unavailable()` and
+the thread simply exited. Since `.start()` is only ever called once (at
+daemon startup, from `pages/spectrum.py::start_capture()`), this meant a
+single failed attempt killed audio capture for the rest of the daemon's
+life with no way to recover short of a manual restart -- and the single
+most likely failure, losing a real boot-time race against `user@<uid>
+.service`/PipeWire coming up (`midicrtd.service` is a SYSTEM unit that
+starts independently of the user session, see `packaging/midicrtd.service`
+below), would hit on EVERY real reboot. This directly contradicted this
+module's own "Investigation findings" above, which document v1's
+`_ensure_thread()` retrying forever on a 5s cooldown (`_THREAD_COOLDOWN`)
+-- that behavior was described but never actually ported.
+
+Fixed: `_run()` is now a supervisor loop that calls `_open_and_pump()`
+(one open-and-monitor attempt) in a `while not stopped` loop, waiting
+`retry_cooldown` seconds (default `_RETRY_COOLDOWN_S = 5.0`, matching v1
+exactly) between attempts -- forever, until `.stop()` is called. This
+covers BOTH failure shapes:
+1. **Open failure** (missing library, device busy, session not up yet)
+   -- `_open_and_pump()` raises, `_run()` catches it, logs (capped, see
+   below), marks unavailable, waits the cooldown, retries.
+2. **Death after a successful open** (device unplugged, PipeWire/session
+   torn down mid-run) -- nothing in a PortAudio callback loop otherwise
+   notices a silently-stopped stream (the callback just stops firing;
+   `available` would stay `True` forever with frozen bars). `_open_and_pump`
+   now tracks `_last_callback_at` and treats either (a) no callback for
+   more than `stale_after` seconds (default `_STALE_CALLBACK_S = 2.0`)
+   while nominally open, or (b) a truthy `status` argument on any callback
+   invocation (PortAudio's own overflow/underflow/abort signal) as stream
+   death: it returns (closing the stream via the `with` block), `_run()`
+   marks unavailable and re-enters the SAME retry loop as case 1 -- there
+   is only one recovery path, not two.
+
+`retry_cooldown`/`stale_after` are constructor parameters (not bare module
+constants) specifically so tests can shrink them to milliseconds instead
+of waiting multiple real seconds per assertion -- production code
+(`pages/spectrum.py`) never overrides the defaults.
+
+Log-noise cap: a downed device/session can stay down for a long time, and
+the retry loop would otherwise log an "audio capture failed" line every
+`retry_cooldown` (5s) indefinitely. `_log_failure()` logs the FIRST
+failure immediately, then suppresses repeats until
+`_LOG_REPEAT_INTERVAL_S` (60s) has passed since the last one -- capped,
+not silenced. A successful open resets the cap (`_failure_logged_once =
+False`), so the failure after a NEW outage always logs immediately rather
+than possibly being swallowed by a stale timer from a previous, unrelated
+outage.
+
+Shutdown-race hazard found during live verification (disclosed, partially
+mitigated, NOT fully root-caused -- see fix report)
+---------------------------------------------------------------------------
+Live-testing this fix (stopping/restarting PipeWire under a running
+daemon) reproduced ONE `midicrtd` SIGSEGV: `systemctl restart midicrtd`
+delivered SIGTERM at the exact moment the audio thread was inside a
+native PortAudio/ALSA call retrying against an already-vanished device
+(`journalctl` showed PortAudio's own "Wait timed out [PaErrorCode -9987]"
+/ "paTimedOut" native errors immediately preceding it). `AudioCapture` is
+a `daemon=True` thread -- if `stop()`'s `.join(timeout=...)` gives up
+before the thread actually finishes (because it's stuck inside a blocking
+native call that doesn't check the Python-level stop `Event`), the rest
+of `daemon.py`'s shutdown proceeds and the process can begin interpreter
+finalization while that thread is still executing native code -- a known
+hazard class (daemon thread + in-flight native call + interpreter
+teardown). `systemd`'s `Restart=on-failure` recovered the service within
+~1s with no lasting harm (confirmed: the next instance ran stably through
+a full down/up PipeWire cycle with zero further crashes), so this is NOT
+a retry-loop correctness bug, but the retry supervisor DOES make the
+audio thread spend meaningfully more time actively inside native
+open/retry calls than the old one-shot version did, increasing exposure
+to this exact race.
+
+Mitigation shipped: `stop()`'s join timeout was widened from 2.0s to
+`_STOP_JOIN_TIMEOUT_S` (6.0s, comfortably past the ~1-3s native timeouts
+observed) and now logs a warning if the thread is STILL alive after that
+-- makes a recurrence visible instead of silent, and gives a genuinely
+slow-but-finishing native call more room to actually finish before
+shutdown proceeds. This does not, and cannot from pure Python, GUARANTEE
+the native call can never outlive any finite timeout -- full root-cause
+(and a real fix, e.g. upstream `sounddevice`/PortAudio hardening) is
+out of scope for this task and is ledgered as a follow-up, not blocking
+sign-off: the retry/staleness supervisor itself is proven correct and
+recovering under real conditions (see the fix report's live-verification
+section), and the residual risk is bounded to "an ugly `Restart=on-failure`
+bounce during a shutdown that races an already-failing native call,"
+not silent data loss or a stuck/unrecoverable daemon.
 """
 from __future__ import annotations
 
 import logging
 import threading
+import time
 from functools import lru_cache
 from typing import TYPE_CHECKING
 
@@ -119,6 +210,14 @@ HPF_ON = True
 # "analog spectrum analyzer" default, not measured against any v1 behavior
 # since none exists to measure.
 PEAK_DECAY_PER_S = 0.7
+
+# -- AudioCapture supervisor tuning (see module docstring's "Retry/
+# health-check supervisor" section) ------------------------------------------
+_RETRY_COOLDOWN_S = 5.0        # matches v1's own _THREAD_COOLDOWN exactly
+_STALE_CALLBACK_S = 2.0        # no callback for this long while "open" = stream death
+_LOG_REPEAT_INTERVAL_S = 60.0  # cap repeated failure-log noise once already logged once
+_POLL_INTERVAL_S = 0.2         # health-check granularity while a stream is nominally open
+_STOP_JOIN_TIMEOUT_S = 6.0     # see module docstring's "Shutdown-race hazard" note
 
 
 # -- pure math: FFT/bin computation ------------------------------------------
@@ -349,17 +448,37 @@ class AudioCapture:
     `_device_index = None` convention. An unmatched name falls back to the
     same default rather than raising, since a stale/typo'd config value
     should degrade to "some audio" rather than hard-fail the page.
+
+    `retry_cooldown`/`stale_after`/`stop_join_timeout` default to the
+    module constants above (v1-matching or defensively-chosen production
+    values) but are constructor parameters so tests can shrink them to
+    milliseconds -- see module docstring's "Retry/health-check supervisor"
+    and "Shutdown-race hazard" sections for the full rationale.
     """
 
     def __init__(self, analyzer: SpectrumAnalyzer, device: str | None = None,
-                 sr: int = DEFAULT_SR, blocksize: int = BLOCKSIZE, backend=None) -> None:
+                 sr: int = DEFAULT_SR, blocksize: int = BLOCKSIZE, backend=None,
+                 retry_cooldown: float = _RETRY_COOLDOWN_S,
+                 stale_after: float = _STALE_CALLBACK_S,
+                 stop_join_timeout: float = _STOP_JOIN_TIMEOUT_S) -> None:
         self._analyzer = analyzer
         self._device_name = device
         self._sr = sr
         self._blocksize = blocksize
         self._backend = backend
+        self._retry_cooldown = retry_cooldown
+        self._stale_after = stale_after
+        self._stop_join_timeout = stop_join_timeout
+        # Health-check granularity while a stream is nominally open: fine
+        # enough to notice a small injected `stale_after` promptly in
+        # tests, never coarser than the production default.
+        self._poll_interval = min(_POLL_INTERVAL_S, stale_after / 4.0) if stale_after > 0 else _POLL_INTERVAL_S
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._last_callback_at: float | None = None
+        self._stream_error_flagged = False
+        self._failure_logged_once = False
+        self._last_failure_log_at = float("-inf")
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -369,9 +488,21 @@ class AudioCapture:
         self._thread.start()
 
     def stop(self) -> None:
+        """Signal the supervisor loop to stop and wait (up to
+        `stop_join_timeout`) for it to actually exit. If the thread is
+        still alive after that -- it's stuck inside a blocking native
+        PortAudio call that doesn't check the stop `Event` -- logs a
+        warning (visibility for the shutdown-race hazard, see module
+        docstring) instead of blocking forever; the caller proceeds
+        either way, same as before this warning existed."""
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=self._stop_join_timeout)
+            if self._thread.is_alive():
+                _LOG.warning(
+                    "audio capture thread did not exit within %.1fs of stop() -- "
+                    "a native PortAudio call may still be running; the process "
+                    "may exit while it is still in flight", self._stop_join_timeout)
         self._thread = None
 
     def _resolve_device(self, backend) -> int | None:
@@ -398,35 +529,93 @@ class AudioCapture:
         except Exception:  # noqa: BLE001 -- a description failure must not block capture
             return "default" if device_idx is None else f"device {device_idx}"
 
+    def _log_failure(self, msg: str) -> None:
+        """Log an open/retry failure, capped to at most once per
+        `_LOG_REPEAT_INTERVAL_S` once the FIRST failure has been logged --
+        see module docstring's "Log-noise cap" paragraph. A successful
+        open (`_open_and_pump`) resets `_failure_logged_once`, so a NEW
+        outage always logs immediately rather than possibly being
+        swallowed by a stale timer from an earlier, unrelated one."""
+        now = time.monotonic()
+        if not self._failure_logged_once or (now - self._last_failure_log_at) >= _LOG_REPEAT_INTERVAL_S:
+            _LOG.warning(msg)
+            self._failure_logged_once = True
+            self._last_failure_log_at = now
+
+    def _stream_is_stale(self) -> bool:
+        """True when a nominally-open stream has produced no callback for
+        more than `stale_after` seconds -- the device-vanished-silently
+        detector (see module docstring)."""
+        return (self._last_callback_at is not None
+                and (time.monotonic() - self._last_callback_at) > self._stale_after)
+
     def _run(self) -> None:
+        """Supervisor loop: keep (re)trying to open the input stream on a
+        `retry_cooldown` (default 5s, v1's own `_THREAD_COOLDOWN`) until
+        `.stop()` is called -- see module docstring's "Retry/health-check
+        supervisor" section for the full rationale (a one-shot attempt
+        permanently loses a startup race against PipeWire/the user
+        session). `_open_and_pump()` is one full attempt: it raises on
+        open failure, or returns normally when the stream dies/goes stale
+        while open -- EITHER way, this loop marks unavailable and retries,
+        there is only one recovery path.
+        """
+        while not self._stop.is_set():
+            try:
+                self._open_and_pump()
+            except Exception as exc:  # noqa: BLE001 -- any failure must retry, not crash the daemon
+                self._log_failure(
+                    f"audio capture failed ({exc}); retrying in "
+                    f"{self._retry_cooldown:.0f}s; spectrum page will show "
+                    "the no-audio-input placeholder")
+            self._analyzer.mark_unavailable()
+            if self._stop.is_set():
+                break
+            self._stop.wait(self._retry_cooldown)
+        self._analyzer.mark_unavailable()
+
+    def _open_and_pump(self) -> None:
+        """One attempt: resolve the backend/device, open the stream, and
+        block -- health-checking every `_poll_interval` -- until the
+        stream dies (stale callback or an error `status` flag), `.stop()`
+        is requested, or opening itself raises. Raises on any open
+        failure (missing library, device busy, etc.); the caller (`_run`)
+        is the retry loop, this method never retries on its own.
+        """
         backend = self._backend
-        try:
-            if backend is None:
-                import sounddevice as backend
-        except Exception as exc:  # noqa: BLE001 -- missing lib must degrade, not crash the daemon
-            _LOG.info("audio capture unavailable (%s); spectrum page will show "
-                      "the no-audio-input placeholder", exc)
-            self._analyzer.mark_unavailable()
-            return
+        if backend is None:
+            import sounddevice as backend
+        device_idx = self._resolve_device(backend)
+        device_desc = self._describe_device(backend, device_idx)
+        # Grace period before the very first real callback: staleness is
+        # measured from HERE, not from the first callback, so a device
+        # that opens but then never delivers a single callback is still
+        # correctly detected as dead after `stale_after` seconds.
+        self._last_callback_at = time.monotonic()
+        self._stream_error_flagged = False
 
-        try:
-            device_idx = self._resolve_device(backend)
-            device_desc = self._describe_device(backend, device_idx)
+        def callback(indata, frames, time_info, status) -> None:
+            if self._stop.is_set():
+                raise backend.CallbackStop
+            if status:   # PortAudio's own overflow/underflow/abort signal
+                self._stream_error_flagged = True
+            self._last_callback_at = time.monotonic()
+            block = indata.mean(axis=1) if getattr(indata, "ndim", 1) == 2 else indata
+            self._analyzer.on_audio_block(np.asarray(block, dtype=np.float32), self._sr)
 
-            def callback(indata, frames, time_info, status) -> None:
-                if self._stop.is_set():
-                    raise backend.CallbackStop
-                block = indata.mean(axis=1) if getattr(indata, "ndim", 1) == 2 else indata
-                self._analyzer.on_audio_block(np.asarray(block, dtype=np.float32), self._sr)
-
-            with backend.InputStream(samplerate=self._sr, channels=1, dtype="float32",
-                                     blocksize=self._blocksize, callback=callback,
-                                     device=device_idx):
-                self._analyzer.mark_available(device_desc)
-                while not self._stop.is_set():
-                    self._stop.wait(0.2)
-        except Exception as exc:  # noqa: BLE001 -- device open/runtime errors must not crash the daemon
-            _LOG.warning("audio capture failed (%s); spectrum page will show "
-                        "the no-audio-input placeholder", exc)
-        finally:
-            self._analyzer.mark_unavailable()
+        with backend.InputStream(samplerate=self._sr, channels=1, dtype="float32",
+                                 blocksize=self._blocksize, callback=callback,
+                                 device=device_idx):
+            self._analyzer.mark_available(device_desc)
+            self._failure_logged_once = False   # a healthy open resets the noise cap
+            while not self._stop.is_set():
+                if self._stop.wait(self._poll_interval):
+                    return
+                if self._stream_error_flagged:
+                    _LOG.warning("audio stream reported an error status; reopening")
+                    return
+                if self._stream_is_stale():
+                    _LOG.warning(
+                        "audio stream produced no callbacks for >%.1fs (device "
+                        "likely vanished); reopening", self._stale_after)
+                    return

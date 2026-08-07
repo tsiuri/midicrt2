@@ -1,6 +1,14 @@
 [Unit]
 Description=midicrt2 engine daemon
 After=network.target sound.target
+# Phase-3 task 8 review fix: defense-in-depth ordering ONLY -- correctness
+# must NOT depend on this (systemd does not guarantee user@<uid>.service is
+# actually done initializing PipeWire just because it's been "started" by
+# the time this unit's After= is satisfied, and a real boot can still race
+# it either way). The real fix is analyzers/spectrum.py's AudioCapture
+# retry/health-check supervisor, which recovers on its own on a 5s cooldown
+# regardless of ordering. This line just makes the common case faster.
+After=user@1000.service
 
 [Service]
 User=billie
@@ -16,9 +24,21 @@ Environment=PYTHONUNBUFFERED=1
 # fails outright ("Error querying device -1", verified against this exact
 # unit/user), because the ALSA "default" PCM's pipewire/pulse routing
 # depends on finding the user's PipeWire socket under /run/user/<uid>.
-# billie is a fixed, already-hardcoded uid 1000 throughout this unit
-# (User=billie, RuntimeDirectory=midicrt under /run), so hardcoding the
-# matching runtime dir here is consistent, not a new assumption.
+#
+# Deliberately HARDCODED, not "/run/user/%U" -- verified against
+# `man systemd.unit` (systemd 257.8) and empirically on this box: %U/%u/%h
+# resolve to the SERVICE MANAGER instance's own user (root/"0"/"/root" for
+# ANY system-scope unit, unconditionally), never to this unit's own
+# `User=` setting. Deploying `%U` here actually broke capture (confirmed:
+# `systemctl show midicrtd -p Environment` read back
+# "XDG_RUNTIME_DIR=/run/user/0", and the daemon logged the same "Error
+# querying device -1" failure this whole Environment= line exists to fix)
+# before being caught and reverted. There is no systemd specifier for "the
+# UID of the user configured via this unit's own User=" -- billie is
+# already a fixed, hardcoded uid 1000 throughout this unit (User=billie,
+# RuntimeDirectory=midicrt under /run), so hardcoding the matching runtime
+# dir here is consistent with that, not a new assumption, and is the
+# correct fix, not a workaround.
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 
 [Install]

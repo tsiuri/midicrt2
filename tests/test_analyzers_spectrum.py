@@ -8,12 +8,23 @@ Pure-math tests below drive `compute_bins`/`high_pass` with synthetic PCM
 (sine waves at known frequencies, silence, white noise) -- never real audio
 hardware. `AudioCapture` tests use an injected `FakeBackend` (mirroring
 `test_midi_in.py`'s `FakeBackend` for `MidiInput`) -- the real `sounddevice`
-import path (`backend=None`) is only exercised by one test that forces the
+import path (`backend=None`) is only exercised by tests that force the
 import itself to fail, proving the graceful-degradation contract without
 ever touching real PortAudio/hardware. No test here starts a thread against
 `backend=None` with a *working* import -- that path is production-only
 (`pages/spectrum.py`'s `start_capture()`, wired from `daemon.py`), per the
 task's "audio thread must not run in CI" constraint.
+
+Retry-supervisor tests (post-review fix): `FakeBackend.fail_open_times`
+simulates the real boot-time race against PipeWire/the user session
+(failing N attempts, then succeeding) to prove the retry loop recovers on
+its own; `retry_cooldown`/`stale_after` are always shrunk to milliseconds
+via `AudioCapture`'s constructor params so these tests run fast without
+ever touching the production 5s/2s defaults. `stream.callback(...)`
+called with a truthy `status` argument, or simply never called again,
+exercise the two device-vanished-mid-session detectors (error-status flag
+and stale-callback timeout respectively) -- see analyzers/spectrum.py's
+module docstring's "Retry/health-check supervisor" section.
 """
 import time
 
@@ -286,14 +297,25 @@ class FakeBackend:
     """Mirrors `test_midi_in.py`'s `FakeBackend` shape, for the
     `sounddevice` surface AudioCapture actually calls: `query_devices()`,
     `InputStream(...)` (a context manager), and a `CallbackStop` exception
-    class the callback can raise to unwind cleanly."""
+    class the callback can raise to unwind cleanly.
+
+    `fail_open` fails EVERY open attempt (permanent failure -- proves the
+    retry loop never crashes even though it can never recover). `
+    fail_open_times` fails exactly that many attempts and then succeeds
+    (proves the retry loop DOES recover once the environment does) --
+    mirrors the real "PipeWire not up yet at boot" race this whole
+    supervisor exists to survive. `open_attempts` counts every call
+    regardless of outcome, so tests can assert a retry actually happened.
+    """
 
     class CallbackStop(Exception):
         pass
 
-    def __init__(self, devices=None, fail_open=False):
+    def __init__(self, devices=None, fail_open=False, fail_open_times=0):
         self._devices = devices if devices is not None else []
         self.fail_open = fail_open
+        self.fail_open_times = fail_open_times
+        self.open_attempts = 0
         self.streams: list[_FakeStream] = []
 
     def query_devices(self, kind=None):
@@ -302,8 +324,9 @@ class FakeBackend:
         return list(self._devices)
 
     def InputStream(self, **kw):
-        if self.fail_open:
-            raise RuntimeError("no such device")
+        self.open_attempts += 1
+        if self.fail_open or self.open_attempts <= self.fail_open_times:
+            raise RuntimeError(f"no such device (attempt {self.open_attempts})")
         stream = _FakeStream(kw["callback"])
         self.streams.append(stream)
         return stream
@@ -372,19 +395,29 @@ def test_audio_capture_none_device_name_is_default_without_querying():
 
 
 def test_audio_capture_stream_open_failure_marks_unavailable_not_crash():
+    # A PERMANENT open failure must never crash the daemon -- it keeps
+    # retrying forever (see below for the "eventually recovers" case),
+    # this test only proves the immediate-failure path is safe. Uses a
+    # tiny retry_cooldown so `stop()` doesn't have to interrupt a long
+    # real sleep to exit promptly.
     analyzer = SpectrumAnalyzer()
     backend = FakeBackend(fail_open=True)
-    capture = AudioCapture(analyzer, backend=backend)
-    capture.start()
-    capture._thread.join(timeout=2.0)
-    assert analyzer.view_model()["available"] is False
+    capture = AudioCapture(analyzer, backend=backend, retry_cooldown=0.05)
+    try:
+        capture.start()
+        assert _wait_until(lambda: backend.open_attempts >= 1)
+        assert analyzer.view_model()["available"] is False
+    finally:
+        capture.stop()
 
 
 def test_audio_capture_missing_backend_marks_unavailable_not_crash(monkeypatch):
     # Simulates `sounddevice` being unimportable (e.g. no libportaudio on
     # this machine) WITHOUT ever touching the real module -- `backend=None`
-    # triggers AudioCapture's real lazy `import sounddevice` inside `_run`;
-    # this forces that specific import to fail.
+    # triggers AudioCapture's real lazy `import sounddevice` inside
+    # `_open_and_pump`; this forces that specific import to fail, forever
+    # (a missing library never resolves itself, but the retry loop must
+    # still not crash and must still eventually give up cleanly on stop()).
     import builtins
     real_import = builtins.__import__
 
@@ -395,12 +428,144 @@ def test_audio_capture_missing_backend_marks_unavailable_not_crash(monkeypatch):
 
     monkeypatch.setattr(builtins, "__import__", fake_import)
     analyzer = SpectrumAnalyzer()
-    capture = AudioCapture(analyzer)   # backend=None -> real lazy-import path
-    capture.start()
-    capture._thread.join(timeout=2.0)
+    capture = AudioCapture(analyzer, retry_cooldown=0.05)   # backend=None -> real lazy-import path
+    try:
+        capture.start()
+        assert _wait_until(lambda: not analyzer.view_model()["available"])
+        # give it time to actually retry at least once, proving the loop
+        # didn't just exit after the first failure like the pre-fix version.
+        time.sleep(0.2)
+        assert capture._thread is not None and capture._thread.is_alive()
+    finally:
+        capture.stop()
     assert analyzer.view_model()["available"] is False
 
 
 def test_audio_capture_stop_without_start_is_a_noop():
     capture = AudioCapture(SpectrumAnalyzer(), backend=FakeBackend())
     capture.stop()   # must not raise
+
+
+# -- retry supervisor (critical fix: a one-shot open used to lose the -------
+# -- boot race against PipeWire/the user session permanently) ---------------
+
+
+def test_audio_capture_retries_on_cooldown_until_backend_succeeds():
+    # The core boot-race fix: PipeWire/the user session isn't up yet at the
+    # first couple of attempts (fail_open_times=2), then comes up -- the
+    # supervisor must keep retrying on retry_cooldown and recover on its
+    # own, no restart needed.
+    analyzer = SpectrumAnalyzer()
+    backend = FakeBackend(fail_open_times=2)
+    capture = AudioCapture(analyzer, backend=backend, retry_cooldown=0.05)
+    try:
+        capture.start()
+        assert _wait_until(lambda: analyzer.view_model()["available"], timeout=3.0)
+        assert backend.open_attempts == 3   # 2 failures + the successful 3rd attempt
+        assert len(backend.streams) == 1
+    finally:
+        capture.stop()
+
+
+def test_audio_capture_caps_repeated_failure_log_lines(caplog):
+    # Log-noise cap: several failed attempts happening well within
+    # _LOG_REPEAT_INTERVAL_S (60s) of each other must produce only ONE
+    # "audio capture failed" warning, not one per attempt.
+    import logging as _logging
+
+    caplog.set_level(_logging.WARNING, logger="midicrt.analyzers.spectrum")
+    analyzer = SpectrumAnalyzer()
+    backend = FakeBackend(fail_open_times=3)
+    capture = AudioCapture(analyzer, backend=backend, retry_cooldown=0.02)
+    try:
+        capture.start()
+        assert _wait_until(lambda: analyzer.view_model()["available"], timeout=3.0)
+    finally:
+        capture.stop()
+    failure_lines = [r for r in caplog.records if "audio capture failed" in r.message]
+    assert len(failure_lines) == 1
+
+
+def test_audio_capture_reopens_after_stream_reports_an_error_status():
+    # PortAudio's own overflow/underflow/abort signal (a truthy `status`
+    # argument to the callback) must be treated as stream death: close,
+    # mark unavailable, and re-enter the retry loop -- proven here by a
+    # SECOND successful open happening afterward.
+    analyzer = SpectrumAnalyzer(bins=8)
+    backend = FakeBackend()
+    capture = AudioCapture(analyzer, backend=backend, retry_cooldown=0.05, stale_after=10.0)
+    try:
+        capture.start()
+        assert _wait_until(lambda: analyzer.view_model()["available"])
+        assert len(backend.streams) == 1
+
+        block = _sine(2000.0, amp=1.0).reshape(-1, 1)
+        backend.streams[0].callback(block, len(block), None, "input_overflow")
+
+        assert _wait_until(lambda: len(backend.streams) >= 2, timeout=2.0)
+        assert _wait_until(lambda: analyzer.view_model()["available"], timeout=2.0)
+    finally:
+        capture.stop()
+
+
+def test_audio_capture_detects_stale_callback_and_recovers():
+    # A device that silently vanishes (unplugged, session torn down) never
+    # raises anything -- the callback just stops firing. The supervisor
+    # must notice via the last-callback timestamp going stale and recover
+    # on its own once a fresh open succeeds again.
+    analyzer = SpectrumAnalyzer(bins=8)
+    backend = FakeBackend()
+    capture = AudioCapture(analyzer, backend=backend, retry_cooldown=0.05, stale_after=0.15)
+    try:
+        capture.start()
+        assert _wait_until(lambda: analyzer.view_model()["available"])
+        assert len(backend.streams) == 1
+        # Deliberately never call backend.streams[0].callback(...) again --
+        # simulates a device that vanished without a single error signal.
+        assert _wait_until(lambda: len(backend.streams) >= 2, timeout=3.0)
+        assert _wait_until(lambda: analyzer.view_model()["available"], timeout=2.0)
+    finally:
+        capture.stop()
+
+
+class _SlowOpenBackend(FakeBackend):
+    """A backend whose `InputStream()` blocks for `block_s` before
+    returning -- stands in for a native PortAudio call that doesn't check
+    Python's stop `Event` (the shutdown-race hazard found during live
+    verification, see analyzers/spectrum.py's module docstring)."""
+
+    def __init__(self, block_s: float, **kw):
+        super().__init__(**kw)
+        self._block_s = block_s
+
+    def InputStream(self, **kw):
+        time.sleep(self._block_s)
+        return super().InputStream(**kw)
+
+
+def test_audio_capture_stop_logs_a_warning_if_the_thread_outlives_the_join_timeout(caplog):
+    import logging as _logging
+
+    caplog.set_level(_logging.WARNING, logger="midicrt.analyzers.spectrum")
+    backend = _SlowOpenBackend(block_s=0.5)
+    capture = AudioCapture(SpectrumAnalyzer(), backend=backend, retry_cooldown=0.05,
+                           stop_join_timeout=0.05)
+    capture.start()
+    time.sleep(0.1)   # ensure the thread has entered the slow InputStream() call
+    started = time.monotonic()
+    capture.stop()    # must return promptly (bounded by stop_join_timeout), not block for 0.5s
+    assert time.monotonic() - started < 0.4
+    assert any("did not exit" in r.message for r in caplog.records)
+
+
+def test_audio_capture_stop_interrupts_a_pending_retry_cooldown_promptly():
+    # stop() must not have to wait out a long retry_cooldown to take
+    # effect -- proves the cooldown wait is itself interruptible.
+    analyzer = SpectrumAnalyzer()
+    backend = FakeBackend(fail_open=True)
+    capture = AudioCapture(analyzer, backend=backend, retry_cooldown=30.0)
+    capture.start()
+    assert _wait_until(lambda: backend.open_attempts >= 1)
+    started = time.monotonic()
+    capture.stop()
+    assert time.monotonic() - started < 2.0   # well under the 30s cooldown
