@@ -727,12 +727,109 @@ def render_progchanges_frame(vm: dict, surface: Surface) -> None:
         draw_text(surface, LEFT_MARGIN, header_h + i * line_h, line["text"], color, font)
 
 
+# -- CC monitor page (phase-3 task 12, gap ports) ------------------------------
+#
+# Layout: same reverse-video header convention as `render_voices_frame`, then
+# one row per MIDI channel showing its recent-CC window as plain text (e.g.
+# "01  CC74:100  CC01:064") -- unlike voices' bordered poly-meter, a CC
+# monitor has no natural bar-scale (a controller number isn't a magnitude),
+# so this stays pure text per row, matching v1's own `pages/ccmonitor.py`
+# text-table layout (see analyzers/ccmonitor.py's module docstring).
+def _ccmonitor_header_text(vm: dict) -> str:
+    return f"{vm['title']}"
+
+
+def _ccmonitor_row_text(ch_vm: dict) -> str:
+    cells = " ".join(f"CC{e['cc']:02d}:{e['value']:03d}" for e in ch_vm["recent"])
+    return f"{ch_vm['ch']:02d}  {cells}"
+
+
+def render_ccmonitor_frame(vm: dict, surface: Surface) -> None:
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _ccmonitor_header_text(vm), BG, font)
+
+    rows = vm["channels"]
+    if not rows:
+        return
+    usable_h = surface.height - _reserved_chrome_height(font) - header_h
+    row_h = usable_h // len(rows)
+    if row_h <= 0:
+        return
+    for i, row in enumerate(rows):
+        row_y = header_h + i * row_h
+        text_y = row_y + max(0, (row_h - font.height) // 2)
+        draw_text(surface, LEFT_MARGIN, text_y, _ccmonitor_row_text(row), NORMAL_FG, font)
+
+
+# -- CC dashboard page (phase-3 task 12, gap ports) -----------------------------
+#
+# Layout: reverse-video header, then one row per tracked (channel, cc) pair --
+# a "Ch01 CC074:100" label, a `fill_column`-style horizontal bar (task
+# brief's "CC Monitor/Dashboard -> ... two page layouts" naturally maps
+# ccgraph.py's own proportional bar onto `Surface.rect`, mirroring
+# `render_spectrum_frame`'s bar-fill convention transposed horizontally),
+# and a "LIVE"/"N.Ns ago" freshness label in the brighter accent tone while
+# fresh -- matching v1's `ccgraph.py` "perfectly aligned" bars-plus-age
+# layout (see analyzers/ccmonitor.py's module docstring).
+CCDASH_BAR_W = 120   # px
+CCDASH_BAR_GAP = 8
+
+
+def _ccdashboard_header_text(vm: dict) -> str:
+    return f"{vm['title']}"
+
+
+def _ccdashboard_age_text(entry: dict) -> str:
+    return "LIVE" if entry["fresh"] else f"{entry['age_s']:.1f}s"
+
+
+def render_ccdashboard_frame(vm: dict, surface: Surface) -> None:
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _ccdashboard_header_text(vm), BG, font)
+
+    entries = vm["entries"]
+    if not entries:
+        return
+    usable_h = surface.height - _reserved_chrome_height(font) - header_h
+    row_h = usable_h // len(entries)
+    if row_h <= 0:
+        return
+
+    label_w = 15 * font.width   # "Ch01 CC074:100" fits comfortably
+    bar_x = LEFT_MARGIN + label_w
+    for i, entry in enumerate(entries):
+        row_y = header_h + i * row_h
+        text_y = row_y + max(0, (row_h - font.height) // 2)
+        label = f"Ch{entry['ch']:02d} CC{entry['cc']:03d}:{entry['value']:03d}"
+        draw_text(surface, LEFT_MARGIN, text_y, label, NORMAL_FG, font)
+
+        bar_h = max(1, row_h - 2)
+        bar_y = row_y + (row_h - bar_h) // 2
+        fill_w = round(CCDASH_BAR_W * min(max(entry["value"], 0), 127) / 127)
+        if fill_w > 0:
+            fill_color = ACCENT_FG if entry["fresh"] else NORMAL_FG
+            surface.rect(bar_x, bar_y, fill_w, bar_h, fill_color)
+
+        age_x = bar_x + CCDASH_BAR_W + CCDASH_BAR_GAP
+        age_color = ACCENT_FG if entry["fresh"] else NORMAL_FG
+        draw_text(surface, age_x, text_y, _ccdashboard_age_text(entry), age_color, font)
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
              "harmony": render_harmony_frame, "tuner": render_tuner_frame,
              "pianoroll": render_pianoroll_frame, "spectrum": render_spectrum_frame,
              "screensaver": render_screensaver_frame,
              "img2txtviz": render_img2txtviz_frame, "config": render_config_frame,
-             "help": render_help_frame, "progchanges": render_progchanges_frame}
+             "help": render_help_frame, "progchanges": render_progchanges_frame,
+             "ccmonitor": render_ccmonitor_frame, "ccdashboard": render_ccdashboard_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

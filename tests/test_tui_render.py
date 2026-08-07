@@ -843,6 +843,69 @@ def test_progchanges_renderers_dispatch_table_has_progchanges():
     assert RENDERERS["progchanges"] is render_progchanges_lines
 
 
+# -- CC monitor page (phase-3 task 12, gap ports) ------------------------------
+CCMONITOR_VM = {
+    "title": "CC MONITOR",
+    "channels": [{"ch": ch, "recent": []} for ch in range(1, 17)],
+}
+CCMONITOR_VM["channels"][0]["recent"] = [
+    {"cc": 74, "value": 100, "peak": 120}, {"cc": 1, "value": 64, "peak": 64}]
+
+
+def test_render_ccmonitor_lines_pads_to_exact_dimensions():
+    out = tui.RENDERERS["ccmonitor"](CCMONITOR_VM, width=40, height=17)
+    assert len(out) == 17
+    assert all(len(ln) == 40 for ln in out)
+    assert "CC74:100" in out[1]
+    assert "CC01:064" in out[1]
+
+
+def test_render_ccmonitor_lines_cuts_off_extra_rows_when_height_is_short():
+    out = tui.RENDERERS["ccmonitor"](CCMONITOR_VM, width=40, height=3)
+    assert len(out) == 3   # header + exactly 2 channel rows
+
+
+def test_ccmonitor_renderers_dispatch_table_has_ccmonitor():
+    from midicrt.clients.tui import render_ccmonitor_lines
+    assert RENDERERS["ccmonitor"] is render_ccmonitor_lines
+
+
+# -- CC dashboard page (phase-3 task 12, gap ports) -----------------------------
+CCDASHBOARD_VM = {
+    "title": "CC DASHBOARD",
+    "entries": [
+        {"ch": 1, "cc": 74, "value": 100, "peak": 120, "age_s": 0.3, "fresh": True},
+        {"ch": 2, "cc": 1, "value": 40, "peak": 64, "age_s": 5.2, "fresh": False},
+    ],
+}
+
+
+def test_render_ccdashboard_lines_pads_to_exact_dimensions():
+    out = tui.RENDERERS["ccdashboard"](CCDASHBOARD_VM, width=50, height=5)
+    assert len(out) == 5
+    assert all(len(ln) == 50 for ln in out)
+    assert "Ch01 CC074:100" in out[1]
+    assert "LIVE" in out[1]
+    assert "Ch02 CC001:040" in out[2]
+    assert "5.2s" in out[2]
+
+
+def test_render_ccdashboard_lines_cuts_off_extra_rows_when_height_is_short():
+    out = tui.RENDERERS["ccdashboard"](CCDASHBOARD_VM, width=50, height=2)
+    assert len(out) == 2   # header + exactly 1 entry row
+
+
+def test_ccdashboard_bar_scales_with_value():
+    from midicrt.clients.tui import _ccdashboard_bar
+    assert _ccdashboard_bar(0) == "░" * 20
+    assert _ccdashboard_bar(127) == "█" * 20
+
+
+def test_ccdashboard_renderers_dispatch_table_has_ccdashboard():
+    from midicrt.clients.tui import render_ccdashboard_lines
+    assert RENDERERS["ccdashboard"] is render_ccdashboard_lines
+
+
 def test_run_tui_survives_page_switch_before_new_topics_snapshot_arrives(monkeypatch):
     """TUI's twin of fb/app.py::_run_device's regression (same phase-3 task
     11 finding, found live against the real daemon): a page_changed event

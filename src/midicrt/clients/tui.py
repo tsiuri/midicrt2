@@ -621,12 +621,69 @@ def render_progchanges_lines(vm: dict, width: int, height: int) -> list[str]:
     return [_fit(header, width)] + body
 
 
+# -- CC monitor page (phase-3 task 12, gap ports) ------------------------------
+#
+# 16 fixed channel rows (same "top-down in order, pad/cut to height"
+# convention as `render_voices_lines`) -- each row's text is the channel's
+# recent-CC window, plain text since a controller number has no natural
+# bar scale (see fb/app.py's own `render_ccmonitor_frame` comment).
+def _ccmonitor_row_text(ch_vm: dict) -> str:
+    cells = " ".join(f"CC{e['cc']:02d}:{e['value']:03d}" for e in ch_vm["recent"])
+    return f"{ch_vm['ch']:02d}  {cells}"
+
+
+def render_ccmonitor_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = f"{vm['title']}  [n]ext page [q]uit"
+    body_h = height - 1
+    rows = [_fit(_ccmonitor_row_text(r), width) for r in vm["channels"]]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [_fit(header, width)] + body
+
+
+# -- CC dashboard page (phase-3 task 12, gap ports) -----------------------------
+#
+# One row per tracked (channel, cc) pair -- a "Ch01 CC074:100" label, a
+# block-character bar proportional to the value (v1's `ccgraph.py` own
+# "█" fill), and a "LIVE"/"N.Ns ago" freshness label -- matching v1's
+# layout, same pad/cut-to-height convention as the other fixed-list pages.
+_CCDASH_BAR_SEGMENTS = 20
+
+
+def _ccdashboard_bar(value: int, segments: int = _CCDASH_BAR_SEGMENTS) -> str:
+    filled = round(segments * min(max(value, 0), 127) / 127)
+    return "█" * filled + "░" * (segments - filled)
+
+
+def _ccdashboard_age_text(entry: dict) -> str:
+    return "LIVE" if entry["fresh"] else f"{entry['age_s']:.1f}s"
+
+
+def _ccdashboard_row_text(entry: dict) -> str:
+    label = f"Ch{entry['ch']:02d} CC{entry['cc']:03d}:{entry['value']:03d}"
+    bar = _ccdashboard_bar(entry["value"])
+    age = _ccdashboard_age_text(entry)
+    return f"{label}  {bar}  {age:>6}"
+
+
+def render_ccdashboard_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = f"{vm['title']}  [n]ext page [q]uit"
+    body_h = height - 1
+    rows = [_fit(_ccdashboard_row_text(e), width) for e in vm["entries"]]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [_fit(header, width)] + body
+
+
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "harmony": render_harmony_lines, "tuner": render_tuner_lines,
              "pianoroll": render_pianoroll_lines, "spectrum": render_spectrum_lines,
              "screensaver": render_screensaver_lines,
              "img2txtviz": render_img2txtviz_lines, "config": render_config_lines,
-             "help": render_help_lines, "progchanges": render_progchanges_lines}
+             "help": render_help_lines, "progchanges": render_progchanges_lines,
+             "ccmonitor": render_ccmonitor_lines, "ccdashboard": render_ccdashboard_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}

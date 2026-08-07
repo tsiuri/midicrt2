@@ -135,6 +135,8 @@ from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
+from midicrt.pages.ccdashboard import CCDashboardPage
+from midicrt.pages.ccmonitor import CCMonitorPage
 from midicrt.pages.configview import ConfigPage
 from midicrt.pages.eventlog import EventLogPage
 from midicrt.pages.harmony import HarmonyPage
@@ -267,6 +269,13 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # (`pages/proglog.py`) behavioral synthesis -- a rolling program-change
     # log reusing eventlog's own `{title, count, lines}` VM shape.
     "progchanges": lambda config: ProgChangesPage(),
+    # Phase-3 task 12 (gap ports, v1 pages 4 "CC Monitor" + 5 "CC
+    # Dashboard"): both wrap analyzers/ccmonitor.py::CCMonitorAnalyzer, each
+    # a SEPARATE instance (see pages/ccmonitor.py's own module docstring
+    # for why -- no cross-page analyzer-sharing infrastructure exists yet,
+    # same precedent as pages/chordkey.py below).
+    "ccmonitor": lambda config: CCMonitorPage(),
+    "ccdashboard": lambda config: CCDashboardPage(),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`

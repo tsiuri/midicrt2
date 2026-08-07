@@ -1450,6 +1450,138 @@ def test_render_progchanges_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
+# -- CC monitor page (phase-3 task 12, gap ports) ------------------------------
+GOLDEN_CCMONITOR_FRAME = FIXTURES / "fb_ccmonitor_frame_golden.png"
+CCMONITOR_SURFACE_SIZE = (400, 220)
+
+CCMONITOR_VM = {
+    "title": "CC MONITOR",
+    "channels": [
+        {"ch": ch, "recent": []} for ch in range(1, 17)
+    ],
+}
+CCMONITOR_VM["channels"][0]["recent"] = [
+    {"cc": 74, "value": 100, "peak": 120}, {"cc": 1, "value": 64, "peak": 64}]
+CCMONITOR_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+CCMONITOR_ALERTS_VM = {"alerts": []}
+CCMONITOR_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                         "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_ccmonitor_renderers_dispatch_table_has_ccmonitor():
+    assert app.RENDERERS["ccmonitor"] is app.render_ccmonitor_frame
+
+
+def test_render_ccmonitor_frame_header_bar_is_reverse_video():
+    surf = Surface(*CCMONITOR_SURFACE_SIZE)
+    app.render_ccmonitor_frame(CCMONITOR_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._ccmonitor_header_text(CCMONITOR_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+
+
+def test_render_ccmonitor_frame_empty_channels_does_not_crash():
+    surf = Surface(*CCMONITOR_SURFACE_SIZE)
+    app.render_ccmonitor_frame({"title": "CC MONITOR", "channels": []}, surf)   # must not raise
+
+
+def test_render_ccmonitor_frame_draws_text_for_a_row_with_recent_ccs():
+    surf = Surface(*CCMONITOR_SURFACE_SIZE)
+    app.render_ccmonitor_frame(CCMONITOR_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
+    row_h = usable_h // len(CCMONITOR_VM["channels"])
+    text_y = header_h + max(0, (row_h - font.height) // 2)
+    assert any(px[x, y] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width)
+               for y in range(text_y, text_y + font.height))
+
+
+def test_render_ccmonitor_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_CCMONITOR_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-12-report.md"
+    )
+    surf = Surface(*CCMONITOR_SURFACE_SIZE)
+    app.render_ccmonitor_frame(CCMONITOR_VM, surf)
+    app._draw_secondary(surf, CCMONITOR_ALERTS_VM, CCMONITOR_TIMESIG_VM, load_font())
+    app._draw_status(surf, CCMONITOR_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_CCMONITOR_FRAME).convert("RGB")
+    assert golden.size == CCMONITOR_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
+# -- CC dashboard page (phase-3 task 12, gap ports) -----------------------------
+GOLDEN_CCDASHBOARD_FRAME = FIXTURES / "fb_ccdashboard_frame_golden.png"
+CCDASHBOARD_SURFACE_SIZE = (400, 150)
+
+CCDASHBOARD_VM = {
+    "title": "CC DASHBOARD",
+    "entries": [
+        {"ch": 1, "cc": 74, "value": 100, "peak": 120, "age_s": 0.3, "fresh": True},
+        {"ch": 2, "cc": 1, "value": 40, "peak": 64, "age_s": 5.2, "fresh": False},
+    ],
+}
+CCDASHBOARD_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+CCDASHBOARD_ALERTS_VM = {"alerts": []}
+CCDASHBOARD_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                           "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_ccdashboard_renderers_dispatch_table_has_ccdashboard():
+    assert app.RENDERERS["ccdashboard"] is app.render_ccdashboard_frame
+
+
+def test_render_ccdashboard_frame_header_bar_is_reverse_video():
+    surf = Surface(*CCDASHBOARD_SURFACE_SIZE)
+    app.render_ccdashboard_frame(CCDASHBOARD_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._ccdashboard_header_text(CCDASHBOARD_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+
+
+def test_render_ccdashboard_frame_empty_entries_does_not_crash():
+    surf = Surface(*CCDASHBOARD_SURFACE_SIZE)
+    app.render_ccdashboard_frame({"title": "CC DASHBOARD", "entries": []}, surf)   # must not raise
+
+
+def test_render_ccdashboard_frame_fresh_entry_bar_uses_accent_color():
+    surf = Surface(*CCDASHBOARD_SURFACE_SIZE)
+    app.render_ccdashboard_frame(CCDASHBOARD_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    row_h = (surf.height - app._reserved_chrome_height(font) - header_h) // 2
+    bar_y = header_h + row_h // 2
+    label_w = 15 * font.width
+    bar_x = app.LEFT_MARGIN + label_w
+    assert px[bar_x + 2, bar_y] == app.ACCENT_FG   # first (fresh) entry's bar
+
+
+def test_render_ccdashboard_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_CCDASHBOARD_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-12-report.md"
+    )
+    surf = Surface(*CCDASHBOARD_SURFACE_SIZE)
+    app.render_ccdashboard_frame(CCDASHBOARD_VM, surf)
+    app._draw_secondary(surf, CCDASHBOARD_ALERTS_VM, CCDASHBOARD_TIMESIG_VM, load_font())
+    app._draw_status(surf, CCDASHBOARD_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_CCDASHBOARD_FRAME).convert("RGB")
+    assert golden.size == CCDASHBOARD_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
     # rejected by the server's max_rate check, and then hang forever in

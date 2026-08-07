@@ -155,7 +155,7 @@ def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll_spectru
     eng = Engine(Config())
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
-        "img2txtviz", "config", "help", "progchanges",
+        "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
     ]
     assert eng.current_page == "eventlog"
 
@@ -166,7 +166,7 @@ def test_register_page_appends_to_live_roster():
     eng.register_page("second", fake)
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
-        "img2txtviz", "config", "help", "progchanges", "second",
+        "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard", "second",
     ]
     assert eng.pages["second"] is fake
 
@@ -176,7 +176,8 @@ def test_engine_topics_reflects_roster_order():
     eng.register_page("second", _FakePage())
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
-        "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges", "page.second",
+        "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
+        "page.ccmonitor", "page.ccdashboard", "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
@@ -244,6 +245,7 @@ def test_topics_include_overlay_after_page_topics():
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
+        "page.ccmonitor", "page.ccdashboard",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
@@ -327,15 +329,19 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "progchanges"
     await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "ccmonitor"
+    await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "ccdashboard"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "progchanges"
+    assert eng.current_page == "ccdashboard"
 
     names = [e["name"] for e in events]
-    assert names == ["page_changed"] * 11
+    assert names == ["page_changed"] * 13
     assert [e["data"]["page"] for e in events] == [
         "voices", "harmony", "pianoroll", "spectrum", "screensaver", "img2txtviz",
-        "config", "help", "progchanges", "second", "progchanges",
+        "config", "help", "progchanges", "ccmonitor", "ccdashboard", "second", "ccdashboard",
     ]
 
 
