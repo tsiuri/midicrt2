@@ -59,8 +59,43 @@ Deployed v1 default carried forward
 `config/settings.json`'s `pagecycle` section on the Pi has `"enabled":
 true` -- `config.pagecycle_enabled` defaults to `True` to match (see
 `config.py`'s own comment for the full settings.json evidence).
+
+Arbitration with the screensaver (Critical fix, task-9 review)
+---------------------------------------------------------------------------
+`idle_s` (pagecycle's own idle threshold) and `after_s` (`behaviors/
+screensaver.py`'s threshold) are two INDEPENDENT clocks measured from the
+SAME `last_activity_ts` -- with the shipped defaults (`idle_s=300`,
+`after_s=60`, both enabled), a fully idle engine crosses 60s (screensaver
+activates) and then, inevitably, ALSO crosses 300s (pagecycle's own
+threshold) with NO new activity in between. Before this fix, `tick()`
+never looked at `current_page` at all, so at t=300 it dispatched
+`page.next` unconditionally -- un-blanking the just-activated screensaver
+and, since nothing resets `last_activity_ts` while genuinely idle, going
+on to fire AGAIN every further `idle_s` (t=600, t=900, ...) for as long as
+the engine stayed idle. That is the exact burn-in-defeating failure mode
+`behaviors/screensaver.py` exists to prevent -- reproduced against the
+shipped defaults by `test_engine_core.py::
+test_pagecycle_does_not_unblank_screensaver_with_shipped_defaults`.
+
+Fix: `tick()` now refuses to act at all while `current_page` IS the
+screensaver page (checked FIRST, before any idle-time bookkeeping). This
+was chosen over the alternative (asking `ScreensaverBehavior` whether it
+considers itself "active") because it is strictly more robust: it also
+covers a screensaver reached by a MANUAL `page.goto screensaver` (from any
+client, independent of `ScreensaverBehavior`'s own latch), which an
+active-flag check would miss entirely. While blocked this way,
+`_idle_since`/`_last_seen_activity` are left untouched (not advanced, not
+reset) -- idle time "spent" showing the screensaver neither counts for nor
+against pagecycle's own timer; the moment the page changes away from the
+screensaver (whether via `ScreensaverBehavior`'s own activity-triggered
+restore, or a manual navigation), `last_activity_ts` will have moved
+forward too in the normal restore case, and the ordinary "activity moved
+forward -> re-arm from here" branch below picks the timer back up cleanly
+from that instant -- pagecycle never fires immediately upon waking.
 """
 from __future__ import annotations
+
+from midicrt.behaviors.screensaver import SCREENSAVER_PAGE
 
 
 class PageCycleBehavior:
@@ -70,15 +105,22 @@ class PageCycleBehavior:
     never acts" contract. `now`/`last_activity_ts` are always injected by
     the caller (`Engine._tick_behaviors`), never read here."""
 
-    def __init__(self, enabled: bool, idle_s: float) -> None:
+    def __init__(self, enabled: bool, idle_s: float,
+                 screensaver_page: str = SCREENSAVER_PAGE) -> None:
         self.enabled = enabled
         self.idle_s = idle_s
+        self._screensaver_page = screensaver_page
         self._last_seen_activity: float | None = None
         self._idle_since: float | None = None
 
     def tick(self, now: float, last_activity_ts: float,
               current_page: str) -> tuple[str, dict] | None:
         if not self.enabled:
+            return None
+        if current_page == self._screensaver_page:
+            # Critical fix (see module docstring's "Arbitration with the
+            # screensaver" section) -- never act while the screensaver is
+            # showing, however it got there.
             return None
         if self._last_seen_activity is None or last_activity_ts != self._last_seen_activity:
             # Activity moved forward (or this is the very first call, where

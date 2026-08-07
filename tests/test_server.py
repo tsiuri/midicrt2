@@ -40,6 +40,23 @@ class Client:
 
 
 async def make(tmp_path, **cfg):
+    # Disabled by default (task-9 review fix): this helper backs the wire-
+    # protocol/server plumbing tests here AND in test_client_base.py, NONE
+    # of which are testing pagecycle/screensaver -- but several push
+    # synthetic MidiEvents with a placeholder `ts=0` straight onto
+    # `eng.queue` (bypassing engine/midi_in.py's real `time.time()`
+    # stamping), which stamps `Engine._last_activity_ts` to 0 too. Against
+    # a REAL `eng.run()` loop (these tests use one), the very next
+    # `_tick_behaviors(time.time())` sees an "idle" gap of the entire Unix
+    # epoch -- comfortably past even the shipped defaults -- and the
+    # screensaver behavior activates mid-test
+    # (`test_client_base.py::test_request_correlates_amid_interleaved_
+    # snapshots` caught this: `status()["page"]` came back "screensaver",
+    # not "eventlog"). A test that DOES want to exercise the behaviors
+    # through a real server can still pass `pagecycle_enabled=True`/
+    # `screensaver_enabled=True` explicitly via **cfg.
+    cfg.setdefault("pagecycle_enabled", False)
+    cfg.setdefault("screensaver_enabled", False)
     eng = Engine(Config(**cfg))
     srv = ProtocolServer(eng, str(tmp_path / "ctl.sock"))
     await srv.start()

@@ -294,6 +294,45 @@ def test_render_screensaver_frame_is_entirely_background():
     assert surf.image.tobytes() == want.image.tobytes()
 
 
+def test_paint_frame_skips_all_chrome_on_the_screensaver_page():
+    # IMPORTANT fix (task-9 review): a screensaver-page "golden" proving
+    # the frame is entirely background -- header, body, AND all three
+    # chrome strips -- even when handed ACTIVE, non-default status/alerts/
+    # timesig/beatflash/loopprogress VMs (so there is no way for
+    # "unrelated content" to leak through the chrome strips by accident).
+    active_status = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+    active_alerts = {"alerts": [{"ch": 3, "note": 60, "level": "crit", "held_s": 12.0}]}
+    active_timesig = {"labels": ["4/4"], "confidence": 0.9, "events": 30,
+                       "events_window": 30, "events_total": 60, "pending": None}
+    active_beatflash = {"intensity": 1.4, "is_bar": True}
+    active_loopprogress = {"fraction": 0.5, "running": True}
+
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf, "screensaver", {"title": "SCREENSAVER"}, load_font(),
+                      active_status, active_alerts, active_timesig,
+                      active_beatflash, active_loopprogress)
+
+    want = Surface(*GOLDEN_SURFACE_SIZE)
+    want.clear(app.BG)
+    assert surf.image.tobytes() == want.image.tobytes()
+    # Belt and suspenders: every single pixel is BG, not just byte-equal
+    # to a second "clear" call (in case both happened to share a bug).
+    assert set(surf.image.get_flattened_data()) == {app.BG}
+
+
+def test_paint_frame_paints_chrome_normally_on_an_ordinary_page():
+    # Sanity check for the guard's OTHER branch: an ordinary page still
+    # gets all three chrome strips (proves the fix is a page-scoped
+    # exception, not a regression that silently dropped chrome everywhere).
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf, "eventlog", EMPTY_VM, load_font(),
+                      GOLDEN_STATUS_VM, GOLDEN_ALERTS_VM, GOLDEN_TIMESIG_VM,
+                      GOLDEN_BEATFLASH_VM, GOLDEN_LOOPPROGRESS_VM)
+    assert set(surf.image.get_flattened_data()) != {app.BG}
+    px = surf.image.load()
+    assert px[surf.width - 1, surf.height - 1] == app.HEADER_BG
+
+
 def test_render_frame_accent_color_is_brighter_than_normal():
     assert app.ACCENT_FG != app.NORMAL_FG
     assert sum(app.ACCENT_FG) > sum(app.NORMAL_FG)

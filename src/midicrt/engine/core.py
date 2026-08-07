@@ -108,6 +108,16 @@ screensaver.py's module docstring). `self._last_activity_ts` is seeded to
 `time.time()` at construction (NOT epoch 0), so a freshly booted engine
 starts its idle clocks from boot time rather than looking infinitely idle
 on its very first tick.
+
+`pagecycle_idle_s` and `screensaver_after_s` are two INDEPENDENT clocks
+measured off this SAME `_last_activity_ts` -- with `Config()`'s own
+shipped defaults (300s/60s, both enabled) a fully idle engine crosses BOTH
+thresholds, not just the first one reached. `behaviors/pagecycle.py`'s own
+`tick()` is what prevents its later threshold from un-blanking the
+screensaver (see that module's "Arbitration with the screensaver" docstring
+section for the full failure mode a reviewer once reproduced here, and the
+fix) -- `Engine.__init__`'s own comment next to `self._behaviors` restates
+this at the wiring site.
 """
 import asyncio
 import time
@@ -278,14 +288,28 @@ class Engine:
             enabled=config.pagecycle_enabled, idle_s=config.pagecycle_idle_s)
         self._screensaver_behavior = ScreensaverBehavior(
             enabled=config.screensaver_enabled, after_s=config.screensaver_after_s)
-        # Order rarely matters under sane configs (v1's deployed
-        # screensaver_after_s=60 fires well before pagecycle_idle_s=300
-        # ever could -- see config.py's own comment) -- disclosed, not
-        # cross-coordinated: a custom config with a SHORTER pagecycle idle
-        # than screensaver's could let pagecycle's `page.next` wander the
-        # display away from "screensaver" while `_screensaver_behavior`
-        # still believes it's active, only settling back to the real
-        # remembered page once genuine activity finally arrives.
+        # CORRECTED (task-9 review): an earlier version of this comment
+        # claimed "order rarely matters under sane configs" because
+        # screensaver_after_s=60 fires before pagecycle_idle_s=300 ever
+        # could -- that reasoning was WRONG and a reviewer reproduced the
+        # failure against the actual shipped defaults: pagecycle_idle_s and
+        # screensaver_after_s are two INDEPENDENT clocks measured from the
+        # SAME last_activity_ts, so a fully idle engine crosses 60s
+        # (screensaver activates) and then, inevitably, ALSO crosses 300s
+        # (pagecycle's own threshold) with no new activity in between --
+        # order of activation is irrelevant to that. The actual fix lives
+        # in `behaviors/pagecycle.py`'s `tick()` (see its own "Arbitration
+        # with the screensaver" docstring section): it refuses to act at
+        # all while `current_page` is the screensaver page, however that
+        # page was reached. List order below is therefore now genuinely
+        # inconsequential (pagecycle is a no-op whenever screensaver owns
+        # the display, regardless of which behavior's `tick()` runs first
+        # within a given `_tick_behaviors` call) -- verified by
+        # `test_engine_core.py::
+        # test_pagecycle_does_not_unblank_screensaver_with_shipped_defaults`,
+        # which sweeps a fake clock from t=0 to t=900 against Config()'s own
+        # shipped defaults (both behaviors enabled) and asserts the engine
+        # reaches the screensaver at t=60 and STAYS there.
         self._behaviors: list = [self._pagecycle_behavior, self._screensaver_behavior]
         self.actions.register("eventlog.clear", self._clear_eventlog,
                               description="Clear the event log")

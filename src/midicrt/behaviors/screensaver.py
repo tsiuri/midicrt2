@@ -55,6 +55,52 @@ docstring for the same loader mechanic, confirmed against `midicrt.py`'s
 v1 -- does give it an explicit config knob to turn off (the task brief's
 "Behaviors must be disable-able via config" requirement; v1 offers no such
 switch short of deleting the plugin file).
+
+Manual page changes while active are a user override, not noise (Important
+fix, task-9 review)
+---------------------------------------------------------------------------
+v1 has no analog for this at all -- it never leaves the one screen it
+overwrites, so there is no "someone navigated away from the screensaver
+by other means" case to consider. v2's `page.goto`/`page.next` are global
+actions any connected client can dispatch at any time, independent of this
+behavior -- a real TUI/fb client's own `n`/`c` keys, or another script on
+the control socket, can change `current_page` away from `screensaver`
+WITHOUT any new MIDI activity ever happening. Before this fix, `tick()`'s
+"active" branch only ever watched `last_activity_ts` for the restore
+trigger, so a manual navigation like that was invisible to it: internally
+`_active` stayed `True` and `_previous_page` stayed whatever page was
+current at ACTIVATION time, and the next real MIDI activity would
+dispatch `page.goto` back to that STALE remembered page -- silently
+discarding the user's manual choice out from under them. Reproduced by
+`tests/test_behaviors_screensaver.py::
+test_manual_page_change_while_active_is_treated_as_user_override_no_restore`.
+
+Fix: `tick()` now checks, on every call while `_active`, whether
+`current_page` is STILL the screensaver page. The moment it isn't --
+regardless of why -- that is treated as "the user (or some other actor)
+already took over," matching what a human would expect: deactivate
+quietly (no dispatch of this behavior's own; the page has already changed
+to whatever the override set it to) and forget `_previous_page`, so a
+LATER activity tick has nothing stale left to restore.
+
+Disclosed consequence: a manual override buys no grace period on its own
+---------------------------------------------------------------------------
+Idle time is measured PURELY from `last_activity_ts` (real MIDI traffic,
+`Engine._last_activity_ts`) -- a behavior has no channel to bump that
+shared, engine-owned clock itself (see `behaviors/__init__.py`'s "acts
+only through actions" contract). A manual page-change escape therefore
+does NOT reset the idle timer the way v1's own `deactivate()` resets
+`_last_activity = time.time()` on ANY wake trigger including a keypress
+(`~/codex/midicrt/plugins/zscreensaver.py`) -- if `last_activity_ts`
+genuinely never advances, this behavior is free to reclaim the display
+again on the very next tick after a manual override, with no cooldown.
+This is accepted, not fixed: it only matters for the narrow window between
+a manual escape and the next real MIDI event, and the alternative (this
+behavior tracking its own separate "last manual override" timestamp to
+manufacture a synthetic grace period) would be a second, independent
+notion of "activity" this codebase has deliberately avoided everywhere
+else (see `engine/core.py`'s own single-source-of-truth
+`_last_activity_ts`).
 """
 from __future__ import annotations
 
@@ -91,10 +137,20 @@ class ScreensaverBehavior:
             self._previous_page = current_page
             self._activity_at_activation = last_activity_ts
             return ("page.goto", {"name": self._screensaver_page})
-        # Active: the only way out is NEW activity (last_activity_ts moving
-        # past the value recorded at the moment we activated) -- restore
-        # whatever page was showing before, matching the brief's "activity
-        # -> restore previous page".
+        # Active, but something other than our own restore already moved
+        # the page away from "screensaver" (Important fix, see module
+        # docstring's "Manual page changes while active" section) -- treat
+        # it as a user override: deactivate quietly, forget the stale
+        # remembered page, dispatch nothing (the page is already correct).
+        if current_page != self._screensaver_page:
+            self._active = False
+            self._previous_page = None
+            self._activity_at_activation = None
+            return None
+        # Active AND still showing the screensaver: the only way out is NEW
+        # activity (last_activity_ts moving past the value recorded at the
+        # moment we activated) -- restore whatever page was showing before,
+        # matching the brief's "activity -> restore previous page".
         if last_activity_ts != self._activity_at_activation:
             self._active = False
             target = self._previous_page

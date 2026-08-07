@@ -555,11 +555,17 @@ def render_spectrum_frame(vm: dict, surface: Surface) -> None:
 #
 # Clears to background and draws NOTHING else -- no header, no text -- the
 # closest v2 can get to v1's literal `_blank_fb()` (zeroing the entire real
-# framebuffer). See pages/screensaver.py's module docstring for the v1
-# comparison and its disclosed limitation: the chrome strips below are
-# still painted by the run loops AFTER this renderer returns, unconditionally
-# regardless of page, so they stay lit even here -- unlike v1, which has
-# nothing left to draw over once its own blank runs.
+# framebuffer). Task-9 review (Important fix): the run loops now SKIP all
+# three chrome strips whenever this page is current (see `_paint_frame`
+# below) instead of always painting them after the page renderer -- v1's
+# blank is a TRUE full-screen blank (raw fb zeroing bypasses the
+# compositor and every plugin, chrome included), and leaving three
+# brightly-lit reverse-video bars burning at the bottom of the CRT while
+# "screensaving" would defeat the whole burn-in-avoidance purpose. Because
+# this renderer already clears the WHOLE surface (not just the body) via
+# `surface.clear(BG)`, simply not calling the chrome `_draw_*` functions is
+# sufficient -- there is nothing left underneath for them to paint over.
+SCREENSAVER_PAGE = "screensaver"   # matches pages.screensaver.ScreensaverPage.name
 
 
 def render_screensaver_frame(vm: dict, surface: Surface) -> None:
@@ -650,6 +656,27 @@ def _draw_beatprogress(surface: Surface, beatflash_vm: dict, loopprogress_vm: di
     num_chars = max(0, (surface.width - 2 * LEFT_MARGIN) // font.width)
     text = chrome.beatprogress_row_text(beatflash_vm, loopprogress_vm, num_chars)
     draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, text, BG, font)
+
+
+def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
+                  alerts_vm: dict, timesig_vm: dict, beatflash_vm: dict,
+                  loopprogress_vm: dict) -> None:
+    """Render `page`'s body, then all THREE chrome strips -- UNLESS `page`
+    is the screensaver page (Important fix, task-9 review), in which case
+    NO chrome is painted at all, matching v1's true full-screen blank --
+    see the module comment above `render_screensaver_frame`/
+    `SCREENSAVER_PAGE`. Single call site for this "page owns everything,
+    chrome paints after, except when screensaving" rule so the three real
+    run-loop call sites (`_run_device`'s initial paint + its redraw loop,
+    and `run()`'s `--out` one-shot path) can never drift from each other.
+    """
+    renderer = RENDERERS.get(page, _render_unknown)
+    renderer(vm, surface)
+    if page == SCREENSAVER_PAGE:
+        return
+    _draw_secondary(surface, alerts_vm, timesig_vm, font)
+    _draw_status(surface, status_vm, font)
+    _draw_beatprogress(surface, beatflash_vm, loopprogress_vm, font)
 
 
 # -- real-device geometry (coded here, exercised only in Task 4) -----------
@@ -784,11 +811,9 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             threading.Thread(target=_input_loop, args=(client, quit_event), daemon=True).start()
 
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
-        renderer = RENDERERS.get(state["page"], _render_unknown)
-        renderer(vm, surface)
-        _draw_secondary(surface, state["alerts_vm"], state["timesig_vm"], font)
-        _draw_status(surface, state["status_vm"], font)
-        _draw_beatprogress(surface, state["beatflash_vm"], state["loopprogress_vm"], font)
+        _paint_frame(surface, state["page"], vm, font, state["status_vm"],
+                     state["alerts_vm"], state["timesig_vm"],
+                     state["beatflash_vm"], state["loopprogress_vm"])
         surface.write_to_mmap(fb_mm, stride=stride)
 
         period = 1.0 / fps
@@ -829,12 +854,11 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             if page_updated or status_updated or secondary_updated or beatprogress_updated:
                 # `render_frame` clears the WHOLE surface, so all THREE
                 # chrome strips must be repainted on every redraw, not just
-                # when their own vm changed.
-                renderer = RENDERERS.get(state["page"], _render_unknown)
-                renderer(vm, surface)
-                _draw_secondary(surface, state["alerts_vm"], state["timesig_vm"], font)
-                _draw_status(surface, state["status_vm"], font)
-                _draw_beatprogress(surface, state["beatflash_vm"], state["loopprogress_vm"], font)
+                # when their own vm changed (`_paint_frame` skips them
+                # entirely on the screensaver page -- see its own docstring).
+                _paint_frame(surface, state["page"], vm, font, state["status_vm"],
+                             state["alerts_vm"], state["timesig_vm"],
+                             state["beatflash_vm"], state["loopprogress_vm"])
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
     finally:
@@ -893,12 +917,9 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
 
             vm = wait_first_snapshot(inbox, topic, _capture_status)
             surface = Surface(*OUT_SIZE)
-            renderer = RENDERERS.get(page, _render_unknown)
-            renderer(vm, surface)
-            _draw_secondary(surface, secondary["alerts_vm"], secondary["timesig_vm"], load_font())
-            _draw_status(surface, status["vm"], load_font())
-            _draw_beatprogress(surface, beatprogress["beatflash_vm"],
-                                beatprogress["loopprogress_vm"], load_font())
+            _paint_frame(surface, page, vm, load_font(), status["vm"],
+                         secondary["alerts_vm"], secondary["timesig_vm"],
+                         beatprogress["beatflash_vm"], beatprogress["loopprogress_vm"])
             surface.save_png(out_path)
             return 0
         return _run_device(client, inbox, fb_path, no_input, fps, page, topic)

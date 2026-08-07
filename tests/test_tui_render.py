@@ -27,6 +27,7 @@ from midicrt.clients.tui import (
     render_status_row,
     render_tuner_lines,
     render_voices_lines,
+    screensaver_row_texts,
 )
 
 VM = {"title": "EVENT LOG", "count": 12,
@@ -151,6 +152,28 @@ def test_render_screensaver_lines_is_entirely_blank():
 
 def test_render_screensaver_lines_handles_zero_height():
     assert render_screensaver_lines({"title": "SCREENSAVER"}, width=20, height=0) == []
+
+
+def test_screensaver_row_texts_is_fully_blank_including_chrome_rows():
+    # IMPORTANT fix (task-9 review): a screensaver-page "golden" proving
+    # EVERY row -- header, body, AND all three chrome rows -- goes
+    # entirely blank, no reverse-video content anywhere (matching v1's
+    # true full-screen fb blank). header/body here are exactly what
+    # render_screensaver_lines produces for a 10-row page body.
+    header = " " * 40
+    body = render_screensaver_lines({"title": "SCREENSAVER"}, width=40, height=10)
+    rows = screensaver_row_texts(header, body, width=40)
+    assert len(rows) == 1 + 10 + 3   # header + body + secondary/status/beatprogress
+    assert all(row == " " * 40 for row in rows)
+
+
+def test_screensaver_row_texts_chrome_rows_are_blank_even_with_active_content():
+    # The chrome-row blanking must not depend on what the (unused) status/
+    # alerts/beatflash/etc. VMs would otherwise say -- screensaver_row_texts
+    # takes no VM args at all, so there is nothing for "active" content to
+    # leak through from. Sanity-check the shape directly.
+    rows = screensaver_row_texts("H", ["B1", "B2"], width=5)
+    assert rows == ["H", "B1", "B2", "     ", "     ", "     "]
 
 
 # -- voices page (phase-3 task 4) --------------------------------------------

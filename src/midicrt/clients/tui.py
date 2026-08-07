@@ -469,20 +469,29 @@ def render_spectrum_lines(vm: dict, width: int, height: int) -> list[str]:
 #
 # All-blank rows, no header text at all -- see pages/screensaver.py's module
 # docstring for the v1 comparison (v1 zeroes the ENTIRE real framebuffer,
-# bypassing every plugin including chrome) and its disclosed limitation:
-# `run_tui`'s render loop still unconditionally reverse-videos this
-# renderer's first returned line as "the header" (that treatment lives in
-# the generic loop below, outside any per-page renderer's control), so the
-# very top row still shows as a solid color bar rather than true black.
-# This is accepted here rather than special-cased -- TUI runs in an
-# ordinary terminal emulator with no CRT burn-in risk in the first place;
-# the FB client (clients/fb/app.py's `render_screensaver_frame`, which
-# draws NO header at all) is the one this page's real "avoid burn-in"
-# purpose targets.
+# bypassing every plugin including chrome). `run_tui`'s render loop (below)
+# special-cases `state["page"] == _SCREENSAVER_PAGE` at its one chrome-
+# painting call site to skip `term.reverse()` on this renderer's blank
+# header AND skip painting the three chrome rows below it (task-9 review
+# fix -- a prior cut left them lit, a real CRT burn-in regression).
 
 
 def render_screensaver_lines(vm: dict, width: int, height: int) -> list[str]:
     return [" " * width for _ in range(max(0, height))]
+
+
+def screensaver_row_texts(header_line: str, body_lines: list[str], width: int) -> list[str]:
+    """The FULL blank-frame content for the screensaver page (task-9
+    review fix): `header_line`/`body_lines` (already all-blank, from
+    `render_screensaver_lines`) plus THREE further blank rows standing in
+    for the secondary/status/beatprogress chrome rows `run_tui` would
+    otherwise paint in reverse video. Pulled out as a pure function --
+    unlike the reverse-video assembly around it, which needs a real
+    `blessed.Terminal` for its escape codes -- purely so the "screensaver
+    means EVERY row goes blank, no chrome exempted" contract is directly
+    unit-testable. `run_tui` positions these plain (no `term.reverse()`)."""
+    blank_row = " " * width
+    return [header_line, *body_lines, blank_row, blank_row, blank_row]
 
 
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
@@ -492,6 +501,7 @@ RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
+_SCREENSAVER_PAGE = "screensaver"   # matches pages.screensaver.ScreensaverPage.name
 
 
 def run_tui(socket_path: str) -> int:
@@ -582,32 +592,47 @@ def run_tui(socket_path: str) -> int:
                     # the remaining `height - 3` rows.
                     renderer = RENDERERS.get(state["page"], _render_unknown)
                     page_lines = renderer(vm, term.width, term.height - 3)
-                    status_line = render_status_row(state["status_vm"], term.width)
-                    secondary_line = render_secondary_row(
-                        state["alerts_vm"], state["timesig_vm"], term.width)
-                    beatprogress_line = render_beatprogress_row(
-                        state["beatflash_vm"], state["loopprogress_vm"], term.width)
                     header_line, body_lines = page_lines[0], page_lines[1:]
-                    # Accent (bold) highlighting reaches back into the vm's
-                    # own "lines"/"style" shape -- eventlog-specific, but
-                    # `.get()` everywhere below keeps a page whose vm lacks
-                    # that shape from crashing the loop (it just renders
-                    # un-bolded). Factoring this into the per-page renderer
-                    # contract is future chrome-factoring work, not task 3.
-                    shown = _tail(vm.get("lines", []), len(body_lines))
-                    out = [term.home + term.reverse(header_line) + term.normal]
-                    for i, line in enumerate(body_lines):
-                        pad = len(body_lines) - len(shown)
-                        is_accent = i >= pad and shown[i - pad].get("style") == "accent"
-                        styled = term.bold(line) if is_accent else line
-                        out.append(term.move_xy(0, i + 1) + styled)
-                    out.append(term.move_xy(0, term.height - 3)
-                               + term.reverse(secondary_line) + term.normal)
-                    out.append(term.move_xy(0, term.height - 2)
-                               + term.reverse(status_line) + term.normal)
-                    out.append(term.move_xy(0, term.height - 1)
-                               + term.reverse(beatprogress_line) + term.normal)
-                    print("".join(out), end="", flush=True)
+                    if state["page"] == _SCREENSAVER_PAGE:
+                        # Important fix (task-9 review): a TRUE full blank,
+                        # no reverse video anywhere -- matching v1's raw fb
+                        # zeroing, which bypasses chrome entirely (leaving
+                        # three brightly-lit reverse-video bars burning at
+                        # the bottom would defeat the whole burn-in-
+                        # avoidance purpose). See fb/app.py's `_paint_frame`
+                        # for this fix's FB-side twin.
+                        rows = screensaver_row_texts(header_line, body_lines, term.width)
+                        out = [term.home + rows[0]]
+                        for i, line in enumerate(rows[1:]):
+                            out.append(term.move_xy(0, i + 1) + line)
+                        print("".join(out), end="", flush=True)
+                    else:
+                        status_line = render_status_row(state["status_vm"], term.width)
+                        secondary_line = render_secondary_row(
+                            state["alerts_vm"], state["timesig_vm"], term.width)
+                        beatprogress_line = render_beatprogress_row(
+                            state["beatflash_vm"], state["loopprogress_vm"], term.width)
+                        # Accent (bold) highlighting reaches back into the
+                        # vm's own "lines"/"style" shape -- eventlog-
+                        # specific, but `.get()` everywhere below keeps a
+                        # page whose vm lacks that shape from crashing the
+                        # loop (it just renders un-bolded). Factoring this
+                        # into the per-page renderer contract is future
+                        # chrome-factoring work, not task 3.
+                        shown = _tail(vm.get("lines", []), len(body_lines))
+                        out = [term.home + term.reverse(header_line) + term.normal]
+                        for i, line in enumerate(body_lines):
+                            pad = len(body_lines) - len(shown)
+                            is_accent = i >= pad and shown[i - pad].get("style") == "accent"
+                            styled = term.bold(line) if is_accent else line
+                            out.append(term.move_xy(0, i + 1) + styled)
+                        out.append(term.move_xy(0, term.height - 3)
+                                   + term.reverse(secondary_line) + term.normal)
+                        out.append(term.move_xy(0, term.height - 2)
+                                   + term.reverse(status_line) + term.normal)
+                        out.append(term.move_xy(0, term.height - 1)
+                                   + term.reverse(beatprogress_line) + term.normal)
+                        print("".join(out), end="", flush=True)
                     dirty = False
                 key = term.inkey(timeout=0.05)
                 if key == "q":

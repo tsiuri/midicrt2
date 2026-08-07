@@ -699,3 +699,31 @@ async def test_run_loop_fires_pagecycle_via_real_wall_clock():
     eng.stop()
     await task
     assert eng.current_page != "eventlog"
+
+
+async def test_pagecycle_does_not_unblank_screensaver_with_shipped_defaults():
+    # CRITICAL fix (task-9 review): reproduced against the actual shipped
+    # defaults (pagecycle_idle_s=300, screensaver_after_s=60, BOTH
+    # enabled -- Config()'s own defaults, no overrides). Before the fix,
+    # PageCycleBehavior.tick() never looked at current_page at all, so at
+    # t=300 (its own idle threshold, measured from the SAME
+    # last_activity_ts screensaver uses) it unconditionally dispatched
+    # page.next -- un-blanking the screensaver that had already activated
+    # at t=60 -- and then kept doing so every further 300s while the
+    # engine stayed fully idle (t=600, t=900, ...). See behaviors/
+    # pagecycle.py's own "Arbitration with the screensaver" docstring
+    # section for the fix. A fully idle engine must reach the screensaver
+    # at t=60 and STAY there through at least t=900.
+    eng = Engine(Config())
+    eng._last_activity_ts = 0.0
+    seen_screensaver_at = None
+    for now in range(901):
+        await eng._tick_behaviors(float(now))
+        if eng.current_page == "screensaver" and seen_screensaver_at is None:
+            seen_screensaver_at = now
+        if now >= 60:
+            assert eng.current_page == "screensaver", (
+                f"page wandered to {eng.current_page!r} at t={now} while fully idle "
+                "-- pagecycle un-blanked the screensaver"
+            )
+    assert seen_screensaver_at == 60

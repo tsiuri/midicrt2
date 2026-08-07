@@ -61,3 +61,34 @@ def test_remembers_whatever_page_was_current_at_activation_time():
     b.tick(now=60.0, last_activity_ts=0.0, current_page="harmony")
     result = b.tick(now=60.1, last_activity_ts=60.0, current_page="screensaver")
     assert result == ("page.goto", {"name": "harmony"})
+
+
+def test_manual_page_change_while_active_is_treated_as_user_override_no_restore():
+    # IMPORTANT fix (task-9 review): while active, a manual page.next/goto
+    # from ANY client (not MIDI activity) must be treated as the user
+    # taking over -- not silently overridden later by a stale restore.
+    b = ScreensaverBehavior(enabled=True, after_s=60.0)
+    assert b.tick(now=60.0, last_activity_ts=0.0, current_page="voices") == (
+        "page.goto", {"name": "screensaver"})
+    # Manual navigation to a DIFFERENT page than the one remembered
+    # ("voices") -- current_page just changes, no activity involved.
+    assert b.tick(now=61.0, last_activity_ts=0.0, current_page="harmony") is None
+    # Later MIDI activity arrives -- must NOT restore "voices" (the stale
+    # pre-activation page); the manual choice must already have won.
+    assert b.tick(now=62.0, last_activity_ts=62.0, current_page="harmony") is None
+
+
+def test_manual_override_without_new_activity_reactivates_on_the_next_tick():
+    # Disclosed, intended consequence of the fix above: idle time is
+    # measured PURELY from last_activity_ts (real MIDI traffic), which a
+    # manual page override does not touch -- there is no engine-side
+    # channel for a behavior to bump that shared clock itself. If
+    # last_activity_ts never advances, the screensaver is free to reclaim
+    # the display again on the very next tick; a manual escape buys no
+    # grace period unless real MIDI activity actually happens. See
+    # behaviors/screensaver.py's own module docstring.
+    b = ScreensaverBehavior(enabled=True, after_s=60.0)
+    b.tick(now=60.0, last_activity_ts=0.0, current_page="voices")
+    b.tick(now=61.0, last_activity_ts=0.0, current_page="harmony")   # manual override
+    assert b.tick(now=61.1, last_activity_ts=0.0, current_page="harmony") == (
+        "page.goto", {"name": "screensaver"})

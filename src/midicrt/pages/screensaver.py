@@ -12,27 +12,23 @@ carries no content, and both clients' renderers (`clients/tui.py`'s
 unlike every other v2 page, which always draws a reverse-video title
 header first.
 
-Disclosed limitation vs. v1: chrome strips stay lit
+Chrome strips are suppressed too -- a TRUE full blank (task-9 review fix)
 ---------------------------------------------------------------------------
 v1's raw-framebuffer blank overwrites the ENTIRE screen, including the
 area other plugins (timeclock/beatflash/etc.) would otherwise occupy --
 there is nothing left for the compositor to draw over once `_blank_fb()`
-runs. v2 cannot reproduce that: `clients/chrome.py`'s status/secondary/
-beatprogress strips are painted by each client's run loop AFTER the page
-renderer returns, unconditionally, regardless of which page is current
-(the same "page owns only its body" split every other phase-3 page already
-lives under -- see `docs/phase3-notes.md`'s "Factor frame chrome... BEFORE
-cloning the eventlog layout" contract). Suppressing chrome specifically
-for this one page would mean threading page-identity awareness into the
-otherwise page-agnostic run loops, which is out of this task's scope --
-disclosed here, not silently different from what a reader would expect.
-This also means TUI's screensaver body still shows a reverse-videoed
-(but textless) blank top row, since `run_tui`'s render loop always treats
-a renderer's first returned line as "the header" and reverse-videos it
-unconditionally -- of the two clients, this doesn't matter in practice:
-TUI runs in an ordinary terminal emulator with no CRT burn-in risk at all,
-so the FB client (which DOES draw a true, header-less black body) is the
-one this page's real "avoid burn-in" purpose targets.
+runs. The first cut of this page shipped WITHOUT reproducing that (chrome
+strips kept painting over the blank body every frame, regardless of
+page -- a real CRT burn-in regression a reviewer caught): `clients/fb/
+app.py`'s `_paint_frame` and `clients/tui.py`'s `run_tui` render loop now
+both check `page == "screensaver"` at their one shared chrome-painting
+call site and skip ALL THREE chrome strips entirely when it is, leaving
+the frame exactly as `render_screensaver_frame`/`render_screensaver_lines`
+already cleared it (background/blank) -- see those functions' own
+docstrings. TUI additionally overwrites its three bottom rows with plain
+blank text (not just skipping them) since a terminal, unlike a pixel
+surface, does not get implicitly "cleared" by the page renderer alone --
+stale content from a previous frame would otherwise persist there.
 
 `handle()` is a pure no-op: this page has no MIDI-reactive content of its
 own to update (unlike v1's plugin, which only ever reacts to wall-clock
