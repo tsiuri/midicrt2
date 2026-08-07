@@ -137,6 +137,12 @@ def _render_unknown(vm: dict, surface: Surface) -> None:
 # keep byte-identical across clients.
 ROW_PAD = 1            # vertical inset (top+bottom) inside each row's meter box, px
 NAME_COL_CHARS = 15    # "01 " + up to a 12-char instrument name
+NAME_MAX_CHARS = 12    # matches TUI's own name-column width (clients/tui.py's
+                       # _VOICES_NAME_WIDTH) -- keeps "01 <name>" within
+                       # NAME_COL_CHARS so it can never paint into `bar_x`'s
+                       # gap or the meter box itself (review fix: a
+                       # config-overridden name longer than this used to draw
+                       # untruncated, corrupting the layout).
 BAR_GAP = 8            # px between the name column and the meter, and meter and label
 BAR_W = 40             # px, includes the 1px outline on each side
 BAR_MAX = 8            # visual scale -- see comment above
@@ -172,7 +178,8 @@ def render_voices_frame(vm: dict, surface: Surface) -> None:
     for i, row in enumerate(rows):
         row_y = header_h + i * row_h
         text_y = row_y + max(0, (row_h - font.height) // 2)
-        draw_text(surface, LEFT_MARGIN, text_y, f"{row['ch']:02d} {row['name']}", NORMAL_FG, font)
+        name = row["name"][:NAME_MAX_CHARS]
+        draw_text(surface, LEFT_MARGIN, text_y, f"{row['ch']:02d} {name}", NORMAL_FG, font)
 
         bar_y = row_y + ROW_PAD
         bar_h = row_h - 2 * ROW_PAD

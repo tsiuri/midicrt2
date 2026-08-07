@@ -254,6 +254,81 @@ async def test_switch_topic_unsubscribes_old_and_subscribes_new(tmp_path):
     await asyncio.to_thread(client.close)
 
 
+async def test_page_next_action_drives_real_resubscribe_to_voices(tmp_path):
+    # The test above calls switch_topic() DIRECTLY -- it never proves the
+    # EVENT-DRIVEN path (page.next -> page_changed on the wire -> a
+    # client's own on_event callback -> switch_topic -> the new page's
+    # snapshot) actually works end to end against a REAL second page. This
+    # is the "T1 multi-page machinery's first real exercise" claim's actual
+    # proof (phase-3 task 4 review). The `on_event` closure below is a
+    # minimal harness reproducing tui.py's run_tui/fb's app.py
+    # `_make_page_switcher` callback shape exactly -- same drain/dispatch
+    # helpers (`wait_first_snapshot`, `switch_topic`), just without a
+    # terminal/framebuffer around them.
+    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    page, topic = await asyncio.to_thread(current_page_topic, client)
+    assert (page, topic) == ("eventlog", "page.eventlog")
+    await asyncio.to_thread(client.subscribe, [topic], 50.0)
+    inbox = client.start_reader()
+
+    state = {"page": page, "topic": topic}
+
+    def on_event(msg: dict) -> None:
+        if msg.get("kind") == "event" and msg.get("name") == "page_changed":
+            new_page = msg["data"]["page"]
+            new_topic = f"page.{new_page}"
+            switch_topic(client, state["topic"], new_topic, 50.0)
+            state["page"], state["topic"] = new_page, new_topic
+
+    # Prime on the real eventlog snapshot first, exactly like the TUI/fb
+    # startup wait -- proves the client is genuinely live on page.eventlog
+    # before anything switches.
+    vm = await asyncio.to_thread(wait_first_snapshot, inbox, lambda: state["topic"], on_event)
+    assert vm == {"title": "EVENT LOG", "count": 0, "lines": []}
+    assert state["page"] == "eventlog"
+
+    # Fire the real page.next action from a SEPARATE connection (mirrors a
+    # keypress dispatching an action independent of the render loop) --
+    # config.py's default roster is ["eventlog", "voices"], so this lands
+    # directly on the real "voices" page, not a fake double.
+    ctl = EngineClient(srv.socket_path)
+    await asyncio.to_thread(ctl.connect)
+    r = await asyncio.to_thread(ctl.action, "page.next")
+    assert r["ok"] is True and r["data"]["page"] == "voices"
+    await asyncio.to_thread(ctl.close)
+
+    # Block for the next matching snapshot -- the FIRST message through the
+    # persistent client's inbox is the page_changed EVENT itself, which
+    # `on_event` (not a manual switch_topic() call from the test) consumes
+    # and reacts to by resubscribing; `wait_first_snapshot`'s callable
+    # `topic` argument re-reads `state["topic"]` per message so the
+    # NEW topic (page.voices), set by on_event mid-call, is recognised
+    # rather than the stale one this call started with.
+    vm = await asyncio.to_thread(wait_first_snapshot, inbox, lambda: state["topic"], on_event)
+
+    assert state["page"] == "voices" and state["topic"] == "page.voices"
+    # A REAL VoicesPage snapshot -- 16 rows, real v1 instrument names from
+    # Config()'s default `instruments`, not a stub/fake shape.
+    assert vm["title"] == "VOICES"
+    assert len(vm["rows"]) == 16
+    assert vm["rows"][0]["name"] == "Kawai XD5"
+    assert vm["rows"][15]["name"] == "Akai CD4"
+    assert all(r.keys() == {"ch", "name", "active", "peak", "notes"} for r in vm["rows"])
+
+    # Server-side confirmation: the persistent client's connection really
+    # dropped page.eventlog and holds only page.voices now.
+    persistent_conn = next(c for c in srv._conns if c.topics == {"page.voices"})
+    assert persistent_conn is not None
+
+    eng.stop(); await task; await srv.close()
+    await asyncio.to_thread(client.close)
+
+    eng.stop(); await task; await srv.close()
+    await asyncio.to_thread(client.close)
+
+
 async def test_malformed_json_drops_only_that_client(tmp_path):
     eng, srv, task = await make(tmp_path)
 

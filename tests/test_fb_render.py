@@ -320,6 +320,32 @@ def test_render_voices_frame_draws_a_meter_box_outline_per_row():
         assert px[bar_x, bar_y] == app.NORMAL_FG
 
 
+def test_render_voices_frame_truncates_long_instrument_names():
+    # Review fix: `bar_x` is computed assuming the name column is bounded
+    # to NAME_COL_CHARS -- a config-overridden name longer than that must
+    # not paint glyph pixels into the gap before the meter box (or the box
+    # itself), or the layout corrupts. The gap zone [bar_x-BAR_GAP, bar_x)
+    # is pure background space with NO box/label content ever drawn there
+    # (BAR_GAP is a deliberate clear buffer), so ANY non-background pixel
+    # there can only be stray, untruncated name text.
+    long_name_row = {"ch": 1, "name": "A" * 50, "active": 0, "peak": 0, "notes": []}
+    surf = Surface(*VOICES_SURFACE_SIZE)
+    app.render_voices_frame({"title": "VOICES", "total": 0, "total_peak": 0,
+                             "rows": [long_name_row]}, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._status_strip_height(font) - header_h
+    row_h = usable_h // 1
+    text_y = header_h + max(0, (row_h - font.height) // 2)
+    bar_x = app.LEFT_MARGIN + app.NAME_COL_CHARS * font.width + app.BAR_GAP
+    for x in range(bar_x - app.BAR_GAP, bar_x):
+        for y in range(text_y, text_y + font.height):
+            assert px[x, y] == app.BG, (
+                f"stray name-text pixel at ({x},{y}) -- long name not truncated"
+            )
+
+
 def test_render_voices_frame_live_fill_reflects_active_count():
     # Channel 3 (index 2) is maxed at BAR_MAX active voices -> the topmost
     # interior row of its meter box must be filled; an idle channel's must
