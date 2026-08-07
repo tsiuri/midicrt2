@@ -673,6 +673,7 @@ def test_render_tuner_frame_golden_matches_frozen_fixture():
 # color mapping; the mode-specific squish/stretch MATH itself is already
 # covered by tests/test_pages_pianoroll.py's tempo-mode tests.
 GOLDEN_PIANOROLL_FRAME = FIXTURES / "fb_pianoroll_frame_golden.png"
+GOLDEN_PIANOROLL_TEMPO_FRAME = FIXTURES / "fb_pianoroll_tempo_frame_golden.png"
 PIANOROLL_SURFACE_SIZE = (420, 132)   # header(12) + usable(96, 13 pitch rows) + chrome(24)
 
 PIANOROLL_NOTES = [
@@ -685,6 +686,17 @@ PIANOROLL_VM = {
     "notes": PIANOROLL_NOTES,
     "window": {"mode": "wallclock", "span_s": 8.0, "span_beats": 16.0, "zoom": 1.0},
     "range": {"lo": 60, "hi": 72},
+}
+# Same synthetic geometry, "tempo" window metadata -- the renderer only ever
+# consumes already-projected x0/x1/y/vel (see the module comment above
+# render_pianoroll_frame), so this proves the HEADER text tracks
+# `window.mode` on the fb path too (mirrors tests/test_tui_render.py's own
+# GOLDEN_PIANOROLL_WALLCLOCK_FRAME/GOLDEN_PIANOROLL_TEMPO_FRAME split) --
+# body pixels are expected to be identical to the wallclock golden, only
+# the header row differs.
+PIANOROLL_VM_TEMPO = {
+    **PIANOROLL_VM,
+    "window": {"mode": "tempo", "span_s": 8.0, "span_beats": 16.0, "zoom": 1.0},
 }
 PIANOROLL_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
 PIANOROLL_ALERTS_VM = {"alerts": []}
@@ -772,6 +784,33 @@ def test_render_pianoroll_frame_golden_matches_frozen_fixture():
     golden = Image.open(GOLDEN_PIANOROLL_FRAME).convert("RGB")
     assert golden.size == PIANOROLL_SURFACE_SIZE
     assert surf.image.tobytes() == golden.tobytes()
+
+
+def test_render_pianoroll_frame_golden_matches_frozen_fixture_in_tempo_mode():
+    assert GOLDEN_PIANOROLL_TEMPO_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-7-fix1-report.md"
+    )
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM_TEMPO, surf)
+    app._draw_secondary(surf, PIANOROLL_ALERTS_VM, PIANOROLL_TIMESIG_VM, load_font())
+    app._draw_status(surf, PIANOROLL_STATUS_VM, load_font())
+
+    golden = Image.open(GOLDEN_PIANOROLL_TEMPO_FRAME).convert("RGB")
+    assert golden.size == PIANOROLL_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
+def test_pianoroll_tempo_and_wallclock_goldens_share_identical_body_pixels():
+    # The renderer only ever consumes already-projected coordinates -- see
+    # module comment above render_pianoroll_frame -- so the two golden
+    # fixtures must differ ONLY in the header row's text (mode string),
+    # never in the note-rect body below it.
+    wallclock = Image.open(GOLDEN_PIANOROLL_FRAME).convert("RGB")
+    tempo = Image.open(GOLDEN_PIANOROLL_TEMPO_FRAME).convert("RGB")
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    box = (0, header_h, PIANOROLL_SURFACE_SIZE[0], PIANOROLL_SURFACE_SIZE[1])
+    assert wallclock.crop(box).tobytes() == tempo.crop(box).tobytes()
 
 
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
