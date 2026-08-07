@@ -16,9 +16,28 @@ without crashing.
 a page other than eventlog would be rejected by the server as "unknown
 action" only if the page itself removed it -- eventlog.clear is global for
 now, unchanged from phase 2).
+
+Chrome (phase 3 task 3)
+------------------------
+The bottom terminal row is now a reverse-video transport status bar (same
+treatment as the header), built from `clients/chrome.py`'s shared
+`status_text()` so its wording is identical to the fb client's status
+strip. This is the "page owns height-2 rows" split phase3-notes.md asks
+for: `render_lines`'s own contract is UNCHANGED (it still renders its
+header + body, "the page's height-1 rows"), but `run_tui` now calls it
+with `term.height - 1` instead of `term.height`, reserving exactly one row
+for chrome to append below it. The header stays page-owned code (its text
+is page-specific -- title, count, keybinds -- unlike the status bar, which
+is identical regardless of which page is showing) rather than a second
+chrome extraction; only the NEW status row is chrome's to own here.
+`run_tui` subscribes to `overlay.status` ALONGSIDE the current page's
+topic (multi-topic subscribe -- `drain_latest`/`wait_first_snapshot`
+already supported many topics at once, just never asked for more than one
+before this).
 """
 import json
 
+from midicrt.clients import chrome
 from midicrt.clients.base import (
     ClientError,
     EngineClient,
@@ -56,6 +75,14 @@ def _render_unknown(vm: dict, width: int, height: int) -> list[str]:
     return [header] + body
 
 
+def render_status_row(vm: dict, width: int) -> str:
+    """TUI's presentation of the shared chrome status text (clients/chrome.py):
+    fit/pad to the exact terminal width, mirroring `render_lines`'s own
+    `_fit` usage. Reverse-video styling is applied by the caller (run_tui's
+    render loop, same as the header) -- stays plain-text/pure/testable."""
+    return _fit(chrome.status_text(vm), width)
+
+
 RENDERERS = {"eventlog": render_lines}
 
 _SUBSCRIBE_RATE = 10.0
@@ -69,14 +96,14 @@ def run_tui(socket_path: str) -> int:
     try:
         client.connect()
         page, topic = current_page_topic(client)
-        client.subscribe([topic], max_rate=_SUBSCRIBE_RATE)
+        client.subscribe([topic, chrome.OVERLAY_STATUS_TOPIC], max_rate=_SUBSCRIBE_RATE)
     except ClientError as exc:
         print(f"midicrt tui: {exc}")
         client.close()
         return 1
 
     inbox = client.start_reader()
-    state = {"page": page, "topic": topic}
+    state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM)}
 
     def on_event(msg: dict) -> None:
         if msg.get("kind") == "event" and msg.get("name") == "page_changed":
@@ -109,28 +136,42 @@ def run_tui(socket_path: str) -> int:
                     # `on_event` (invoked from inside this very call) can
                     # switch `state["topic"]` mid-drain, and a same-batch
                     # snapshot for the NEW topic must still be recognised.
-                    drained = drain_latest(inbox, lambda: {state["topic"]}, on_event=on_event)
+                    # `overlay.status` is a FIXED second member -- it is
+                    # never switched, so it needs no such closure trick.
+                    drained = drain_latest(
+                        inbox, lambda: {state["topic"], chrome.OVERLAY_STATUS_TOPIC},
+                        on_event=on_event)
                 except ClientError:
                     lost = True
                     return 1
                 if state["topic"] in drained:
                     vm, dirty = drained[state["topic"]], True
+                if chrome.OVERLAY_STATUS_TOPIC in drained:
+                    state["status_vm"] = drained[chrome.OVERLAY_STATUS_TOPIC]
+                    dirty = True
                 if dirty:
+                    # Chrome reserves the LAST row; the page renders header +
+                    # body into the remaining `height - 1` rows (see module
+                    # docstring's "page owns height-2 rows" note).
                     renderer = RENDERERS.get(state["page"], _render_unknown)
-                    lines = renderer(vm, term.width, term.height)
+                    page_lines = renderer(vm, term.width, term.height - 1)
+                    status_line = render_status_row(state["status_vm"], term.width)
+                    header_line, body_lines = page_lines[0], page_lines[1:]
                     # Accent (bold) highlighting reaches back into the vm's
                     # own "lines"/"style" shape -- eventlog-specific, but
                     # `.get()` everywhere below keeps a page whose vm lacks
                     # that shape from crashing the loop (it just renders
                     # un-bolded). Factoring this into the per-page renderer
-                    # contract is future chrome-factoring work, not task 1.
-                    shown = _tail(vm.get("lines", []), term.height - 1)
-                    out = [term.home + term.reverse(lines[0]) + term.normal]
-                    for i, line in enumerate(lines[1:]):
-                        pad = len(lines[1:]) - len(shown)
+                    # contract is future chrome-factoring work, not task 3.
+                    shown = _tail(vm.get("lines", []), len(body_lines))
+                    out = [term.home + term.reverse(header_line) + term.normal]
+                    for i, line in enumerate(body_lines):
+                        pad = len(body_lines) - len(shown)
                         is_accent = i >= pad and shown[i - pad].get("style") == "accent"
                         styled = term.bold(line) if is_accent else line
                         out.append(term.move_xy(0, i + 1) + styled)
+                    out.append(term.move_xy(0, term.height - 1)
+                               + term.reverse(status_line) + term.normal)
                     print("".join(out), end="", flush=True)
                     dirty = False
                 key = term.inkey(timeout=0.05)

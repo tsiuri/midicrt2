@@ -19,6 +19,22 @@ This module does not write to /dev/fb0 during Phase 2 Task 3 -- v1 owns the
 real CRT until Task 4's supervised smoke test exercises the real-device path
 (`_run_device`/`_read_fb_geometry`) for real. All tests here use `--out` PNG
 mode against a real (but socket-only) daemon.
+
+Chrome (phase 3 task 3)
+------------------------
+A bottom status strip (`_draw_status`, `font.height + 2*STATUS_PAD` px
+tall) now mirrors the TUI's bottom row: same shared text
+(`clients/chrome.py`'s `status_text()`), same reverse-video treatment as
+the header. `render_frame` reserves the strip's height when computing how
+many event lines fit (`_status_strip_height`) so the page body never draws
+under it, but does NOT draw the strip itself -- `render_frame`'s own
+signature/contract is unchanged (still `(vm, Surface) -> None`, still only
+the eventlog page's own content, no analyzer/overlay knowledge). The run
+loops (`run()`'s `--out` branch and `_run_device`) call `_draw_status`
+separately, right after the page renderer, same "page owns everything
+except the reserved strip" split as tui.py's `render_lines`/
+`render_status_row`. Both clients subscribe to `overlay.status` ALONGSIDE
+the current page's topic (multi-topic subscribe).
 """
 import argparse
 import logging
@@ -28,6 +44,7 @@ import threading
 from pathlib import Path
 
 from midicrt import config as config_mod
+from midicrt.clients import chrome
 from midicrt.clients.base import (
     ClientError,
     EngineClient,
@@ -52,6 +69,7 @@ ACCENT_FG = (0, 255, 80)
 HEADER_PAD = 2   # vertical inset (top+bottom) inside the header bar, px
 LINE_GAP = 1     # extra vertical gap between event-line rows, px
 LEFT_MARGIN = 4  # left inset for header + event text, px
+STATUS_PAD = 2   # vertical inset (top+bottom) inside the status strip, px -- mirrors HEADER_PAD
 
 # `--out` mode always renders at this fixed size (task brief: "--out mode
 # uses 800x475 fixed"), independent of whatever a real /dev/fb0 reports.
@@ -69,11 +87,14 @@ def render_frame(vm: dict, surface: Surface) -> None:
     Layout: a reverse-video header bar (`HEADER_BG` fill, text painted in
     `BG` so it reads as inverted) showing "<title>  (<count> events)", then
     event lines below it, oldest-to-newest top-to-bottom, tailed to
-    whatever fits the remaining height at one text-line per row. Tailing
-    reuses `clients.tui._tail`'s exact slicing (imported, not duplicated)
-    so the fb and TUI clients agree on "what's visible" for the same
-    view-model. Accent-styled lines (currently note_on events -- see
-    pages/eventlog.py) draw in the brighter tone.
+    whatever fits the remaining height at one text-line per row. The
+    bottom `_status_strip_height(font)` px are reserved (left as
+    background -- NOT drawn here, see `_draw_status`) so the page body
+    never overlaps the chrome status strip the run loops paint after this.
+    Tailing reuses `clients.tui._tail`'s exact slicing (imported, not
+    duplicated) so the fb and TUI clients agree on "what's visible" for
+    the same view-model. Accent-styled lines (currently note_on events --
+    see pages/eventlog.py) draw in the brighter tone.
     """
     font = load_font()
     surface.clear(BG)
@@ -84,7 +105,8 @@ def render_frame(vm: dict, surface: Surface) -> None:
     draw_text(surface, LEFT_MARGIN, HEADER_PAD, header_text, BG, font)
 
     line_h = font.height + LINE_GAP
-    body_h = max(0, (surface.height - header_h) // line_h)
+    usable_h = surface.height - _status_strip_height(font)
+    body_h = max(0, (usable_h - header_h) // line_h)
     for i, line in enumerate(_tail(vm["lines"], body_h)):
         color = ACCENT_FG if line["style"] == "accent" else NORMAL_FG
         draw_text(surface, LEFT_MARGIN, header_h + i * line_h, line["text"], color, font)
@@ -100,6 +122,30 @@ def _render_unknown(vm: dict, surface: Surface) -> None:
 
 
 RENDERERS = {"eventlog": render_frame}
+
+
+# -- chrome: status strip (phase-3 task 3) -----------------------------------
+
+
+def _status_strip_height(font) -> int:
+    """Pixel height of the bottom status strip -- mirrors the header's own
+    `font.height + 2*HEADER_PAD` sizing convention (see module docstring)."""
+    return font.height + 2 * STATUS_PAD
+
+
+def _draw_status(surface: Surface, vm: dict, font) -> None:
+    """Paint the bottom status strip onto `surface`: a reverse-video bar
+    (same `HEADER_BG` fill / `BG` text convention as the page header)
+    showing the shared chrome status text (`clients/chrome.py` --
+    word-for-word identical to the TUI's bottom row, per the task-3
+    brief's "mirrors it"). Pinned to the bottom `_status_strip_height(font)`
+    px of `surface`, which `render_frame` already leaves clear for this.
+    Pure aside from the font glyph cache, same contract as `render_frame`.
+    """
+    strip_h = _status_strip_height(font)
+    y = surface.height - strip_h
+    surface.rect(0, y, surface.width, strip_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, chrome.status_text(vm), BG, font)
 
 
 # -- real-device geometry (coded here, exercised only in Task 4) -----------
@@ -212,7 +258,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
     """
     width, height, stride = _read_fb_geometry()
     surface = Surface(width, height)
-    state = {"page": page, "topic": topic}
+    font = load_font()
+    state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM)}
     on_event = _make_page_switcher(client, state, fps)
 
     fb_file, fb_mm = open_fb_mmap(fb_path, stride * height)
@@ -232,6 +279,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
         renderer = RENDERERS.get(state["page"], _render_unknown)
         renderer(vm, surface)
+        _draw_status(surface, state["status_vm"], font)
         surface.write_to_mmap(fb_mm, stride=stride)
 
         period = 1.0 / fps
@@ -242,11 +290,24 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             # (invoked from inside this very call) can switch `state["topic"]`
             # mid-drain, and a same-batch snapshot for the NEW topic must
             # still be recognised, not dropped by a stale membership check.
-            drained = drain_latest(inbox, lambda: {state["topic"]}, on_event=on_event)
-            if state["topic"] in drained:
+            # `overlay.status` is a fixed second member -- updates on its own
+            # schedule (once a beat), independent of the page topic.
+            drained = drain_latest(
+                inbox, lambda: {state["topic"], chrome.OVERLAY_STATUS_TOPIC},
+                on_event=on_event)
+            page_updated = state["topic"] in drained
+            if page_updated:
                 vm = drained[state["topic"]]
+            status_updated = chrome.OVERLAY_STATUS_TOPIC in drained
+            if status_updated:
+                state["status_vm"] = drained[chrome.OVERLAY_STATUS_TOPIC]
+            if page_updated or status_updated:
+                # `render_frame` clears the WHOLE surface, so the status
+                # strip must be repainted on every redraw, not just when
+                # `status_vm` itself changed.
                 renderer = RENDERERS.get(state["page"], _render_unknown)
                 renderer(vm, surface)
+                _draw_status(surface, state["status_vm"], font)
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
     finally:
@@ -260,7 +321,7 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
     try:
         client.connect()
         page, topic = current_page_topic(client)
-        client.subscribe([topic], max_rate=fps)
+        client.subscribe([topic, chrome.OVERLAY_STATUS_TOPIC], max_rate=fps)
     except ClientError as exc:
         print(f"midicrt-fb: {exc}")
         client.close()
@@ -274,11 +335,23 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
             # fb device regardless of --no-input/--fb. No input thread
             # exists in this path (deliberately, per the docstring above),
             # so there's no concurrent source of a page_changed here -- a
-            # plain fixed `topic`, no `on_event`, is correct as-is.
-            vm = wait_first_snapshot(inbox, topic)
+            # plain fixed `topic` for the PAGE wait is correct as-is; the
+            # overlay.status snapshot (seeded server-side at subscribe()
+            # time, same as the page's) is captured opportunistically via
+            # `on_event` -- both are typically delivered in the very first
+            # push tick, but a sane default covers the case it hasn't
+            # landed yet by the time the page snapshot does.
+            status = {"vm": dict(chrome.DEFAULT_STATUS_VM)}
+
+            def _capture_status(msg: dict) -> None:
+                if msg.get("kind") == "snapshot" and msg.get("topic") == chrome.OVERLAY_STATUS_TOPIC:
+                    status["vm"] = msg["data"]
+
+            vm = wait_first_snapshot(inbox, topic, _capture_status)
             surface = Surface(*OUT_SIZE)
             renderer = RENDERERS.get(page, _render_unknown)
             renderer(vm, surface)
+            _draw_status(surface, status["vm"], load_font())
             surface.save_png(out_path)
             return 0
         return _run_device(client, inbox, fb_path, no_input, fps, page, topic)

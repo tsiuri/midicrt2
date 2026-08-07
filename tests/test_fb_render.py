@@ -35,6 +35,15 @@ VM = {
 }
 GOLDEN_SURFACE_SIZE = (220, 60)
 
+# The golden-frame fixture now also exercises the chrome status strip
+# (phase-3 task 3: "golden updates for both renderers -- chrome now
+# present") -- a fixed, representative overlay.status view-model so the
+# frozen PNG shows real BPM/BAR/BEAT/running/source content, not just the
+# all-defaults idle state (that case is covered separately by the
+# `--out`-mode golden against a real `--no-midi` daemon, which never sees
+# a start/clock event and so IS the all-defaults case).
+GOLDEN_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+
 
 def test_renderers_dispatch_table_has_eventlog():
     assert app.RENDERERS["eventlog"] is app.render_frame
@@ -84,8 +93,9 @@ def test_render_frame_body_background_untouched_with_no_lines():
 def test_render_frame_tails_to_whatever_fits_newest_only():
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
+    strip_h = app._status_strip_height(font)
     line_h = font.height + app.LINE_GAP
-    size = (200, header_h + line_h)  # room for exactly one body line
+    size = (200, header_h + strip_h + line_h)  # room for exactly one body line
     many = {"title": "EVENT LOG", "count": 5,
             "lines": [{"text": f"line{i}", "style": "normal"} for i in range(5)]}
 
@@ -105,8 +115,9 @@ def test_render_frame_tails_to_whatever_fits_newest_only():
 def test_render_frame_orders_tail_oldest_to_newest_top_down():
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
+    strip_h = app._status_strip_height(font)
     line_h = font.height + app.LINE_GAP
-    size = (200, header_h + 2 * line_h)  # room for exactly two body lines
+    size = (200, header_h + strip_h + 2 * line_h)  # room for exactly two body lines
     many = {"title": "EVENT LOG", "count": 5,
             "lines": [{"text": f"line{i}", "style": "normal"} for i in range(5)]}
 
@@ -124,17 +135,83 @@ def test_render_frame_orders_tail_oldest_to_newest_top_down():
     assert got.image.tobytes() == want.image.tobytes()
 
 
+def test_render_frame_reserves_the_bottom_status_strip_as_background():
+    # The strip itself is reserved (left BG) by render_frame, not drawn --
+    # `_draw_status` (called separately by the run loops) paints it.
+    font = load_font()
+    strip_h = app._status_strip_height(font)
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    many = {"title": "EVENT LOG", "count": 50,
+            "lines": [{"text": f"line{i}", "style": "normal"} for i in range(50)]}
+    app.render_frame(many, surf)  # enough lines to fill all available body rows
+    px = surf.image.load()
+    y_in_strip = surf.height - strip_h + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_status_strip_height_matches_header_sizing_convention():
+    font = load_font()
+    assert app._status_strip_height(font) == font.height + 2 * app.STATUS_PAD
+
+
+def test_draw_status_paints_reverse_video_bar_at_the_bottom():
+    font = load_font()
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    surf.clear(app.BG)
+    app._draw_status(surf, GOLDEN_STATUS_VM, font)
+    px = surf.image.load()
+    strip_h = app._status_strip_height(font)
+    y = surf.height - strip_h
+    # Fill matches the header's reverse-video bar colour.
+    assert px[surf.width - 1, y] == app.HEADER_BG
+    assert px[surf.width - 1, surf.height - 1] == app.HEADER_BG
+    # Above the strip is untouched.
+    assert px[0, y - 1] == app.BG
+    # A lit stroke pixel of the status text is painted in the background
+    # colour (reverse video), same convention as the header.
+    assert any(
+        px[x, yy] == app.BG
+        for x in range(app.LEFT_MARGIN, surf.width)
+        for yy in range(y + app.STATUS_PAD, y + app.STATUS_PAD + font.height)
+    )
+
+
+def test_draw_status_text_matches_shared_chrome_status_text():
+    from midicrt.clients import chrome
+
+    font = load_font()
+    surf_a = Surface(300, GOLDEN_SURFACE_SIZE[1])
+    surf_a.clear(app.BG)
+    app._draw_status(surf_a, GOLDEN_STATUS_VM, font)
+
+    surf_b = Surface(300, GOLDEN_SURFACE_SIZE[1])
+    surf_b.clear(app.BG)
+    strip_h = app._status_strip_height(font)
+    y = surf_b.height - strip_h
+    surf_b.rect(0, y, surf_b.width, strip_h, app.HEADER_BG)
+    draw_text(surf_b, app.LEFT_MARGIN, y + app.STATUS_PAD,
+              chrome.status_text(GOLDEN_STATUS_VM), app.BG, font)
+
+    assert surf_a.image.tobytes() == surf_b.image.tobytes()
+
+
 def test_render_frame_accent_color_is_brighter_than_normal():
     assert app.ACCENT_FG != app.NORMAL_FG
     assert sum(app.ACCENT_FG) > sum(app.NORMAL_FG)
 
 
 def test_render_frame_golden_matches_frozen_fixture():
+    # Phase-3 task 3: the golden now composes BOTH renderers, page body
+    # (render_frame) + chrome status strip (_draw_status), the same way the
+    # real run loops do -- "golden updates for both renderers, chrome now
+    # present" (task-3 brief).
     assert GOLDEN_FRAME.exists(), (
         "golden fixture missing -- see freeze procedure in task-3-report.md"
     )
     surf = Surface(*GOLDEN_SURFACE_SIZE)
     app.render_frame(VM, surf)
+    app._draw_status(surf, GOLDEN_STATUS_VM, load_font())
 
     golden = Image.open(GOLDEN_FRAME).convert("RGB")
     assert golden.size == GOLDEN_SURFACE_SIZE
@@ -156,6 +233,10 @@ def _start_daemon(sock):
 
 
 def test_out_mode_renders_one_frame_and_exits_against_real_daemon(tmp_path):
+    # A fresh `--no-midi` daemon's TransportAnalyzer never sees a start/
+    # clock event, so this golden's status strip is the all-defaults idle
+    # state (chrome.DEFAULT_STATUS_VM) -- the non-idle case is covered by
+    # test_render_frame_golden_matches_frozen_fixture above.
     assert GOLDEN_EMPTY.exists(), (
         "golden fixture missing -- see freeze procedure in task-3-report.md"
     )

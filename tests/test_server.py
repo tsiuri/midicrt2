@@ -58,7 +58,7 @@ async def test_hello_and_describe(tmp_path):
     d = await c.request("describe")
     assert "eventlog.clear" in d["data"]["actions"]
     assert d["data"]["pages"] == ["eventlog"]
-    assert d["data"]["topics"] == ["page.eventlog"]
+    assert d["data"]["topics"] == ["page.eventlog", "overlay.status"]
     eng.stop(); await task; await srv.close()
 
 
@@ -84,6 +84,28 @@ async def test_subscribe_streams_latest_snapshot(tmp_path):
     snaps = [m for m in c.inbox if m.get("kind") == "snapshot"]
     assert snaps, "expected at least one snapshot"
     assert snaps[-1]["data"]["lines"][-1]["text"] == "n4"  # latest wins
+    eng.stop(); await task; await srv.close()
+
+
+async def test_subscribe_to_page_and_overlay_delivers_both_snapshots(tmp_path):
+    # phase-3 task 3: a client subscribing to a page topic ALONGSIDE
+    # overlay.status (the chrome multi-topic subscribe both clients now do)
+    # must get snapshots for both, independently -- proves the dispatch
+    # table's multi-topic support end-to-end over the real wire protocol,
+    # not just drain_latest()'s in-memory contract (tests/test_client_base.py).
+    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    r = await c.request("subscribe", topics=["page.eventlog", "overlay.status"], max_rate=50.0)
+    assert r["ok"] is True
+    assert sorted(r["data"]["topics"]) == ["overlay.status", "page.eventlog"]
+
+    await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 60, 1, "n0"))
+    await asyncio.sleep(0.3)
+    await c.read_msgs(0.2)
+    snaps = {m["topic"] for m in c.inbox if m.get("kind") == "snapshot"}
+    assert snaps == {"page.eventlog", "overlay.status"}
     eng.stop(); await task; await srv.close()
 
 

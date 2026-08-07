@@ -45,6 +45,17 @@ def test_eventlog_page_capacity_and_vm():
     assert vm["lines"][1]["style"] == "accent"   # note_on
 
 
+def test_eventlog_page_ignores_clock_tick_no_spam():
+    # phase-3 task 3: engine/midi_in.py aggregates raw MIDI clock into one
+    # clock_tick MidiEvent per beat for the transport analyzer -- the
+    # eventlog page must not surface it as a line.
+    eng = Engine(Config())
+    page = eng.pages["eventlog"]
+    changed = page.handle(ev(type="clock_tick", summary="clock_tick"))
+    assert changed is False
+    assert page.view_model()["count"] == 0
+
+
 async def test_engine_publishes_dirty_snapshots():
     eng = Engine(Config(tick_hz=50.0))
     got = []
@@ -98,7 +109,7 @@ def test_register_page_appends_to_live_roster():
 def test_engine_topics_reflects_roster_order():
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
-    assert eng.topics == ["page.eventlog", "page.second"]
+    assert eng.topics == ["page.eventlog", "page.second", "overlay.status"]
 
 
 def test_handle_marks_dirty_only_for_pages_reporting_true():
@@ -119,6 +130,73 @@ def test_handle_marks_non_current_page_dirty_too():
     assert eng.current_page == "eventlog"  # "loud" is NOT current
     eng._handle(ev())
     assert eng._dirty == {"page.eventlog", "page.loud"}
+
+
+# -- transport analyzer / overlay wiring (phase-3 task 3) --------------------
+
+def test_default_analyzer_roster_is_status_only():
+    eng = Engine(Config())
+    assert list(eng.analyzers) == ["status"]
+
+
+def test_register_analyzer_appends_to_live_roster():
+    eng = Engine(Config())
+    fake = _FakePage()  # same handle()/view_model() shape as an Analyzer
+    eng.register_analyzer("second", fake)
+    assert list(eng.analyzers) == ["status", "second"]
+    assert eng.analyzers["second"] is fake
+
+
+def test_topics_include_overlay_after_page_topics():
+    eng = Engine(Config())
+    assert eng.topics == ["page.eventlog", "overlay.status"]
+
+
+def test_handle_marks_overlay_dirty_when_analyzer_reports_true():
+    eng = Engine(Config())
+    loud = _FakePage(dirty=True)
+    eng.register_analyzer("loud", loud)
+    eng._handle(ev())
+    assert "overlay.loud" in eng._dirty
+    assert loud.seen == 1  # analyzers see every event too, same as pages
+
+
+def test_handle_does_not_mark_overlay_dirty_when_analyzer_reports_false():
+    eng = Engine(Config())
+    quiet = _FakePage(dirty=False)
+    eng.register_analyzer("quiet", quiet)
+    eng._handle(ev())
+    assert "overlay.quiet" not in eng._dirty
+    assert quiet.seen == 1
+
+
+def test_snapshot_now_serves_overlay_topic():
+    eng = Engine(Config())
+    snap = eng.snapshot_now("overlay.status")
+    assert snap is not None
+    assert snap["topic"] == "overlay.status"
+    assert snap["data"] == {
+        "bpm": None, "bar": 0, "beat": 1, "running": False, "source": None,
+    }
+
+
+def test_snapshot_now_unknown_overlay_returns_none():
+    eng = Engine(Config())
+    assert eng.snapshot_now("overlay.nonexistent") is None
+
+
+async def test_clock_tick_does_not_dirty_eventlog_but_dirties_overlay_once_running():
+    # The eventlog page must never show clock spam; the status overlay must
+    # react to it (once transport is running -- see analyzers/transport.py).
+    eng = Engine(Config())
+    eng._handle(MidiEvent(ts=0.0, source="USB", type="start", channel=None,
+                          data1=None, data2=None, summary="start"))
+    eng._dirty.clear()
+    eng._handle(MidiEvent(ts=0.5, source="USB", type="clock_tick", channel=None,
+                          data1=24, data2=None, summary="clock_tick",
+                          clock_batch_start=None))
+    assert eng._dirty == {"overlay.status"}
+    assert eng.pages["eventlog"].view_model()["count"] == 1  # only the "start" line
 
 
 async def test_page_next_prev_cycle_and_emit_page_changed():

@@ -26,10 +26,26 @@ with no back-reference to the engine.
 Event topics
 ------------
 `Engine.topics` is the single source of truth for "all subscribable
-topics" (currently `page.<name>` for each roster entry) -- `describe`
+topics" -- `page.<name>` for each page roster entry AND `overlay.<name>`
+for each analyzer (phase-3 task 3 is the first of the latter) -- `describe`
 reports it verbatim so it can never drift from what `snapshot_now` can
-actually resolve. Future phases append non-page topics (overlays) here as
-those land.
+actually resolve.
+
+Analyzers (phase-3 task 3)
+--------------------------
+`Engine.analyzers` mirrors `Engine.pages`: an ordered dict (`name ->
+analyzer instance`) built from `_ANALYZER_FACTORIES`, published under
+`overlay.<name>` topics instead of `page.<name>`. Unlike pages, analyzers
+are not config-gated (no `config.overlays` list exists yet) -- every
+registered analyzer is always live, since there is currently exactly one
+(`"status"` -> `TransportAnalyzer`) and it is meant to be visible
+regardless of which page is current (a status bar, not a page). Analyzers
+are wired BEFORE pages in `__init__`/`_handle` on the (currently latent,
+future-proofing) assumption that a page's own view_model could one day
+read an analyzer's derived state within the same event tick; today the two
+sets are independent and order has no observable effect.
+`Engine.register_analyzer()` mirrors `register_page()` for the same
+test/dynamically-arriving-overlay reasons.
 """
 import asyncio
 import time
@@ -38,6 +54,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from midicrt import proto
+from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.eventlog import EventLogPage
@@ -52,6 +69,14 @@ class MidiEvent:
     data1: int | None
     data2: int | None
     summary: str
+    # `type == "clock_tick"` only: timestamp of the PREVIOUS 24-raw-clock
+    # aggregation boundary (see engine/midi_in.py's module docstring for why
+    # clock is batched instead of queued per-pulse). `ts - clock_batch_start`
+    # spans exactly 24 clock pulses (one quarter note), letting
+    # analyzers/transport.py derive bpm without any smoothing of its own.
+    # None for every other event type, and for the first batch after a
+    # start/stop/continue reset (no prior boundary exists yet).
+    clock_batch_start: float | None = None
 
 
 class Page(Protocol):
@@ -59,12 +84,29 @@ class Page(Protocol):
     def view_model(self) -> dict: ...
 
 
+class Analyzer(Protocol):
+    """Same shape as `Page` (see analyzers/__init__.py) -- kept as a
+    separate Protocol rather than reusing `Page` so the two roster kinds
+    stay independently evolvable even though today they're structurally
+    identical."""
+
+    def handle(self, ev: MidiEvent) -> bool: ...
+    def view_model(self) -> dict: ...
+
+
 PageFactory = Callable[[Config], Page]
+AnalyzerFactory = Callable[[Config], Analyzer]
 
 # Known production pages, keyed by the name used in config.pages / topics.
 # Add an entry here as each phase-3 parity page lands.
 _PAGE_FACTORIES: dict[str, PageFactory] = {
     "eventlog": lambda config: EventLogPage(capacity=config.eventlog_capacity),
+}
+
+# Known production analyzers, keyed by the name used in the `overlay.<name>`
+# topic. Unlike pages, not config-gated -- see the module docstring.
+_ANALYZER_FACTORIES: dict[str, AnalyzerFactory] = {
+    "status": lambda config: TransportAnalyzer(),
 }
 
 
@@ -73,6 +115,9 @@ class Engine:
         self.config = config
         self.queue: asyncio.Queue = asyncio.Queue()
         self.actions = ActionRegistry()
+        self.analyzers: dict[str, Analyzer] = {
+            name: factory(config) for name, factory in _ANALYZER_FACTORIES.items()
+        }
         self.pages: dict[str, Page] = {
             name: _PAGE_FACTORIES[name](config)
             for name in config.pages
@@ -105,6 +150,12 @@ class Engine:
         overlays later)."""
         self.pages[name] = page
 
+    def register_analyzer(self, name: str, analyzer: Analyzer) -> None:
+        """Append `analyzer` to the live roster under `name`, publishing it
+        under `overlay.<name>`. Mirrors `register_page()` for the same
+        no-production-factory-yet reasons (tests today)."""
+        self.analyzers[name] = analyzer
+
     def _page_order(self) -> list[str]:
         return list(self.pages)
 
@@ -130,8 +181,9 @@ class Engine:
 
     @property
     def topics(self) -> list[str]:
-        """All subscribable topics, roster order."""
-        return [f"page.{name}" for name in self.pages]
+        """All subscribable topics, roster order: pages first, then overlays."""
+        return [f"page.{name}" for name in self.pages] + \
+            [f"overlay.{name}" for name in self.analyzers]
 
     def add_listener(self, cb: Callable[[dict], None]) -> None:
         self._listeners.append(cb)
@@ -144,12 +196,17 @@ class Engine:
         self._broadcast(proto.event(name, data))
 
     def snapshot_now(self, topic: str) -> dict | None:
-        page = self.pages.get(topic.removeprefix("page."))
-        if page is None:
+        if topic.startswith("page."):
+            obj = self.pages.get(topic.removeprefix("page."))
+        elif topic.startswith("overlay."):
+            obj = self.analyzers.get(topic.removeprefix("overlay."))
+        else:
+            obj = None
+        if obj is None:
             return None
         seq = self._seq.get(topic, 0) + 1
         self._seq[topic] = seq
-        return proto.snapshot(topic, seq, page.view_model())
+        return proto.snapshot(topic, seq, obj.view_model())
 
     def status(self) -> dict:
         return {
@@ -162,6 +219,9 @@ class Engine:
 
     def _handle(self, ev: MidiEvent) -> None:
         self.events_total += 1
+        for name, analyzer in self.analyzers.items():
+            if analyzer.handle(ev):
+                self._dirty.add(f"overlay.{name}")
         for name, page in self.pages.items():
             if page.handle(ev):
                 self._dirty.add(f"page.{name}")
