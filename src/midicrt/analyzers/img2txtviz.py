@@ -24,7 +24,7 @@ ASCII-density charsets each frame. "img2txt" names the ASCII IMAGE it
 Consequently: no `imgbank_dir` config key exists (there is nothing on disk
 this page reads, so a "point v2's default at v1's imgbank path" fallback
 would be pointing at nothing this page ever opens), and there is no
-"next image" control -- the task brief's own speculative "(next image
+"next image" control -- the task dispatch's own speculative "(next image
 action?)" parenthetical does not apply. v1's REAL controls, read from its
 `keypress()` (lines ~178-214 there): `[`/`]` block size, `i` invert, `c`
 charset cycle, `a` audio toggle, `g`/`h`/`-`/`+` gamma, `j`/`k` fps cap,
@@ -79,8 +79,9 @@ Disclosed v2 adaptation (not a literal port -- see "Investigation finding")
 - Grid resolution: fixed `GRID_COLS=40, GRID_ROWS=20` (2:1) -- independent
   of any client's terminal/pixel size, matching pages/pianoroll.py's own
   "engine emits a fixed normalized shape, renderers quantize/upsample to
-  their own raster" convention (docs/phase3-notes.md's "renderers only
-  quantize" rule) rather than v1's live-terminal-size / user-adjustable-
+  their own raster" convention (the design spec's §5: renderers are
+  "client-side, deliberately dumb" and "quantize normalized view-models to
+  the raster") rather than v1's live-terminal-size / user-adjustable-
   block-size buffer.
 - The wave field (`_cell_value` below) is a disclosed, independently-
   specified 3-term spatial function (two orthogonal sine sweeps + a

@@ -62,7 +62,7 @@ class Config:
     # actually the deciding signal for v2's roster, given task 9's own
     # finding that `behaviors/pagecycle.py` doesn't model that curated-
     # subset concept at all). "config" (also task 10) is a read-only
-    # viewer with zero dependency of any kind -- the task brief's own
+    # viewer with zero dependency of any kind -- the task dispatch's own
     # explicit ask ("roster: add 'config'") -- appended last as the newest
     # addition, same convention every prior task's page followed.
     pages: list[str] = field(

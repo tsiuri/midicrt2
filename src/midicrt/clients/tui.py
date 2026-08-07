@@ -486,10 +486,11 @@ def render_screensaver_lines(vm: dict, width: int, height: int) -> list[str]:
 # -- img2txtviz page (phase-3 task 10) ---------------------------------------
 #
 # The engine already emits a FIXED `GRID_ROWS` x `GRID_COLS` grid of final
-# [0,1] brightness values (analyzers/img2txtviz.py's own module docstring:
-# "renderers only quantize" -- docs/phase3-notes.md's rule) -- this
-# renderer's only job is a nearest-neighbor UPSAMPLE from that small grid
-# onto `width` x `body_h` terminal cells (the reverse direction of
+# [0,1] brightness values (analyzers/img2txtviz.py's own module docstring,
+# citing the design spec's §5 "renderers... quantize normalized view-models
+# to the raster" rule) -- this renderer's only job is a nearest-neighbor
+# UPSAMPLE from that small grid onto `width` x `body_h` terminal cells (the
+# reverse direction of
 # `_pianoroll_grid`'s continuous-to-bucket quantization above, same "the
 # engine emits one normalized shape, every client quantizes it to its own
 # raster independently" spirit), then an index into `vm["charset"]`

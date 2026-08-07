@@ -4,10 +4,11 @@ clarification: "The config page is a *viewer* of effective config plus a
 surface for the runtime-adjustable parameters, which it changes via
 actions -- durable edits remain hand-edits to `config.toml`, keeping the
 never-writes rule intact." This task (10) implements the VIEWING half only,
-per its own explicit scope note: "read-only display; NO mutation actions in
-this task (runtime-adjustable params already have their own actions
-elsewhere)" -- e.g. `pianoroll.zoom`/`.projection`/`.channels` (task 7),
-`img2txtviz.charset`/`.invert` (this same task, see pages/img2txtviz.py).
+per the task dispatch's own explicit scope note: "read-only display; NO
+mutation actions in this task (runtime-adjustable params already have their
+own actions elsewhere)" -- e.g. `pianoroll.zoom`/`.projection`/`.channels`
+(task 7), `img2txtviz.charset`/`.invert` (this same task, see
+pages/img2txtviz.py).
 This page only DISPLAYS the config those actions already mutate live state
 for; it registers no actions of its own.
 
@@ -19,15 +20,15 @@ to mutate values in place, `s` to write `settings.json` back to disk via
 the "runtime settings-rewrite once destroyed the user's instrument names"
 clobber class spec §7 exists to eliminate). v2 drops ALL of that: per spec
 §7's hard config/state split ("Engine never writes it... `config.reload`
-applies hand edits") and this task's own explicit "NO mutation actions"
-scope, this page instead shows a FIXED, flat list of the fields that
-actually matter operationally (the ones spec §5's task brief calls out:
+applies hand edits") and the task dispatch's own explicit "NO mutation
+actions" scope, this page instead shows a FIXED, flat list of the fields
+that actually matter operationally (the ones the task dispatch calls out:
 socket path, midi_sources, tick_hz, pages roster, instrument NAME COUNT,
 behavior knobs, capture keys "when they exist") rather than a generic
 recursive JSON tree. There is no "capture" section in `Config` yet (phase 5
 of the migration plan, not built) -- so no capture rows appear here; add
-them to `_config_rows()` when that phase lands, per spec §5's own
-parenthetical.
+them to `_config_rows()` when that phase lands, per the task dispatch's own
+"capture keys when they exist" parenthetical.
 
 Engine-info wiring
 ------------------

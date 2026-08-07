@@ -246,7 +246,7 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     "img2txtviz": lambda config: Img2TxtVizPage(),
     # Phase-3 task 10: spec §5's read-only config viewer -- see
     # pages/configview.py's module docstring. `config.pages` now defaults
-    # to [..., "config"] (config.py, the task brief's explicit ask).
+    # to [..., "config"] (config.py, the task dispatch's explicit ask).
     # Constructed here from `config` alone like every other factory;
     # `Engine.__init__` wires its LIVE engine-info callback separately
     # right after `self.pages` is built (see the "config page" section
