@@ -44,6 +44,24 @@ def _parse_args(pairs: list[str]) -> dict:
 # `start_reader()`-then-block pattern) rather than the fire-and-forget
 # `request()` helper above.
 
+def _format_learn_bound(data: dict) -> str:
+    """Build the text `midicrt bind learn` prints for a `learn_bound`
+    event's data payload (review fix: replace-on-relearn reporting,
+    docs/phase4-notes.md task-3 follow-up). `data["replaced"]` is the
+    (possibly empty) list of bindings `Engine._capture_learn` removed
+    because their `match` was EXACTLY equal to the one just captured (see
+    that method's own docstring) -- surfaced here as one "replaced ..."
+    line per entry, ABOVE the new binding's own JSON, so an operator
+    re-mapping an already-bound key/knob sees explicitly what got
+    replaced instead of silently losing track of the old binding. No
+    "replaced" line at all when the list is empty (the common case: a
+    genuinely NEW match)."""
+    lines = [f"midicrt: replaced binding {r.get('id')} ({r.get('action')})"
+             for r in data.get("replaced", [])]
+    lines.append(json.dumps(data["binding"], indent=2))
+    return "\n".join(lines)
+
+
 def _bind_learn_cli(socket_path: str, action_name: str, mode: str, arg_pairs: list[str],
                     timeout: float) -> None:
     """`midicrt bind learn <action>`: arms the engine's single learn slot
@@ -92,7 +110,7 @@ def _bind_learn_cli(socket_path: str, action_name: str, mode: str, arg_pairs: li
                 continue
             name = msg.get("name")
             if name == "learn_bound":
-                print(json.dumps(msg["data"]["binding"], indent=2))
+                print(_format_learn_bound(msg["data"]))
                 return
             if name == "learn_cancelled":
                 reason = msg.get("data", {}).get("reason", "unknown")

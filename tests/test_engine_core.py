@@ -2009,6 +2009,18 @@ async def test_bind_learn_trigger_valid_args_arms_successfully():
     assert eng._learn_armed.args_template == {"name": "harmony"}
 
 
+async def test_bind_learn_trigger_rejects_a_none_valued_arg_with_clean_action_error():
+    # Review fix (Minor): validate_binding's own new None-in-trigger check
+    # (test_bindings.py), surfaced here through the real bind.learn arm
+    # path -- a clean ActionError at ARM time, never a silently-wrong
+    # persisted binding.
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="[Nn]one"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "page.goto", "mode": "trigger", "args": {"name": None}})
+    assert eng._learn_armed is None
+
+
 async def test_bind_learn_continuous_requires_exactly_one_float_arg_when_none_declared():
     eng = Engine(Config())
     with pytest.raises(ActionError, match="float"):
@@ -2297,3 +2309,124 @@ async def test_learn_captured_event_still_reaches_pages_and_analyzers_normally(t
     eng.stop()
     await task
     assert eng.pages["eventlog"].view_model()["count"] == before + 1
+
+
+# -- replace-on-relearn (review Critical, live-reproduced) -------------------
+#
+# Without this, re-learning an already-bound physical control just ADDS a
+# second binding alongside the first -- both then fire on every future
+# trigger, silently accumulating forever. This breaks the primary DAW-learn
+# use case (remapping a control you already bound something to) the task-3
+# report itself names. Fix: at capture time, remove any existing binding(s)
+# whose `match` is EXACTLY equal (dataclass `==` on type/number/channel/
+# port_pattern) to the one just captured, in the SAME atomic save as the
+# new binding's addition, and report the replaced binding(s) in the
+# `learn_bound` event's new `"replaced"` field.
+
+async def test_learn_capture_relearning_the_same_exact_match_replaces_the_old_binding(tmp_path):
+    p = tmp_path / "bindings.toml"
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    got = []
+    eng.add_listener(got.append)
+    task = asyncio.create_task(eng.run())
+    note60 = ev(type="note_on", data1=60, data2=100, channel=0, source="Midi Through:0")
+
+    # First learn: note 60 -> page.next. The capturing event itself is
+    # CONSUMED (never dispatched, see the capture-consumption tests above)
+    # -- a SECOND, fresh injection is what actually proves it fires.
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    await eng.queue.put(note60)
+    await asyncio.sleep(0.05)
+    assert eng.current_page == "eventlog"   # capture consumed, no dispatch yet
+    await eng.queue.put(note60)
+    await asyncio.sleep(0.05)
+    assert eng.current_page == "voices"     # page.next really fired
+
+    # Relearn the SAME exact match to page.prev.
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.prev", "mode": "trigger", "args": {}})
+    await eng.queue.put(note60)   # captures + consumes + REPLACES the old binding
+    await asyncio.sleep(0.05)
+    assert eng.current_page == "voices"     # still consumed, unchanged by this event
+
+    assert len(eng._bindings_file.bindings) == 1
+    only = eng._bindings_file.bindings[0]
+    assert only.action == "page.prev"
+
+    from midicrt.engine.bindings import BindingsFile
+    assert BindingsFile.load(str(p)).bindings == [only]   # atomic: one binding on disk, not two
+
+    bound_events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_bound"]
+    assert len(bound_events) == 2
+    assert bound_events[0]["data"]["replaced"] == []             # nothing to replace the first time
+    assert len(bound_events[1]["data"]["replaced"]) == 1
+    assert bound_events[1]["data"]["replaced"][0]["action"] == "page.next"
+
+    # The real proof: a FRESH injection now fires ONLY page.prev, not both
+    # (if the old page.next binding had leaked, this event would fire
+    # page.next THEN page.prev in sequence and net back to "voices",
+    # unchanged -- a single page.prev fire from "voices" lands on
+    # "eventlog", which is what distinguishes "fixed" from "still buggy").
+    await eng.queue.put(note60)
+    await asyncio.sleep(0.05)
+    eng.stop()
+    await task
+    assert eng.current_page == "eventlog"
+
+
+async def test_learn_capture_a_different_match_does_not_replace_unrelated_bindings(tmp_path):
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(tmp_path / "bindings.toml"))
+    task = asyncio.create_task(eng.run())
+
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100, channel=0, source="A"))
+    await asyncio.sleep(0.05)
+
+    # Different NUMBER -- must coexist, not replace.
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.prev", "mode": "trigger", "args": {}})
+    await eng.queue.put(ev(type="note_on", data1=61, data2=100, channel=0, source="A"))
+    await asyncio.sleep(0.05)
+
+    # Different CHANNEL, same number -- must ALSO coexist.
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.goto", "mode": "trigger", "args": {"name": "harmony"}})
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100, channel=5, source="A"))
+    await asyncio.sleep(0.05)
+
+    eng.stop()
+    await task
+    assert len(eng._bindings_file.bindings) == 3
+
+
+async def test_learn_capture_does_not_remove_an_overlapping_wildcard_port_binding(tmp_path):
+    """Documented contract (review): replace-on-relearn is EXACT-match
+    only (`BindingMatch` dataclass `==`, no `fnmatch`) -- a pre-existing
+    WILDCARD-port binding that would ALSO match the newly captured
+    physical event (via `BindingDispatcher._matches`'s own fnmatch
+    semantics) is left alone here, even though the two will now both
+    genuinely fire on that event going forward. Simple, honest, disclosed
+    limitation: only a binding whose match is byte-for-byte identical to
+    the freshly captured one is ever replaced."""
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, binding_id="wild", action="page.next",
+                          number=60, port_pattern="Midi Through*")
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.prev", "mode": "trigger", "args": {}})
+    got = []
+    eng.add_listener(got.append)
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100, channel=0,
+                           source="Midi Through:Midi Through Port-0 14:0"))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+
+    ids = {b.id for b in eng._bindings_file.bindings}
+    assert "wild" in ids
+    assert len(eng._bindings_file.bindings) == 2
+    bound_events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_bound"]
+    assert bound_events[-1]["data"]["replaced"] == []

@@ -348,7 +348,21 @@ def validate_binding(binding: Binding, actions: dict) -> str | None:
     marker (`None`), that key must be a schema arg declared type `"float"`
     (the "action's declared float arg" the task brief names), and every
     OTHER `args` entry must satisfy the remaining schema exactly like
-    trigger mode."""
+    trigger mode.
+
+    Review fix (Minor, task-3 follow-up): for `mode == "trigger"`, NO
+    `args` entry may be `None` -- unlike continuous mode, trigger has no
+    fill-target concept at all (see `Binding`'s own docstring: "for mode
+    == continuous exactly one entry is the literal Python None ... every
+    OTHER entry (BOTH modes) is a static value"), so a `None` here can
+    only ever be a caller mistake (most plausibly `bind.learn` handed a
+    JSON `null` for a static arg). Left unchecked, it would silently
+    coerce to the STRING `"None"` at real dispatch time
+    (`ActionRegistry.dispatch`'s own `str(None)` for a `"str"`-typed arg)
+    instead of failing loudly -- caught here so `bind.learn`'s arm-time
+    validation (its own docstring, engine/core.py) surfaces a clear
+    `ActionError` instead of ever persisting a binding that would
+    misbehave the first time it fires."""
     info = actions.get(binding.action)
     if info is None:
         return f"unknown action: {binding.action!r}"
@@ -365,6 +379,11 @@ def validate_binding(binding: Binding, actions: dict) -> str | None:
             return (f"fill arg {fill_key!r} is not declared 'float' by action "
                     f"{binding.action!r} (schema: {schema!r})")
         del args[fill_key]
+    elif binding.mode == "trigger":
+        none_args = sorted(k for k, v in args.items() if v is None)
+        if none_args:
+            return (f"trigger binding args must not contain None (found in {none_args}) -- "
+                    f"None is only meaningful for a continuous binding's fill-target arg")
     provided = set(args)
     declared = set(schema) - ({fill_key} if fill_key is not None else set())
     missing = declared - provided

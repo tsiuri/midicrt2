@@ -724,6 +724,20 @@ def test_validate_binding_continuous_with_extra_static_arg_satisfied():
     assert validate_binding(b, actions) is None
 
 
+def test_validate_binding_trigger_rejects_a_none_valued_static_arg():
+    # Review fix (Minor): trigger mode has no fill-target concept at all
+    # (only continuous does) -- a None-valued arg here would silently
+    # coerce to the STRING "None" at dispatch time (`ActionRegistry.
+    # dispatch`'s own `str(None)`), a footgun `bind.learn`'s arm-time
+    # validation should catch with a clear error instead of ever reaching
+    # a real MIDI event.
+    b = trigger_binding(action="page.goto", args={"name": None})
+    actions = {"page.goto": {"description": "", "args": {"name": "str"}}}
+    err = validate_binding(b, actions)
+    assert err is not None
+    assert "none" in err.lower()
+
+
 # -- is_learnable_event (Phase 4 Task 3, docs/phase4-notes.md) ---------------
 #
 # Pure MIDI-semantics predicate, deliberately placed here (not engine/core.py)

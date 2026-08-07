@@ -1007,6 +1007,44 @@ class Engine:
             suffix += 1
         return candidate
 
+    def _replace_bindings_with_exact_match(
+            self, match: bindings_mod.BindingMatch) -> list[bindings_mod.Binding]:
+        """DAW-standard replace-on-relearn (review Critical finding,
+        live-reproduced): without this, re-learning an already-bound
+        physical control just ADDS a second binding alongside the first --
+        both then fire on every future trigger, silently accumulating
+        forever. This is the primary DAW-learn use case (remapping a
+        control you already bound something to), so it's a correctness
+        bug, not a cosmetic one.
+
+        Removes every currently-persisted binding whose `match` is
+        EXACTLY equal to `match` (`BindingMatch` is a plain dataclass, so
+        `==` already compares type/number/channel/port_pattern all
+        together) -- deliberately EXACT equality, not `BindingDispatcher.
+        _matches`'s own `fnmatch`-on-`port_pattern` semantics: a
+        pre-existing WILDCARD binding (e.g. `port_pattern="Midi
+        Through*"`) that would ALSO match the same physical event going
+        forward is left untouched here. This is a disclosed, honest
+        simplification -- exact-match relearn is unambiguous (there is
+        only ever at most one prior binding it could mean "this one,
+        specifically"), whereas removing every WILDCARD binding that
+        happens to overlap would be a much more aggressive, surprising
+        operation with no single obvious "the one being replaced" target
+        (see test_engine_core.py::
+        test_learn_capture_does_not_remove_an_overlapping_wildcard_port_binding).
+
+        Returns the removed bindings (for the `learn_bound` event's own
+        `"replaced"` field) but does NOT call `BindingsFile.save()` --
+        `_capture_learn` adds the new binding to the SAME in-memory list
+        right after this returns and saves ONCE, so the file transitions
+        directly from "old binding present" to "new binding present" in a
+        single atomic write, never through an intermediate state with
+        neither on disk."""
+        to_remove = [b for b in self._bindings_file.bindings if b.match == match]
+        for b in to_remove:
+            self._bindings_file.remove(b.id)
+        return to_remove
+
     def _capture_learn(self, ev: MidiEvent) -> None:
         """Turn the currently-armed learn slot + `ev` into a real,
         persisted `Binding` -- called from `_handle` (see that method's
@@ -1016,19 +1054,28 @@ class Engine:
         pattern" -- not a wildcard/fnmatch pattern a human would
         hand-author) -- `BindingDispatcher._matches`'s `fnmatch.fnmatch`
         still matches an exact string against itself correctly, so this
-        needs no special-casing on the matching side."""
+        needs no special-casing on the matching side. Any binding(s) with
+        this EXACT match are replaced first (`_replace_bindings_with_
+        exact_match`, see its own docstring) -- both the removal and this
+        new binding's addition are persisted in ONE `BindingsFile.save()`
+        call, and `learn_bound`'s payload discloses whatever was
+        replaced."""
         arm = self._learn_armed
         self._learn_armed = None
         match = bindings_mod.BindingMatch(
             type=ev.type, number=ev.data1, channel=ev.channel, port_pattern=ev.source)
+        replaced = self._replace_bindings_with_exact_match(match)
         binding = bindings_mod.Binding(
             id=self._new_binding_id(), match=match, action=arm.action,
             args=dict(arm.args_template), mode=arm.mode, range=arm.range)
         self._bindings_file.add(binding)
         self._bindings_file.save()
         self._binding_dispatcher.set_bindings(self._bindings_file.bindings)
-        self.emit_event("learn_bound",
-                        {"binding": self._serialize_binding(binding, self.actions.describe())})
+        actions = self.actions.describe()
+        self.emit_event("learn_bound", {
+            "binding": self._serialize_binding(binding, actions),
+            "replaced": [self._serialize_binding(b, actions) for b in replaced],
+        })
 
     def _tick_learn(self, now: float) -> None:
         """Called from `run()` once per tick (mirrors `_tick_analyzers`/
