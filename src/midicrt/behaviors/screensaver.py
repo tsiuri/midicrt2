@@ -83,24 +83,34 @@ quietly (no dispatch of this behavior's own; the page has already changed
 to whatever the override set it to) and forget `_previous_page`, so a
 LATER activity tick has nothing stale left to restore.
 
-Disclosed consequence: a manual override buys no grace period on its own
+A manual override now buys a FRESH `after_s` grace period (2nd review
+pass -- corrects the previous "disclosed consequence" below, which turned
+out to be a real bug in the sibling behavior)
 ---------------------------------------------------------------------------
-Idle time is measured PURELY from `last_activity_ts` (real MIDI traffic,
-`Engine._last_activity_ts`) -- a behavior has no channel to bump that
-shared, engine-owned clock itself (see `behaviors/__init__.py`'s "acts
-only through actions" contract). A manual page-change escape therefore
-does NOT reset the idle timer the way v1's own `deactivate()` resets
-`_last_activity = time.time()` on ANY wake trigger including a keypress
-(`~/codex/midicrt/plugins/zscreensaver.py`) -- if `last_activity_ts`
-genuinely never advances, this behavior is free to reclaim the display
-again on the very next tick after a manual override, with no cooldown.
-This is accepted, not fixed: it only matters for the narrow window between
-a manual escape and the next real MIDI event, and the alternative (this
-behavior tracking its own separate "last manual override" timestamp to
-manufacture a synthetic grace period) would be a second, independent
-notion of "activity" this codebase has deliberately avoided everywhere
-else (see `engine/core.py`'s own single-source-of-truth
-`_last_activity_ts`).
+An earlier version of this section argued idle time is measured PURELY
+from `last_activity_ts`, so a manual escape gets no grace period and this
+behavior is "free to reclaim the display again on the very next tick."
+That turned out to be more than an accepted quirk: fixing
+`behaviors/pagecycle.py`'s OWN "re-arm after a manual escape" bug (see
+that module's docstring) exposed that pagecycle can only ever actually
+resume normal operation once it gets a genuinely UNINTERRUPTED stretch of
+`idle_s` on a non-screensaver page -- and an instantly-reclaiming
+screensaver would re-block it before that stretch could ever complete,
+i.e. pagecycle would appear "fixed" in isolation but remain functionally
+dead forever in practice whenever the deployed defaults' zero-activity
+idle window runs long. This behavior needed the EXACT SAME fix pagecycle
+did, for the exact same reason: `_idle_reference_ts` (NOT `last_activity_ts`
+directly) is now what the "not active" branch's threshold check compares
+`now` against. It tracks `last_activity_ts` under normal operation
+(updated whenever real activity advances, so the ordinary "idle for
+`after_s` since the last real event" behavior is unchanged), but is ALSO
+re-armed to `now` at the moment of a manual-override deactivation --
+giving that escape a genuine fresh `after_s` window, mirroring
+`behaviors/pagecycle.py`'s `_idle_since` re-arm precisely. Covered by
+`tests/test_behaviors_screensaver.py::
+test_manual_override_re_arms_the_idle_reference_a_full_after_s_required`
+(replaces the now-obsolete "reactivates on the very next tick" test this
+section used to point to).
 """
 from __future__ import annotations
 
@@ -123,15 +133,29 @@ class ScreensaverBehavior:
         self._active = False
         self._previous_page: str | None = None
         self._activity_at_activation: float | None = None
+        self._last_seen_activity: float | None = None
+        # The "not active" branch's idle threshold compares `now` against
+        # THIS, not `last_activity_ts` directly -- see module docstring's
+        # "A manual override now buys a FRESH after_s grace period" section
+        # for why the two can diverge (a manual-override deactivation
+        # re-arms this to `now`, independent of whether real activity ever
+        # advances).
+        self._idle_reference_ts: float | None = None
 
     def tick(self, now: float, last_activity_ts: float,
               current_page: str) -> tuple[str, dict] | None:
         if not self.enabled:
             return None
+        if self._idle_reference_ts is None or last_activity_ts != self._last_seen_activity:
+            # Real activity advanced (or this is the very first call) --
+            # track it as the idle reference point, same "(re)arm from the
+            # activity instant" convention behaviors/pagecycle.py uses.
+            self._last_seen_activity = last_activity_ts
+            self._idle_reference_ts = last_activity_ts
         if not self._active:
             if current_page == self._screensaver_page:
                 return None   # already there (e.g. manual navigation) -- nothing to latch
-            if now - last_activity_ts < self.after_s:
+            if now - self._idle_reference_ts < self.after_s:
                 return None
             self._active = True
             self._previous_page = current_page
@@ -146,6 +170,11 @@ class ScreensaverBehavior:
             self._active = False
             self._previous_page = None
             self._activity_at_activation = None
+            # 2nd-review-pass fix: re-arm the idle reference to NOW, giving
+            # this manual escape a genuine fresh `after_s` window instead of
+            # letting the (possibly ancient) last_activity_ts immediately
+            # satisfy the threshold check above on the very next tick.
+            self._idle_reference_ts = now
             return None
         # Active AND still showing the screensaver: the only way out is NEW
         # activity (last_activity_ts moving past the value recorded at the

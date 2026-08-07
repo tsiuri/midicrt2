@@ -77,6 +77,7 @@ import threading
 from pathlib import Path
 
 from midicrt import config as config_mod
+from midicrt.behaviors.screensaver import SCREENSAVER_PAGE
 from midicrt.clients import chrome
 from midicrt.clients.base import (
     ClientError,
@@ -565,7 +566,10 @@ def render_spectrum_frame(vm: dict, surface: Surface) -> None:
 # this renderer already clears the WHOLE surface (not just the body) via
 # `surface.clear(BG)`, simply not calling the chrome `_draw_*` functions is
 # sufficient -- there is nothing left underneath for them to paint over.
-SCREENSAVER_PAGE = "screensaver"   # matches pages.screensaver.ScreensaverPage.name
+# `SCREENSAVER_PAGE` is imported from `behaviors.screensaver` (2nd review
+# pass, Minor fix) rather than hardcoded here a second time -- the same
+# anti-drift precedent `behaviors/pagecycle.py`'s own `screensaver_page`
+# parameter already set for the engine-side behaviors.
 
 
 def render_screensaver_frame(vm: dict, surface: Surface) -> None:

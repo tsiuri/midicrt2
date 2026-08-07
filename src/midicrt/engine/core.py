@@ -310,6 +310,16 @@ class Engine:
         # which sweeps a fake clock from t=0 to t=900 against Config()'s own
         # shipped defaults (both behaviors enabled) and asserts the engine
         # reaches the screensaver at t=60 and STAYS there.
+        #
+        # 2nd review pass: that fix alone introduced a SIBLING gap -- a
+        # MANUAL escape from the screensaver (no MIDI activity) left
+        # pagecycle's own idle timer stale, firing `page.next` on the very
+        # next tick and discarding the manual choice. Both
+        # `behaviors/pagecycle.py` AND `behaviors/screensaver.py` now
+        # re-arm their respective idle references to `now` when a block/
+        # activation ends WITHOUT a real activity advance -- see each
+        # module's own docstring ("Re-arming after a manual escape" /
+        # "A manual override now buys a FRESH after_s grace period").
         self._behaviors: list = [self._pagecycle_behavior, self._screensaver_behavior]
         self.actions.register("eventlog.clear", self._clear_eventlog,
                               description="Clear the event log")

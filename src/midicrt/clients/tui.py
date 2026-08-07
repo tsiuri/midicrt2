@@ -64,6 +64,7 @@ new overlay topics alongside the existing three.
 """
 import json
 
+from midicrt.behaviors.screensaver import SCREENSAVER_PAGE
 from midicrt.clients import chrome
 from midicrt.clients.base import (
     ClientError,
@@ -470,10 +471,12 @@ def render_spectrum_lines(vm: dict, width: int, height: int) -> list[str]:
 # All-blank rows, no header text at all -- see pages/screensaver.py's module
 # docstring for the v1 comparison (v1 zeroes the ENTIRE real framebuffer,
 # bypassing every plugin including chrome). `run_tui`'s render loop (below)
-# special-cases `state["page"] == _SCREENSAVER_PAGE` at its one chrome-
+# special-cases `state["page"] == SCREENSAVER_PAGE` at its one chrome-
 # painting call site to skip `term.reverse()` on this renderer's blank
 # header AND skip painting the three chrome rows below it (task-9 review
 # fix -- a prior cut left them lit, a real CRT burn-in regression).
+# `SCREENSAVER_PAGE` is imported from `behaviors.screensaver` (2nd review
+# pass, Minor fix) rather than hardcoded here a second time.
 
 
 def render_screensaver_lines(vm: dict, width: int, height: int) -> list[str]:
@@ -501,7 +504,6 @@ RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
-_SCREENSAVER_PAGE = "screensaver"   # matches pages.screensaver.ScreensaverPage.name
 
 
 def run_tui(socket_path: str) -> int:
@@ -593,7 +595,7 @@ def run_tui(socket_path: str) -> int:
                     renderer = RENDERERS.get(state["page"], _render_unknown)
                     page_lines = renderer(vm, term.width, term.height - 3)
                     header_line, body_lines = page_lines[0], page_lines[1:]
-                    if state["page"] == _SCREENSAVER_PAGE:
+                    if state["page"] == SCREENSAVER_PAGE:
                         # Important fix (task-9 review): a TRUE full blank,
                         # no reverse video anywhere -- matching v1's raw fb
                         # zeroing, which bypasses chrome entirely (leaving

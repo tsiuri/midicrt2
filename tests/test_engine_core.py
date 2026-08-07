@@ -727,3 +727,55 @@ async def test_pagecycle_does_not_unblank_screensaver_with_shipped_defaults():
                 "-- pagecycle un-blanked the screensaver"
             )
     assert seen_screensaver_at == 60
+
+
+async def test_pagecycle_does_not_immediately_override_a_manual_screensaver_escape():
+    # 2nd review pass: fixing the Critical bug above introduced a NEW
+    # Important interaction -- with the fix as first shipped, pagecycle's
+    # `_idle_since` stays frozen while blocked, so a MANUAL escape from the
+    # screensaver (a client dispatching page.goto/next directly, with no
+    # MIDI activity) left the stale elapsed check already satisfied on the
+    # very next tick, firing page.next immediately and discarding the
+    # user's manual choice -- the exact symptom the Important fix above
+    # closed, now via the sibling behavior. See behaviors/pagecycle.py's
+    # own "Re-arming after a manual escape" docstring section for the fix.
+    #
+    # This is an engine-level smoke test using REAL dual-behavior wiring
+    # (both enabled, shipped defaults) for the setup + the critical
+    # non-firing assertion. It deliberately does NOT project all the way
+    # out to pagecycle's own full re-armed idle_s (that exact timing
+    # contract is covered in isolation by test_behaviors_pagecycle.py::
+    # test_rearms_after_a_manual_screensaver_escape_instead_of_firing_immediately)
+    # -- with the shipped defaults, screensaver's own SHORTER after_s (60s)
+    # will legitimately reclaim the display again well before pagecycle's
+    # longer idle_s (300s) could ever elapse uninterrupted (a real,
+    # disclosed, and arguably correct consequence of screensaver taking
+    # priority -- see behaviors/pagecycle.py's `Engine.__init__` comment),
+    # which would make asserting a specific later page value here brittle
+    # and would actually be testing screensaver's OWN timer, not
+    # pagecycle's.
+    eng = Engine(Config())
+    eng._last_activity_ts = 0.0
+    for now in range(501):
+        await eng._tick_behaviors(float(now))
+    assert eng.current_page == "screensaver"
+
+    # A manual escape: some OTHER client dispatches page.goto directly --
+    # NOT via either behavior, and with NO MIDI activity in between.
+    await eng.actions.dispatch("page.goto", {"name": "voices"})
+    assert eng.current_page == "voices"
+
+    calls = []
+    original_dispatch = eng.actions.dispatch
+
+    async def spy(name, args):
+        calls.append((name, args))
+        return await original_dispatch(name, args)
+
+    eng.actions.dispatch = spy
+
+    await eng._tick_behaviors(500.5)
+    assert eng.current_page == "voices", (
+        "pagecycle overrode the manual escape on the very next tick"
+    )
+    assert ("page.next", {}) not in calls

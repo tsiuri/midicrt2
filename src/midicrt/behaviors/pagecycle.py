@@ -86,12 +86,42 @@ client, independent of `ScreensaverBehavior`'s own latch), which an
 active-flag check would miss entirely. While blocked this way,
 `_idle_since`/`_last_seen_activity` are left untouched (not advanced, not
 reset) -- idle time "spent" showing the screensaver neither counts for nor
-against pagecycle's own timer; the moment the page changes away from the
-screensaver (whether via `ScreensaverBehavior`'s own activity-triggered
-restore, or a manual navigation), `last_activity_ts` will have moved
-forward too in the normal restore case, and the ordinary "activity moved
-forward -> re-arm from here" branch below picks the timer back up cleanly
-from that instant -- pagecycle never fires immediately upon waking.
+against pagecycle's own timer.
+
+Re-arming after a manual escape (2nd review pass -- a NEW Important
+finding this first fix introduced)
+---------------------------------------------------------------------------
+The paragraph above ends "...the ordinary 'activity moved forward -> re-arm
+from here' branch below picks the timer back up cleanly from that instant"
+-- true ONLY when real MIDI activity is what ended the block (the normal
+`ScreensaverBehavior`-driven restore, where `last_activity_ts` genuinely
+advances). It is FALSE for a MANUAL escape (a client dispatching
+`page.next`/`page.goto` directly, with NO new MIDI activity): `current_page`
+leaves the screensaver page, but `last_activity_ts` does not move, so the
+"activity moved forward" branch never fires, and `_idle_since` is still
+whatever ancient value it was frozen at when blocking began. The very next
+tick's elapsed check (`now - _idle_since >= idle_s`) is then almost always
+already true (real wall-clock `now` has kept advancing the whole time the
+behavior sat blocked) -- so `tick()` fired `page.next` on literally the
+very next tick after a manual escape, discarding the user's manual choice
+just as surely as the ORIGINAL Critical bug did, just via the sibling
+behavior this time. Reproduced by `tests/test_behaviors_pagecycle.py::
+test_rearms_after_a_manual_screensaver_escape_instead_of_firing_immediately`.
+
+Fix: track whether the PREVIOUS tick was blocked (`_was_blocked`). On the
+first tick where the block has just ended, check whether activity actually
+advanced during the block:
+- If it DID (the normal activity-driven restore case), fall through to the
+  existing "activity moved forward" branch unchanged -- it already
+  re-arms correctly from the real activity instant.
+- If it did NOT (a manual escape), re-arm `_idle_since = now` directly and
+  return `None` this tick -- exactly the same "reset the clock, take no
+  action THIS tick" shape the activity-moved-forward branch already uses,
+  just anchored to `now` (the escape instant) instead of an activity
+  timestamp, since no real activity instant exists to anchor to here.
+  This is what lets pagecycle resume normal operation a full, FRESH
+  `idle_s` after a manual escape, rather than firing immediately or being
+  permanently wedged.
 """
 from __future__ import annotations
 
@@ -112,6 +142,7 @@ class PageCycleBehavior:
         self._screensaver_page = screensaver_page
         self._last_seen_activity: float | None = None
         self._idle_since: float | None = None
+        self._was_blocked = False
 
     def tick(self, now: float, last_activity_ts: float,
               current_page: str) -> tuple[str, dict] | None:
@@ -121,8 +152,23 @@ class PageCycleBehavior:
             # Critical fix (see module docstring's "Arbitration with the
             # screensaver" section) -- never act while the screensaver is
             # showing, however it got there.
+            self._was_blocked = True
             return None
-        if self._last_seen_activity is None or last_activity_ts != self._last_seen_activity:
+        activity_advanced = (self._last_seen_activity is None
+                              or last_activity_ts != self._last_seen_activity)
+        if self._was_blocked and not activity_advanced:
+            # 2nd-review-pass fix (see module docstring's "Re-arming after
+            # a manual escape" section): the block just ended, but NOT via
+            # real activity -- a manual page.next/goto escape. `_idle_since`
+            # is stale relative to `now`; falling through to the elapsed
+            # check below would fire immediately, discarding the user's
+            # manual choice exactly like the ORIGINAL Critical bug. Re-arm
+            # from `now` (the escape instant) instead.
+            self._was_blocked = False
+            self._idle_since = now
+            return None
+        self._was_blocked = False
+        if activity_advanced:
             # Activity moved forward (or this is the very first call, where
             # there is nothing yet to measure idleness FROM) -- (re)arm the
             # idle window starting at the activity instant itself, and take
