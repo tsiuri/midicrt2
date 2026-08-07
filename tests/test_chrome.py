@@ -1,12 +1,20 @@
 from midicrt.clients.chrome import (
     DEFAULT_ALERTS_VM,
+    DEFAULT_BEATFLASH_VM,
+    DEFAULT_LOOPPROGRESS_VM,
     DEFAULT_STATUS_VM,
     DEFAULT_TIMESIG_VM,
+    LOOPPROGRESS_BAR_WIDTH,
     OVERLAY_ALERTS_TOPIC,
+    OVERLAY_BEATFLASH_TOPIC,
+    OVERLAY_LOOPPROGRESS_TOPIC,
     OVERLAY_STATUS_TOPIC,
     OVERLAY_TIMESIG_TOPIC,
     alerts_text,
+    beatflash_glyph,
+    beatprogress_row_text,
     format_bpm,
+    loopprogress_bar,
     secondary_status_text,
     status_text,
     timesig_text,
@@ -134,3 +142,69 @@ def test_secondary_status_text_prefers_alerts_over_timesig():
 def test_secondary_status_text_falls_back_to_timesig_when_no_alerts():
     text = secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM)
     assert text == "Time Signature: (no lock)"
+
+
+# -- beatflash + loopprogress (phase-3 task 9) --------------------------------
+
+def test_overlay_beatflash_and_loopprogress_topics_match_engine_convention():
+    assert OVERLAY_BEATFLASH_TOPIC == "overlay.beatflash"
+    assert OVERLAY_LOOPPROGRESS_TOPIC == "overlay.loopprogress"
+
+
+def test_default_beatflash_and_loopprogress_vms_match_analyzer_initial_view_models():
+    from midicrt.analyzers.beatflash import BeatFlashAnalyzer
+    from midicrt.analyzers.loopprogress import LoopProgressAnalyzer
+
+    assert DEFAULT_BEATFLASH_VM == BeatFlashAnalyzer().view_model()
+    assert DEFAULT_LOOPPROGRESS_VM == LoopProgressAnalyzer().view_model()
+
+
+def test_beatflash_glyph_is_blank_when_intensity_zero():
+    assert beatflash_glyph(DEFAULT_BEATFLASH_VM) == "  "
+
+
+def test_beatflash_glyph_ramps_through_shades_as_intensity_rises():
+    assert beatflash_glyph({"intensity": 0.1, "is_bar": False}) == "░░"
+    assert beatflash_glyph({"intensity": 0.5, "is_bar": False}) == "▒▒"
+    assert beatflash_glyph({"intensity": 0.9, "is_bar": False}) == "▓▓"
+
+
+def test_beatflash_glyph_reaches_full_block_only_above_beat_peak():
+    # A regular beat (BEAT_PEAK == 1.0) must never reach the solid block --
+    # that top level is reserved for a bar flash's higher peak (task
+    # brief: "stronger on bar"). See analyzers/beatflash.py's BEAT_PEAK/
+    # BAR_PEAK constants.
+    assert beatflash_glyph({"intensity": 1.0, "is_bar": False}) == "▓▓"
+    assert beatflash_glyph({"intensity": 1.4, "is_bar": True}) == "██"
+
+
+def test_loopprogress_bar_is_blank_when_not_running():
+    assert loopprogress_bar(DEFAULT_LOOPPROGRESS_VM) == "[" + " " * LOOPPROGRESS_BAR_WIDTH + "]"
+
+
+def test_loopprogress_bar_places_asterisk_at_fraction_position():
+    bar = loopprogress_bar({"fraction": 0.5, "running": True})
+    assert bar == "[    *   ]"
+
+
+def test_loopprogress_bar_clamps_position_within_width_near_full_wrap():
+    bar = loopprogress_bar({"fraction": 0.999, "running": True})
+    assert bar.count("*") == 1
+    assert len(bar) == LOOPPROGRESS_BAR_WIDTH + 2
+
+
+def test_beatprogress_row_text_is_exactly_width_wide():
+    row = beatprogress_row_text(DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, width=40)
+    assert len(row) == 40
+    row = beatprogress_row_text(DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, width=6)
+    assert len(row) == 6
+
+
+def test_beatprogress_row_text_places_glyph_at_left_and_bar_centered():
+    beatflash_vm = {"intensity": 1.4, "is_bar": True}
+    loopprogress_vm = {"fraction": 0.5, "running": True}
+    row = beatprogress_row_text(beatflash_vm, loopprogress_vm, width=40)
+    assert row.startswith("██")
+    bar = loopprogress_bar(loopprogress_vm)
+    expected_start = (40 - len(bar)) // 2
+    assert row[expected_start:expected_start + len(bar)] == bar

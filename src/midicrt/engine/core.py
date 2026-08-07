@@ -78,6 +78,36 @@ events, which no page previously needed (every other page is fully
 event-driven). `run()` calls it right after `_tick_analyzers(now)`, same
 injected `now`, same duck-typed OPTIONAL `tick(now) -> bool` convention,
 minus `drain_alerts()` (analyzer-only, no page needs it).
+
+Behaviors + activity tracking (phase-3 task 9)
+------------------------------------------------
+`behaviors/pagecycle.py` and `behaviors/screensaver.py` are a THIRD
+roster kind, structurally different from analyzers/pages: a behavior
+publishes no topic and holds no view model at all -- it is a pure idle-
+timer state machine whose `tick(now, last_activity_ts, current_page) ->
+(action_name, args) | None` either does nothing or returns ONE action
+intent for the engine to dispatch (see `behaviors/__init__.py`'s module
+docstring for why this is stricter than "no I/O": a behavior cannot even
+call `dispatch` itself, only ask the engine to). `_tick_behaviors(now)`
+(called from `run()` right after `_tick_pages(now)`) is the only place
+that ever turns one of those intents into a real `await
+self.actions.dispatch(...)` call -- an `ActionError` there (e.g. a custom
+config removed the "screensaver" page a behavior tries to `page.goto`) is
+swallowed rather than propagated, since an internal, unattended behavior
+tick crashing the whole `run()` loop would be far worse than one skipped
+auto-action.
+
+Both behaviors need "has anything happened recently" as their idle
+reference point, which -- like `_tick_analyzers`'s `now` -- only the
+engine is positioned to track: `_handle(ev)` stamps `self._last_activity_ts
+= ev.ts` for `note_on`/`note_off`/`control_change` events ONLY, mirroring
+v1's own `plugins/zscreensaver.py::handle()` activity filter exactly (a
+running MIDI clock alone must not count as "activity", or a transport left
+running with nobody playing would never idle out -- see behaviors/
+screensaver.py's module docstring). `self._last_activity_ts` is seeded to
+`time.time()` at construction (NOT epoch 0), so a freshly booted engine
+starts its idle clocks from boot time rather than looking infinitely idle
+on its very first tick.
 """
 import asyncio
 import time
@@ -86,17 +116,29 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from midicrt import proto
+from midicrt.analyzers.beatflash import BeatFlashAnalyzer
+from midicrt.analyzers.loopprogress import LoopProgressAnalyzer
 from midicrt.analyzers.stucknotes import StuckNotesAnalyzer
 from midicrt.analyzers.timesig import TimesigAnalyzer
 from midicrt.analyzers.transport import TransportAnalyzer
+from midicrt.behaviors.pagecycle import PageCycleBehavior
+from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.eventlog import EventLogPage
 from midicrt.pages.harmony import HarmonyPage
 from midicrt.pages.pianoroll import PianorollPage
+from midicrt.pages.screensaver import ScreensaverPage
 from midicrt.pages.spectrum import SpectrumPage
 from midicrt.pages.tuner import TunerPage
 from midicrt.pages.voices import VoicesPage
+
+# `_handle()` stamps `Engine._last_activity_ts` only for these event types --
+# matches v1's `plugins/zscreensaver.py::handle()` activity filter exactly
+# (see the module docstring's "Behaviors + activity tracking" section and
+# behaviors/screensaver.py's own docstring for why a free-running MIDI
+# clock must NOT count as activity).
+_ACTIVITY_EVENT_TYPES = {"note_on", "note_off", "control_change"}
 
 
 @dataclass
@@ -176,6 +218,12 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # roster is built, guarded by a `--no-audio` opt-out mirroring
     # `--no-midi`.
     "spectrum": lambda config: SpectrumPage(device=config.audio_device, bins=config.spectrum_bins),
+    # Phase-3 task 9: the page `behaviors/screensaver.py` switches to via
+    # `page.goto screensaver` -- see pages/screensaver.py's module
+    # docstring for the v1 comparison. In `config.pages`' default list
+    # (config.py) so it is already instantiated (and therefore goto-able)
+    # on a stock deploy, matching v1's screensaver being always-live too.
+    "screensaver": lambda config: ScreensaverPage(),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`
@@ -190,6 +238,14 @@ _ANALYZER_FACTORIES: dict[str, AnalyzerFactory] = {
     # as analyzers/overlays, not pages, matching "status"'s own precedent.
     "alerts": lambda config: StuckNotesAnalyzer(),
     "timesig": lambda config: TimesigAnalyzer(),
+    # Phase-3 task 9: v1's plugins/beatflash.py (beat-synced flash pulse)
+    # and plugins/loopprogress.py (8-bar cyclic position bar) -- both v1
+    # "always visible regardless of page" chrome-class features (see
+    # analyzers/beatflash.py's/analyzers/loopprogress.py's own module
+    # docstrings for the v1 row-offset evidence), registered as overlays
+    # here matching "status"'s own precedent.
+    "beatflash": lambda config: BeatFlashAnalyzer(),
+    "loopprogress": lambda config: LoopProgressAnalyzer(),
 }
 
 
@@ -213,6 +269,24 @@ class Engine:
         self._seq: dict[str, int] = {}
         self._dirty: set[str] = set()
         self._running = False
+        # Phase-3 task 9: seeded to "now", NOT epoch 0 -- see the module
+        # docstring's "Behaviors + activity tracking" section for why a
+        # freshly booted engine must not look infinitely idle on its very
+        # first `_tick_behaviors` call.
+        self._last_activity_ts: float = time.time()
+        self._pagecycle_behavior = PageCycleBehavior(
+            enabled=config.pagecycle_enabled, idle_s=config.pagecycle_idle_s)
+        self._screensaver_behavior = ScreensaverBehavior(
+            enabled=config.screensaver_enabled, after_s=config.screensaver_after_s)
+        # Order rarely matters under sane configs (v1's deployed
+        # screensaver_after_s=60 fires well before pagecycle_idle_s=300
+        # ever could -- see config.py's own comment) -- disclosed, not
+        # cross-coordinated: a custom config with a SHORTER pagecycle idle
+        # than screensaver's could let pagecycle's `page.next` wander the
+        # display away from "screensaver" while `_screensaver_behavior`
+        # still believes it's active, only settling back to the real
+        # remembered page once genuine activity finally arrives.
+        self._behaviors: list = [self._pagecycle_behavior, self._screensaver_behavior]
         self.actions.register("eventlog.clear", self._clear_eventlog,
                               description="Clear the event log")
         self.actions.register("page.next", self._page_next,
@@ -345,6 +419,8 @@ class Engine:
 
     def _handle(self, ev: MidiEvent) -> None:
         self.events_total += 1
+        if ev.type in _ACTIVITY_EVENT_TYPES:
+            self._last_activity_ts = ev.ts
         for name, analyzer in self.analyzers.items():
             if analyzer.handle(ev):
                 self._dirty.add(f"overlay.{name}")
@@ -386,6 +462,30 @@ class Engine:
             if tick_fn is not None and tick_fn(now):
                 self._dirty.add(f"page.{name}")
 
+    async def _tick_behaviors(self, now: float) -> None:
+        """Give each behavior (phase-3 task 9) a chance to act, and
+        dispatch any action intent it returns -- see the module docstring's
+        "Behaviors + activity tracking" section. Unlike `_tick_analyzers`/
+        `_tick_pages` (which only ever set dirty flags directly), this is
+        the ONLY place a behavior's decision turns into a real
+        `ActionRegistry.dispatch` call -- the behaviors themselves stay
+        synchronous and side-effect-free (see `behaviors/__init__.py`).
+        `await`ed (dispatch is async) so this method itself must be
+        awaited by `run()`'s loop, unlike its two siblings."""
+        for behavior in self._behaviors:
+            intent = behavior.tick(now, self._last_activity_ts, self.current_page)
+            if intent is None:
+                continue
+            name, args = intent
+            try:
+                await self.actions.dispatch(name, args)
+            except ActionError:
+                # e.g. a custom config removed the "screensaver" page a
+                # behavior tries to `page.goto` -- an unattended internal
+                # tick crashing the whole run() loop would be far worse
+                # than one skipped auto-action; see module docstring.
+                pass
+
     async def run(self) -> None:
         self._running = True
         tick = 1.0 / max(self.config.tick_hz, 1.0)
@@ -400,6 +500,7 @@ class Engine:
             now = time.time()
             self._tick_analyzers(now)
             self._tick_pages(now)
+            await self._tick_behaviors(now)
             for topic in sorted(self._dirty):
                 snap = self.snapshot_now(topic)
                 if snap:

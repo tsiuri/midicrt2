@@ -95,6 +95,95 @@ def timesig_text(vm: dict) -> str:
     return text
 
 
+OVERLAY_BEATFLASH_TOPIC = "overlay.beatflash"
+OVERLAY_LOOPPROGRESS_TOPIC = "overlay.loopprogress"
+
+DEFAULT_BEATFLASH_VM = {"intensity": 0.0, "is_bar": False}
+DEFAULT_LOOPPROGRESS_VM = {"fraction": 0.0, "running": False}
+
+# v1 actually reserves FOUR bottom rows, not the two the task-3/task-6
+# chrome rows above account for: `plugins/beatflash.py` draws at the
+# screen's literal bottom-most row (y = SCREEN_ROWS - 1), and
+# `plugins/loopprogress.py` at the row directly above it (Y_POS_OFFSET=2)
+# -- both BELOW `plugins/timeclock.py`'s own row (Y_POS_OFFSET=3, ported as
+# `overlay.status` above) and `plugins/zstucknotes.py`'s (Y_POS_OFFSET=4,
+# ported as the alerts/timesig row above). This third v2 chrome row hosts
+# those remaining two v1 widgets TOGETHER (one row, not two): v1's
+# loopprogress.py itself only fills the LEFT portion of its row with
+# unrelated scheduler/sysex diagnostic text that has no v2 analog (see
+# analyzers/loopprogress.py's module docstring -- not ported), which
+# leaves that space free for beatflash's own tiny (2-char) indicator
+# instead of needing a whole extra reserved row of its own. Combining
+# follows the exact same "v1 reserves N bottom rows; group cheap/glanceable
+# concerns onto shared rows" precedent `secondary_status_text` above
+# already established for alerts+timesig.
+_BEATFLASH_LEVELS = (
+    (1.0, "██"),    # only a bar flash (BAR_PEAK > BEAT_PEAK) ever reaches this
+    (0.66, "▓▓"),
+    (0.33, "▒▒"),
+    (0.0, "░░"),
+)
+
+LOOPPROGRESS_BAR_WIDTH = 8   # matches v1's BAR_WIDTH exactly
+
+
+def beatflash_glyph(vm: dict) -> str:
+    """Build v1's 2-char beat-flash block from an `overlay.beatflash`
+    view-model, ramped through shading levels as `intensity` decays (v1
+    itself is a hard on/off toggle -- see analyzers/beatflash.py's module
+    docstring for why v2 shows a graduated fade instead) -- two blank
+    spaces once fully decayed (or before the first beat), matching v1's
+    idle appearance."""
+    intensity = vm.get("intensity", 0.0)
+    for threshold, glyph in _BEATFLASH_LEVELS:
+        if intensity > threshold:
+            return glyph
+    return "  "
+
+
+def loopprogress_bar(vm: dict) -> str:
+    """Build v1's `[        ]`/`[   *    ]` 8-cell bracketed bar from an
+    `overlay.loopprogress` view-model. Blank (no `*`) while `running` is
+    False, matching v1's own `if running: bar_chars[pos] = "*"` gating --
+    the bar position freezes wherever it stopped, simply hidden until the
+    transport runs again."""
+    cells = [" "] * LOOPPROGRESS_BAR_WIDTH
+    if vm.get("running"):
+        pos = min(LOOPPROGRESS_BAR_WIDTH - 1, int(vm.get("fraction", 0.0) * LOOPPROGRESS_BAR_WIDTH))
+        cells[max(0, pos)] = "*"
+    return "[" + "".join(cells) + "]"
+
+
+def beatprogress_row_text(beatflash_vm: dict, loopprogress_vm: dict, width: int) -> str:
+    """Compose the shared third chrome row: `beatflash_glyph()` pinned to
+    column 0 (mirroring v1's own `x=0` placement) and `loopprogress_bar()`
+    centered across `width` (mirroring v1's own `xmid - len(visual)//2`
+    centering) -- both built ONCE here so the fb and TUI clients render
+    byte-identical text, same "mirrors it" contract as `status_text`/
+    `secondary_status_text` above. Unlike those two, this function takes
+    `width` explicitly: centering a moving bar is inherently a layout
+    computation, and keeping it in ONE place (rather than each client
+    re-deriving the same centering formula) is what actually prevents the
+    two clients from drifting here, not a width-agnostic pure string.
+    Always exactly `width` characters (space-padded/truncated), matching
+    every other chrome row's `_fit()`-at-the-client convention -- done here
+    instead since this function is already width-aware."""
+    if width <= 0:
+        return ""
+    glyph = beatflash_glyph(beatflash_vm)
+    bar = loopprogress_bar(loopprogress_vm)
+    row = [" "] * width
+    for i, ch in enumerate(glyph):
+        if i < width:
+            row[i] = ch
+    start = max(len(glyph) + 1, (width - len(bar)) // 2)
+    for i, ch in enumerate(bar):
+        pos = start + i
+        if 0 <= pos < width:
+            row[pos] = ch
+    return "".join(row)
+
+
 def secondary_status_text(alerts_vm: dict, timesig_vm: dict) -> str:
     """The shared second chrome row's text: `alerts_text()` when any alert
     is active, else `timesig_text()` -- see the module-level comment above

@@ -142,12 +142,16 @@ async def test_clear_action_and_status():
 
 def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll_spectrum():
     # Phase-3 task 4 added "voices"; task 5 appends "harmony"; task 7
-    # appends "pianoroll"; task 8 appends "spectrum" -- all four live by
-    # default (config.py's Config.pages default) so they're reachable with
-    # no config.toml on a stock deploy. "eventlog" stays first/current --
+    # appends "pianoroll"; task 8 appends "spectrum"; task 9 appends
+    # "screensaver" (see config.py's own comment for why it -- unlike
+    # "tuner" -- joins the default roster) -- all five live by default
+    # (config.py's Config.pages default) so they're reachable with no
+    # config.toml on a stock deploy. "eventlog" stays first/current --
     # order is preserved from config.pages.
     eng = Engine(Config())
-    assert list(eng.pages) == ["eventlog", "voices", "harmony", "pianoroll", "spectrum"]
+    assert list(eng.pages) == [
+        "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
+    ]
     assert eng.current_page == "eventlog"
 
 
@@ -156,7 +160,7 @@ def test_register_page_appends_to_live_roster():
     fake = _FakePage()
     eng.register_page("second", fake)
     assert list(eng.pages) == [
-        "eventlog", "voices", "harmony", "pianoroll", "spectrum", "second",
+        "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver", "second",
     ]
     assert eng.pages["second"] is fake
 
@@ -166,7 +170,9 @@ def test_engine_topics_reflects_roster_order():
     eng.register_page("second", _FakePage())
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
-        "page.second", "overlay.status", "overlay.alerts", "overlay.timesig",
+        "page.screensaver", "page.second",
+        "overlay.status", "overlay.alerts", "overlay.timesig",
+        "overlay.beatflash", "overlay.loopprogress",
     ]
 
 
@@ -207,18 +213,21 @@ def test_handle_marks_non_current_page_dirty_too():
 
 def test_default_analyzer_roster_is_status_alerts_timesig():
     # Phase-3 task 6 added "alerts" (StuckNotesAnalyzer) and "timesig"
-    # (TimesigAnalyzer) the same way task-3 introduced "status" -- both are
-    # v1 chrome-class features (always visible regardless of page), never
+    # (TimesigAnalyzer) the same way task-3 introduced "status"; task 9
+    # adds "beatflash"/"loopprogress" the same way again -- all are v1
+    # chrome-class features (always visible regardless of page), never
     # config-gated, see engine/core.py's module docstring.
     eng = Engine(Config())
-    assert list(eng.analyzers) == ["status", "alerts", "timesig"]
+    assert list(eng.analyzers) == ["status", "alerts", "timesig", "beatflash", "loopprogress"]
 
 
 def test_register_analyzer_appends_to_live_roster():
     eng = Engine(Config())
     fake = _FakePage()  # same handle()/view_model() shape as an Analyzer
     eng.register_analyzer("second", fake)
-    assert list(eng.analyzers) == ["status", "alerts", "timesig", "second"]
+    assert list(eng.analyzers) == [
+        "status", "alerts", "timesig", "beatflash", "loopprogress", "second",
+    ]
     assert eng.analyzers["second"] is fake
 
 
@@ -226,7 +235,9 @@ def test_topics_include_overlay_after_page_topics():
     eng = Engine(Config())
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
+        "page.screensaver",
         "overlay.status", "overlay.alerts", "overlay.timesig",
+        "overlay.beatflash", "overlay.loopprogress",
     ]
 
 
@@ -264,8 +275,10 @@ def test_snapshot_now_unknown_overlay_returns_none():
 
 
 async def test_clock_tick_does_not_dirty_eventlog_but_dirties_overlay_once_running():
-    # The eventlog page must never show clock spam; the status overlay must
-    # react to it (once transport is running -- see analyzers/transport.py).
+    # The eventlog page must never show clock spam; the status overlay
+    # (and, since phase-3 task 9, beatflash/loopprogress -- both also
+    # transport-driven) must react to it once running (see analyzers/
+    # transport.py, analyzers/beatflash.py, analyzers/loopprogress.py).
     eng = Engine(Config())
     eng._handle(MidiEvent(ts=0.0, source="USB", type="start", channel=None,
                           data1=None, data2=None, summary="start"))
@@ -273,14 +286,14 @@ async def test_clock_tick_does_not_dirty_eventlog_but_dirties_overlay_once_runni
     eng._handle(MidiEvent(ts=0.5, source="USB", type="clock_tick", channel=None,
                           data1=24, data2=None, summary="clock_tick",
                           clock_batch_start=None))
-    assert eng._dirty == {"overlay.status"}
+    assert eng._dirty == {"overlay.status", "overlay.beatflash", "overlay.loopprogress"}
     assert eng.pages["eventlog"].view_model()["count"] == 1  # only the "start" line
 
 
 async def test_page_next_prev_cycle_and_emit_page_changed():
-    # Roster is now 6 deep by default: eventlog, voices, harmony, pianoroll,
-    # spectrum (phase-3 tasks 4, 5, 7, and 8's default pages), then the
-    # dynamically-registered "second".
+    # Roster is now 7 deep by default: eventlog, voices, harmony, pianoroll,
+    # spectrum, screensaver (phase-3 tasks 4, 5, 7, 8, and 9's default
+    # pages), then the dynamically-registered "second".
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
     events = []
@@ -296,14 +309,16 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "spectrum"
     await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "screensaver"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "spectrum"
+    assert eng.current_page == "screensaver"
 
     names = [e["name"] for e in events]
-    assert names == ["page_changed"] * 6
+    assert names == ["page_changed"] * 7
     assert [e["data"]["page"] for e in events] == [
-        "voices", "harmony", "pianoroll", "spectrum", "second", "spectrum",
+        "voices", "harmony", "pianoroll", "spectrum", "screensaver", "second", "screensaver",
     ]
 
 
@@ -560,3 +575,127 @@ def test_spectrum_tick_is_wired_through_tick_pages():
     eng = Engine(Config())
     eng._tick_pages(1.0)
     assert "page.spectrum" not in eng._dirty
+
+
+# -- behaviors: pagecycle + screensaver (phase-3 task 9) ---------------------
+
+def test_last_activity_ts_seeded_to_now_not_epoch_zero():
+    before = time.time()
+    eng = Engine(Config())
+    after = time.time()
+    assert before <= eng._last_activity_ts <= after
+
+
+def test_activity_ts_updates_on_note_on_note_off_control_change_only():
+    eng = Engine(Config())
+    baseline = eng._last_activity_ts
+    eng._handle(MidiEvent(ts=12345.0, source="USB", type="clock_tick", channel=None,
+                          data1=24, data2=None, summary="clock_tick", clock_batch_start=None))
+    assert eng._last_activity_ts == baseline   # clock_tick is not "activity"
+    eng._handle(MidiEvent(ts=12345.0, source="USB", type="start", channel=None,
+                          data1=None, data2=None, summary="start"))
+    assert eng._last_activity_ts == baseline   # transport messages are not "activity"
+    eng._handle(ev(type="note_on", ts=99999.0))
+    assert eng._last_activity_ts == 99999.0
+    eng._handle(ev(type="note_off", ts=99999.5))
+    assert eng._last_activity_ts == 99999.5
+    eng._handle(ev(type="control_change", ts=100000.0))
+    assert eng._last_activity_ts == 100000.0
+
+
+async def test_tick_behaviors_dispatches_page_next_when_pagecycle_behavior_fires():
+    eng = Engine(Config(pagecycle_idle_s=5.0, screensaver_enabled=False))
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(0.0)   # bootstraps the idle window -- no fire yet
+    assert eng.current_page == "eventlog"
+    await eng._tick_behaviors(5.0)
+    assert eng.current_page == "voices"
+
+
+async def test_tick_behaviors_pagecycle_dispatch_is_observable_via_a_spy():
+    # Task brief: "fake-clock idle progression -> page.next fired via a spy
+    # on dispatch" -- exercised literally here, alongside the state-based
+    # assertion above.
+    eng = Engine(Config(pagecycle_idle_s=5.0, screensaver_enabled=False))
+    eng._last_activity_ts = 0.0
+    calls = []
+    original_dispatch = eng.actions.dispatch
+
+    async def spy(name, args):
+        calls.append((name, args))
+        return await original_dispatch(name, args)
+
+    eng.actions.dispatch = spy
+    await eng._tick_behaviors(0.0)
+    await eng._tick_behaviors(5.0)
+    assert calls == [("page.next", {})]
+
+
+def test_pagecycle_disabled_by_config_never_fires():
+    eng = Engine(Config(pagecycle_idle_s=5.0, pagecycle_enabled=False, screensaver_enabled=False))
+    eng._last_activity_ts = 0.0
+
+    async def run_ticks():
+        await eng._tick_behaviors(0.0)
+        await eng._tick_behaviors(5.0)
+        await eng._tick_behaviors(1000.0)
+
+    asyncio.run(run_ticks())
+    assert eng.current_page == "eventlog"
+
+
+async def test_tick_behaviors_activates_and_restores_screensaver():
+    eng = Engine(Config(screensaver_after_s=10.0, pagecycle_enabled=False))
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(10.0)
+    assert eng.current_page == "screensaver"
+    # Simulate real activity arriving -- restore the remembered page.
+    eng._handle(ev(type="note_on", ts=10.5))
+    await eng._tick_behaviors(10.6)
+    assert eng.current_page == "eventlog"
+
+
+async def test_tick_behaviors_screensaver_remembers_the_actual_current_page():
+    eng = Engine(Config(screensaver_after_s=10.0, pagecycle_enabled=False))
+    eng._last_activity_ts = 0.0
+    await eng.actions.dispatch("page.goto", {"name": "harmony"})
+    await eng._tick_behaviors(10.0)
+    assert eng.current_page == "screensaver"
+    eng._handle(ev(type="note_on", ts=10.5))
+    await eng._tick_behaviors(10.6)
+    assert eng.current_page == "harmony"
+
+
+def test_screensaver_disabled_by_config_never_fires():
+    eng = Engine(Config(screensaver_after_s=5.0, screensaver_enabled=False, pagecycle_enabled=False))
+    eng._last_activity_ts = 0.0
+
+    async def run_ticks():
+        await eng._tick_behaviors(0.0)
+        await eng._tick_behaviors(5.0)
+        await eng._tick_behaviors(1000.0)
+
+    asyncio.run(run_ticks())
+    assert eng.current_page == "eventlog"
+
+
+async def test_tick_behaviors_swallows_action_error_from_a_stripped_roster():
+    # A custom config that drops "screensaver" from config.pages must not
+    # crash the engine when the behavior still tries to `page.goto` it --
+    # see `Engine._tick_behaviors`'s own docstring.
+    eng = Engine(Config(pages=["eventlog"], screensaver_after_s=5.0, pagecycle_enabled=False))
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(5.0)   # must not raise
+    assert eng.current_page == "eventlog"
+
+
+async def test_run_loop_fires_pagecycle_via_real_wall_clock():
+    # End-to-end proof (real run() loop, real time.time() reads) that
+    # _tick_behaviors is actually wired into the run loop, not just
+    # unit-callable in isolation.
+    eng = Engine(Config(pagecycle_idle_s=0.05, screensaver_enabled=False, tick_hz=200.0))
+    task = asyncio.create_task(eng.run())
+    await asyncio.sleep(0.25)
+    eng.stop()
+    await task
+    assert eng.current_page != "eventlog"

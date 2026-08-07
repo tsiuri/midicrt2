@@ -1,7 +1,10 @@
 from midicrt.clients.chrome import (
     DEFAULT_ALERTS_VM,
+    DEFAULT_BEATFLASH_VM,
+    DEFAULT_LOOPPROGRESS_VM,
     DEFAULT_STATUS_VM,
     DEFAULT_TIMESIG_VM,
+    beatprogress_row_text,
     secondary_status_text,
     status_text,
 )
@@ -14,9 +17,11 @@ from midicrt.clients.tui import (
     _spectrum_bar_rows,
     _spectrum_columns,
     _voices_bar,
+    render_beatprogress_row,
     render_harmony_lines,
     render_lines,
     render_pianoroll_lines,
+    render_screensaver_lines,
     render_secondary_row,
     render_spectrum_lines,
     render_status_row,
@@ -116,6 +121,36 @@ def test_render_secondary_row_truncates_to_width():
     row = render_secondary_row(alerts_vm, DEFAULT_TIMESIG_VM, width=6)
     assert len(row) == 6
     assert row == secondary_status_text(alerts_vm, DEFAULT_TIMESIG_VM)[:6]
+
+
+# -- third chrome row: beatflash/loopprogress (phase-3 task 9) ---------------
+
+def test_render_beatprogress_row_is_exactly_width_wide():
+    row = render_beatprogress_row(DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, width=40)
+    assert len(row) == 40
+
+
+def test_render_beatprogress_row_delegates_to_shared_chrome_text():
+    beatflash_vm = {"intensity": 1.0, "is_bar": False}
+    loopprogress_vm = {"fraction": 0.25, "running": True}
+    assert render_beatprogress_row(beatflash_vm, loopprogress_vm, width=50) == \
+        beatprogress_row_text(beatflash_vm, loopprogress_vm, 50)
+
+
+# -- screensaver page (phase-3 task 9) ---------------------------------------
+
+def test_renderers_dispatch_table_has_screensaver():
+    assert RENDERERS["screensaver"] is render_screensaver_lines
+
+
+def test_render_screensaver_lines_is_entirely_blank():
+    out = render_screensaver_lines({"title": "SCREENSAVER"}, width=20, height=5)
+    assert len(out) == 5
+    assert all(line == " " * 20 for line in out)
+
+
+def test_render_screensaver_lines_handles_zero_height():
+    assert render_screensaver_lines({"title": "SCREENSAVER"}, width=20, height=0) == []
 
 
 # -- voices page (phase-3 task 4) --------------------------------------------

@@ -45,6 +45,22 @@ row shows the time-signature line). `run_tui` now reserves the bottom TWO
 rows for chrome (`render_lines`'s own contract stays unchanged, just
 invoked with `term.height - 2`) and subscribes to both new overlay topics
 alongside `overlay.status`.
+
+Chrome, part 3 (phase 3 task 9): a THIRD row, below status, for beatflash
++ loopprogress
+------------------------------------------------------------------------
+`overlay.beatflash` (beat-synced flash pulse) and `overlay.loopprogress`
+(8-bar cyclic position bar) share a further row -- `render_beatprogress_row`,
+`clients/chrome.py`'s `beatprogress_row_text()` -- positioned as the new
+TRUE BOTTOM-MOST row, with the status row now one row above it. This
+mirrors v1's own physical layout exactly, not an arbitrary stacking
+choice: `plugins/beatflash.py`/`plugins/loopprogress.py` draw at v1's
+literal bottom two screen rows, BELOW `plugins/timeclock.py`'s own row
+(ported as `overlay.status`) -- see `clients/chrome.py`'s module comment
+above `beatprogress_row_text` for the full row-offset evidence. `run_tui`
+now reserves the bottom THREE rows for chrome (`render_lines`'s contract
+again unchanged, invoked with `term.height - 3`) and subscribes to both
+new overlay topics alongside the existing three.
 """
 import json
 
@@ -100,6 +116,17 @@ def render_secondary_row(alerts_vm: dict, timesig_vm: dict, width: int) -> str:
     estimate -- see clients/chrome.py's `secondary_status_text()`). Same
     fit/pad treatment as `render_status_row`."""
     return _fit(chrome.secondary_status_text(alerts_vm, timesig_vm), width)
+
+
+def render_beatprogress_row(beatflash_vm: dict, loopprogress_vm: dict, width: int) -> str:
+    """TUI's presentation of the shared THIRD chrome row (phase-3 task 9:
+    v1's beatflash + loopprogress rows, combined onto one -- see
+    `clients/chrome.py`'s `beatprogress_row_text()` for the full v1
+    row-offset evidence and why they share a row). That shared function is
+    already width-aware and returns exactly `width` characters; this thin
+    wrapper exists purely for naming symmetry with `render_status_row`/
+    `render_secondary_row` above."""
+    return chrome.beatprogress_row_text(beatflash_vm, loopprogress_vm, width)
 
 
 # -- voices page (phase-3 task 4) --------------------------------------------
@@ -438,9 +465,30 @@ def render_spectrum_lines(vm: dict, width: int, height: int) -> list[str]:
     return [header] + [_fit(r, width) for r in rows]
 
 
+# -- screensaver page (phase-3 task 9) ---------------------------------------
+#
+# All-blank rows, no header text at all -- see pages/screensaver.py's module
+# docstring for the v1 comparison (v1 zeroes the ENTIRE real framebuffer,
+# bypassing every plugin including chrome) and its disclosed limitation:
+# `run_tui`'s render loop still unconditionally reverse-videos this
+# renderer's first returned line as "the header" (that treatment lives in
+# the generic loop below, outside any per-page renderer's control), so the
+# very top row still shows as a solid color bar rather than true black.
+# This is accepted here rather than special-cased -- TUI runs in an
+# ordinary terminal emulator with no CRT burn-in risk in the first place;
+# the FB client (clients/fb/app.py's `render_screensaver_frame`, which
+# draws NO header at all) is the one this page's real "avoid burn-in"
+# purpose targets.
+
+
+def render_screensaver_lines(vm: dict, width: int, height: int) -> list[str]:
+    return [" " * width for _ in range(max(0, height))]
+
+
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "harmony": render_harmony_lines, "tuner": render_tuner_lines,
-             "pianoroll": render_pianoroll_lines, "spectrum": render_spectrum_lines}
+             "pianoroll": render_pianoroll_lines, "spectrum": render_spectrum_lines,
+             "screensaver": render_screensaver_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
@@ -451,7 +499,8 @@ def run_tui(socket_path: str) -> int:
 
     client = EngineClient(socket_path)
     overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
-                       chrome.OVERLAY_TIMESIG_TOPIC]
+                       chrome.OVERLAY_TIMESIG_TOPIC, chrome.OVERLAY_BEATFLASH_TOPIC,
+                       chrome.OVERLAY_LOOPPROGRESS_TOPIC]
     try:
         client.connect()
         page, topic = current_page_topic(client)
@@ -463,7 +512,9 @@ def run_tui(socket_path: str) -> int:
 
     inbox = client.start_reader()
     state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM),
-             "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM)}
+             "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
+             "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
+             "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
 
     def on_event(msg: dict) -> None:
         if msg.get("kind") == "event" and msg.get("name") == "page_changed":
@@ -515,16 +566,27 @@ def run_tui(socket_path: str) -> int:
                 if chrome.OVERLAY_TIMESIG_TOPIC in drained:
                     state["timesig_vm"] = drained[chrome.OVERLAY_TIMESIG_TOPIC]
                     dirty = True
+                if chrome.OVERLAY_BEATFLASH_TOPIC in drained:
+                    state["beatflash_vm"] = drained[chrome.OVERLAY_BEATFLASH_TOPIC]
+                    dirty = True
+                if chrome.OVERLAY_LOOPPROGRESS_TOPIC in drained:
+                    state["loopprogress_vm"] = drained[chrome.OVERLAY_LOOPPROGRESS_TOPIC]
+                    dirty = True
                 if dirty:
-                    # Chrome reserves the LAST TWO rows (phase-3 task 6 adds
-                    # the secondary alerts/timesig row above the original
-                    # status row); the page renders header + body into the
-                    # remaining `height - 2` rows.
+                    # Chrome reserves the LAST THREE rows (phase-3 task 9
+                    # adds the beatflash/loopprogress row BELOW the
+                    # original status row, matching v1's own bottom-to-top
+                    # physical layout -- see clients/chrome.py's module
+                    # comment above `beatprogress_row_text` for the row-
+                    # offset evidence); the page renders header + body into
+                    # the remaining `height - 3` rows.
                     renderer = RENDERERS.get(state["page"], _render_unknown)
-                    page_lines = renderer(vm, term.width, term.height - 2)
+                    page_lines = renderer(vm, term.width, term.height - 3)
                     status_line = render_status_row(state["status_vm"], term.width)
                     secondary_line = render_secondary_row(
                         state["alerts_vm"], state["timesig_vm"], term.width)
+                    beatprogress_line = render_beatprogress_row(
+                        state["beatflash_vm"], state["loopprogress_vm"], term.width)
                     header_line, body_lines = page_lines[0], page_lines[1:]
                     # Accent (bold) highlighting reaches back into the vm's
                     # own "lines"/"style" shape -- eventlog-specific, but
@@ -539,10 +601,12 @@ def run_tui(socket_path: str) -> int:
                         is_accent = i >= pad and shown[i - pad].get("style") == "accent"
                         styled = term.bold(line) if is_accent else line
                         out.append(term.move_xy(0, i + 1) + styled)
-                    out.append(term.move_xy(0, term.height - 2)
+                    out.append(term.move_xy(0, term.height - 3)
                                + term.reverse(secondary_line) + term.normal)
-                    out.append(term.move_xy(0, term.height - 1)
+                    out.append(term.move_xy(0, term.height - 2)
                                + term.reverse(status_line) + term.normal)
+                    out.append(term.move_xy(0, term.height - 1)
+                               + term.reverse(beatprogress_line) + term.normal)
                     print("".join(out), end="", flush=True)
                     dirty = False
                 key = term.inkey(timeout=0.05)

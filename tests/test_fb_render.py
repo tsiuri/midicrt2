@@ -10,6 +10,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from midicrt.clients.chrome import DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM
 from midicrt.clients.fb import app
 from midicrt.clients.fb.surface import Surface
 from midicrt.clients.fb.text import draw_text, load_font
@@ -19,6 +20,16 @@ VENVPY = sys.executable
 FIXTURES = Path(__file__).parent / "fixtures"
 GOLDEN_FRAME = FIXTURES / "fb_frame_golden.png"
 GOLDEN_EMPTY = FIXTURES / "fb_frame_empty_golden.png"
+
+# Phase-3 task 9 note (applies to every *_SURFACE_SIZE constant in this
+# file): each fixed surface height below grew by exactly one strip's worth
+# of pixels (`font.height + 2*STATUS_PAD` = 12px at the vendored PSF font's
+# 8px height) to make room for the new `_draw_beatprogress` strip WITHOUT
+# shrinking any page's usable body height -- `_reserved_chrome_height(font)`
+# grew by that same 12px, so `usable_h = surface.height -
+# _reserved_chrome_height(font) - header_h` is unchanged from before this
+# task, and every row-count/geometry assertion below (and the frozen
+# golden PNGs, re-frozen per this task's report) still lines up exactly.
 
 EMPTY_VM = {"title": "EVENT LOG", "count": 0, "lines": []}
 
@@ -33,7 +44,7 @@ VM = {
         {"text": "cc      ch1 7=100", "style": "normal"},
     ],
 }
-GOLDEN_SURFACE_SIZE = (220, 60)
+GOLDEN_SURFACE_SIZE = (220, 72)   # +12px for the new beatprogress strip (see note above)
 
 # The golden-frame fixture now also exercises the chrome status strip
 # (phase-3 task 3: "golden updates for both renderers -- chrome now
@@ -51,6 +62,14 @@ GOLDEN_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source"
 GOLDEN_ALERTS_VM = {"alerts": [{"ch": 3, "note": 60, "level": "warn", "held_s": 2.3}]}
 GOLDEN_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
                       "events_window": 24, "events_total": 40, "pending": None}
+
+# Phase-3 task 9: a representative MID-DECAY beat flash + a running
+# loop-progress bar -- exercises the new third strip's real-content branch
+# on this (the eventlog) golden only, same "one golden shows the
+# interesting case, the rest show idle/default" precedent phase-3 task 6
+# already set for GOLDEN_ALERTS_VM/VOICES_ALERTS_VM.
+GOLDEN_BEATFLASH_VM = {"intensity": 0.8, "is_bar": False}
+GOLDEN_LOOPPROGRESS_VM = {"fraction": 0.375, "running": True}
 
 
 def test_renderers_dispatch_table_has_eventlog():
@@ -164,16 +183,19 @@ def test_status_strip_height_matches_header_sizing_convention():
 
 
 def test_draw_status_paints_reverse_video_bar_at_the_bottom():
+    # Phase-3 task 9: the status strip no longer sits at `surf.height`'s own
+    # edge -- the new beatprogress strip does (see app._draw_beatprogress's
+    # own docstring for why, matching v1's physical row order).
     font = load_font()
     surf = Surface(*GOLDEN_SURFACE_SIZE)
     surf.clear(app.BG)
     app._draw_status(surf, GOLDEN_STATUS_VM, font)
     px = surf.image.load()
     strip_h = app._status_strip_height(font)
-    y = surf.height - strip_h
+    y = surf.height - app._beatprogress_strip_height(font) - strip_h
     # Fill matches the header's reverse-video bar colour.
     assert px[surf.width - 1, y] == app.HEADER_BG
-    assert px[surf.width - 1, surf.height - 1] == app.HEADER_BG
+    assert px[surf.width - 1, y + strip_h - 1] == app.HEADER_BG
     # Above the strip is untouched.
     assert px[0, y - 1] == app.BG
     # A lit stroke pixel of the status text is painted in the background
@@ -196,12 +218,80 @@ def test_draw_status_text_matches_shared_chrome_status_text():
     surf_b = Surface(300, GOLDEN_SURFACE_SIZE[1])
     surf_b.clear(app.BG)
     strip_h = app._status_strip_height(font)
-    y = surf_b.height - strip_h
+    y = surf_b.height - app._beatprogress_strip_height(font) - strip_h
     surf_b.rect(0, y, surf_b.width, strip_h, app.HEADER_BG)
     draw_text(surf_b, app.LEFT_MARGIN, y + app.STATUS_PAD,
               chrome.status_text(GOLDEN_STATUS_VM), app.BG, font)
 
     assert surf_a.image.tobytes() == surf_b.image.tobytes()
+
+
+# -- third chrome strip: beatflash/loopprogress (phase-3 task 9) ------------
+
+def test_beatprogress_strip_height_matches_the_other_strips_sizing_convention():
+    font = load_font()
+    assert app._beatprogress_strip_height(font) == font.height + 2 * app.STATUS_PAD
+    assert app._beatprogress_strip_height(font) == app._status_strip_height(font)
+
+
+def test_reserved_chrome_height_sums_all_three_strips():
+    font = load_font()
+    assert app._reserved_chrome_height(font) == (
+        app._secondary_strip_height(font) + app._status_strip_height(font)
+        + app._beatprogress_strip_height(font)
+    )
+
+
+def test_draw_beatprogress_paints_reverse_video_bar_at_the_true_bottom():
+    font = load_font()
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    surf.clear(app.BG)
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, font)
+    px = surf.image.load()
+    strip_h = app._beatprogress_strip_height(font)
+    y = surf.height - strip_h
+    # Pinned to surface.height's own edge -- the new true bottom-most strip.
+    assert y + strip_h == surf.height
+    assert px[surf.width - 1, y] == app.HEADER_BG
+    assert px[surf.width - 1, surf.height - 1] == app.HEADER_BG
+    assert px[0, y - 1] == app.BG   # above the strip is untouched
+
+
+def test_draw_beatprogress_text_matches_shared_chrome_row_text():
+    font = load_font()
+    beatflash_vm = {"intensity": 1.4, "is_bar": True}
+    loopprogress_vm = {"fraction": 0.5, "running": True}
+
+    surf_a = Surface(300, GOLDEN_SURFACE_SIZE[1])
+    surf_a.clear(app.BG)
+    app._draw_beatprogress(surf_a, beatflash_vm, loopprogress_vm, font)
+
+    surf_b = Surface(300, GOLDEN_SURFACE_SIZE[1])
+    surf_b.clear(app.BG)
+    strip_h = app._beatprogress_strip_height(font)
+    y = surf_b.height - strip_h
+    surf_b.rect(0, y, surf_b.width, strip_h, app.HEADER_BG)
+    num_chars = (surf_b.width - 2 * app.LEFT_MARGIN) // font.width
+    text = app.chrome.beatprogress_row_text(beatflash_vm, loopprogress_vm, num_chars)
+    draw_text(surf_b, app.LEFT_MARGIN, y + app.STATUS_PAD, text, app.BG, font)
+
+    assert surf_a.image.tobytes() == surf_b.image.tobytes()
+
+
+# -- screensaver page (phase-3 task 9) ---------------------------------------
+
+def test_screensaver_renderers_dispatch_table_has_screensaver():
+    assert app.RENDERERS["screensaver"] is app.render_screensaver_frame
+
+
+def test_render_screensaver_frame_is_entirely_background():
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    # Paint something first so a no-op renderer would be caught red-handed.
+    surf.rect(0, 0, surf.width, surf.height, app.HEADER_BG)
+    app.render_screensaver_frame({"title": "SCREENSAVER"}, surf)
+    want = Surface(*GOLDEN_SURFACE_SIZE)
+    want.clear(app.BG)
+    assert surf.image.tobytes() == want.image.tobytes()
 
 
 def test_render_frame_accent_color_is_brighter_than_normal():
@@ -214,15 +304,17 @@ def test_render_frame_golden_matches_frozen_fixture():
     # (render_frame) + chrome status strip (_draw_status), the same way the
     # real run loops do -- "golden updates for both renderers, chrome now
     # present" (task-3 brief). Phase-3 task 6 re-froze it again to add the
-    # secondary alerts/timesig strip (`_draw_secondary`) the run loops now
-    # also always paint.
+    # secondary alerts/timesig strip (`_draw_secondary`); phase-3 task 9
+    # re-froze it once more to add the third beatflash/loopprogress strip
+    # (`_draw_beatprogress`) the run loops now also always paint.
     assert GOLDEN_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-6-report.md"
+        "golden fixture missing -- see freeze procedure in task-9-report.md"
     )
     surf = Surface(*GOLDEN_SURFACE_SIZE)
     app.render_frame(VM, surf)
     app._draw_secondary(surf, GOLDEN_ALERTS_VM, GOLDEN_TIMESIG_VM, load_font())
     app._draw_status(surf, GOLDEN_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, GOLDEN_BEATFLASH_VM, GOLDEN_LOOPPROGRESS_VM, load_font())
 
     golden = Image.open(GOLDEN_FRAME).convert("RGB")
     assert golden.size == GOLDEN_SURFACE_SIZE
@@ -273,7 +365,7 @@ def test_out_mode_renders_one_frame_and_exits_against_real_daemon(tmp_path):
 # -- voices page (phase-3 task 4) --------------------------------------------
 
 GOLDEN_VOICES_FRAME = FIXTURES / "fb_voices_frame_golden.png"
-VOICES_SURFACE_SIZE = (240, 216)   # header(12) + 16 rows*12 + status strip(12)
+VOICES_SURFACE_SIZE = (240, 228)   # header(12) + 16 rows*~11 + reserved chrome(36)
 
 VOICES_ROWS = [
     {"ch": i, "name": f"Instr{i}", "active": 0, "peak": 0, "notes": []}
@@ -421,12 +513,13 @@ def test_render_voices_frame_reserves_the_bottom_status_strip_as_background():
 
 def test_render_voices_frame_golden_matches_frozen_fixture():
     assert GOLDEN_VOICES_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-6-report.md"
+        "golden fixture missing -- see freeze procedure in task-9-report.md"
     )
     surf = Surface(*VOICES_SURFACE_SIZE)
     app.render_voices_frame(VOICES_VM, surf)
     app._draw_secondary(surf, VOICES_ALERTS_VM, VOICES_TIMESIG_VM, load_font())
     app._draw_status(surf, VOICES_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
 
     golden = Image.open(GOLDEN_VOICES_FRAME).convert("RGB")
     assert golden.size == VOICES_SURFACE_SIZE
@@ -436,7 +529,7 @@ def test_render_voices_frame_golden_matches_frozen_fixture():
 # -- harmony page (phase-3 task 5) --------------------------------------------
 
 GOLDEN_HARMONY_FRAME = FIXTURES / "fb_harmony_frame_golden.png"
-HARMONY_SURFACE_SIZE = (420, 114)   # header(12) + 10 rows*9 + status strip(12)
+HARMONY_SURFACE_SIZE = (420, 126)   # header(12) + 10 rows*9 + reserved chrome(36)
 
 HARMONY_VM = {
     "title": "HARMONY",
@@ -568,12 +661,13 @@ def test_render_harmony_frame_reserves_the_bottom_status_strip_as_background():
 
 def test_render_harmony_frame_golden_matches_frozen_fixture():
     assert GOLDEN_HARMONY_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-6-report.md"
+        "golden fixture missing -- see freeze procedure in task-9-report.md"
     )
     surf = Surface(*HARMONY_SURFACE_SIZE)
     app.render_harmony_frame(HARMONY_VM, surf)
     app._draw_secondary(surf, HARMONY_ALERTS_VM, HARMONY_TIMESIG_VM, load_font())
     app._draw_status(surf, HARMONY_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
 
     golden = Image.open(GOLDEN_HARMONY_FRAME).convert("RGB")
     assert golden.size == HARMONY_SURFACE_SIZE
@@ -583,7 +677,7 @@ def test_render_harmony_frame_golden_matches_frozen_fixture():
 # -- tuner page (phase-3 task 6) ----------------------------------------------
 
 GOLDEN_TUNER_FRAME = FIXTURES / "fb_tuner_frame_golden.png"
-TUNER_SURFACE_SIZE = (560, 54)   # header(12) + 2 rows*9 + reserved chrome(24)
+TUNER_SURFACE_SIZE = (560, 66)   # header(12) + 2 rows*9 + reserved chrome(36)
 
 TUNER_IDLE_VM = {"title": "TUNER", "note": "", "cents": 0.0, "hz": 0.0,
                  "confidence": 0.0, "db": -120.0, "has_signal": False}
@@ -651,12 +745,13 @@ def test_render_tuner_frame_reserves_the_bottom_chrome_as_background():
 
 def test_render_tuner_frame_golden_matches_frozen_fixture():
     assert GOLDEN_TUNER_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-6-report.md"
+        "golden fixture missing -- see freeze procedure in task-9-report.md"
     )
     surf = Surface(*TUNER_SURFACE_SIZE)
     app.render_tuner_frame(TUNER_LOCKED_VM, surf)
     app._draw_secondary(surf, TUNER_ALERTS_VM, TUNER_TIMESIG_VM, load_font())
     app._draw_status(surf, TUNER_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
 
     golden = Image.open(GOLDEN_TUNER_FRAME).convert("RGB")
     assert golden.size == TUNER_SURFACE_SIZE
@@ -674,7 +769,7 @@ def test_render_tuner_frame_golden_matches_frozen_fixture():
 # covered by tests/test_pages_pianoroll.py's tempo-mode tests.
 GOLDEN_PIANOROLL_FRAME = FIXTURES / "fb_pianoroll_frame_golden.png"
 GOLDEN_PIANOROLL_TEMPO_FRAME = FIXTURES / "fb_pianoroll_tempo_frame_golden.png"
-PIANOROLL_SURFACE_SIZE = (420, 132)   # header(12) + usable(96, 13 pitch rows) + chrome(24)
+PIANOROLL_SURFACE_SIZE = (420, 144)   # header(12) + usable(96, 13 pitch rows) + chrome(36)
 
 PIANOROLL_NOTES = [
     {"ch": 1, "y": 0.0, "x0": 0.1, "x1": 0.9, "vel": 1.0, "active": False},
@@ -774,12 +869,13 @@ def test_render_pianoroll_frame_reserves_the_bottom_chrome_as_background():
 
 def test_render_pianoroll_frame_golden_matches_frozen_fixture():
     assert GOLDEN_PIANOROLL_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-7-report.md"
+        "golden fixture missing -- see freeze procedure in task-9-report.md"
     )
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM, surf)
     app._draw_secondary(surf, PIANOROLL_ALERTS_VM, PIANOROLL_TIMESIG_VM, load_font())
     app._draw_status(surf, PIANOROLL_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
 
     golden = Image.open(GOLDEN_PIANOROLL_FRAME).convert("RGB")
     assert golden.size == PIANOROLL_SURFACE_SIZE
@@ -788,12 +884,13 @@ def test_render_pianoroll_frame_golden_matches_frozen_fixture():
 
 def test_render_pianoroll_frame_golden_matches_frozen_fixture_in_tempo_mode():
     assert GOLDEN_PIANOROLL_TEMPO_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-7-fix1-report.md"
+        "golden fixture missing -- see freeze procedure in task-9-report.md"
     )
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM_TEMPO, surf)
     app._draw_secondary(surf, PIANOROLL_ALERTS_VM, PIANOROLL_TIMESIG_VM, load_font())
     app._draw_status(surf, PIANOROLL_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
 
     golden = Image.open(GOLDEN_PIANOROLL_TEMPO_FRAME).convert("RGB")
     assert golden.size == PIANOROLL_SURFACE_SIZE
@@ -816,7 +913,7 @@ def test_pianoroll_tempo_and_wallclock_goldens_share_identical_body_pixels():
 # -- spectrum page (phase-3 task 8) -------------------------------------------
 
 GOLDEN_SPECTRUM_FRAME = FIXTURES / "fb_spectrum_frame_golden.png"
-SPECTRUM_SURFACE_SIZE = (300, 116)   # header(12) + usable(80) + reserved chrome(24)
+SPECTRUM_SURFACE_SIZE = (300, 128)   # header(12) + usable(80) + reserved chrome(36)
 
 SPECTRUM_VM = {
     "title": "SPECTRUM", "available": True, "device": "USB Audio Device",
@@ -944,12 +1041,13 @@ def test_render_spectrum_frame_reserves_the_bottom_chrome_as_background():
 
 def test_render_spectrum_frame_golden_matches_frozen_fixture():
     assert GOLDEN_SPECTRUM_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-8-report.md"
+        "golden fixture missing -- see freeze procedure in task-9-report.md"
     )
     surf = Surface(*SPECTRUM_SURFACE_SIZE)
     app.render_spectrum_frame(SPECTRUM_VM, surf)
     app._draw_secondary(surf, SPECTRUM_ALERTS_VM, SPECTRUM_TIMESIG_VM, load_font())
     app._draw_status(surf, SPECTRUM_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
 
     golden = Image.open(GOLDEN_SPECTRUM_FRAME).convert("RGB")
     assert golden.size == SPECTRUM_SURFACE_SIZE

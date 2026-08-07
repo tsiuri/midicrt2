@@ -48,6 +48,26 @@ renderer's usable-height math now subtracts BOTH strips
 (`_secondary_strip_height(font) + _status_strip_height(font)`); the run
 loops subscribe to both new overlay topics alongside `overlay.status` and
 call `_draw_secondary` right after `_draw_status`.
+
+Chrome, part 3 (phase 3 task 9): a THIRD strip, below status, for
+beatflash + loopprogress
+--------------------------------------------------------------------------
+A third reserved strip (`_draw_beatprogress`, same height convention)
+becomes the new TRUE BOTTOM-MOST strip -- `_draw_status`'s own strip moves
+up by one strip-height to sit directly above it. This mirrors v1's actual
+physical layout exactly: `~/codex/midicrt/plugins/beatflash.py`/
+`loopprogress.py` draw at v1's literal bottom two screen rows, BELOW
+`plugins/timeclock.py`'s own row (ported as the status strip) -- see
+`clients/chrome.py`'s module comment above `beatprogress_row_text()` for
+the full row-offset evidence. That shared function needs a character-count
+`width` to center v1's loop-progress bar within (the same reason the TUI
+client passes `term.width`); this strip passes `(surface.width - 2 *
+LEFT_MARGIN) // font.width` -- the printable area in character units,
+symmetric about `LEFT_MARGIN` on both sides -- as its closest FB analog.
+Every page renderer's usable-height math now subtracts all THREE strips
+(`_reserved_chrome_height`); the run loops subscribe to both new overlay
+topics and call `_draw_beatprogress` right after `_draw_secondary`/
+`_draw_status`.
 """
 import argparse
 import logging
@@ -531,9 +551,25 @@ def render_spectrum_frame(vm: dict, surface: Surface) -> None:
             surface.hline(x, peak_y, bar_w, ACCENT_FG)
 
 
+# -- screensaver page (phase-3 task 9) ---------------------------------------
+#
+# Clears to background and draws NOTHING else -- no header, no text -- the
+# closest v2 can get to v1's literal `_blank_fb()` (zeroing the entire real
+# framebuffer). See pages/screensaver.py's module docstring for the v1
+# comparison and its disclosed limitation: the chrome strips below are
+# still painted by the run loops AFTER this renderer returns, unconditionally
+# regardless of page, so they stay lit even here -- unlike v1, which has
+# nothing left to draw over once its own blank runs.
+
+
+def render_screensaver_frame(vm: dict, surface: Surface) -> None:
+    surface.clear(BG)
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
              "harmony": render_harmony_frame, "tuner": render_tuner_frame,
-             "pianoroll": render_pianoroll_frame, "spectrum": render_spectrum_frame}
+             "pianoroll": render_pianoroll_frame, "spectrum": render_spectrum_frame,
+             "screensaver": render_screensaver_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------
@@ -546,16 +582,18 @@ def _status_strip_height(font) -> int:
 
 
 def _draw_status(surface: Surface, vm: dict, font) -> None:
-    """Paint the bottom status strip onto `surface`: a reverse-video bar
-    (same `HEADER_BG` fill / `BG` text convention as the page header)
-    showing the shared chrome status text (`clients/chrome.py` --
-    word-for-word identical to the TUI's bottom row, per the task-3
-    brief's "mirrors it"). Pinned to the bottom `_status_strip_height(font)`
-    px of `surface`, which `render_frame` already leaves clear for this.
-    Pure aside from the font glyph cache, same contract as `render_frame`.
+    """Paint the status strip onto `surface`: a reverse-video bar (same
+    `HEADER_BG` fill / `BG` text convention as the page header) showing the
+    shared chrome status text (`clients/chrome.py` -- word-for-word
+    identical to the TUI's status row, per the task-3 brief's "mirrors
+    it"). Sits directly ABOVE the beatprogress strip (phase-3 task 9 made
+    THAT the new true bottom-most strip, matching v1's own physical
+    layout -- see module docstring), not pinned to `surface.height` itself
+    any more. Pure aside from the font glyph cache, same contract as
+    `render_frame`.
     """
     strip_h = _status_strip_height(font)
-    y = surface.height - strip_h
+    y = surface.height - _beatprogress_strip_height(font) - strip_h
     surface.rect(0, y, surface.width, strip_h, HEADER_BG)
     draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, chrome.status_text(vm), BG, font)
 
@@ -570,10 +608,11 @@ def _secondary_strip_height(font) -> int:
 
 
 def _reserved_chrome_height(font) -> int:
-    """Total px reserved at the bottom of the surface for BOTH chrome
+    """Total px reserved at the bottom of the surface for ALL THREE chrome
     strips -- every page renderer's usable-height math subtracts this
     (see module docstring)."""
-    return _secondary_strip_height(font) + _status_strip_height(font)
+    return (_secondary_strip_height(font) + _status_strip_height(font)
+            + _beatprogress_strip_height(font))
 
 
 def _draw_secondary(surface: Surface, alerts_vm: dict, timesig_vm: dict, font) -> None:
@@ -584,6 +623,32 @@ def _draw_secondary(surface: Surface, alerts_vm: dict, timesig_vm: dict, font) -
     y = surface.height - _reserved_chrome_height(font)
     surface.rect(0, y, surface.width, strip_h, HEADER_BG)
     text = chrome.secondary_status_text(alerts_vm, timesig_vm)
+    draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, text, BG, font)
+
+
+# -- chrome: beatflash/loopprogress strip (phase-3 task 9) -------------------
+
+
+def _beatprogress_strip_height(font) -> int:
+    """Pixel height of the third reserved strip -- same sizing convention
+    as `_status_strip_height`/`_secondary_strip_height`."""
+    return font.height + 2 * STATUS_PAD
+
+
+def _draw_beatprogress(surface: Surface, beatflash_vm: dict, loopprogress_vm: dict, font) -> None:
+    """Paint the third reserved strip -- the new TRUE BOTTOM-MOST strip
+    (see module docstring for why this, not the status strip, now owns
+    `surface.height`'s own edge) -- same reverse-video convention, showing
+    `clients/chrome.py`'s `beatprogress_row_text()`. `num_chars` is the
+    printable width in CHARACTER units (symmetric about `LEFT_MARGIN` on
+    both sides) -- the FB analog of the TUI client's `term.width`, needed
+    because that shared function centers v1's loop-progress bar within it.
+    """
+    strip_h = _beatprogress_strip_height(font)
+    y = surface.height - strip_h
+    surface.rect(0, y, surface.width, strip_h, HEADER_BG)
+    num_chars = max(0, (surface.width - 2 * LEFT_MARGIN) // font.width)
+    text = chrome.beatprogress_row_text(beatflash_vm, loopprogress_vm, num_chars)
     draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, text, BG, font)
 
 
@@ -699,7 +764,9 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
     surface = Surface(width, height)
     font = load_font()
     state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM),
-             "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM)}
+             "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
+             "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
+             "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
     on_event = _make_page_switcher(client, state, fps)
 
     fb_file, fb_mm = open_fb_mmap(fb_path, stride * height)
@@ -721,6 +788,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
         renderer(vm, surface)
         _draw_secondary(surface, state["alerts_vm"], state["timesig_vm"], font)
         _draw_status(surface, state["status_vm"], font)
+        _draw_beatprogress(surface, state["beatflash_vm"], state["loopprogress_vm"], font)
         surface.write_to_mmap(fb_mm, stride=stride)
 
         period = 1.0 / fps
@@ -731,11 +799,12 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             # (invoked from inside this very call) can switch `state["topic"]`
             # mid-drain, and a same-batch snapshot for the NEW topic must
             # still be recognised, not dropped by a stale membership check.
-            # The three overlay topics are fixed members -- each updates on
+            # The five overlay topics are fixed members -- each updates on
             # its own schedule, independent of the page topic.
             drained = drain_latest(
                 inbox, lambda: {state["topic"], chrome.OVERLAY_STATUS_TOPIC,
-                                chrome.OVERLAY_ALERTS_TOPIC, chrome.OVERLAY_TIMESIG_TOPIC},
+                                chrome.OVERLAY_ALERTS_TOPIC, chrome.OVERLAY_TIMESIG_TOPIC,
+                                chrome.OVERLAY_BEATFLASH_TOPIC, chrome.OVERLAY_LOOPPROGRESS_TOPIC},
                 on_event=on_event)
             page_updated = state["topic"] in drained
             if page_updated:
@@ -750,14 +819,22 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             if chrome.OVERLAY_TIMESIG_TOPIC in drained:
                 state["timesig_vm"] = drained[chrome.OVERLAY_TIMESIG_TOPIC]
                 secondary_updated = True
-            if page_updated or status_updated or secondary_updated:
-                # `render_frame` clears the WHOLE surface, so both chrome
-                # strips must be repainted on every redraw, not just when
-                # their own vm changed.
+            beatprogress_updated = False
+            if chrome.OVERLAY_BEATFLASH_TOPIC in drained:
+                state["beatflash_vm"] = drained[chrome.OVERLAY_BEATFLASH_TOPIC]
+                beatprogress_updated = True
+            if chrome.OVERLAY_LOOPPROGRESS_TOPIC in drained:
+                state["loopprogress_vm"] = drained[chrome.OVERLAY_LOOPPROGRESS_TOPIC]
+                beatprogress_updated = True
+            if page_updated or status_updated or secondary_updated or beatprogress_updated:
+                # `render_frame` clears the WHOLE surface, so all THREE
+                # chrome strips must be repainted on every redraw, not just
+                # when their own vm changed.
                 renderer = RENDERERS.get(state["page"], _render_unknown)
                 renderer(vm, surface)
                 _draw_secondary(surface, state["alerts_vm"], state["timesig_vm"], font)
                 _draw_status(surface, state["status_vm"], font)
+                _draw_beatprogress(surface, state["beatflash_vm"], state["loopprogress_vm"], font)
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
     finally:
@@ -769,7 +846,8 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
         no_input: bool, fps: float) -> int:
     client = EngineClient(socket_path)
     overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
-                       chrome.OVERLAY_TIMESIG_TOPIC]
+                       chrome.OVERLAY_TIMESIG_TOPIC, chrome.OVERLAY_BEATFLASH_TOPIC,
+                       chrome.OVERLAY_LOOPPROGRESS_TOPIC]
     try:
         client.connect()
         page, topic = current_page_topic(client)
@@ -796,6 +874,8 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
             secondary = {"alerts_vm": dict(chrome.DEFAULT_ALERTS_VM),
                         "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM)}
             status = {"vm": dict(chrome.DEFAULT_STATUS_VM)}
+            beatprogress = {"beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
+                            "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
 
             def _capture_status(msg: dict) -> None:
                 if msg.get("kind") != "snapshot":
@@ -806,6 +886,10 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
                     secondary["alerts_vm"] = msg["data"]
                 elif msg.get("topic") == chrome.OVERLAY_TIMESIG_TOPIC:
                     secondary["timesig_vm"] = msg["data"]
+                elif msg.get("topic") == chrome.OVERLAY_BEATFLASH_TOPIC:
+                    beatprogress["beatflash_vm"] = msg["data"]
+                elif msg.get("topic") == chrome.OVERLAY_LOOPPROGRESS_TOPIC:
+                    beatprogress["loopprogress_vm"] = msg["data"]
 
             vm = wait_first_snapshot(inbox, topic, _capture_status)
             surface = Surface(*OUT_SIZE)
@@ -813,6 +897,8 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
             renderer(vm, surface)
             _draw_secondary(surface, secondary["alerts_vm"], secondary["timesig_vm"], load_font())
             _draw_status(surface, status["vm"], load_font())
+            _draw_beatprogress(surface, beatprogress["beatflash_vm"],
+                                beatprogress["loopprogress_vm"], load_font())
             surface.save_png(out_path)
             return 0
         return _run_device(client, inbox, fb_path, no_input, fps, page, topic)
