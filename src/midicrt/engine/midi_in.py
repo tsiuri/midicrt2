@@ -43,6 +43,43 @@ NOT reset its own beat counter on continue, matching v1 -- so a phase
 error introduced here would never self-correct). Only "start" truly
 restarts the beat grid from tick 0, so only "start" zeroes the pulse
 tally.
+
+Self-subscription exclusion (phase-3 task 12 fix -- Critical, live-
+reproduced)
+---------------------------------------------------------------------------
+`engine/midi_out.py::MidiOutput` lazily opens a virtual ALSA output port
+(default name "midicrt2 Output") the first time the engine sends anything
+(a Send Notes trigger, a SysEx reply). ALSA/RtMidi virtual ports are
+bidirectionally discoverable -- creating one as an OUTPUT also creates a
+name `get_input_names()` reports (observed live, exact string: `"RtMidiOut
+Client:midicrt2 Output 142:0"`) -- so `MidiInput`'s default wildcard
+pattern (`config.midi_sources = ["*"]`) would happily match and OPEN the
+daemon's own output as an input source, creating a true self-subscription
+feedback loop. Confirmed live via `aconnect` (the daemon's own reader
+thread held "Connected From" its own output port) with two reproduced
+consequences: (a) any reply-eliciting SysEx command -- even the standard
+`CMD_CAPABILITIES` handshake -- loops FOREVER, since `engine/sysex.py::
+build_reply()`'s own marker byte makes every reply itself re-parse as a
+brand-new valid command with no origin check anywhere in the dispatch
+path (sustained ~175 events/sec for 20+ minutes until a manual
+`systemctl restart`); (b) every real Send Notes trigger echoes back as a
+PHANTOM external note-on, contaminating `voices`/`harmony`/`stucknotes`/
+`eventlog` with fake incoming MIDI that never actually arrived from
+anywhere real.
+
+Fixed here as LAYER 1 of a two-layer defense (layer 2:
+`engine/core.py::Engine._handle`'s own unconditional source filter, belt-
+and-suspenders against any FUTURE code path that opens a port without
+going through this scan, or a bug here): `MidiInput.__init__` takes an
+`exclude_names` collection (daemon.py wires in `engine.midi_output_port_
+name`, the engine's OWN configured output-port name); `_watch()`'s scan
+loop never opens a port whose enumerated name CONTAINS one of those
+names. Substring containment, not exact match -- the real observed form
+above wraps the configured name in backend-specific client/port framing
+that an exact-match check would silently miss entirely, which is exactly
+how this bug slipped through code review and unit tests the first time:
+nothing had ever exercised what `get_input_names()` ACTUALLY returns for
+a self-opened virtual port on real hardware.
 """
 import fnmatch
 import logging
@@ -64,6 +101,18 @@ _CLOCK_BOUNDARY_RESET_TYPES = {"start", "stop", "continue"}  # always clear the 
 
 def matches(port_name: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(port_name, p) for p in patterns)
+
+
+def _is_own_output(port_name: str, exclude_names) -> bool:
+    """True if `port_name` (an ALSA-enumerated INPUT-port name, as
+    returned by `get_input_names()`) refers to one of `exclude_names` --
+    the daemon's own `MidiOutput` port(s). See this module's own docstring
+    ("Self-subscription exclusion") for why substring containment, not
+    exact match, is required, and for the real observed name form this
+    was written against. Falsy entries in `exclude_names` (e.g. `None`/
+    `""`, before the output port's name is known) are ignored -- an empty
+    string would otherwise match every port name via `in`."""
+    return any(name and name in port_name for name in exclude_names)
 
 
 def translate(msg, source: str, ts: float) -> MidiEvent | None:
@@ -113,7 +162,7 @@ def translate(msg, source: str, ts: float) -> MidiEvent | None:
 
 
 class MidiInput:
-    def __init__(self, patterns, queue, poll_interval=3.0, backend=None):
+    def __init__(self, patterns, queue, poll_interval=3.0, backend=None, exclude_names=()):
         if backend is None:
             import mido as backend
         self._backend = backend
@@ -126,6 +175,13 @@ class MidiInput:
         self._loop = None
         self._clock_count = 0
         self._clock_batch_start: float | None = None
+        # Phase-3 task 12 fix (self-subscription feedback loop, Critical --
+        # see module docstring): never OPEN a port whose enumerated name
+        # refers to one of these -- normally the daemon's own MidiOutput
+        # port name, wired in by daemon.py via `engine.midi_output_port_
+        # name`.
+        self._exclude_names = tuple(exclude_names)
+        self._excluded_warned: set[str] = set()   # log each skipped name once, not every poll
 
     @property
     def open_ports(self) -> list[str]:
@@ -179,13 +235,22 @@ class MidiInput:
                 _LOG.warning("port scan failed: %s", exc)
                 available = set()
             for name in sorted(available):
-                if name not in self._ports and matches(name, self._patterns):
-                    try:
-                        self._ports[name] = self._backend.open_input(
-                            name, callback=lambda m, n=name: self._enqueue(m, n))
-                        _LOG.info("opened MIDI input: %s", name)
-                    except Exception as exc:  # noqa: BLE001 — same: one bad port must not kill the loop
-                        _LOG.warning("open failed for %s: %s", name, exc)
+                if name in self._ports or not matches(name, self._patterns):
+                    continue
+                if _is_own_output(name, self._exclude_names):
+                    # Critical fix (self-subscription feedback loop -- see
+                    # module docstring): NEVER open our own daemon's output
+                    # port as an input, however it matches `_patterns`.
+                    if name not in self._excluded_warned:
+                        _LOG.info("skipping own output port (would self-subscribe): %s", name)
+                        self._excluded_warned.add(name)
+                    continue
+                try:
+                    self._ports[name] = self._backend.open_input(
+                        name, callback=lambda m, n=name: self._enqueue(m, n))
+                    _LOG.info("opened MIDI input: %s", name)
+                except Exception as exc:  # noqa: BLE001 — same: one bad port must not kill the loop
+                    _LOG.warning("open failed for %s: %s", name, exc)
             for name in list(self._ports):
                 if name not in available:
                     _LOG.info("MIDI input vanished: %s", name)

@@ -178,6 +178,27 @@ class SendNotesPage:
             expired.append((entry["note"], entry["ch"]))
         return expired
 
+    def flush_all(self) -> list[tuple[int, int]]:
+        """Unconditionally release EVERY still-gated active note,
+        regardless of whether its gate has elapsed yet -- called ONCE,
+        synchronously, from `Engine.stop()` (Important fix, live-
+        reproduced): before this existed, a routine daemon restart
+        mid-note just closed `MidiOutput` out from under `drain_expired`'s
+        future release, leaving a real downstream synth holding a stuck
+        note with no way to release it short of the synth's own local
+        panic/timeout, if it even has one.
+
+        Unlike `drain_expired(now)`, this takes NO clock argument at all
+        -- at shutdown there is nothing left to wait for, so every queued
+        entry is released immediately, in the same FIFO order they were
+        pressed (matches `drain_expired`'s own ordering, just unconditional
+        rather than gated on `expire_ts`). Idempotent: a second call on an
+        already-empty queue returns `[]`.
+        """
+        flushed = [(entry["note"], entry["ch"]) for entry in self._active]
+        self._active.clear()
+        return flushed
+
     # -- view model ---------------------------------------------------------
 
     def view_model(self) -> dict:

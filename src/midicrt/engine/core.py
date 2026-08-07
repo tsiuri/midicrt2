@@ -621,6 +621,16 @@ class Engine:
         return [f"page.{name}" for name in self.pages] + \
             [f"overlay.{name}" for name in self.analyzers]
 
+    @property
+    def midi_output_port_name(self) -> str:
+        """Phase-3 task 12 fix: the daemon's own `MidiOutput` port name,
+        exposed so `daemon.py::build()` can wire it into `MidiInput`'s
+        `exclude_names` -- the layer-1 self-subscription defense (see
+        `engine/midi_in.py`'s own module docstring for the full incident).
+        A public accessor rather than daemon.py reaching into
+        `engine._midi_out.port_name` directly."""
+        return self._midi_out.port_name
+
     def add_listener(self, cb: Callable[[dict], None]) -> None:
         self._listeners.append(cb)
 
@@ -654,6 +664,24 @@ class Engine:
         }
 
     def _handle(self, ev: MidiEvent) -> None:
+        # Phase-3 task 12 fix (Critical, live-reproduced self-subscription
+        # feedback loop): drop ANY event whose `source` refers to our own
+        # `MidiOutput` port, before touching anything else -- events_total,
+        # activity, analyzers, pages, all of it. This is LAYER 2 of a
+        # two-layer defense (layer 1: `engine/midi_in.py::MidiInput`'s own
+        # `exclude_names`, which should already prevent this port from ever
+        # being opened as an input at all -- see that module's own
+        # docstring for the full incident writeup). Layer 2 exists as cheap
+        # insurance against ANY future code path that opens a port without
+        # going through that scan, or a bug there: a self-subscription loop
+        # is catastrophic enough (a SysEx reply re-parses as a brand-new
+        # valid command with no origin field anywhere in the wire format,
+        # so it would otherwise loop forever) that a second, independent
+        # check here is cheap. Substring match (not exact), matching layer
+        # 1's own reasoning -- the real ALSA-enumerated source name wraps
+        # our configured port name in backend-specific client/port framing.
+        if ev.source and self._midi_out.port_name in ev.source:
+            return
         self.events_total += 1
         if ev.type in _ACTIVITY_EVENT_TYPES:
             self._last_activity_ts = ev.ts
@@ -863,6 +891,17 @@ class Engine:
 
     def stop(self) -> None:
         self._running = False
+        # Phase-3 task 12 fix (Important, live-reproduced): flush any
+        # still-gated Send Notes BEFORE closing midi_out -- a routine
+        # restart mid-note used to just close the port out from under
+        # `drain_expired`'s future note_off, leaving a real downstream
+        # synth holding a stuck note. `flush_all()` needs no injected
+        # clock (see that method's own docstring), so this is safe to call
+        # synchronously right here, while the port is still open/usable.
+        sendnotes = self.pages.get("sendnotes")
+        if sendnotes is not None:
+            for note, ch in sendnotes.flush_all():
+                self._midi_out.note_off(note, ch)
         # Phase-3 task 12: unlike MidiInput (owned/started/stopped by
         # daemon.py, injected via self.queue), MidiOutput is constructed
         # entirely inside Engine.__init__ with no external owner -- so

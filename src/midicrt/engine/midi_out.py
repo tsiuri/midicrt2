@@ -40,6 +40,44 @@ load time. `Engine.__init__` can therefore always construct one
 unconditionally (see `engine/core.py`) without ever touching a real MIDI
 port unless a `sendnotes.key` action or a real Cirklon SysEx command
 actually arrives.
+
+Why this port's NAME matters beyond cosmetics: self-subscription
+(Critical fix, live-reproduced after initial landing)
+---------------------------------------------------------------------------
+This port's name is a load-bearing identifier, not just a label a human
+reads in an ALSA patchbay. ALSA/RtMidi virtual ports are bidirectionally
+discoverable -- creating one as an OUTPUT (`open_output(name,
+virtual=True)`) ALSO creates a name `mido.get_input_names()` reports
+(observed live: a port opened here as `"midicrt2 Output"` is enumerated
+back as `"RtMidiOut Client:midicrt2 Output 142:0"`). `engine/midi_in.py::
+MidiInput`'s default wildcard pattern (`config.midi_sources = ["*"]`)
+would happily match and OPEN that name as an INPUT SOURCE, subscribing
+the daemon's own reader to its own writer -- confirmed live via `aconnect`
+(the reader thread held "Connected From" this very output port). Two
+reproduced consequences before the fix: any reply-eliciting SysEx (even
+the standard `CMD_CAPABILITIES` handshake) looped FOREVER, since `engine/
+sysex.py::build_reply()`'s own marker byte makes every reply re-parse as
+a brand-new valid command with no origin field anywhere in the wire
+format (sustained ~175 events/sec for 20+ minutes until a manual
+restart); every real Send Notes trigger also echoed back as a phantom
+external note-on, contaminating `voices`/`harmony`/`stucknotes`/
+`eventlog` with fake incoming MIDI.
+
+Fixed as a two-layer defense, NEITHER layer living in this file (this
+module only owns the NAME both layers key off of):
+1. `engine/midi_in.py::MidiInput`'s own `exclude_names` -- never OPEN a
+   port whose enumerated name contains one of these (wired from `daemon.
+   py::build()` via `Engine.midi_output_port_name`, a public accessor
+   onto this class's own `port_name` property, added for exactly this
+   wiring).
+2. `engine/core.py::Engine._handle`'s own unconditional source filter --
+   belt and suspenders, dropping any event whose `source` contains this
+   port's name regardless of whether layer 1 ever let it through.
+
+`DEFAULT_PORT_NAME`'s distinctness from v1's own "GreenCRT Sender" (see
+above) turns out to matter for BOTH reasons now: avoiding a v1 collision,
+and giving both defense layers a short, precise, unlikely-to-false-
+positive substring to match against.
 """
 import logging
 

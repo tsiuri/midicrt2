@@ -3,6 +3,7 @@ import asyncio
 import mido
 
 from midicrt.analyzers.transport import TransportAnalyzer
+from midicrt.engine import midi_in
 from midicrt.engine.midi_in import MidiInput, matches, translate
 
 
@@ -57,6 +58,46 @@ def test_matches():
     assert matches("anything", ["*"])
 
 
+# -- self-subscription feedback-loop fix (live-reproduced Critical) --------
+#
+# MidiOutput's own virtual port (e.g. "midicrt2 Output") is enumerable by
+# MidiInput's default wildcard `["*"]` pattern -- ALSA/RtMidi virtual ports
+# are bidirectionally discoverable, so creating one as an OUTPUT also
+# creates a name `get_input_names()` reports. Confirmed live via `aconnect`
+# (the daemon's own reader thread held "Connected From" its own output
+# port) and reproduced: any reply-eliciting SysEx (even the standard
+# CMD_CAPABILITIES handshake) loops forever, since `build_reply()`'s own
+# marker byte makes every reply re-parse as a fresh command with no origin
+# check; every sendnotes note also echoed back as phantom external MIDI.
+# `_is_own_output` is layer 1 of the two-layer fix (layer 2 is
+# `Engine._handle`'s own source filter, see test_engine_core.py).
+def test_is_own_output_matches_the_exact_configured_name():
+    assert midi_in._is_own_output("midicrt2 Output", ("midicrt2 Output",))
+
+
+def test_is_own_output_matches_the_real_observed_prefixed_alsa_form():
+    # Live-observed exact string (task-12 fix live verification): a
+    # virtual output port named "midicrt2 Output" is enumerated back by
+    # get_input_names() wrapped in backend-specific client/port framing --
+    # exact-match would miss this entirely.
+    name = "RtMidiOut Client:midicrt2 Output 142:0"
+    assert midi_in._is_own_output(name, ("midicrt2 Output",))
+
+
+def test_is_own_output_no_match_for_an_unrelated_port():
+    assert not midi_in._is_own_output("NetMIDI 128:0", ("midicrt2 Output",))
+
+
+def test_is_own_output_empty_exclude_list_never_matches():
+    assert not midi_in._is_own_output("RtMidiOut Client:midicrt2 Output 142:0", ())
+
+
+def test_is_own_output_ignores_falsy_exclude_entries():
+    # Defensive: a blank/None exclude name (e.g. before MidiOutput's port
+    # is known) must never match everything via an empty-string `in` check.
+    assert not midi_in._is_own_output("anything at all", ("", None))
+
+
 class FakeBackend:
     def __init__(self):
         self.names = ["NetMIDI 128:0", "Midi Through 14:0"]
@@ -92,6 +133,32 @@ async def test_midi_input_opens_matching_and_enqueues():
             break
         await asyncio.sleep(0.05)
     assert mi.open_ports == []
+
+
+async def test_midi_input_never_opens_its_own_daemons_output_port():
+    # Reproduces the live incident: a wildcard ["*"] pattern would
+    # otherwise match the daemon's own MidiOutput port (enumerated in its
+    # real, backend-prefixed form) -- exclude_names must prevent it from
+    # EVER being opened, across repeated poll cycles, while a genuinely
+    # separate real port with a similar-looking name still opens normally.
+    backend = FakeBackend()
+    backend.names = [
+        "RtMidiOut Client:midicrt2 Output 142:0",   # the daemon's own output
+        "USB MIDI 20:0",                             # a real, unrelated device
+    ]
+    queue = asyncio.Queue()
+    mi = MidiInput(["*"], queue, poll_interval=0.05, backend=backend,
+                    exclude_names=("midicrt2 Output",))
+    mi.start(asyncio.get_running_loop())
+    for _ in range(50):
+        if mi.open_ports:
+            break
+        await asyncio.sleep(0.05)
+    # Give it a few more poll cycles to make sure it doesn't get opened later.
+    await asyncio.sleep(0.2)
+    assert mi.open_ports == ["USB MIDI 20:0"]
+    assert "RtMidiOut Client:midicrt2 Output 142:0" not in backend.opened
+    mi.stop()
     mi.stop()
 
 

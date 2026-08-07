@@ -18,7 +18,12 @@ def build(cfg, socket_path: str, use_midi: bool):
     midi = None
     if use_midi:
         from midicrt.engine.midi_in import MidiInput  # lazy: needs rtmidi
-        midi = MidiInput(cfg.midi_sources, engine.queue)
+        # Phase-3 task 12 fix (Critical, live-reproduced self-subscription
+        # feedback loop): never let MidiInput's own wildcard scan open the
+        # engine's own MidiOutput port as an input -- see engine/midi_in.py's
+        # module docstring for the full incident writeup.
+        midi = MidiInput(cfg.midi_sources, engine.queue,
+                         exclude_names=(engine.midi_output_port_name,))
     return engine, server, midi
 
 

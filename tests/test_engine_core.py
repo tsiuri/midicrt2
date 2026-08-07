@@ -934,15 +934,22 @@ class _FakeMidiOut:
         self.closed = False
         self.port_name = "fake"
         self.is_open = True
+        # Phase-3 task 12 fix: ordered log of every call, so tests can
+        # assert RELATIVE ordering (e.g. "all note_offs happen before
+        # close"), not just that each individually occurred.
+        self.call_order: list[tuple] = []
 
     def note_on(self, note, velocity, channel):
         self.note_on_calls.append((note, velocity, channel))
+        self.call_order.append(("note_on", note, velocity, channel))
 
     def note_off(self, note, channel):
         self.note_off_calls.append((note, channel))
+        self.call_order.append(("note_off", note, channel))
 
     def close(self):
         self.closed = True
+        self.call_order.append(("close",))
 
 
 def test_sendnotes_is_in_the_default_roster():
@@ -1020,3 +1027,82 @@ def test_engine_stop_closes_midi_out():
     eng._midi_out = fake
     eng.stop()
     assert fake.closed is True
+
+
+# -- self-subscription feedback-loop fix (live-reproduced Critical) --------
+#
+# Layer 2 (belt and suspenders alongside engine/midi_in.py's own
+# exclude_names, layer 1): Engine._handle drops ANY event -- not just
+# sysex -- whose `source` refers to our own MidiOutput port, before any
+# processing at all. Reproduced live: every real Send Notes trigger
+# echoed back as a phantom external note-on, contaminating
+# voices/harmony/stucknotes/eventlog with fake incoming MIDI.
+
+def test_handle_drops_an_event_whose_source_is_our_own_output_port():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    before_total = eng.events_total
+    eng._handle(ev(source=fake.port_name))
+    assert eng.events_total == before_total          # true drop, not even counted
+    assert eng._dirty == set()                        # no page/analyzer saw it
+    assert eng.pages["voices"].view_model()["total"] == 0   # no phantom note tracked
+
+
+def test_handle_drops_an_event_with_the_real_prefixed_alsa_source_form():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    fake.port_name = "midicrt2 Output"
+    eng._midi_out = fake
+    eng._handle(ev(source="RtMidiOut Client:midicrt2 Output 142:0"))
+    assert eng.pages["voices"].view_model()["total"] == 0
+
+
+def test_handle_still_processes_an_event_from_a_genuinely_different_source():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    before_total = eng.events_total
+    eng._handle(ev(source="USB MIDI Keyboard"))
+    assert eng.events_total == before_total + 1
+    assert eng.pages["voices"].view_model()["total"] == 1
+
+
+# -- guaranteed note-offs on shutdown (Important, live-reproduced) ---------
+#
+# Engine.stop() used to close MidiOutput without draining SendNotesPage's
+# still-gated active notes -- a routine restart mid-note left a real
+# downstream synth holding a stuck note with no way to release it.
+
+async def test_engine_stop_flushes_pending_sendnotes_before_closing_midi_out():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    await eng.actions.dispatch("sendnotes.key", {"key": "z"})    # note 60, ch 1, gate 120ms
+    await eng.actions.dispatch("sendnotes.key", {"key": "s"})    # note 61, ch 1
+    fake.note_on_calls.clear()   # only care about the SHUTDOWN-time note_offs below
+    fake.call_order.clear()
+    eng.stop()
+    assert set(fake.note_off_calls) == {(60, 1), (61, 1)}
+    assert eng.pages["sendnotes"].view_model()["active"] == 0
+    # Order matters: both note_offs must reach midi_out BEFORE close(),
+    # while the port is still usable -- not after.
+    close_index = fake.call_order.index(("close",))
+    note_off_indices = [i for i, c in enumerate(fake.call_order) if c[0] == "note_off"]
+    assert note_off_indices and all(i < close_index for i in note_off_indices)
+
+
+def test_engine_stop_is_a_no_op_when_sendnotes_is_not_in_the_roster():
+    eng = Engine(Config(pages=["eventlog"]))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng.stop()   # must not raise (no "sendnotes" key in self.pages)
+    assert fake.closed is True
+
+
+def test_engine_stop_with_no_pending_notes_sends_no_note_offs():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng.stop()
+    assert fake.note_off_calls == []

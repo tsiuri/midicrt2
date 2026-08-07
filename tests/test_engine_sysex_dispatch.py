@@ -8,6 +8,7 @@ genuine production captures, not synthetic).
 from pathlib import Path
 
 from midicrt.config import Config
+from midicrt.engine import sysex as sysex_mod
 from midicrt.engine.core import Engine, MidiEvent
 
 FIXTURES = Path(__file__).parent / "fixtures" / "sysex_captures"
@@ -23,8 +24,8 @@ def load_syx(name: str) -> tuple[int, ...]:
     return tuple(all_bytes[1:-1])
 
 
-def sysex_ev(data: tuple[int, ...], ts: float = 1000.0) -> MidiEvent:
-    return MidiEvent(ts=ts, source="Cirklon", type="sysex", channel=None,
+def sysex_ev(data: tuple[int, ...], ts: float = 1000.0, source: str = "Cirklon") -> MidiEvent:
+    return MidiEvent(ts=ts, source=source, type="sysex", channel=None,
                       data1=None, data2=None, summary=f"sysex ({len(data)} bytes)",
                       sysex_data=data)
 
@@ -67,6 +68,54 @@ def test_real_capture_non_midicrt_frame_is_ignored_entirely():
     assert eng.current_page == before_page
     assert fake.sent == []
     assert events == []   # no sysex_command event for non-matching traffic
+
+
+# -- self-subscription feedback-loop fix (live-reproduced Critical) --------
+#
+# Layer 2 (belt and suspenders alongside engine/midi_in.py's own
+# exclude_names, layer 1): Engine._handle drops ANY event whose `source`
+# refers to our own MidiOutput port, before any processing at all. This is
+# what makes a SysEx reply loop impossible even if layer 1 somehow failed:
+# build_reply()'s own marker byte makes every reply re-parse as a
+# perfectly valid NEW command (no origin field in the wire format itself),
+# so without this check a looped-back reply would dispatch, reply again,
+# loop back again, forever -- reproduced live at ~175 events/sec for 20+
+# minutes before this fix.
+
+def test_reply_frame_looped_back_from_our_own_output_is_dropped():
+    eng, fake = engine_with_fake_out()
+    reply = sysex_mod.build_reply(1, sysex_mod.CMD_CAPABILITIES, 0x00, (1, 0, 0, 1, 1))
+    ev = sysex_ev(reply, ts=1000.0, source=fake.port_name)
+    events = []
+    eng.add_listener(lambda m: events.append(m) if m.get("kind") == "event" else None)
+    before_total = eng.events_total
+    eng._handle(ev)
+    assert eng.events_total == before_total   # a true drop -- not even counted
+    assert fake.sent == []                    # no re-reply sent -- the loop stops here
+    assert events == []                       # no sysex_command event either
+
+
+def test_reply_frame_with_the_real_prefixed_alsa_source_form_is_also_dropped():
+    # Matches engine/midi_in.py's own layer-1 exclusion test: the real
+    # observed ALSA name wraps the configured port name in backend
+    # framing -- this layer's check must be substring, not exact, too.
+    eng, fake = engine_with_fake_out()
+    fake.port_name = "midicrt2 Output"
+    reply = sysex_mod.build_reply(1, sysex_mod.CMD_SWITCH_PAGE, 0x00, (8,))
+    ev = sysex_ev(reply, ts=1000.0, source="RtMidiOut Client:midicrt2 Output 142:0")
+    eng._handle(ev)
+    assert fake.sent == []
+    assert eng.current_page != "pianoroll"   # never dispatched at all
+
+
+def test_a_command_from_a_genuinely_different_source_still_dispatches_normally():
+    # Regression guard: the source filter must not be so broad it drops
+    # LEGITIMATE traffic from a real device that merely shares no
+    # relationship with our own output port name.
+    eng, _fake = engine_with_fake_out()
+    ev = sysex_ev((0x7D, 0x6D, 0x63, 0x01, 0x08), ts=1000.0, source="Cirklon Hardware Port")
+    eng._handle(ev)
+    assert eng.current_page == "pianoroll"
 
 
 def test_real_capture_legacy_switch_page_0_switches_to_help():

@@ -180,3 +180,49 @@ def test_drain_expired_front_only_quirk_a_shortened_gate_can_stick_behind_an_ear
     # Once note 60 (the front) finally expires, BOTH release together.
     released = page.drain_expired(now=0.20)
     assert released == [(60, 1), (61, 1)]
+
+
+# -- flush_all (Important fix, live-reproduced) -------------------------------
+#
+# Engine.stop() used to close MidiOutput without draining still-gated
+# active notes -- a routine daemon restart mid-note left a real
+# downstream synth holding a stuck note with no way to release it.
+# flush_all() releases EVERYTHING unconditionally, regardless of whether
+# any note's gate has actually elapsed yet, and needs no injected clock
+# (unlike drain_expired) since nothing is time-gated at shutdown.
+
+def test_flush_all_releases_notes_whose_gate_has_not_elapsed_yet():
+    page = SendNotesPage()
+    page.apply_key("z", now=0.0)   # note 60, gate 120ms -- nowhere near expired
+    flushed = page.flush_all()
+    assert flushed == [(60, 1)]
+    assert page.view_model()["active"] == 0
+
+
+def test_flush_all_releases_everything_in_fifo_order():
+    page = SendNotesPage()
+    page.apply_key("z", now=0.0)    # note 60
+    page.apply_key("s", now=0.0)    # note 61
+    page.apply_key("x", now=0.0)    # note 62
+    assert page.flush_all() == [(60, 1), (61, 1), (62, 1)]
+    assert page.view_model()["active"] == 0
+
+
+def test_flush_all_on_an_empty_page_returns_empty_list():
+    page = SendNotesPage()
+    assert page.flush_all() == []
+
+
+def test_flush_all_is_idempotent_a_second_call_returns_nothing_more():
+    page = SendNotesPage()
+    page.apply_key("z", now=0.0)
+    assert page.flush_all() == [(60, 1)]
+    assert page.flush_all() == []
+
+
+def test_flush_all_does_not_need_a_now_argument():
+    # Unlike drain_expired(now), flush_all() takes no clock at all -- it
+    # is called once, synchronously, from Engine.stop().
+    import inspect
+    sig = inspect.signature(SendNotesPage.flush_all)
+    assert list(sig.parameters) == ["self"]
