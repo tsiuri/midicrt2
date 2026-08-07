@@ -124,7 +124,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 from midicrt import config as config_mod
 from midicrt import proto
@@ -396,6 +396,25 @@ _SYSEX_PAGE_ID_MAP: dict[int, str] = {
 }
 
 
+@dataclass
+class _LearnArm:
+    """Phase 4 Task 3 (DAW-style MIDI learn, docs/phase4-notes.md): the
+    engine's single armed learn slot (`Engine._learn_armed`, `None` when
+    nothing is armed -- see `Engine._bind_learn`'s own docstring for how
+    this is built and validated, and `Engine._capture_learn` for how it
+    turns into a real, persisted `bindings_mod.Binding` once a qualifying
+    `MidiEvent` arrives). `args_template` already carries the mode ==
+    "continuous" fill marker (a real Python `None` on the ONE
+    auto-detected float arg) -- everything needed to build the eventual
+    `Binding` except the `match`, which only the CAPTURED event itself can
+    supply."""
+    action: str
+    mode: str
+    args_template: dict[str, Any]
+    range: tuple[float, float]
+    armed_at: float
+
+
 class Engine:
     def __init__(self, config: Config, *, keymap_path: str | None = None,
                  config_path: str | None = None, bindings_path: str | None = None):
@@ -654,6 +673,28 @@ class Engine:
                               description="List MIDI bindings and their validity")
         self.actions.register("bind.remove", self._bind_remove,
                               description="Remove a MIDI binding by id", args={"id": "str"})
+        # Phase 4 Task 3 (DAW-style MIDI learn, docs/phase4-notes.md):
+        # `self._learn_armed` is the engine's single armed learn slot (see
+        # `_LearnArm`'s own docstring) -- `None` whenever nothing is armed,
+        # which is also the initial state (a freshly booted engine has
+        # never had `bind.learn` called). Registered here, right alongside
+        # `bind.list`/`bind.remove`, for the exact same "before the
+        # keymap-filtering block below" reason that section's own comment
+        # already gives: a user COULD (if oddly) bind a key to `bind.
+        # cancel` (never `bind.learn` itself -- its `args` schema entry is
+        # a nested dict a plain keymap.toml key->action mapping has no way
+        # to supply, see `clients/base.py::dispatch_key`'s own no-args
+        # `client.action(action)` call), so both must exist before
+        # `self.keymap`'s own construction computes THIS build's complete
+        # action vocabulary.
+        self._learn_armed: _LearnArm | None = None
+        self.actions.register(
+            "bind.learn", self._bind_learn,
+            description="Arm the engine to learn a new MIDI binding from the next "
+                        "qualifying MIDI event",
+            args={"action": "str", "mode": "str", "args": "dict"})
+        self.actions.register("bind.cancel", self._bind_cancel,
+                              description="Cancel the currently armed learn slot, if any")
         # Phase 4 Task 1 (config-served keymap, docs/phase4-notes.md):
         # registered LAST, after every other action above (engine-owned
         # AND page-declared) -- both because `config.reload` itself is a
@@ -810,22 +851,29 @@ class Engine:
         absent -- "kept-but-inert" only means something if a human can
         actually SEE the inert entry."""
         actions = self.actions.describe()
-        bindings = []
-        for b in self._bindings_file.bindings:
-            error = bindings_mod.validate_binding(b, actions)
-            bindings.append({
-                "id": b.id,
-                "match": {"type": b.match.type, "number": b.match.number,
-                         "channel": b.match.channel, "port_pattern": b.match.port_pattern},
-                "action": b.action,
-                "args": dict(b.args),
-                "mode": b.mode,
-                "threshold": b.threshold,
-                "range": list(b.range),
-                "valid": error is None,
-                "error": error,
-            })
-        return {"bindings": bindings}
+        return {"bindings": [self._serialize_binding(b, actions)
+                             for b in self._bindings_file.bindings]}
+
+    def _serialize_binding(self, b: bindings_mod.Binding, actions: dict) -> dict:
+        """Shared wire-shape builder for one `Binding` (Phase 4 Task 3
+        extraction, docs/phase4-notes.md) -- `bind.list` (above, every
+        persisted binding) and `_capture_learn`'s own `learn_bound` event
+        payload (below, exactly one binding, freshly created) both need
+        the IDENTICAL shape, so this is the one place that shape is
+        actually written."""
+        error = bindings_mod.validate_binding(b, actions)
+        return {
+            "id": b.id,
+            "match": {"type": b.match.type, "number": b.match.number,
+                     "channel": b.match.channel, "port_pattern": b.match.port_pattern},
+            "action": b.action,
+            "args": dict(b.args),
+            "mode": b.mode,
+            "threshold": b.threshold,
+            "range": list(b.range),
+            "valid": error is None,
+            "error": error,
+        }
 
     def _bind_remove(self, id: str) -> dict:
         """`bind.remove` action handler: drops the binding by id, persists
@@ -846,6 +894,155 @@ class Engine:
         self._bindings_file.save()
         self._binding_dispatcher.set_bindings(self._bindings_file.bindings)
         return {"removed": True}
+
+    # -- bind.learn / bind.cancel: DAW-style MIDI learn (Phase 4 Task 3,
+    # docs/phase4-notes.md) ----------------------------------------------
+    #
+    # `bind.learn` arms `self._learn_armed`; the next qualifying MidiEvent
+    # (`bindings_mod.is_learnable_event`, checked in `_handle` BEFORE the
+    # binding dispatcher sees the event -- see that method's own comment)
+    # is captured by `_capture_learn` into a real, persisted `Binding`.
+    # `_tick_learn` (called from `run()` once per tick, same injected-`now`
+    # convention as `_tick_analyzers`/`_tick_pages`/`_tick_behaviors`)
+    # auto-cancels an arm that's sat unanswered past `bindings_mod.
+    # LEARN_TIMEOUT_S`. `bind.cancel` is the manual equivalent.
+
+    def _bind_learn(self, action: str, mode: str, args: dict) -> dict:
+        """`bind.learn` action handler: arms the engine's single learn
+        slot. A second `bind.learn` call while already armed REPLACES the
+        arm outright (no stacking, no error) -- `learn_armed` is emitted
+        again for the new arm; there is no separate "the old arm was
+        discarded" event, since the old arm was never itself observable
+        externally as anything but "armed" (docs/phase4-notes.md's task-3
+        amplification: document this choice, don't build a queue of one).
+
+        Validation happens ENTIRELY here, at ARM time, never at capture
+        time -- the task brief's own requirement, and the only way a human
+        arming a learn from the CLI ever SEES a validation failure (a
+        capture-time failure would only ever surface in the daemon's log,
+        arriving whenever a MIDI event happens to land, disconnected from
+        the arm command that caused it):
+
+        - `mode` must be "trigger" or "continuous".
+        - `action` must be a real, currently-registered action.
+        - For `mode == "continuous"`: the target action's schema must
+          declare EXACTLY ONE `"float"` arg (ambiguous otherwise -- which
+          one would the lerped CC value even fill?); that arg is
+          AUTO-DETECTED as the fill target -- `args` must NOT also name
+          it, since there is nothing left to statically supply for a key
+          learn is about to fill from live MIDI.
+        - Every other check (missing/unknown args, a continuous fill arg
+          not declared float) is delegated to `bindings_mod.
+          validate_binding` itself, run here against a throwaway PROBE
+          `Binding` (its `match` is never consulted by that function at
+          all -- only `action`/`args`/`mode` are) -- one validator, shared
+          with `bind.list`'s own post-hoc check, rather than re-deriving
+          the same rules twice.
+        """
+        if mode not in ("trigger", "continuous"):
+            raise ActionError(
+                f"bind.learn: unknown mode {mode!r} (must be 'trigger' or 'continuous')")
+        actions = self.actions.describe()
+        info = actions.get(action)
+        if info is None:
+            raise ActionError(f"bind.learn: cannot learn unknown action: {action!r}")
+        schema = info.get("args", {})
+        args_template = dict(args)
+        range_ = (0.0, 1.0)
+        if mode == "continuous":
+            float_args = sorted(k for k, t in schema.items() if t == "float")
+            if len(float_args) != 1:
+                raise ActionError(
+                    f"bind.learn: continuous mode requires {action!r} to declare exactly "
+                    f"one 'float' arg to auto-fill from the MIDI value, found "
+                    f"{len(float_args)}: {float_args}")
+            fill_key = float_args[0]
+            if fill_key in args_template:
+                raise ActionError(
+                    f"bind.learn: {fill_key!r} is auto-filled from the MIDI value in "
+                    f"continuous mode and must not be passed in args")
+            args_template[fill_key] = None
+        probe = bindings_mod.Binding(
+            id="_probe", match=bindings_mod.BindingMatch(type="note_on", number=0),
+            action=action, args=args_template, mode=mode, range=range_)
+        error = bindings_mod.validate_binding(probe, actions)
+        if error:
+            raise ActionError(f"bind.learn: {error}")
+        self._learn_armed = _LearnArm(action=action, mode=mode, args_template=args_template,
+                                      range=range_, armed_at=time.time())
+        self.emit_event("learn_armed", {"action": action, "mode": mode, "args": args_template})
+        return {"armed": True, "action": action, "mode": mode}
+
+    def _bind_cancel(self) -> dict:
+        """`bind.cancel` action handler: disarms the learn slot if one is
+        armed. A no-op (not an `ActionError`) when nothing is armed --
+        unlike `bind.remove`'s "unknown id is a genuine caller error"
+        precedent above, `bind.cancel` names no resource at all; "cancel
+        whatever might be armed" is naturally idempotent, so calling it
+        with nothing armed is a harmless confirmation, not a mistake worth
+        surfacing loudly. No event is emitted for the no-op case either --
+        `learn_cancelled` means "an arm that existed just ended", which
+        isn't true here."""
+        was_armed = self._learn_armed is not None
+        self._learn_armed = None
+        if was_armed:
+            self.emit_event("learn_cancelled", {"reason": "cancelled"})
+        return {"cancelled": was_armed}
+
+    def _new_binding_id(self) -> str:
+        """A short, stable, TOML-table-key-safe id for a freshly learned
+        binding (`Binding.id`'s own contract, see that dataclass's
+        docstring in engine/bindings.py) -- a millisecond wall-clock
+        timestamp, de-duplicated against every currently-persisted binding
+        id. A same-millisecond collision (two captures within 1ms of each
+        other) is astronomically unlikely given learn always waits for a
+        real, human-triggered MIDI event -- but cheap to guard against
+        outright rather than merely disclose."""
+        base = f"learn_{int(time.time() * 1000)}"
+        existing = {b.id for b in self._bindings_file.bindings}
+        candidate = base
+        suffix = 1
+        while candidate in existing:
+            candidate = f"{base}_{suffix}"
+            suffix += 1
+        return candidate
+
+    def _capture_learn(self, ev: MidiEvent) -> None:
+        """Turn the currently-armed learn slot + `ev` into a real,
+        persisted `Binding` -- called from `_handle` (see that method's
+        own comment for why this must run BEFORE `self._binding_
+        dispatcher.handle(ev)`). `match.port_pattern` is set to `ev.
+        source` VERBATIM (the task brief's own "exact ev.source as the
+        pattern" -- not a wildcard/fnmatch pattern a human would
+        hand-author) -- `BindingDispatcher._matches`'s `fnmatch.fnmatch`
+        still matches an exact string against itself correctly, so this
+        needs no special-casing on the matching side."""
+        arm = self._learn_armed
+        self._learn_armed = None
+        match = bindings_mod.BindingMatch(
+            type=ev.type, number=ev.data1, channel=ev.channel, port_pattern=ev.source)
+        binding = bindings_mod.Binding(
+            id=self._new_binding_id(), match=match, action=arm.action,
+            args=dict(arm.args_template), mode=arm.mode, range=arm.range)
+        self._bindings_file.add(binding)
+        self._bindings_file.save()
+        self._binding_dispatcher.set_bindings(self._bindings_file.bindings)
+        self.emit_event("learn_bound",
+                        {"binding": self._serialize_binding(binding, self.actions.describe())})
+
+    def _tick_learn(self, now: float) -> None:
+        """Called from `run()` once per tick (mirrors `_tick_analyzers`/
+        `_tick_pages`/`_tick_behaviors`'s own injected-`now` convention) --
+        auto-cancels an armed learn slot that has sat unanswered past
+        `bindings_mod.LEARN_TIMEOUT_S`, so a human who armed a learn and
+        then walked away (or hit the wrong key/knob first) doesn't leave
+        the slot armed forever, silently capturing whatever MIDI arrives
+        next no matter how much later."""
+        if self._learn_armed is None:
+            return
+        if now - self._learn_armed.armed_at >= bindings_mod.LEARN_TIMEOUT_S:
+            self._learn_armed = None
+            self.emit_event("learn_cancelled", {"reason": "timeout"})
 
     async def _dispatch_bindings(self) -> None:
         """Dispatch every binding-triggered action intent collected by
@@ -1138,17 +1335,38 @@ class Engine:
         # our configured port name in backend-specific client/port framing.
         if ev.source and self._midi_out.port_name in ev.source:
             return
-        # Phase 4 Task 2 (MIDI bindings, docs/phase4-notes.md): bindings
-        # consume every event BEFORE analyzers/pages get it -- `_handle` is
-        # synchronous and `ActionRegistry.dispatch` is a coroutine, so this
-        # only ever COLLECTS intents here; `_dispatch_bindings` (called
-        # from `run()` right after `_handle` returns, see that method's own
-        # docstring) is the one place they actually fire. Collected even
-        # for a `clock_tick`/`sysex`/etc event -- harmless, since
-        # `BindingDispatcher._matches` only ever matches `note_on`/
-        # `control_change` types, so every other event type is a guaranteed
-        # no-op pass-through here.
-        self._pending_binding_dispatches.extend(self._binding_dispatcher.handle(ev))
+        # Phase 4 Task 3 (DAW-style MIDI learn, docs/phase4-notes.md): an
+        # armed learn slot CONSUMES the next qualifying event -- it must
+        # NOT also reach the binding dispatcher below, or a learn capture
+        # on a note that already has an existing binding would fire that
+        # stale binding's action in the same instant it's being remapped
+        # (task brief: "a learned-this-instant event must not also fire
+        # existing bindings" -- see test_engine_core.py::
+        # test_learn_captured_event_is_not_also_dispatched_to_an_existing_
+        # matching_binding for the live-shaped proof). Deliberately scoped
+        # to the BINDING dispatcher only, via this if/else -- analyzers/
+        # pages further down still see this event completely normally (it
+        # IS a real, currently-arriving MIDI message; only a pre-existing
+        # binding's own action is withheld -- see test_engine_core.py::
+        # test_learn_captured_event_still_reaches_pages_and_analyzers_
+        # normally). Checked BEFORE the self-output-filter's sibling
+        # concerns below (activity stamp, sysex, analyzers/pages) so a
+        # capture always happens on the very same tick the qualifying
+        # event arrives, never delayed a tick behind them.
+        if self._learn_armed is not None and bindings_mod.is_learnable_event(ev):
+            self._capture_learn(ev)
+        else:
+            # Phase 4 Task 2 (MIDI bindings, docs/phase4-notes.md): bindings
+            # consume every event BEFORE analyzers/pages get it -- `_handle`
+            # is synchronous and `ActionRegistry.dispatch` is a coroutine, so
+            # this only ever COLLECTS intents here; `_dispatch_bindings`
+            # (called from `run()` right after `_handle` returns, see that
+            # method's own docstring) is the one place they actually fire.
+            # Collected even for a `clock_tick`/`sysex`/etc event --
+            # harmless, since `BindingDispatcher._matches` only ever matches
+            # `note_on`/`control_change` types, so every other event type is
+            # a guaranteed no-op pass-through here.
+            self._pending_binding_dispatches.extend(self._binding_dispatcher.handle(ev))
         self.events_total += 1
         if ev.type in _ACTIVITY_EVENT_TYPES:
             self._last_activity_ts = ev.ts
@@ -1505,4 +1723,11 @@ class Engine:
             self._tick_analyzers(now)
             self._tick_pages(now)
             await self._tick_behaviors(now)
+            # Phase 4 Task 3 (DAW-style MIDI learn): auto-cancel an armed
+            # learn slot past its timeout -- see `_tick_learn`'s own
+            # docstring. Placed after `_tick_behaviors` (an armed learn has
+            # no interaction with pagecycle/screensaver) and before
+            # `_flush_dirty` (a `learn_cancelled` event this call emits
+            # should reach clients in the same tick it fires).
+            self._tick_learn(now)
             self._flush_dirty()

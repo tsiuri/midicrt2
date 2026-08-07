@@ -520,6 +520,84 @@ async def test_config_reload_with_malformed_keymap_toml_keeps_connection_alive(t
     eng.stop(); await task; await srv.close()
 
 
+async def test_bind_learn_arm_capture_persist_event_round_trip_over_the_wire(tmp_path):
+    """The headline Phase 4 Task 3 proof (docs/phase4-notes.md): the WHOLE
+    DAW-style learn cycle -- arm via a real `action bind.learn` request,
+    capture a real MidiEvent through a real running `Engine.run()` loop,
+    persist to a real bindings.toml, and see BOTH `learn_armed` and
+    `learn_bound` arrive over a REAL subscribed socket connection. Engine-
+    unit-level coverage of the same mechanics (arm validation, disqualified
+    events, re-arm, timeout, capture-consumption) lives in
+    test_engine_core.py, mirroring test_bindings.py vs that file's own
+    split; this is the one test that proves none of it silently depends on
+    being called in-process rather than through the real wire protocol."""
+    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+
+    r = await c.request("action", name="bind.learn",
+                        args={"action": "page.next", "mode": "trigger", "args": {}})
+    assert r["ok"] is True
+    assert r["data"]["armed"] is True
+
+    await eng.queue.put(MidiEvent(0.0, "Midi Through:0", "note_on", 2, 60, 100, "n"))
+    await asyncio.sleep(0.2)
+    await c.read_msgs(0.2)
+
+    armed_events = [m for m in c.inbox
+                    if m.get("kind") == "event" and m.get("name") == "learn_armed"]
+    assert armed_events, "expected learn_armed on the wire"
+    assert armed_events[-1]["data"]["action"] == "page.next"
+
+    bound_events = [m for m in c.inbox
+                    if m.get("kind") == "event" and m.get("name") == "learn_bound"]
+    assert bound_events, "expected learn_bound on the wire"
+    binding_data = bound_events[-1]["data"]["binding"]
+    assert binding_data["action"] == "page.next"
+    assert binding_data["match"]["type"] == "note_on"
+    assert binding_data["match"]["number"] == 60
+    assert binding_data["match"]["channel"] == 2
+    assert binding_data["valid"] is True
+
+    # Really persisted -- a fresh load from disk shows the same binding.
+    from midicrt.engine.bindings import BindingsFile
+    reloaded = BindingsFile.load(eng._bindings_path)
+    assert len(reloaded.bindings) == 1
+    assert reloaded.bindings[0].id == binding_data["id"]
+
+    eng.stop(); await task; await srv.close()
+
+
+async def test_bind_learn_timeout_over_the_wire_via_backdated_arm(tmp_path):
+    """`_tick_learn`'s 30s auto-cancel, proven against the real `run()`
+    loop's own tick (not a directly-injected `now` like test_engine_core.
+    py's unit test) -- backdating `_learn_armed.armed_at` lets a fast
+    `tick_hz` cross `LEARN_TIMEOUT_S` in well under a second of real wall
+    time instead of an actual 30s sleep."""
+    from midicrt.engine.bindings import LEARN_TIMEOUT_S
+
+    eng, srv, task = await make(tmp_path, tick_hz=200.0)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+
+    r = await c.request("action", name="bind.learn",
+                        args={"action": "page.next", "mode": "trigger", "args": {}})
+    assert r["ok"] is True
+    eng._learn_armed.armed_at -= LEARN_TIMEOUT_S + 1.0   # backdate past the timeout
+
+    await asyncio.sleep(0.1)
+    await c.read_msgs(0.2)
+    cancelled = [m for m in c.inbox
+                if m.get("kind") == "event" and m.get("name") == "learn_cancelled"]
+    assert cancelled, "expected learn_cancelled on the wire"
+    assert cancelled[-1]["data"]["reason"] == "timeout"
+    assert eng._learn_armed is None
+
+    eng.stop(); await task; await srv.close()
+
+
 async def test_config_reload_with_wrong_shaped_keys_keeps_connection_alive(tmp_path):
     """Re-review, live-reproduced: `keys = "oops"` (and `keys = 5` /
     `keys = ["a"]`) is syntactically VALID TOML that still crashed

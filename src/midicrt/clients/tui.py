@@ -836,6 +836,57 @@ def _active_error_text(state: dict) -> str | None:
     return None
 
 
+# -- DAW-style MIDI learn status-line flash (Phase 4 Task 3,
+# docs/phase4-notes.md) ------------------------------------------------------
+#
+# `learn_bound`/`learn_cancelled` reuse the SAME transient-message mechanism
+# as `_handle_key_press`'s own `last_error`/`_active_error_text` right above
+# (fixed `_ERROR_DISPLAY_S`-second display window, overwrites the status
+# line while active) -- via a PARALLEL state slot (`learn_msg`/`learn_msg_
+# until`), not the literal same one: a learn outcome isn't an error (bound
+# successfully is good news), and the two must be able to coexist without
+# one clobbering the other's expiry. `learn_armed` itself is a separate,
+# STICKY flag (`state["learn_armed"]`, plain bool) -- there's no fixed
+# duration for "how long a human takes to hit a key/knob after arming", so
+# it stays true for as long as the arm is outstanding, cleared the moment
+# either outcome event arrives.
+
+_LEARN_EVENT_NAMES = {"learn_armed", "learn_bound", "learn_cancelled"}
+
+
+def _set_learn_message(state: dict, text: str) -> None:
+    state["learn_msg"] = text
+    state["learn_msg_until"] = time.time() + _ERROR_DISPLAY_S
+
+
+def _active_learn_message(state: dict) -> str | None:
+    if state.get("learn_msg") and time.time() < state.get("learn_msg_until", 0):
+        return state["learn_msg"]
+    return None
+
+
+def _apply_learn_event(state: dict, msg: dict) -> None:
+    """Update `state` for a `learn_armed`/`learn_bound`/`learn_cancelled`
+    event -- called from `run_tui`'s own `on_event` closure for exactly
+    these three event names (`_LEARN_EVENT_NAMES`). `learn_armed` sets the
+    sticky flag with no transient message of its own (the "waiting for
+    MIDI..." text is a STATIC status while armed, not a flash -- rendered
+    directly off `state["learn_armed"]` at the call site, see `run_tui`'s
+    main loop); either outcome clears that flag and records a transient
+    confirmation via `_set_learn_message`."""
+    name = msg.get("name")
+    if name == "learn_armed":
+        state["learn_armed"] = True
+        return
+    state["learn_armed"] = False
+    if name == "learn_bound":
+        binding_id = msg.get("data", {}).get("binding", {}).get("id", "?")
+        _set_learn_message(state, f"LEARN: bound to {binding_id}")
+    elif name == "learn_cancelled":
+        reason = msg.get("data", {}).get("reason", "?")
+        _set_learn_message(state, f"LEARN: cancelled ({reason})")
+
+
 def run_tui(socket_path: str) -> int:
     import blessed
 
@@ -858,7 +909,8 @@ def run_tui(socket_path: str) -> int:
              "status_vm": dict(chrome.DEFAULT_STATUS_VM),
              "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
-             "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
+             "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM),
+             "learn_armed": False}
 
     def on_event(msg: dict) -> None:
         if msg.get("kind") == "event" and msg.get("name") == "page_changed":
@@ -874,6 +926,11 @@ def run_tui(socket_path: str) -> int:
             # right now, same "ask, don't assume" precedent `page_changed`'s
             # own handler above already sets for page/topic state.
             state["keymap"] = fetch_keymap(client)
+        elif msg.get("kind") == "event" and msg.get("name") in _LEARN_EVENT_NAMES:
+            # Phase 4 Task 3 (DAW-style MIDI learn, docs/phase4-notes.md):
+            # see `_apply_learn_event`'s own docstring for the sticky-flag/
+            # transient-flash split.
+            _apply_learn_event(state, msg)
 
     try:
         # `on_event` is wired in HERE, before the startup wait, not just for
@@ -963,6 +1020,7 @@ def run_tui(socket_path: str) -> int:
                     else:
                         status_line = render_status_row(state["status_vm"], term.width)
                         error_text = _active_error_text(state)
+                        learn_text = _active_learn_message(state)
                         if error_text:
                             # Bindings review fix: a rejected key-dispatch
                             # (see `_handle_key_press`) shows here instead
@@ -970,6 +1028,19 @@ def run_tui(socket_path: str) -> int:
                             # -- overwrites, never appends, so it can never
                             # push the line past `term.width`.
                             status_line = _fit(f"ERROR: {error_text}", term.width)
+                        elif learn_text:
+                            # Phase 4 Task 3: a learn OUTCOME (`learn_bound`/
+                            # `learn_cancelled`) flashes here transiently,
+                            # same mechanism/priority slot as a rejected key
+                            # dispatch right above (an error mid-learn still
+                            # wins, though nothing in this task ever produces
+                            # both at once).
+                            status_line = _fit(learn_text, term.width)
+                        elif state.get("learn_armed"):
+                            # Sticky (not transient) for as long as the arm
+                            # is outstanding -- see _apply_learn_event's own
+                            # docstring for why this has no display window.
+                            status_line = _fit("LEARN: waiting for MIDI...", term.width)
                         secondary_line = render_secondary_row(
                             state["alerts_vm"], state["timesig_vm"], term.width)
                         beatprogress_line = render_beatprogress_row(
@@ -999,10 +1070,13 @@ def run_tui(socket_path: str) -> int:
                 key = term.inkey(timeout=0.05)
                 if _handle_key_press(client, str(key), state):
                     return 0
-                if _active_error_text(state):
-                    # Keep repainting while the transient error message is
-                    # still within its display window, even with no other
-                    # state change (see _handle_key_press/_active_error_text).
+                if _active_error_text(state) or _active_learn_message(state) or state.get(
+                        "learn_armed"):
+                    # Keep repainting while the transient error/learn
+                    # message is still within its display window, or while
+                    # a learn slot is armed, even with no other state
+                    # change (see _handle_key_press/_active_error_text and
+                    # _apply_learn_event/_active_learn_message above).
                     dirty = True
     finally:
         client.close()

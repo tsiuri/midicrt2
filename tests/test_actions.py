@@ -57,3 +57,48 @@ async def test_bool_coercion_from_strings():
 
     with pytest.raises(ActionError):
         await reg.dispatch("toggle.set", {"enabled": "maybe"})
+
+
+# -- "dict" coercion (Phase 4 Task 3, docs/phase4-notes.md): added for
+# `bind.learn {action, mode, args}`, whose own `args` param is itself a
+# nested k/v template for the TARGET action being learned -- the only
+# action in the registry whose schema needs a non-scalar arg type. A real
+# `client.action(...)` call over the wire already carries `args` as a
+# genuine JSON object (no client in this codebase ever needs to stringify
+# it), so the common case is a pass-through identity check; the JSON-string
+# fallback exists so the generic `midicrt action bind.learn --arg args=...`
+# CLI path (whose `--arg k=v` always produces STRING values, see
+# clients/cli.py::_parse_args) can reach the exact same coercer as the
+# dedicated `midicrt bind learn` subcommand, which sends a real dict
+# directly -- one coercer, two equally-valid callers.
+
+async def test_dict_coercion_passes_a_real_dict_through_unchanged():
+    reg = ActionRegistry()
+    seen = []
+    reg.register("bind.learn", lambda args: seen.append(args), args={"args": "dict"})
+    await reg.dispatch("bind.learn", {"args": {"level": 5}})
+    assert seen[-1] == {"level": 5}
+
+
+async def test_dict_coercion_parses_a_json_object_string():
+    reg = ActionRegistry()
+    seen = []
+    reg.register("bind.learn", lambda args: seen.append(args), args={"args": "dict"})
+    await reg.dispatch("bind.learn", {"args": '{"level": 5}'})
+    assert seen[-1] == {"level": 5}
+
+
+async def test_dict_coercion_rejects_invalid_json_string():
+    reg = ActionRegistry()
+    reg.register("bind.learn", lambda args: None, args={"args": "dict"})
+    with pytest.raises(ActionError):
+        await reg.dispatch("bind.learn", {"args": "not json at all {{{"})
+
+
+async def test_dict_coercion_rejects_a_json_value_that_is_not_an_object():
+    reg = ActionRegistry()
+    reg.register("bind.learn", lambda args: None, args={"args": "dict"})
+    with pytest.raises(ActionError):
+        await reg.dispatch("bind.learn", {"args": "[1, 2, 3]"})
+    with pytest.raises(ActionError):
+        await reg.dispatch("bind.learn", {"args": 5})

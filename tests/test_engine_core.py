@@ -5,6 +5,7 @@ import pytest
 
 from midicrt.config import Config, ConfigError
 from midicrt.engine.actions import ActionError
+from midicrt.engine.bindings import LEARN_TIMEOUT_S
 from midicrt.engine.core import Engine, MidiEvent
 
 
@@ -1932,3 +1933,367 @@ async def test_config_reload_with_no_bindings_file_is_a_noop_convenience(tmp_pat
     result = await eng.actions.dispatch("config.reload", {})
     assert eng._bindings_file.bindings == []
     assert result["warnings"] == []
+
+
+# -- bind.learn / bind.cancel: DAW-style MIDI learn (Phase 4 Task 3,
+# docs/phase4-notes.md) --------------------------------------------------
+#
+# Pure `is_learnable_event`/`LEARN_TIMEOUT_S` logic is tested in
+# test_bindings.py (same split test_bindings.py's own header comment
+# establishes for Task 2). Everything below is registry-aware ENGINE
+# wiring: arm-time validation (reuses `validate_binding` against a probe
+# Binding), the `_handle`-time capture-vs-dispatch consumption decision,
+# persistence, events, re-arm, and the tick-driven timeout.
+
+async def test_describe_style_action_registry_contains_bind_learn_and_cancel():
+    eng = Engine(Config())
+    actions = eng.actions.describe()
+    assert "bind.learn" in actions
+    assert actions["bind.learn"]["args"] == {"action": "str", "mode": "str", "args": "dict"}
+    assert "bind.cancel" in actions
+    assert actions["bind.cancel"]["args"] == {}
+
+
+# -- bind.learn: arm-time validation -----------------------------------------
+
+async def test_bind_learn_arms_and_emits_learn_armed_event():
+    eng = Engine(Config())
+    got = []
+    eng.add_listener(got.append)
+    result = await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    assert result == {"armed": True, "action": "page.next", "mode": "trigger"}
+    assert eng._learn_armed is not None
+    events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_armed"]
+    assert events
+    assert events[-1]["data"]["action"] == "page.next"
+    assert events[-1]["data"]["mode"] == "trigger"
+
+
+async def test_bind_learn_unknown_action_raises_action_error():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="bogus.action"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "bogus.action", "mode": "trigger", "args": {}})
+    assert eng._learn_armed is None
+
+
+async def test_bind_learn_unknown_mode_raises_action_error():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="mode"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "page.next", "mode": "bogus", "args": {}})
+    assert eng._learn_armed is None
+
+
+async def test_bind_learn_trigger_missing_required_arg_raises_action_error():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="name"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "page.goto", "mode": "trigger", "args": {}})
+    assert eng._learn_armed is None
+
+
+async def test_bind_learn_trigger_unknown_extra_arg_raises_action_error():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="bogus"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "page.next", "mode": "trigger", "args": {"bogus": "x"}})
+
+
+async def test_bind_learn_trigger_valid_args_arms_successfully():
+    eng = Engine(Config())
+    result = await eng.actions.dispatch(
+        "bind.learn", {"action": "page.goto", "mode": "trigger", "args": {"name": "harmony"}})
+    assert result["armed"] is True
+    assert eng._learn_armed.args_template == {"name": "harmony"}
+
+
+async def test_bind_learn_continuous_requires_exactly_one_float_arg_when_none_declared():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="float"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "page.goto", "mode": "continuous", "args": {}})
+    assert eng._learn_armed is None
+
+
+async def test_bind_learn_continuous_requires_exactly_one_float_arg_when_two_declared():
+    eng = Engine(Config())
+    eng.actions.register("test.twofloat", lambda a, b: {"a": a, "b": b},
+                         args={"a": "float", "b": "float"})
+    with pytest.raises(ActionError, match="float"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "test.twofloat", "mode": "continuous", "args": {}})
+
+
+async def test_bind_learn_continuous_auto_detects_the_declared_float_arg_as_fill_key():
+    eng = Engine(Config())
+    result = await eng.actions.dispatch(
+        "bind.learn", {"action": "pianoroll.zoom_level", "mode": "continuous", "args": {}})
+    assert result["armed"] is True
+    assert eng._learn_armed.args_template == {"level": None}
+
+
+async def test_bind_learn_continuous_rejects_the_fill_key_if_passed_explicitly():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="level"):
+        await eng.actions.dispatch(
+            "bind.learn",
+            {"action": "pianoroll.zoom_level", "mode": "continuous", "args": {"level": "0.5"}})
+    assert eng._learn_armed is None
+
+
+async def test_bind_learn_rearm_replaces_previous_arm_and_emits_learn_armed_again():
+    eng = Engine(Config())
+    got = []
+    eng.add_listener(got.append)
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.prev", "mode": "trigger", "args": {}})
+    assert eng._learn_armed.action == "page.prev"   # replaced, not stacked
+    armed_events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_armed"]
+    assert len(armed_events) == 2
+    assert armed_events[0]["data"]["action"] == "page.next"
+    assert armed_events[1]["data"]["action"] == "page.prev"
+
+
+# -- bind.cancel --------------------------------------------------------------
+
+async def test_bind_cancel_clears_armed_slot_and_emits_learn_cancelled():
+    eng = Engine(Config())
+    got = []
+    eng.add_listener(got.append)
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    result = await eng.actions.dispatch("bind.cancel", {})
+    assert result == {"cancelled": True}
+    assert eng._learn_armed is None
+    events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_cancelled"]
+    assert events
+    assert events[-1]["data"]["reason"] == "cancelled"
+
+
+async def test_bind_cancel_with_nothing_armed_is_a_noop_and_emits_nothing():
+    eng = Engine(Config())
+    got = []
+    eng.add_listener(got.append)
+    result = await eng.actions.dispatch("bind.cancel", {})
+    assert result == {"cancelled": False}
+    events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_cancelled"]
+    assert events == []
+
+
+# -- tick-driven 30s timeout (injected now, no real sleep) -------------------
+
+async def test_tick_learn_does_not_cancel_before_the_timeout():
+    eng = Engine(Config())
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    armed_at = eng._learn_armed.armed_at
+    eng._tick_learn(armed_at + LEARN_TIMEOUT_S - 0.01)
+    assert eng._learn_armed is not None
+
+
+async def test_tick_learn_cancels_at_the_timeout_boundary_and_emits_learn_cancelled():
+    eng = Engine(Config())
+    got = []
+    eng.add_listener(got.append)
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    armed_at = eng._learn_armed.armed_at
+    eng._tick_learn(armed_at + LEARN_TIMEOUT_S)
+    assert eng._learn_armed is None
+    events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_cancelled"]
+    assert events
+    assert events[-1]["data"]["reason"] == "timeout"
+
+
+def test_tick_learn_is_a_noop_when_nothing_armed():
+    eng = Engine(Config())
+    eng._tick_learn(time.time() + 100000)   # must not raise
+    assert eng._learn_armed is None
+
+
+# -- capture: the full arm -> real MidiEvent -> Binding cycle ----------------
+#
+# Real `Engine.run()` loop, real `eng.queue.put(...)` -- same style as the
+# zero-client-firing bindings-dispatch tests above.
+
+async def test_learn_capture_note_on_builds_binding_persists_and_emits_learn_bound(tmp_path):
+    p = tmp_path / "bindings.toml"
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    got = []
+    eng.add_listener(got.append)
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100, channel=3,
+                           source="Midi Through:Midi Through Port-0 14:0"))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+
+    assert eng._learn_armed is None   # slot cleared
+    assert len(eng._bindings_file.bindings) == 1
+    b = eng._bindings_file.bindings[0]
+    assert b.action == "page.next"
+    assert b.mode == "trigger"
+    assert b.match.type == "note_on"
+    assert b.match.number == 60
+    assert b.match.channel == 3
+    # Exact source string, not a wildcard/fnmatch pattern (task brief).
+    assert b.match.port_pattern == "Midi Through:Midi Through Port-0 14:0"
+
+    from midicrt.engine.bindings import BindingsFile
+    assert BindingsFile.load(str(p)).bindings == [b]   # persisted atomically
+
+    bound_events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_bound"]
+    assert bound_events
+    assert bound_events[-1]["data"]["binding"]["id"] == b.id
+    assert bound_events[-1]["data"]["binding"]["action"] == "page.next"
+    assert bound_events[-1]["data"]["binding"]["valid"] is True
+
+
+async def test_learn_capture_control_change_builds_a_cc_binding(tmp_path):
+    p = tmp_path / "bindings.toml"
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="control_change", data1=20, data2=64, channel=1))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+    b = eng._bindings_file.bindings[0]
+    assert b.match.type == "control_change"
+    assert b.match.number == 20
+    assert b.match.channel == 1
+
+
+async def test_learn_capture_continuous_stores_none_fill_marker_and_persists_as_sentinel(tmp_path):
+    p = tmp_path / "bindings.toml"
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "pianoroll.zoom_level", "mode": "continuous", "args": {}})
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="control_change", data1=22, data2=64))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+    b = eng._bindings_file.bindings[0]
+    assert b.mode == "continuous"
+    assert b.args == {"level": None}
+    assert b.range == (0.0, 1.0)
+
+    from midicrt.engine.bindings import CONTINUOUS_FILL_TOKEN, BindingsFile
+    assert CONTINUOUS_FILL_TOKEN in p.read_text()
+    assert BindingsFile.load(str(p)).bindings == [b]
+
+
+async def test_bind_learn_successive_captures_get_distinct_binding_ids(tmp_path):
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(tmp_path / "bindings.toml"))
+    task = asyncio.create_task(eng.run())
+
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100))
+    await asyncio.sleep(0.05)
+
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.prev", "mode": "trigger", "args": {}})
+    await eng.queue.put(ev(type="note_on", data1=61, data2=100))
+    await asyncio.sleep(0.05)
+
+    eng.stop()
+    await task
+    ids = [b.id for b in eng._bindings_file.bindings]
+    assert len(ids) == 2
+    assert len(set(ids)) == 2
+
+
+# -- disqualified events never capture ---------------------------------------
+
+async def test_learn_ignores_every_disqualified_event_type_and_leaves_the_arm_intact(tmp_path):
+    """Every type `is_learnable_event` (engine/bindings.py) rejects must
+    leave the arm exactly as it was: no binding created, still armed, no
+    learn_bound/learn_cancelled event -- proven here against the real
+    `Engine._handle` path, not just the pure predicate
+    test_bindings.py already covers."""
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(tmp_path / "bindings.toml"))
+    got = []
+    eng.add_listener(got.append)
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    task = asyncio.create_task(eng.run())
+
+    disqualified = [
+        ev(type="note_on", data1=60, data2=0),
+        ev(type="note_off", data1=60, data2=100),
+        ev(type="clock_tick", channel=None, data1=24, data2=None, clock_batch_start=None),
+        ev(type="program_change", data1=5, data2=None),
+        ev(type="start", channel=None, data1=None, data2=None),
+        ev(type="stop", channel=None, data1=None, data2=None),
+        ev(type="continue", channel=None, data1=None, data2=None),
+        ev(type="songpos", channel=None, data1=None, data2=None),
+        ev(type="sysex", channel=None, data1=None, data2=None, sysex_data=(1, 2, 3)),
+    ]
+    for e in disqualified:
+        await eng.queue.put(e)
+    await asyncio.sleep(0.1)
+
+    eng.stop()
+    await task
+    assert eng._learn_armed is not None   # still armed the whole time
+    assert eng._bindings_file.bindings == []
+    fired = [m for m in got if m.get("kind") == "event"
+             and m.get("name") in {"learn_bound", "learn_cancelled"}]
+    assert fired == []
+
+
+# -- capture-consumption: withheld from bindings, not from the rest of the
+# pipeline --------------------------------------------------------------------
+
+async def test_learn_captured_event_is_not_also_dispatched_to_an_existing_matching_binding(
+        tmp_path):
+    """Design decision (docs/phase4-notes.md, task-3 amplification): the
+    SAME MidiEvent that completes a learn capture must not also fire a
+    pre-existing binding matching that identical note -- see
+    `Engine._handle`'s own comment for why capture is checked BEFORE
+    `self._binding_dispatcher.handle(ev)` runs for that event."""
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, binding_id="existing", action="page.next", number=60)
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    assert eng.current_page == "eventlog"
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.goto", "mode": "trigger", "args": {"name": "harmony"}})
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+
+    # The existing "note 60 -> page.next" binding must NOT have fired even
+    # though this event matches it exactly.
+    assert eng.current_page == "eventlog"
+    assert len(eng._bindings_file.bindings) == 2
+    learned = next(b for b in eng._bindings_file.bindings if b.id != "existing")
+    assert learned.action == "page.goto"
+
+
+async def test_learn_captured_event_still_reaches_pages_and_analyzers_normally(tmp_path):
+    """Consumption is scoped to the BINDING dispatcher only -- the
+    captured event is a real, currently-arriving MIDI message and must
+    still update every other engine consumer (eventlog etc) exactly as if
+    no learn were in progress. Only a pre-existing binding's own action
+    is withheld (see the test right above)."""
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(tmp_path / "bindings.toml"))
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    before = eng.pages["eventlog"].view_model()["count"]
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+    assert eng.pages["eventlog"].view_model()["count"] == before + 1

@@ -157,6 +157,122 @@ def test_active_error_text_expires_after_display_window():
     assert tui._active_error_text(state) is None
 
 
+# -- DAW-style MIDI learn status-line flash (Phase 4 Task 3,
+# docs/phase4-notes.md) ------------------------------------------------------
+#
+# `learn_bound`/`learn_cancelled` reuse T1's transient-message MECHANISM
+# (same fixed display window, same "overwrite the status line while active"
+# shape as `_handle_key_press`'s own `last_error`/`_active_error_text` right
+# above) via a PARALLEL state slot (`learn_msg`/`learn_msg_until`) rather
+# than the literal same one -- a learn outcome is not an error (bound
+# successfully is good news), and the two must be able to coexist without
+# one silently clobbering the other's expiry. `learn_armed` itself is NOT
+# transient -- it's a STICKY flag that stays true for as long as the arm is
+# outstanding (there's no fixed duration for "how long a human takes to hit
+# a key/knob"), cleared the moment either outcome event arrives.
+
+def test_set_learn_message_and_active_learn_message_round_trip():
+    state = {}
+    tui._set_learn_message(state, "LEARN: bound to b1")
+    assert tui._active_learn_message(state) == "LEARN: bound to b1"
+
+
+def test_active_learn_message_none_when_nothing_recorded():
+    assert tui._active_learn_message({}) is None
+
+
+def test_active_learn_message_expires_after_display_window():
+    state = {"learn_msg": "LEARN: bound to b1", "learn_msg_until": time.time() - 1}
+    assert tui._active_learn_message(state) is None
+
+
+def test_apply_learn_event_armed_sets_the_sticky_flag():
+    state = {"learn_armed": False}
+    tui._apply_learn_event(state, {"kind": "event", "name": "learn_armed",
+                                   "data": {"action": "page.next", "mode": "trigger"}})
+    assert state["learn_armed"] is True
+    assert tui._active_learn_message(state) is None   # armed alone is not a transient flash
+
+
+def test_apply_learn_event_bound_clears_the_sticky_flag_and_sets_a_transient_message():
+    state = {"learn_armed": True}
+    tui._apply_learn_event(state, {"kind": "event", "name": "learn_bound",
+                                   "data": {"binding": {"id": "learn_123", "action": "page.next"}}})
+    assert state["learn_armed"] is False
+    assert "learn_123" in tui._active_learn_message(state)
+
+
+def test_apply_learn_event_cancelled_clears_the_sticky_flag_and_sets_a_transient_message():
+    state = {"learn_armed": True}
+    tui._apply_learn_event(state, {"kind": "event", "name": "learn_cancelled",
+                                   "data": {"reason": "timeout"}})
+    assert state["learn_armed"] is False
+    assert "timeout" in tui._active_learn_message(state)
+
+
+def test_run_tui_handles_learn_events_without_crashing(monkeypatch):
+    """`learn_armed`/`learn_bound`/`learn_cancelled` arriving mid-session
+    must never crash `run_tui`'s main loop -- proven the same
+    scripted-inbox/FakeEngineClient/background-thread technique as
+    test_run_tui_refetches_keymap_on_keymap_changed_event above; the
+    state-mutation logic itself is unit-tested directly (the four tests
+    right above), so this only needs to prove the `on_event` WIRING
+    doesn't crash and the loop still shuts down cleanly afterward."""
+    inbox = queue.Queue()
+    inbox.put({"kind": "snapshot", "topic": "page.eventlog",
+               "data": {"title": "EVENT LOG", "count": 0, "lines": []}})
+    inbox.put({"kind": "event", "name": "learn_armed",
+               "data": {"action": "page.next", "mode": "trigger", "args": {}}})
+    inbox.put({"kind": "event", "name": "learn_bound",
+               "data": {"binding": {"id": "learn_1", "action": "page.next"}}})
+
+    class FakeEngineClient:
+        def __init__(self, socket_path):
+            pass
+
+        def connect(self):
+            pass
+
+        def request(self, cmd):
+            return {"data": {"current_page": "eventlog", "keymap": {}}}
+
+        def subscribe(self, topics, max_rate):
+            pass
+
+        def unsubscribe(self, topics):
+            pass
+
+        def start_reader(self):
+            return inbox
+
+        def action(self, name):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tui, "EngineClient", FakeEngineClient)
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = run_tui("/tmp/unused.sock")
+        except BaseException as exc:  # noqa: BLE001 -- capture ANY crash
+            outcome["exception"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert "exception" not in outcome, (
+        f"run_tui crashed handling learn events: {outcome.get('exception')!r}")
+
+    inbox.put(None)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive(), "run_tui did not exit after the shutdown sentinel"
+
+
 def test_render_unknown_fallback_has_no_crash_on_bare_vm():
     out = _render_unknown({}, width=20, height=3)
     assert len(out) == 3

@@ -13,10 +13,12 @@ import pytest
 
 from midicrt.engine.bindings import (
     CONTINUOUS_FILL_TOKEN,
+    LEARN_TIMEOUT_S,
     Binding,
     BindingDispatcher,
     BindingMatch,
     BindingsFile,
+    is_learnable_event,
     validate_binding,
 )
 from midicrt.engine.core import MidiEvent
@@ -720,3 +722,60 @@ def test_validate_binding_continuous_with_extra_static_arg_satisfied():
     b = continuous_binding(action="chrome.tint", args={"channel": "warm", "level": None})
     actions = {"chrome.tint": {"description": "", "args": {"channel": "str", "level": "float"}}}
     assert validate_binding(b, actions) is None
+
+
+# -- is_learnable_event (Phase 4 Task 3, docs/phase4-notes.md) ---------------
+#
+# Pure MIDI-semantics predicate, deliberately placed here (not engine/core.py)
+# -- mirrors this module's own "no registry, no engine, just MIDI shapes"
+# charter (see module docstring): the question "is this a MIDI shape a
+# binding could ever be learned from" needs no Engine/ActionRegistry access
+# at all, same as `_MATCH_TYPES`/`BindingDispatcher._matches` right above.
+# `Engine._handle` (engine/core.py) is the only call site -- see that
+# method's own comment for why capture must be checked BEFORE the binding
+# dispatcher sees the event.
+
+def test_is_learnable_event_true_for_note_on_with_positive_velocity():
+    assert is_learnable_event(ev(type="note_on", data2=100)) is True
+
+
+def test_is_learnable_event_false_for_note_on_with_zero_velocity():
+    # Running-status note-off, not a real trigger -- same rule
+    # BindingDispatcher._trigger already applies for a stored binding.
+    assert is_learnable_event(ev(type="note_on", data2=0)) is False
+
+
+def test_is_learnable_event_true_for_control_change_any_value():
+    assert is_learnable_event(ev(type="control_change", data1=20, data2=0)) is True
+    assert is_learnable_event(ev(type="control_change", data1=20, data2=127)) is True
+
+
+def test_is_learnable_event_false_for_note_off():
+    assert is_learnable_event(ev(type="note_off", data2=100)) is False
+
+
+def test_is_learnable_event_false_for_clock_tick():
+    assert is_learnable_event(ev(type="clock_tick", channel=None, data1=24, data2=None)) is False
+
+
+def test_is_learnable_event_false_for_program_change():
+    assert is_learnable_event(ev(type="program_change", data1=5, data2=None)) is False
+
+
+def test_is_learnable_event_false_for_sysex():
+    assert is_learnable_event(
+        ev(type="sysex", channel=None, data1=None, data2=None, sysex_data=(1, 2, 3))) is False
+
+
+def test_is_learnable_event_false_for_transport_start_stop_continue_songpos():
+    for transport_type in ("start", "stop", "continue", "songpos"):
+        assert is_learnable_event(
+            ev(type=transport_type, channel=None, data1=None, data2=None)) is False
+
+
+def test_learn_timeout_s_is_thirty_seconds():
+    # Task brief: "30s timeout via the engine tick path" -- a plain module
+    # constant so `engine/core.py`'s `_tick_learn` and `clients/cli.py`'s
+    # own wait-timeout default (engine timeout + slack) both read the SAME
+    # number instead of two independently-maintained literals.
+    assert LEARN_TIMEOUT_S == 30.0

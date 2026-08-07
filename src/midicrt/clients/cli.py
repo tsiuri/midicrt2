@@ -1,9 +1,12 @@
 """midicrt — protocol client CLI (also the debugging tool)."""
 import argparse
 import json
+import queue
+import time
 
 from midicrt import config as config_mod
 from midicrt.clients.base import ClientError, EngineClient
+from midicrt.engine.bindings import LEARN_TIMEOUT_S
 
 
 def request(socket_path: str, cmd: str, **kw) -> dict:
@@ -30,6 +33,89 @@ def _parse_args(pairs: list[str]) -> dict:
     return out
 
 
+# -- `midicrt bind ...` (Phase 4 Task 3, docs/phase4-notes.md) ---------------
+#
+# `list`/`remove`/`cancel` are plain one-shot request/response, same shape
+# as the generic `action` subcommand above (just pre-filling the action
+# name/args) -- `_bind_learn_cli` is the one exception: arming is a
+# request/response, but the RESULT (`learn_bound`/`learn_cancelled`) only
+# ever arrives later, as an EVENT, so it needs a persistent connection with
+# a reader thread (mirrors `clients/tui.py::run_tui`'s own
+# `start_reader()`-then-block pattern) rather than the fire-and-forget
+# `request()` helper above.
+
+def _bind_learn_cli(socket_path: str, action_name: str, mode: str, arg_pairs: list[str],
+                    timeout: float) -> None:
+    """`midicrt bind learn <action>`: arms the engine's single learn slot
+    (`bind.learn`, engine/core.py) then blocks on the SAME connection's
+    reader thread for the resulting `learn_bound`/`learn_cancelled` event.
+    No `subscribe` call is needed to see either event -- `ProtocolServer.
+    _on_engine_message` broadcasts every event to every GREETED client
+    unconditionally, regardless of topic subscriptions (see engine/
+    server.py); only snapshots are subscription-gated.
+
+    `timeout` defaults to `LEARN_TIMEOUT_S` (the engine's own arm window)
+    plus a slack margin for wire round-trip/scheduling latency, so a
+    client waiting under normal conditions is never the one to time out
+    first -- the engine's own `learn_cancelled {reason: "timeout"}` should
+    always win that race and produce a readable message here instead of a
+    bare "timed out waiting" with no explanation."""
+    client = EngineClient(socket_path)
+    try:
+        client.connect()
+    except ClientError as exc:
+        raise SystemExit(f"midicrt: {exc}") from exc
+    inbox = client.start_reader()
+    try:
+        # `.action()` itself raises `ClientError` for a rejected arm (see
+        # `EngineClient.request`) -- its response has no further data this
+        # caller needs beyond "the arm succeeded", so it's discarded here.
+        client.action("bind.learn", {
+            "action": action_name, "mode": mode, "args": _parse_args(arg_pairs)})
+    except ClientError as exc:
+        client.close()
+        raise SystemExit(f"midicrt: {exc}") from exc
+    print(f"midicrt: armed -- waiting for MIDI (timeout {timeout:.0f}s)...")
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise SystemExit("midicrt: timed out waiting for a learn result")
+            try:
+                msg = inbox.get(timeout=remaining)
+            except queue.Empty:
+                raise SystemExit("midicrt: timed out waiting for a learn result") from None
+            if msg is None:
+                raise SystemExit("midicrt: engine connection lost")
+            if msg.get("kind") != "event":
+                continue
+            name = msg.get("name")
+            if name == "learn_bound":
+                print(json.dumps(msg["data"]["binding"], indent=2))
+                return
+            if name == "learn_cancelled":
+                reason = msg.get("data", {}).get("reason", "unknown")
+                raise SystemExit(f"midicrt: learn cancelled ({reason})")
+            # Any other event (page_changed, keymap_changed, alert, ...)
+            # arriving while armed is unrelated -- keep waiting.
+    finally:
+        client.close()
+
+
+def _handle_bind(socket_path: str, args) -> None:
+    if args.bind_cmd == "learn":
+        _bind_learn_cli(socket_path, args.action, args.mode, args.arg, args.timeout)
+        return
+    if args.bind_cmd == "list":
+        data = request(socket_path, "action", name="bind.list", args={})
+    elif args.bind_cmd == "remove":
+        data = request(socket_path, "action", name="bind.remove", args={"id": args.id})
+    elif args.bind_cmd == "cancel":
+        data = request(socket_path, "action", name="bind.cancel", args={})
+    print(json.dumps(data, indent=2))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(prog="midicrt")
     ap.add_argument("--socket", default=None)
@@ -40,6 +126,19 @@ def main() -> None:
     p_action.add_argument("name")
     p_action.add_argument("--arg", action="append", default=[])
     sub.add_parser("tui")
+
+    p_bind = sub.add_parser("bind")
+    bind_sub = p_bind.add_subparsers(dest="bind_cmd", required=True)
+    bind_sub.add_parser("list")
+    p_bind_remove = bind_sub.add_parser("remove")
+    p_bind_remove.add_argument("id")
+    bind_sub.add_parser("cancel")
+    p_bind_learn = bind_sub.add_parser("learn")
+    p_bind_learn.add_argument("action")
+    p_bind_learn.add_argument("--mode", default="trigger", choices=["trigger", "continuous"])
+    p_bind_learn.add_argument("--arg", action="append", default=[])
+    p_bind_learn.add_argument("--timeout", type=float, default=LEARN_TIMEOUT_S + 5.0)
+
     args = ap.parse_args()
 
     socket_path = args.socket or config_mod.load(None).socket_path
@@ -47,6 +146,9 @@ def main() -> None:
     if args.cmd == "tui":
         from midicrt.clients.tui import run_tui  # lazy: needs blessed
         raise SystemExit(run_tui(socket_path))
+    if args.cmd == "bind":
+        _handle_bind(socket_path, args)
+        return
     if args.cmd == "action":
         data = request(socket_path, "action", name=args.name, args=_parse_args(args.arg))
     else:

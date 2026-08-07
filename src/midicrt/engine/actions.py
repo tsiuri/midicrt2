@@ -1,5 +1,6 @@
 """Central action registry: every engine capability is a named action (spec §4)."""
 import inspect
+import json
 from collections.abc import Callable
 
 
@@ -14,7 +15,32 @@ def _parse_bool(value):
     raise ValueError(f"not a bool: {value!r}")
 
 
-_COERCERS = {"int": int, "float": float, "str": str, "bool": _parse_bool}
+def _parse_dict(value):
+    """Phase 4 Task 3 (docs/phase4-notes.md): the one non-scalar arg type,
+    added for `bind.learn {action, mode, args}` -- `args` is itself a
+    nested k/v template for the TARGET action being learned. A real
+    `client.action(...)` call over the wire already carries `args` as a
+    genuine JSON object (proto.py encodes/decodes plain JSON, so a client
+    never needs to stringify a dict it's about to send), so the common case
+    is a pass-through identity check. The JSON-string fallback exists so
+    the generic `midicrt action bind.learn --arg args=...` CLI path (whose
+    `--arg k=v` always produces STRING values, see clients/cli.py::
+    _parse_args) can reach this exact same coercer, not just the dedicated
+    `midicrt bind learn` subcommand (which sends a real dict directly)."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"not valid JSON: {value!r}") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError(f"not a JSON object: {value!r}")  # noqa: TRY004
+        return parsed
+    raise ValueError(f"not an object: {value!r}")
+
+
+_COERCERS = {"int": int, "float": float, "str": str, "bool": _parse_bool, "dict": _parse_dict}
 
 
 class ActionError(Exception):

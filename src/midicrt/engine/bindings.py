@@ -94,6 +94,29 @@ DEFAULT_PATH = os.path.expanduser("~/.config/midicrt/bindings.toml")
 _MATCH_TYPES = {"note_on", "control_change"}
 _MODES = {"trigger", "continuous"}
 
+
+def is_learnable_event(ev) -> bool:
+    """Phase 4 Task 3 (DAW-style MIDI learn): is `ev` a MidiEvent a `bind.
+    learn` arm can capture? Only `control_change` (any value -- a fader
+    sitting anywhere still identifies which controller it is) or `note_on`
+    with velocity > 0 (mirrors `BindingDispatcher._trigger`'s own "a
+    velocity-0 note_on is a running-status note-off, not a real trigger"
+    rule, and `_MATCH_TYPES` above -- a binding can only ever WATCH these
+    two event types, so learn can only ever CAPTURE from them too).
+
+    Every other `MidiEvent.type` this engine ever queues -- `clock_tick`
+    (synthesized, never a real controller identity), `note_off`, transport
+    `start`/`stop`/`continue`/`songpos` (global transport messages, not
+    tied to any one controller/knob), `sysex` (consumed engine-side before
+    this would ever run, see `Engine._handle_sysex`), `program_change`
+    (single data byte, no natural "trigger" semantics a binding's `match`
+    shape can represent) -- is disqualified simply by falling through both
+    checks below; no explicit type-by-type exclusion list is needed since
+    `_MATCH_TYPES` is already the complete set of learnable shapes."""
+    if ev.type == "control_change":
+        return True
+    return ev.type == "note_on" and bool(ev.data2)
+
 # TOML has no null literal, so a continuous binding's "this arg gets filled
 # from the lerped CC value" marker can't be a real Python `None` on disk --
 # see `BindingDispatcher._continuous`'s own docstring and this module's
@@ -103,6 +126,22 @@ _MODES = {"trigger", "continuous"}
 # extremely unlikely to matter -- no shipped action takes a string arg
 # resembling a sentinel like this today).
 CONTINUOUS_FILL_TOKEN = "$midicrt_fill_from_cc$"
+
+# Phase 4 Task 3 (DAW-style MIDI learn, docs/phase4-notes.md): how long a
+# single armed learn slot (`Engine._bind_learn`) waits for a qualifying
+# MidiEvent before auto-cancelling (`Engine._tick_learn`, called from
+# `run()` once per tick -- "the engine tick path" the task brief names,
+# same mechanism `_tick_analyzers`/`_tick_pages`/`_tick_behaviors` already
+# use for injected-wall-clock work). A plain module constant, not a
+# `Config` field -- this is a fixed UX timing decision (how long a human
+# has to hit a key/knob after arming), not a per-deployment tunable
+# anything in this codebase's `config.toml` precedent would suggest making
+# adjustable (contrast `tick_hz`/`pagecycle_idle_s`, which really do vary
+# per rig). Both `engine/core.py`'s own timeout check AND `clients/cli.py`'s
+# `midicrt bind learn` wait-timeout default (this value plus slack for
+# wire round-trip latency) read this SAME constant rather than each
+# hardcoding an independently-maintained "30".
+LEARN_TIMEOUT_S = 30.0
 
 
 @dataclass
