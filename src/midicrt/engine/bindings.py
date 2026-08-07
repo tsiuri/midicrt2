@@ -42,6 +42,27 @@ Every `Binding` is one of two `mode`s:
     `BindingDispatcher._continuous`'s own docstring for the design this
     picks for TOML's lack of a null literal).
 
+Continuous mode wants an ABSOLUTE setter action, not a delta/increment one
+(review finding, live-reproduced): a CC binding fires once per PHYSICAL
+MOVE of the controller, and each firing carries the CC's raw 0-127 value
+lerped into `range` -- if the bound action ADDS that value to its current
+state (e.g. a `{"delta": float}`-shaped action), a knob sweep keeps adding
+on top of whatever the PREVIOUS message already added, saturating to
+whatever clamp the action enforces almost immediately regardless of the
+knob's actual physical position (reproduced live: a sweep through
+`pianoroll.zoom`'s own `{"delta": float}` shape hit `ZOOM_MAX` after a
+handful of messages and stayed pinned there for the rest of the sweep --
+not the "knob position tracks the parameter" behavior anyone binding a
+fader to a continuous parameter actually wants). An action meant to be a
+continuous-binding TARGET must instead accept the parameter's intended
+ABSOLUTE value directly (e.g. `pianoroll.zoom_level {level: float}`, added
+alongside the pre-existing cumulative `pianoroll.zoom {delta: float}`) --
+`validate_binding` cannot detect this distinction from the schema alone
+(both shapes declare one `"float"` arg), so it is a convention documented
+here, not a mechanically enforced one: delta-style actions are for TRIGGER
+mode (or a normal keymap/CLI one-shot nudge), absolute-setter actions are
+for CONTINUOUS mode.
+
 Every `Binding.action`'s `args` are dispatched THROUGH `ActionRegistry.
 dispatch` exactly like any other action call -- schema coercion/validation
 happens there, once, not duplicated here (mirrors `dispatch_key` in
@@ -328,6 +349,15 @@ def validate_binding(binding: Binding, actions: dict) -> str | None:
 # this load/save boundary -- `BindingDispatcher`/`validate_binding` (both
 # tested directly against real `Binding` objects) never see the token at
 # all.
+#
+# Review fix (Important): this translation is scoped to `mode ==
+# "continuous"` ONLY, on both the load and save sides -- it used to run
+# unconditionally for every binding regardless of mode, so a TRIGGER
+# binding carrying the literal token string as a genuine static arg value
+# (e.g. an action argument that happens to equal `CONTINUOUS_FILL_TOKEN`)
+# was silently corrupted to `None` on load, with no fill-target concept to
+# even make sense of it. See `test_bindingsfile_load_trigger_binding_with_
+# literal_sentinel_string_keeps_it_verbatim` (test_bindings.py).
 
 def _parse_match(binding_id: str, raw: Any) -> BindingMatch | None:
     if not isinstance(raw, dict):
@@ -403,7 +433,20 @@ def _parse_binding_entry(binding_id: str, raw: Any) -> Binding | None:
         _LOG.warning("bindings: %r has a malformed 'threshold' (must be an int 0-127), "
                      "got %r, skipping", binding_id, threshold)
         return None
-    args = {k: (None if v == CONTINUOUS_FILL_TOKEN else v) for k, v in args_raw.items()}
+    # Review fix (Important): the sentinel->None translation must be scoped
+    # to `mode == "continuous"` ONLY -- it used to run unconditionally for
+    # every binding, so a TRIGGER binding carrying `CONTINUOUS_FILL_TOKEN`
+    # as a genuine literal string arg value (an unlikely but real
+    # collision) was silently corrupted to `None` even though trigger mode
+    # has no fill-target concept at all. A trigger binding's `args` are now
+    # copied through completely verbatim; only a continuous binding's args
+    # table is ever scanned for the token (and only that single value is
+    # actually meaningful there -- see the "exactly one fill marker" check
+    # below, which is what identifies THE designated fill key, not merely
+    # "any key that happens to match").
+    args = dict(args_raw)
+    if mode == "continuous":
+        args = {k: (None if v == CONTINUOUS_FILL_TOKEN else v) for k, v in args.items()}
     range_ = (0.0, 1.0)
     if mode == "continuous":
         range_raw = raw.get("range")
@@ -585,7 +628,15 @@ def _binding_to_raw(binding: Binding) -> str:
         lines.append("")
         lines.append(f"[bindings.{_toml_string(binding.id)}.args]")
         for key, value in binding.args.items():
-            on_disk = CONTINUOUS_FILL_TOKEN if value is None else value
+            # Symmetric with the load-side fix above: only a CONTINUOUS
+            # binding's `None` fill marker is ever translated to the
+            # on-disk sentinel. A trigger binding's args are never expected
+            # to contain a real `None` at all (there is no fill-target
+            # concept there) -- if one somehow did, `_toml_value` raising
+            # `TypeError` on it is the honest failure, not a silent,
+            # wrong-mode sentinel substitution.
+            on_disk = CONTINUOUS_FILL_TOKEN if (binding.mode == "continuous"
+                                                and value is None) else value
             lines.append(f"{_toml_string(key)} = {_toml_value(on_disk)}")
     lines.append("")
     lines.append(f"[bindings.{_toml_string(binding.id)}.match]")

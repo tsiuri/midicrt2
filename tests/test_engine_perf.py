@@ -118,3 +118,57 @@ def test_idle_tick_cycle_is_fast_with_no_subscribers(capsys):
         "(tripwire bound 3.0 ms) -- see finding 1 in docs/phase3-parity.md's "
         "'Performance at phase-3 close' section"
     )
+
+
+async def test_continuous_binding_cc_burst_dispatch_is_fast(capsys, tmp_path):
+    """Non-gating perf tripwire for Phase 4 Task 2's MIDI bindings
+    (review, Important finding 3): one continuous CC binding driven
+    through a realistic 128-message sweep burst, through the ACTUAL
+    production dispatch path -- `_handle` (collects the intent via
+    `BindingDispatcher.handle`) then `_dispatch_bindings` (the async
+    `ActionRegistry.dispatch` call) -- not `BindingDispatcher.handle()`
+    called in isolation, which would miss any cost in the dispatch half
+    (arg coercion, the target action's own handler, `Engine._wrap_page_
+    action`'s dirty-marking).
+
+    Reviewer measured ~6.56ms for the whole 128-message burst live on the
+    Pi; this bound is deliberately generous (~9x headroom, matching this
+    file's own convention -- see module docstring) so ordinary Pi load
+    jitter never fails CI while a real regression (e.g. an accidentally
+    reintroduced per-event O(n) rescan of something that should be O(1),
+    or a newly-expensive handler landing on the continuous-binding hot
+    path) still trips it."""
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.c1]\n'
+        'action = "pianoroll.zoom_level"\n'
+        'mode = "continuous"\n'
+        'range = [0.25, 4.0]\n'
+        '\n'
+        '[bindings.c1.args]\n'
+        'level = "$midicrt_fill_from_cc$"\n'
+        '\n'
+        '[bindings.c1.match]\n'
+        'type = "control_change"\n'
+        'number = 23\n'
+    )
+    eng = Engine(Config(), bindings_path=str(p))
+
+    t0 = time.perf_counter()
+    for cc_value in range(128):
+        eng._handle(MidiEvent(ts=0.0, source="USB MIDI", type="control_change",
+                              channel=0, data1=23, data2=cc_value,
+                              summary=f"control_change ch1 cc23 v{cc_value}"))
+        await eng._dispatch_bindings()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+
+    with capsys.disabled():
+        print(f"\n[perf] continuous binding, 128-message CC burst (real dispatch "
+              f"path): {elapsed_ms:.2f} ms total")
+
+    assert elapsed_ms < 60.0, (
+        f"continuous-binding CC-burst dispatch regressed to {elapsed_ms:.2f} ms "
+        "for a 128-message burst (tripwire bound 60 ms) -- see the phase-4 "
+        "task-2 review's finding 3 for the last known-good number "
+        "(~6.56 ms measured live on the Pi)"
+    )

@@ -327,6 +327,45 @@ def test_bindingsfile_load_a_continuous_binding_with_fill_token(tmp_path):
     assert b.args == {"level": None}   # sentinel translated to real None in memory
 
 
+# -- sentinel substitution is scoped to mode == "continuous" only -----------
+# (review finding, Important, live-reproduced: the token->None translation
+# ran unconditionally for every binding regardless of mode -- a TRIGGER
+# binding whose args happened to carry the literal sentinel STRING as a
+# genuine static value was silently corrupted to None, even though trigger
+# mode has no fill-target concept at all to make sense of that.)
+
+def test_bindingsfile_load_trigger_binding_with_literal_sentinel_string_keeps_it_verbatim(
+        tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.b1]\n'
+        'action = "page.goto"\n'
+        'mode = "trigger"\n'
+        '\n'
+        '[bindings.b1.args]\n'
+        f'name = "{CONTINUOUS_FILL_TOKEN}"\n'
+        '\n'
+        '[bindings.b1.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+    )
+    bf = BindingsFile.load(str(p))
+    b = bf.bindings[0]
+    assert b.mode == "trigger"
+    # Must stay the literal string -- NOT translated to None, unlike the
+    # continuous case right above.
+    assert b.args == {"name": CONTINUOUS_FILL_TOKEN}
+
+
+def test_bindingsfile_roundtrip_trigger_binding_with_literal_sentinel_string(tmp_path):
+    p = tmp_path / "bindings.toml"
+    original = trigger_binding(action="page.goto", args={"name": CONTINUOUS_FILL_TOKEN})
+    bf = BindingsFile([original], path=str(p))
+    bf.save()
+    reloaded = BindingsFile.load(str(p))
+    assert reloaded.bindings == [original]   # verbatim round-trip, not corrupted to None
+
+
 def test_bindingsfile_load_tolerates_unknown_keys(tmp_path):
     p = tmp_path / "bindings.toml"
     p.write_text(

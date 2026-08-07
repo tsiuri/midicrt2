@@ -12,6 +12,8 @@ import pytest
 
 from midicrt.engine.core import MidiEvent
 from midicrt.pages.pianoroll import (
+    ZOOM_MAX,
+    ZOOM_MIN,
     PianorollPage,
     PianorollState,
     _parse_channel_spec,
@@ -335,6 +337,35 @@ def test_zoom_reflected_in_window_vm():
     assert s.view_model()["window"]["zoom"] == pytest.approx(2.0)
 
 
+# -- absolute zoom (review finding, Important): a continuous MIDI binding
+# needs an ABSOLUTE setter, not `zoom_by`'s cumulative delta -- see
+# engine/bindings.py's module docstring ("Trigger vs continuous") for the
+# live-reproduced saturation bug this fixes. `set_zoom_level` sets the zoom
+# to EXACTLY the given value (clamped), regardless of the current zoom or
+# how many prior calls there were -- unlike `zoom_by`, which always adds to
+# whatever the zoom already is.
+
+def test_set_zoom_level_sets_the_exact_absolute_value():
+    s = PianorollState(now=100.0)
+    assert s.set_zoom_level(2.5) == pytest.approx(2.5)
+    assert s.view_model()["window"]["zoom"] == pytest.approx(2.5)
+
+
+def test_set_zoom_level_is_not_cumulative_across_repeated_calls():
+    s = PianorollState(now=100.0)
+    s.set_zoom_level(2.0)
+    s.set_zoom_level(2.0)   # same level again -- must NOT stack like zoom_by would
+    assert s.view_model()["window"]["zoom"] == pytest.approx(2.0)
+    s.set_zoom_level(1.0)   # a lower level after a higher one -- must jump straight there
+    assert s.view_model()["window"]["zoom"] == pytest.approx(1.0)
+
+
+def test_set_zoom_level_clamps_to_min_and_max():
+    s = PianorollState(now=100.0)
+    assert s.set_zoom_level(-5.0) == pytest.approx(ZOOM_MIN)
+    assert s.set_zoom_level(999.0) == pytest.approx(ZOOM_MAX)
+
+
 # -- projection mode control ----------------------------------------------
 
 def test_set_projection_accepts_known_modes():
@@ -472,6 +503,7 @@ def test_page_unrelated_event_is_not_dirty():
 def test_page_action_glue_methods_delegate():
     page = PianorollPage()
     assert page.zoom_by(1.0) == pytest.approx(2.0)
+    assert page.set_zoom_level(3.0) == pytest.approx(3.0)
     assert page.set_projection("tempo") == "tempo"
     assert page.set_channels("1,2") == [1, 2]
 

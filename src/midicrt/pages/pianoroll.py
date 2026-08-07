@@ -446,6 +446,22 @@ class PianorollState:
         self._zoom = max(ZOOM_MIN, min(ZOOM_MAX, self._zoom + float(delta)))
         return self._zoom
 
+    def set_zoom_level(self, level: float) -> float:
+        """Set the zoom to EXACTLY `level` (clamped to `[ZOOM_MIN,
+        ZOOM_MAX]`, same clamp `zoom_by` enforces) -- unlike `zoom_by`,
+        never reads or adds to the CURRENT zoom, so repeated calls with the
+        same `level` are idempotent and a lower `level` after a higher one
+        jumps straight there. Added as the ABSOLUTE counterpart to
+        `zoom_by`'s cumulative delta specifically for `engine/bindings.py`'s
+        continuous MIDI-binding mode (see that module's own docstring,
+        "Trigger vs continuous" section, for the live-reproduced saturation
+        bug a delta-shaped action causes there -- a CC sweep through
+        `zoom_by` keeps ADDING on top of whatever the previous message
+        already added, pinning to `ZOOM_MAX` almost immediately regardless
+        of the knob's actual physical position)."""
+        self._zoom = max(ZOOM_MIN, min(ZOOM_MAX, float(level)))
+        return self._zoom
+
     def set_projection(self, mode: str) -> str:
         mode = str(mode).strip().lower()
         if mode not in _PROJECTION_MODES:
@@ -561,6 +577,9 @@ class PianorollPage:
     def zoom_by(self, delta: float) -> float:
         return self._state.zoom_by(delta)
 
+    def set_zoom_level(self, level: float) -> float:
+        return self._state.set_zoom_level(level)
+
     def set_projection(self, mode: str) -> str:
         return self._state.set_projection(mode)
 
@@ -588,6 +607,9 @@ class PianorollPage:
     def _action_zoom(self, delta: float) -> dict:
         return {"zoom": self.zoom_by(delta)}
 
+    def _action_zoom_level(self, level: float) -> dict:
+        return {"zoom": self.set_zoom_level(level)}
+
     def _action_projection(self, mode: str) -> dict:
         return {"mode": self.set_projection(mode)}
 
@@ -598,6 +620,16 @@ class PianorollPage:
         return [
             ("pianoroll.zoom", self._action_zoom,
              "Adjust the pianoroll's zoom level", {"delta": "float"}),
+            # Review finding (Important, engine/bindings.py's own docstring
+            # "Trigger vs continuous" section): the ABSOLUTE counterpart to
+            # "pianoroll.zoom" above -- sets the zoom directly rather than
+            # adding to it, the shape a continuous MIDI binding (a knob/
+            # fader whose CC value should map to a parameter's actual
+            # position) needs. "pianoroll.zoom" itself stays as-is for
+            # trigger-mode/keymap/CLI one-shot nudges.
+            ("pianoroll.zoom_level", self._action_zoom_level,
+             ("Set the pianoroll's zoom level directly (absolute; see "
+              "pianoroll.zoom for the cumulative delta version)"), {"level": "float"}),
             ("pianoroll.projection", self._action_projection,
              "Switch the pianoroll's projection mode (wallclock|tempo)",
              {"mode": "str"}),

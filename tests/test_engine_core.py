@@ -575,7 +575,8 @@ def test_pianoroll_is_in_the_default_roster():
 def test_pianoroll_actions_are_registered_when_the_page_is_present():
     eng = Engine(Config())
     described = eng.actions.describe()
-    assert {"pianoroll.zoom", "pianoroll.projection", "pianoroll.channels"} <= set(described)
+    assert {"pianoroll.zoom", "pianoroll.zoom_level", "pianoroll.projection",
+            "pianoroll.channels"} <= set(described)
 
 
 def test_pianoroll_actions_are_absent_when_the_page_is_not_in_the_roster():
@@ -584,7 +585,23 @@ def test_pianoroll_actions_are_absent_when_the_page_is_not_in_the_roster():
     # never advertises these actions (no KeyError at dispatch time either).
     eng = Engine(Config(pages=["eventlog"]))
     described = eng.actions.describe()
-    assert not ({"pianoroll.zoom", "pianoroll.projection", "pianoroll.channels"} & set(described))
+    assert not ({"pianoroll.zoom", "pianoroll.zoom_level", "pianoroll.projection",
+                "pianoroll.channels"} & set(described))
+
+
+async def test_pianoroll_zoom_level_action_sets_absolute_value_and_marks_dirty():
+    # The ABSOLUTE counterpart to pianoroll.zoom's cumulative delta (review
+    # finding, Important -- see engine/bindings.py's own "Trigger vs
+    # continuous" docstring section for the live-reproduced saturation bug
+    # this exists to fix).
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("pianoroll.zoom_level", {"level": "2.5"})
+    assert r["zoom"] == pytest.approx(2.5)
+    assert "page.pianoroll" in eng._dirty
+    # NOT cumulative -- a second dispatch with a LOWER level jumps straight
+    # there rather than adding on top of the first.
+    r = await eng.actions.dispatch("pianoroll.zoom_level", {"level": "1.0"})
+    assert r["zoom"] == pytest.approx(1.0)
 
 
 async def test_pianoroll_zoom_action_mutates_and_marks_dirty():
@@ -1700,15 +1717,22 @@ async def test_binding_cc_trigger_fires_with_zero_clients(tmp_path):
 
 
 async def test_binding_continuous_fills_a_real_float_arg_with_zero_clients(tmp_path):
+    # Review finding (Important, live-reproduced): this test originally
+    # targeted "pianoroll.zoom" (a CUMULATIVE delta) as "just plumbing
+    # proof" -- but that is exactly the semantically-wrong target a
+    # continuous binding should never actually use in practice (see
+    # engine/bindings.py's own "Trigger vs continuous" docstring section).
+    # Now targets "pianoroll.zoom_level", the ABSOLUTE setter added
+    # specifically for this mode.
     p = tmp_path / "bindings.toml"
     p.write_text(
         '[bindings.c1]\n'
-        'action = "pianoroll.zoom"\n'
+        'action = "pianoroll.zoom_level"\n'
         'mode = "continuous"\n'
-        'range = [-0.5, 0.5]\n'
+        'range = [0.5, 2.5]\n'
         '\n'
         '[bindings.c1.args]\n'
-        'delta = "$midicrt_fill_from_cc$"\n'
+        'level = "$midicrt_fill_from_cc$"\n'
         '\n'
         '[bindings.c1.match]\n'
         'type = "control_change"\n'
@@ -1721,7 +1745,59 @@ async def test_binding_continuous_fills_a_real_float_arg_with_zero_clients(tmp_p
     await asyncio.sleep(0.1)
     eng.stop()
     await task
-    assert eng.pages["pianoroll"].view_model()["window"]["zoom"] == pytest.approx(1.5)
+    assert eng.pages["pianoroll"].view_model()["window"]["zoom"] == pytest.approx(2.5)
+
+
+async def test_binding_continuous_sweep_sets_pianoroll_zoom_level_proportionally(tmp_path):
+    # Reviewer finding (Important), the actual "does this behave like a
+    # knob user expects" proof: bind pianoroll.zoom_level (the ABSOLUTE
+    # setter) to a CC, range=[ZOOM_MIN, ZOOM_MAX], and drive a whole sweep
+    # of messages through the REAL dispatch path (queue -> run() ->
+    # _handle -> _dispatch_bindings -> ActionRegistry.dispatch), not a
+    # single message -- proves each message sets the zoom to its OWN
+    # proportional position, unmoved by how many prior messages already
+    # fired (the cumulative-delta saturation bug this whole fix exists
+    # for: reviewer live-reproduced "pianoroll.zoom" pinning to ZOOM_MAX
+    # after only a handful of sweep messages).
+    from midicrt.pages.pianoroll import ZOOM_MAX, ZOOM_MIN
+
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.c1]\n'
+        'action = "pianoroll.zoom_level"\n'
+        'mode = "continuous"\n'
+        f'range = [{ZOOM_MIN!r}, {ZOOM_MAX!r}]\n'
+        '\n'
+        '[bindings.c1.args]\n'
+        'level = "$midicrt_fill_from_cc$"\n'
+        '\n'
+        '[bindings.c1.match]\n'
+        'type = "control_change"\n'
+        'number = 23\n'
+    )
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    task = asyncio.create_task(eng.run())
+
+    async def _sweep_to(cc_value):
+        await eng.queue.put(ev(type="control_change", data1=23, data2=cc_value))
+        await asyncio.sleep(0.02)
+        return eng.pages["pianoroll"].view_model()["window"]["zoom"]
+
+    # A full sweep of many messages FIRST -- if zoom_level were cumulative
+    # (the bug this fixes), this alone would already have pinned it to
+    # ZOOM_MAX. It must not have: the very next single message below still
+    # lands EXACTLY where its own CC value maps to, regardless of this
+    # sweep having happened first.
+    for cc_value in range(0, 128, 4):
+        await _sweep_to(cc_value)
+
+    assert await _sweep_to(0) == pytest.approx(ZOOM_MIN)
+    assert await _sweep_to(127) == pytest.approx(ZOOM_MAX)
+    assert await _sweep_to(64) == pytest.approx(
+        ZOOM_MIN + (64 / 127) * (ZOOM_MAX - ZOOM_MIN), rel=1e-6)
+
+    eng.stop()
+    await task
 
 
 # -- dispatch-time graceful skip (never crash the loop, no alert storm) -----
