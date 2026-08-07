@@ -24,11 +24,25 @@ batch's own last pulse becomes `ts`). The span `ts - clock_batch_start` is
 EXACTLY 24 raw clock intervals -- one quarter note -- letting
 `analyzers/transport.py` derive bpm with no averaging of its own (see that
 module's docstring). `clock_batch_start` is None for the first batch after
-start-up, AND the pulse counter/boundary are both reset on every
-"start"/"stop"/"continue" message (which still pass through normally as
-their own MidiEvents, translate() never ignored them) -- without this
-reset, the first batch completed after a stop-then-resume gap would
-measure a bpm across the silent gap instead of across real beats.
+start-up, and is reset (cleared to None) on every "start"/"stop"/"continue"
+message (which still pass through normally as their own MidiEvents,
+translate() never ignored them) -- without this reset, the first batch
+completed after a stop-then-resume gap would measure a bpm across the
+silent gap instead of across real beats.
+
+`_clock_count` (the raw pulse tally within the current batch) is reset to
+0 ONLY on "start" -- NOT on "stop"/"continue". MIDI's "continue" message
+resumes the clock from the EXACT tick it was stopped at, not from the
+start of a beat: a stop at pulse 10-of-24 followed by continue means only
+14 MORE pulses complete that beat, not a fresh 24. Zeroing `_clock_count`
+on stop/continue (an earlier version of this module did) silently
+discarded that in-flight tally, delaying the next `clock_tick` by up to a
+full beat and permanently offsetting `analyzers/transport.py`'s bar/beat
+count from the real transport position (that analyzer deliberately does
+NOT reset its own beat counter on continue, matching v1 -- so a phase
+error introduced here would never self-correct). Only "start" truly
+restarts the beat grid from tick 0, so only "start" zeroes the pulse
+tally.
 """
 import fnmatch
 import logging
@@ -38,9 +52,14 @@ import time
 from midicrt.engine.core import MidiEvent
 
 _LOG = logging.getLogger(__name__)
-_IGNORED_TYPES = {"clock", "activesensing"}
+# mido's real type string is "active_sensing" (verified via
+# `mido.Message("active_sensing").type`) -- "activesensing" (no underscore)
+# never matched, so active-sensing messages were passing translate()
+# unfiltered until this fix.
+_IGNORED_TYPES = {"clock", "active_sensing"}
 _CLOCK_BATCH_SIZE = 24  # standard MIDI clock: 24 pulses per quarter note
-_CLOCK_RESET_TYPES = {"start", "stop", "continue"}
+_CLOCK_FULL_RESET_TYPES = {"start"}            # zero the in-batch pulse tally too
+_CLOCK_BOUNDARY_RESET_TYPES = {"start", "stop", "continue"}  # always clear the bpm reference
 
 
 def matches(port_name: str, patterns: list[str]) -> bool:
@@ -103,9 +122,10 @@ class MidiInput:
         if msg.type == "clock":
             self._on_clock(source)
             return
-        if msg.type in _CLOCK_RESET_TYPES:
-            self._clock_count = 0
+        if msg.type in _CLOCK_BOUNDARY_RESET_TYPES:
             self._clock_batch_start = None
+        if msg.type in _CLOCK_FULL_RESET_TYPES:
+            self._clock_count = 0
         ev = translate(msg, source, time.time())
         if ev is not None:
             self._loop.call_soon_threadsafe(self._queue.put_nowait, ev)

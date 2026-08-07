@@ -2,6 +2,7 @@ import asyncio
 
 import mido
 
+from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.engine.midi_in import MidiInput, matches, translate
 
 
@@ -12,6 +13,17 @@ def test_translate_note_and_cc():
     ev = translate(mido.Message("control_change", channel=3, control=7, value=90), "USB", 1.0)
     assert ev.summary == "control_change ch4 cc7 v90"
     assert translate(mido.Message("clock"), "USB", 1.0) is None
+
+
+def test_translate_ignores_active_sensing():
+    # Regression: `_IGNORED_TYPES` used to contain the typo "activesensing"
+    # (no underscore), which never matched mido's real type string --
+    # `mido.Message("active_sensing").type == "active_sensing"` -- so
+    # active-sensing messages were passing translate() completely
+    # unfiltered (every ~300ms from most controllers) instead of being
+    # dropped like "clock".
+    assert mido.Message("active_sensing").type == "active_sensing"
+    assert translate(mido.Message("active_sensing"), "USB", 1.0) is None
 
 
 def test_matches():
@@ -150,6 +162,11 @@ async def test_start_message_resets_the_clock_counter_and_boundary():
 
 
 async def test_stop_and_continue_also_reset_the_clock_batch_boundary():
+    # Boundary-ALIGNED case: stop/continue happen right after a completed
+    # batch, when `_clock_count` is already 0 -- clearing `clock_batch_start`
+    # here is what prevents the NEXT batch's bpm from spanning the silent
+    # stop gap. See test_continue_mid_batch_resumes_the_partial_pulse_tally
+    # below for the boundary-MISALIGNED (partial-batch) case.
     q = asyncio.Queue()
     mi = _clockless_input(q)
     for _ in range(24):
@@ -168,6 +185,57 @@ async def test_stop_and_continue_also_reset_the_clock_batch_boundary():
     await asyncio.sleep(0)
     ev = q.get_nowait()
     assert ev.clock_batch_start is None   # boundary was cleared by stop/continue
+
+
+async def test_continue_mid_batch_resumes_the_partial_pulse_tally():
+    # Regression: MIDI "continue" resumes the clock from the EXACT tick it
+    # was stopped at -- stopping at pulse 10-of-24 then continuing means
+    # only 14 MORE pulses complete that beat, not a fresh 24. An earlier
+    # version of `_enqueue` zeroed `_clock_count` on stop/continue too,
+    # which silently discarded that in-flight tally: the next clock_tick
+    # would need a full 24 more pulses, landing up to a full beat late and
+    # permanently offsetting TransportAnalyzer's bar/beat count (which
+    # deliberately does NOT reset on continue, so a phase error here would
+    # never self-correct).
+    q = asyncio.Queue()
+    mi = _clockless_input(q)
+    for _ in range(10):
+        mi._enqueue(mido.Message("clock"), "USB")
+    mi._enqueue(mido.Message("stop"), "USB")
+    mi._enqueue(mido.Message("continue"), "USB")
+    await asyncio.sleep(0)
+    assert q.qsize() == 2
+    q.get_nowait(), q.get_nowait()  # stop, continue passthrough events
+
+    # 13 more pulses (10 + 13 = 23) must NOT complete the batch yet -- a
+    # buggy fresh-24-count would also not fire here (14 < 24), so the real
+    # proof is the NEXT assertion: exactly one more pulse (the TRUE 24th)
+    # must fire it, not 10 more (which a buggy reset would require).
+    for _ in range(13):
+        mi._enqueue(mido.Message("clock"), "USB")
+    await asyncio.sleep(0)
+    assert q.qsize() == 0
+
+    mi._enqueue(mido.Message("clock"), "USB")   # the true 24th pulse (10 + 14)
+    await asyncio.sleep(0)
+    assert q.qsize() == 1
+    ev = q.get_nowait()
+    assert ev.type == "clock_tick"
+    assert ev.clock_batch_start is None   # bpm reference was cleared by stop/continue
+
+    # Feed the resulting clock_tick into a real analyzer: the beat must
+    # advance by EXACTLY one (proving the boundary landed at the true
+    # 24-pulse mark, not early/late/duplicated).
+    from midicrt.engine.core import MidiEvent
+
+    analyzer = TransportAnalyzer()
+    analyzer.handle(MidiEvent(ts=0.0, source="USB", type="start", channel=None,
+                              data1=None, data2=None, summary="start"))
+    before = analyzer.view_model()
+    assert before["bar"] == 0 and before["beat"] == 1
+    analyzer.handle(ev)
+    after = analyzer.view_model()
+    assert after["bar"] == 0 and after["beat"] == 2   # advanced by exactly one beat
 
 
 async def test_translate_still_ignores_clock_when_called_directly():

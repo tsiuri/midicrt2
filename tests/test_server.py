@@ -109,6 +109,42 @@ async def test_subscribe_to_page_and_overlay_delivers_both_snapshots(tmp_path):
     eng.stop(); await task; await srv.close()
 
 
+async def test_clock_tick_updates_only_overlay_status_over_the_wire(tmp_path):
+    # phase-3 task 3, review follow-up: the "eventlog must not show clock
+    # spam" contract was previously only verified at the engine-unit level
+    # (test_engine_core.py). This proves it end-to-end over a REAL
+    # subscribed connection: a clock_tick delivered through a running
+    # engine must dirty overlay.status but must NOT cause a second
+    # page.eventlog snapshot on the wire.
+    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    await c.request("subscribe", topics=["page.eventlog", "overlay.status"], max_rate=50.0)
+    await asyncio.sleep(0.1)
+    await c.read_msgs(0.1)
+    c.inbox.clear()   # drop the initial subscribe-time seeded snapshots
+
+    await eng.queue.put(MidiEvent(0.0, "t", "start", None, None, None, "start"))
+    await asyncio.sleep(0.15)
+    await eng.queue.put(MidiEvent(0.5, "t", "clock_tick", None, 24, None, "clock_tick",
+                                  clock_batch_start=None))
+    await asyncio.sleep(0.3)
+    await c.read_msgs(0.2)
+
+    snap_topics = [m["topic"] for m in c.inbox if m.get("kind") == "snapshot"]
+    # "start" is the only eventlog-visible event here -- clock_tick must
+    # never add a second page.eventlog snapshot.
+    assert snap_topics.count("page.eventlog") == 1
+    overlay_snaps = [m for m in c.inbox
+                     if m.get("kind") == "snapshot" and m["topic"] == "overlay.status"]
+    assert overlay_snaps, "expected at least one overlay.status snapshot"
+    # ...and overlay.status DID pick up the clock_tick's effect (beat
+    # advanced past the post-"start" idle value of 1).
+    assert overlay_snaps[-1]["data"]["beat"] == 2
+    eng.stop(); await task; await srv.close()
+
+
 async def test_subscribe_rejects_non_positive_max_rate(tmp_path):
     eng, srv, task = await make(tmp_path)
     c = Client()
