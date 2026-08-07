@@ -12,8 +12,14 @@ from midicrt.engine.server import ProtocolServer
 _LOG = logging.getLogger("midicrtd")
 
 
-def build(cfg, socket_path: str, use_midi: bool):
-    engine = Engine(cfg)
+def build(cfg, socket_path: str, use_midi: bool, config_path: str | None = None):
+    # `config_path` (Phase 4 Task 1, docs/phase4-notes.md): threaded straight
+    # from `main()`'s own `args.config` (the SAME path `config_mod.load()`
+    # already used to build `cfg` above it in the call chain) so
+    # `config.reload`'s config.toml half re-reads the file this daemon was
+    # actually started with -- not always the hardcoded default path when a
+    # custom `--config` was given.
+    engine = Engine(cfg, config_path=config_path)
     server = ProtocolServer(engine, socket_path)
     midi = None
     if use_midi:
@@ -27,8 +33,9 @@ def build(cfg, socket_path: str, use_midi: bool):
     return engine, server, midi
 
 
-async def run(cfg, socket_path: str, use_midi: bool, use_audio: bool = True) -> None:
-    engine, server, midi = build(cfg, socket_path, use_midi)
+async def run(cfg, socket_path: str, use_midi: bool, use_audio: bool = True,
+              config_path: str | None = None) -> None:
+    engine, server, midi = build(cfg, socket_path, use_midi, config_path)
     await server.start()
     if midi:
         midi.start(asyncio.get_running_loop())
@@ -71,7 +78,8 @@ def main() -> None:
     args = ap.parse_args()
     cfg = config_mod.load(args.config)
     asyncio.run(run(cfg, args.socket or cfg.socket_path,
-                    use_midi=not args.no_midi, use_audio=not args.no_audio))
+                    use_midi=not args.no_midi, use_audio=not args.no_audio,
+                    config_path=args.config))
 
 
 if __name__ == "__main__":

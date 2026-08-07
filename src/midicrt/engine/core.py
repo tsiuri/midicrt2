@@ -120,11 +120,13 @@ fix) -- `Engine.__init__`'s own comment next to `self._behaviors` restates
 this at the wiring site.
 """
 import asyncio
+import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
+from midicrt import config as config_mod
 from midicrt import proto
 from midicrt.analyzers.beatflash import BeatFlashAnalyzer
 from midicrt.analyzers.loopprogress import LoopProgressAnalyzer
@@ -134,6 +136,7 @@ from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config, ConfigError
+from midicrt.engine import keymap as keymap_mod
 from midicrt.engine import sysex as sysex_mod
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.engine.midi_out import MidiOutput
@@ -152,6 +155,8 @@ from midicrt.pages.sendnotes import SendNotesPage
 from midicrt.pages.spectrum import SpectrumPage
 from midicrt.pages.tuner import TunerPage
 from midicrt.pages.voices import VoicesPage
+
+_LOG = logging.getLogger(__name__)
 
 # `_handle()` stamps `Engine._last_activity_ts` only for these event types --
 # matches v1's `plugins/zscreensaver.py::handle()` activity filter exactly
@@ -391,8 +396,27 @@ _SYSEX_PAGE_ID_MAP: dict[int, str] = {
 
 
 class Engine:
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, keymap_path: str | None = None,
+                 config_path: str | None = None):
         self.config = config
+        # Phase 4 Task 1 (config-served keymap, docs/phase4-notes.md):
+        # `self._keymap_path` is eagerly resolved to a concrete path (never
+        # `None`) so it always reads back as the truth ("what file does
+        # THIS engine's config.reload re-read?") -- see
+        # test_engine_core.py::test_engine_default_keymap_path_is_the_real_
+        # config_dir_path. `self._config_path` is kept as whatever was
+        # passed (including `None`) since `config_mod.load()` already does
+        # its own `path or DEFAULT_PATH` resolution internally every time
+        # it's called -- eagerly resolving it here would be redundant, not
+        # wrong, just extra state to keep in sync with that function's own
+        # fallback. `_config_reload` (below) is the one place either is
+        # ever read again; `daemon.py::build()` is the one production call
+        # site that passes `config_path=args.config` through (mirrors how
+        # `args.config` already flows into `config_mod.load()` at daemon
+        # startup) so a reload re-reads the SAME file the daemon was
+        # actually started with, not always the hardcoded default path.
+        self._keymap_path = keymap_path or keymap_mod.DEFAULT_PATH
+        self._config_path = config_path
         self.queue: asyncio.Queue = asyncio.Queue()
         self.actions = ActionRegistry()
         self.analyzers: dict[str, Analyzer] = {
@@ -593,6 +617,82 @@ class Engine:
                 self.actions.register(
                     action_name, self._wrap_page_action(page_name, handler),
                     description=description, args=args_schema)
+        # Phase 4 Task 1 (config-served keymap, docs/phase4-notes.md):
+        # registered LAST, after every other action above (engine-owned
+        # AND page-declared) -- both because `config.reload` itself is a
+        # perfectly legitimate keymap target (a user COULD bind a key to
+        # it) and because `self.keymap`'s own construction right below
+        # needs `self.actions.describe()` to already reflect THIS build's
+        # complete, roster-dependent action vocabulary (see
+        # `keymap_mod.filter_known_actions`'s own docstring for why that
+        # order matters: an action name valid in a full-roster build but
+        # absent here must be dropped, not just left in as a landmine for
+        # the first keypress/dispatch to hit).
+        self.actions.register("config.reload", self._config_reload,
+                              description="Re-read keymap.toml (and, best-effort, "
+                                          "config.toml's instruments) without a restart")
+        self.keymap: dict[str, str] = keymap_mod.filter_known_actions(
+            keymap_mod.load_keymap(self._keymap_path), set(self.actions.describe()))
+
+    def _config_reload(self) -> dict:
+        """`config.reload` action handler (Phase 4 Task 1, docs/phase4-
+        notes.md): the ONE live-reload entry point.
+
+        Unconditionally re-reads `keymap.toml` (`self._keymap_path`) --
+        this is the actual point of the task -- re-validates it against
+        THIS build's current action registry exactly like construction
+        time did, and always emits a `keymap_changed` event (even when the
+        freshly-loaded keymap is byte-identical to the old one -- simplest
+        correct behavior: a client's "refetch on keymap_changed" path
+        stays one unconditional code path with no "did it actually change"
+        check of its own to get wrong).
+
+        Then, as a cheap best-effort CONVENIENCE (not the task's core
+        deliverable -- see docs/phase4-notes.md's own task-1 framing):
+        re-reads `config.toml` (`self._config_path`) and
+          - pushes an `instruments` change live into the "voices" page
+            (see `VoicesPage.set_instruments`'s own docstring for why
+            that's safe/cheap: plain data, no analyzer state involved),
+          - but only WARNS (never applies) a `pages` roster change -- the
+            roster is built once, at `__init__`, and every page/analyzer
+            below it (harmony's shared-instance dedup, sendnotes' real
+            `MidiOutput`, every topic's subscriber refcount) has no tested
+            migration path for being re-parented live. A restart is the
+            honest way to apply a roster change, matching
+            docs/phase4-notes.md's own "action vocabulary is roster-
+            dependent" architecture fact.
+        A `config.toml` that fails to parse (or doesn't exist -- tolerated
+        silently, matching `config_mod.load()`'s own "no file -> defaults"
+        contract) never blocks the keymap half above: this method's return
+        value's `warnings` list is the only place either failure surfaces,
+        never an exception.
+        """
+        known_actions = set(self.actions.describe())
+        self.keymap = keymap_mod.filter_known_actions(
+            keymap_mod.load_keymap(self._keymap_path), known_actions)
+        warnings: list[str] = []
+        try:
+            new_config = config_mod.load(self._config_path)
+        except (OSError, ValueError) as exc:
+            warnings.append(f"config.toml reload failed: {exc}")
+            new_config = None
+        if new_config is not None:
+            if new_config.pages != self.config.pages:
+                msg = ("config.toml 'pages' changed but the live page roster is "
+                      "fixed at startup -- restart midicrtd to apply")
+                warnings.append(msg)
+                _LOG.warning("config.reload: %s (old=%r new=%r)",
+                             msg, self.config.pages, new_config.pages)
+            voices = self.pages.get("voices")
+            if (voices is not None and hasattr(voices, "set_instruments")
+                    and new_config.instruments != self.config.instruments):
+                voices.set_instruments(new_config.instruments)
+                self.config.instruments = new_config.instruments
+                self._dirty.add("page.voices")
+        if "config" in self.pages:
+            self._dirty.add("page.config")   # cheap; the viewer's own facts may have shifted
+        self.emit_event("keymap_changed", {"keymap": self.keymap, "warnings": warnings})
+        return {"keymap": self.keymap, "warnings": warnings}
 
     def _sendnotes_device_info(self) -> dict:
         """Bound into `pages/sendnotes.py`'s `SendNotesPage` at construction

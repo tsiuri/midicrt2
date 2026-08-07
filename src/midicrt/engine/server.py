@@ -186,7 +186,14 @@ class ProtocolServer:
                 "pages": sorted(self.engine.pages),
                 "topics": self.engine.topics,
                 "current_page": self.engine.current_page,
-                "keymap": {},
+                # Phase 4 Task 1 (docs/phase4-notes.md): was a reserved
+                # `{}` placeholder through phase 3 -- now the engine's
+                # real, live key->action table (`engine/keymap.py`),
+                # already validated against THIS build's action registry
+                # at construction/`config.reload` time (see
+                # `Engine.__init__`'s own comment for why that validation
+                # happens engine-side, not here).
+                "keymap": self.engine.keymap,
                 "engine_version": self.engine.status()["engine_version"],
                 "proto_version": proto.PROTO_VERSION,
             }))

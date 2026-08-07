@@ -12,11 +12,12 @@ Changes at all).
 
 Why this is a v2-appropriate-equivalent, not a literal port
 ---------------------------------------------------------------------------
-v2 has no keymap/key-to-action table at all yet -- `engine/server.py`'s
-`describe` response ships a `"keymap": {}` placeholder explicitly, and
-`phase3-notes.md`'s own "Known-latent items" section calls this out as
+At the time this page was first written (phase-3, task 12), v2 had no
+keymap/key-to-action table at all -- `engine/server.py`'s `describe`
+response shipped a `"keymap": {}` placeholder explicitly, and
+`phase3-notes.md`'s own "Known-latent items" section called this out as
 Phase 4, unbuilt ("Input layer needs a key->action TABLE"). A v2 help page
-therefore has nothing keybinding-shaped to show yet -- but it DOES have
+therefore had nothing keybinding-shaped to show yet -- but it DID have
 something v1 never had: a live, structured, always-in-sync ACTION REGISTRY
 (`engine/actions.py::ActionRegistry.describe()`, spec §4: "every engine
 capability is a named action") and a live page roster
@@ -26,10 +27,18 @@ describe data IS the parity port"), this page shows exactly that: the
 current page roster (in cycle order, i.e. what `page.next`/`page.prev`
 walk through) and the full sorted action list with descriptions/args --
 the same data `midicrt describe` already reports over the wire, just
-rendered on-screen. Once Phase 4's keymap lands, this page is the natural
-place to also show it (a `"keymap"` field is already reserved in
-`describe`'s response for exactly that future addition) -- not done here,
-since there is nothing live to show yet.
+rendered on-screen.
+
+UPDATE (Phase 4 Task 1, docs/phase4-notes.md): `describe`'s `"keymap"`
+field is no longer a placeholder -- `engine/keymap.py` now serves a real,
+live key->action table there, and both clients (`clients/tui.py`,
+`clients/fb/app.py`) build their key dispatch from it. This page's OWN
+rendering was deliberately left untouched by that task (its scope was the
+keymap plumbing + client adoption, not this page) -- `view_model()` still
+returns only `{page_rows, action_rows}`, no keymap rows. Adding a "--
+Keymap --" section here (mirroring `_config_rows`/`_engine_rows`'s own
+label/value-row shape) is a small, natural, still-unclaimed follow-up
+whenever someone next touches this page.
 
 Engine-info wiring
 ------------------

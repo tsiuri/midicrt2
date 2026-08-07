@@ -13,7 +13,6 @@ from midicrt.clients.chrome import (
     status_text,
 )
 from midicrt.clients.tui import (
-    _KEY_ACTIONS,
     RENDERERS,
     _config_body_lines,
     _help_body_lines,
@@ -70,10 +69,14 @@ def test_renderers_dispatch_table_has_eventlog():
     assert RENDERERS["eventlog"] is render_lines
 
 
-def test_key_actions_maps_n_to_page_next_and_c_to_clear():
-    assert _KEY_ACTIONS["n"] == "page.next"
-    assert _KEY_ACTIONS["c"] == "eventlog.clear"
-    assert "q" not in _KEY_ACTIONS  # quit is handled separately, not via action dispatch
+def test_key_actions_are_now_keymap_driven_not_a_hardcoded_module_dict():
+    # Phase 4 Task 1 (docs/phase4-notes.md): the old module-level
+    # `_KEY_ACTIONS` dict is gone entirely -- `run_tui` now builds its key
+    # dispatch from `fetch_keymap(client)` at connect (see
+    # `test_run_tui_dispatches_a_remapped_key_from_the_fetched_keymap`
+    # below for the resolution path itself, and test_client_base.py's
+    # `dispatch_key`/`fetch_keymap` tests for the shared machinery).
+    assert not hasattr(tui, "_KEY_ACTIONS")
 
 
 def test_render_unknown_fallback_has_no_crash_on_bare_vm():
@@ -1083,3 +1086,79 @@ def test_run_tui_survives_page_switch_before_new_topics_snapshot_arrives(monkeyp
     thread.join(timeout=2.0)
     assert not thread.is_alive(), "run_tui did not exit after the shutdown sentinel"
     assert outcome.get("result") == 1
+
+
+def test_run_tui_refetches_keymap_on_keymap_changed_event(monkeypatch):
+    """`keymap_changed` (Phase 4 Task 1, docs/phase4-notes.md, emitted by
+    the engine's `config.reload` action) must trigger a REAL re-fetch --
+    `fetch_keymap`'s own `describe` round trip, not a cached/reused copy
+    from connect time. Same scripted-inbox/FakeEngineClient/background-
+    thread technique as
+    test_run_tui_survives_page_switch_before_new_topics_snapshot_arrives
+    above; here the fake's `describe` response changes across calls so a
+    growing `describe_calls` count is direct, unambiguous proof a second
+    (or third) fetch actually happened rather than merely not crashing."""
+    inbox = queue.Queue()
+    inbox.put({"kind": "snapshot", "topic": "page.eventlog",
+               "data": {"title": "EVENT LOG", "count": 0, "lines": []}})
+    inbox.put({"kind": "event", "name": "keymap_changed", "data": {}})
+
+    describe_calls = []
+
+    class FakeEngineClient:
+        def __init__(self, socket_path):
+            pass
+
+        def connect(self):
+            pass
+
+        def request(self, cmd):
+            if cmd == "describe":
+                describe_calls.append(cmd)
+                # Second+ call reports a remapped keymap -- proves this is
+                # a genuine re-fetch, not a value cached at connect time.
+                keymap = ({"n": "page.prev"} if len(describe_calls) > 1
+                         else {"n": "page.next"})
+                return {"data": {"current_page": "eventlog", "keymap": keymap}}
+            return {"data": {}}
+
+        def subscribe(self, topics, max_rate):
+            pass
+
+        def unsubscribe(self, topics):
+            pass
+
+        def start_reader(self):
+            return inbox
+
+        def action(self, name):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tui, "EngineClient", FakeEngineClient)
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = run_tui("/tmp/unused.sock")
+        except BaseException as exc:  # noqa: BLE001 -- capture ANY crash
+            outcome["exception"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+
+    assert "exception" not in outcome, (
+        f"run_tui crashed handling keymap_changed: {outcome.get('exception')!r}")
+    # 2 at connect (current_page_topic's own describe() + fetch_keymap's),
+    # a 3rd from the keymap_changed event's on_event handler re-fetching.
+    assert len(describe_calls) >= 3, (
+        f"expected a re-fetch after keymap_changed, only saw {len(describe_calls)} describe() calls"
+    )
+
+    inbox.put(None)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive(), "run_tui did not exit after the shutdown sentinel"

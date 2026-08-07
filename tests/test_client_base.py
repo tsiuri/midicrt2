@@ -12,7 +12,9 @@ from midicrt.clients.base import (
     ClientError,
     EngineClient,
     current_page_topic,
+    dispatch_key,
     drain_latest,
+    fetch_keymap,
     switch_topic,
     wait_first_snapshot,
 )
@@ -531,3 +533,77 @@ def test_drain_latest_still_accepts_a_plain_set_of_topics():
     q: queue.Queue = queue.Queue()
     q.put({"kind": "snapshot", "topic": "page.eventlog", "seq": 1, "data": {"n": 1}})
     assert drain_latest(q, {"page.eventlog"}) == {"page.eventlog": {"n": 1}}
+
+
+# -- dispatch_key / fetch_keymap (Phase 4 Task 1, docs/phase4-notes.md) -----
+#
+# Shared key-resolution machinery both clients now build their key dispatch
+# from -- see clients/base.py's own docstrings. Tested here at the unit
+# level with a tiny recorder double (same convention as
+# `test_switch_topic_is_noop_when_topics_match`'s `_Recorder`), no real
+# terminal/evdev/socket needed for `dispatch_key` itself.
+
+class _ActionRecorder:
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def action(self, name):
+        self.calls.append(name)
+
+
+def test_dispatch_key_client_quit_returns_true_without_calling_action():
+    client = _ActionRecorder()
+    assert dispatch_key(client, "q", {"q": "client.quit"}) is True
+    assert client.calls == []
+
+
+def test_dispatch_key_sends_named_action_for_a_real_key():
+    client = _ActionRecorder()
+    assert dispatch_key(client, "c", {"c": "eventlog.clear"}) is False
+    assert client.calls == ["eventlog.clear"]
+
+
+def test_dispatch_key_unmapped_key_is_a_silent_noop():
+    client = _ActionRecorder()
+    assert dispatch_key(client, "z", {"q": "client.quit"}) is False
+    assert client.calls == []
+
+
+def test_dispatch_key_unrecognized_client_pseudo_action_is_a_silent_noop():
+    # A keymap.toml typo or a future pseudo-action this client build
+    # doesn't know about yet -- never reaches the engine either way.
+    client = _ActionRecorder()
+    assert dispatch_key(client, "x", {"x": "client.bogus"}) is False
+    assert client.calls == []
+
+
+def test_dispatch_key_drives_a_remapped_page_action():
+    # "a remapped key in a fake keymap drives the action" -- the exact
+    # scenario a user's keymap.toml exists to enable: "n" no longer means
+    # page.next once the fake describe-shaped keymap below says otherwise.
+    client = _ActionRecorder()
+    fake_keymap = {"n": "page.prev"}
+    assert dispatch_key(client, "n", fake_keymap) is False
+    assert client.calls == ["page.prev"]
+
+
+async def test_fetch_keymap_reads_the_real_engine_keymap_over_the_wire(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    keymap = await asyncio.to_thread(fetch_keymap, client)
+    assert keymap == eng.keymap == {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"}
+    await asyncio.to_thread(client.close)
+    eng.stop(); await task; await srv.close()
+
+
+def test_fetch_keymap_falls_back_to_default_when_server_predates_the_field():
+    # Wire-compat: an older server's `describe` response has no "keymap"
+    # key at all -- must not raise, must fall back to DEFAULT_KEYMAP.
+    from midicrt.engine.keymap import DEFAULT_KEYMAP
+
+    class _OldServerClient:
+        def request(self, cmd):
+            return {"data": {"current_page": "eventlog"}}   # no "keymap" key
+
+    assert fetch_keymap(_OldServerClient()) == DEFAULT_KEYMAP

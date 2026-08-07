@@ -12,10 +12,20 @@ page name this client build doesn't recognise -- wire compat is
 additive-only, so an older client can meet a newer server's extra page
 without crashing.
 
-`n` sends `page.next`; `c` still sends `eventlog.clear` (a no-op action on
-a page other than eventlog would be rejected by the server as "unknown
-action" only if the page itself removed it -- eventlog.clear is global for
-now, unchanged from phase 2).
+Key dispatch (Phase 4 Task 1, docs/phase4-notes.md)
+----------------------------------------------------
+Key handling used to be a hardcoded module-level `_KEY_ACTIONS = {"c":
+"eventlog.clear", "n": "page.next"}` dict, with `q` (quit) special-cased
+separately before it was even consulted. Both are now driven entirely by
+the engine's OWN keymap (`engine/keymap.py`), fetched once via `describe`
+at connect (`fetch_keymap`, `clients/base.py`) and re-fetched whenever a
+`keymap_changed` event arrives (the engine's `config.reload` action
+re-read `keymap.toml`) -- `dispatch_key` (also `clients/base.py`, shared
+with the fb client) is the one place that resolves a pressed key against
+`state["keymap"]` and either quits locally (`client.quit`, the only
+`client.*` pseudo-action with real meaning) or sends the named action to
+the engine. An unmapped key is silently ignored, matching the prior
+hardcoded behavior exactly.
 
 Chrome (phase 3 task 3)
 ------------------------
@@ -70,7 +80,9 @@ from midicrt.clients.base import (
     ClientError,
     EngineClient,
     current_page_topic,
+    dispatch_key,
     drain_latest,
+    fetch_keymap,
     switch_topic,
     wait_first_snapshot,
 )
@@ -775,7 +787,6 @@ RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "chordkey": render_chordkey_lines, "sendnotes": render_sendnotes_lines}
 
 _SUBSCRIBE_RATE = 10.0
-_KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
 
 
 def run_tui(socket_path: str) -> int:
@@ -788,6 +799,7 @@ def run_tui(socket_path: str) -> int:
     try:
         client.connect()
         page, topic = current_page_topic(client)
+        keymap = fetch_keymap(client)
         client.subscribe([topic, *overlay_topics], max_rate=_SUBSCRIBE_RATE)
     except ClientError as exc:
         print(f"midicrt tui: {exc}")
@@ -795,7 +807,8 @@ def run_tui(socket_path: str) -> int:
         return 1
 
     inbox = client.start_reader()
-    state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM),
+    state = {"page": page, "topic": topic, "keymap": keymap,
+             "status_vm": dict(chrome.DEFAULT_STATUS_VM),
              "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
              "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
@@ -806,6 +819,14 @@ def run_tui(socket_path: str) -> int:
             new_topic = f"page.{new_page}"
             switch_topic(client, state["topic"], new_topic, _SUBSCRIBE_RATE)
             state["page"], state["topic"] = new_page, new_topic
+        elif msg.get("kind") == "event" and msg.get("name") == "keymap_changed":
+            # Phase 4 Task 1: the engine's `config.reload` action re-read
+            # keymap.toml -- re-fetch the full table via `describe` (rather
+            # than trusting this event's own payload) so this client's
+            # dispatch always matches what a fresh `describe` would report
+            # right now, same "ask, don't assume" precedent `page_changed`'s
+            # own handler above already sets for page/topic state.
+            state["keymap"] = fetch_keymap(client)
 
     try:
         # `on_event` is wired in HERE, before the startup wait, not just for
@@ -921,15 +942,12 @@ def run_tui(socket_path: str) -> int:
                         print("".join(out), end="", flush=True)
                     dirty = False
                 key = term.inkey(timeout=0.05)
-                if key == "q":
-                    return 0
-                name = _KEY_ACTIONS.get(str(key))
-                if name:
-                    try:
-                        client.action(name)
-                    except ClientError:
-                        lost = True
-                        return 1
+                try:
+                    if dispatch_key(client, str(key), state["keymap"]):
+                        return 0
+                except ClientError:
+                    lost = True
+                    return 1
     finally:
         client.close()
         if lost:

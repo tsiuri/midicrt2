@@ -64,3 +64,16 @@ def test_default_config_instruments_produce_the_v1_names():
     names = [r["name"] for r in page.view_model()["rows"]]
     assert names[0] == "Kawai XD5"
     assert names[15] == "Akai CD4"
+
+
+def test_set_instruments_swaps_names_live_without_losing_analyzer_state():
+    page = VoicesPage(instruments=NAMES_16)
+    page.handle(note_on(0, 60))   # live poly state on channel 1
+
+    page.set_instruments(["Renamed"])
+
+    vm = page.view_model()
+    assert vm["rows"][0]["name"] == "Renamed"
+    assert vm["rows"][1]["name"] == "CH 2"           # fewer-than-16 fallback, same as ctor
+    assert vm["rows"][0]["active"] == 1              # analyzer state untouched by the swap
+    assert vm["total"] == 1

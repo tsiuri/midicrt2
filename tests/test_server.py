@@ -39,7 +39,7 @@ class Client:
         return await self.request("hello", proto_version=version)
 
 
-async def make(tmp_path, **cfg):
+async def make(tmp_path, keymap_path=None, config_path=None, **cfg):
     # Disabled by default (task-9 review fix): this helper backs the wire-
     # protocol/server plumbing tests here AND in test_client_base.py, NONE
     # of which are testing pagecycle/screensaver -- but several push
@@ -57,7 +57,7 @@ async def make(tmp_path, **cfg):
     # `screensaver_enabled=True` explicitly via **cfg.
     cfg.setdefault("pagecycle_enabled", False)
     cfg.setdefault("screensaver_enabled", False)
-    eng = Engine(Config(**cfg))
+    eng = Engine(Config(**cfg), keymap_path=keymap_path, config_path=config_path)
     srv = ProtocolServer(eng, str(tmp_path / "ctl.sock"))
     await srv.start()
     task = asyncio.create_task(eng.run())
@@ -96,6 +96,11 @@ async def test_hello_and_describe(tmp_path):
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
+    # Phase 4 Task 1 (docs/phase4-notes.md): "keymap" used to be a reserved
+    # `{}` placeholder -- now the engine's real (default, no keymap.toml on
+    # this tmp_path) key->action table, byte-identical to `eng.keymap`.
+    assert d["data"]["keymap"] == eng.keymap
+    assert d["data"]["keymap"] == {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"}
     eng.stop(); await task; await srv.close()
 
 
@@ -441,5 +446,39 @@ async def test_disconnecting_the_last_subscriber_stops_materialization(tmp_path)
     await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 60, 1, "x"))
     await asyncio.sleep(0.3)
     assert spy.view_model_calls == calls_at_disconnect
+
+    eng.stop(); await task; await srv.close()
+
+
+# -- config.reload round-trip over the wire (Phase 4 Task 1) -----------------
+
+async def test_config_reload_round_trip_over_the_wire(tmp_path):
+    """The full path a real operator/client exercises: `describe` shows
+    the default keymap, a keymap.toml is dropped onto disk, `action
+    config.reload` is dispatched over the socket, and BOTH `describe`'s
+    fresh response AND a `keymap_changed` event reflect the change --
+    without a daemon restart."""
+    keymap_path = tmp_path / "keymap.toml"
+    eng, srv, task = await make(tmp_path, keymap_path=str(keymap_path))
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+
+    d = await c.request("describe")
+    assert d["data"]["keymap"] == {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"}
+
+    keymap_path.write_text('[keys]\nn = "page.prev"\n')
+    r = await c.request("action", name="config.reload", args={})
+    assert r["ok"] is True
+    assert r["data"]["keymap"]["n"] == "page.prev"
+    await c.read_msgs(0.2)   # drain any straggling event bytes not yet in c.inbox
+
+    d2 = await c.request("describe")
+    assert d2["data"]["keymap"]["n"] == "page.prev"
+    assert d2["data"]["keymap"]["q"] == "client.quit"   # untouched default, merge semantics
+
+    events = [m for m in c.inbox if m.get("kind") == "event" and m.get("name") == "keymap_changed"]
+    assert events, "config.reload must broadcast keymap_changed over the wire"
+    assert events[-1]["data"]["keymap"]["n"] == "page.prev"
 
     eng.stop(); await task; await srv.close()

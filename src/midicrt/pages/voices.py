@@ -17,6 +17,16 @@ class VoicesPage:
         self._analyzer = VoiceMonitorAnalyzer()
         self._names = list(instruments)
 
+    def set_instruments(self, instruments: list[str]) -> None:
+        """Phase 4 Task 1 (`config.reload`, docs/phase4-notes.md): live-swap
+        the per-channel instrument names read from config.toml's
+        `instruments` list, without reconstructing the page -- which would
+        also discard the live `VoiceMonitorAnalyzer`'s currently-tracked
+        note/poly state mid-run. Cheap and safe: `self._names` is plain
+        data with no analyzer coupling at all (see `view_model`'s own use
+        of it, purely as a label lookup by channel index)."""
+        self._names = list(instruments)
+
     def handle(self, ev) -> bool:
         return self._analyzer.handle(ev)
 

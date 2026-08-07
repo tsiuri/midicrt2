@@ -11,6 +11,7 @@ import socket
 import threading
 
 from midicrt import proto
+from midicrt.engine.keymap import CLIENT_QUIT_ACTION, DEFAULT_KEYMAP
 
 
 class ClientError(Exception):
@@ -343,6 +344,56 @@ def current_page_topic(client: EngineClient) -> tuple[str, str]:
     second page could exist. Returns `(page_name, topic)`."""
     page = client.request("describe")["data"]["current_page"]
     return page, f"page.{page}"
+
+
+def fetch_keymap(client: EngineClient) -> dict[str, str]:
+    """Ask the engine (via `describe`) for its CURRENT key->action keymap
+    (Phase 4 Task 1, docs/phase4-notes.md) -- called once at connect
+    (alongside `current_page_topic`'s own separate `describe()` call) and
+    again whenever a `keymap_changed` event arrives (the engine's
+    `config.reload` action re-read `keymap.toml`), so both clients always
+    dispatch through whatever the engine reports RIGHT NOW rather than a
+    table cached once at connect time.
+
+    Defensive against an older server predating this task (wire compat is
+    additive-only, same "an older/newer client and server never crash each
+    other" spirit as `clients/tui.py`'s/`clients/fb/app.py`'s own
+    `_render_unknown` fallbacks) -- a `describe` response with no
+    `"keymap"` key at all, or a non-dict value there, falls back to
+    `DEFAULT_KEYMAP` rather than raising `KeyError`/misbehaving on bad
+    data."""
+    data = client.request("describe")["data"]
+    keymap = data.get("keymap")
+    return dict(keymap) if isinstance(keymap, dict) else dict(DEFAULT_KEYMAP)
+
+
+def dispatch_key(client: EngineClient, key: str, keymap: dict[str, str]) -> bool:
+    """Shared key-dispatch resolution for both clients (Phase 4 Task 1):
+    look `key` up in `keymap` and either handle a `client.*` pseudo-action
+    locally or send the named action to the engine via `client.action`.
+
+    Returns `True` when the caller should quit (the `CLIENT_QUIT_ACTION`
+    pseudo-action, "client.quit") -- the only `client.*` name with any
+    real meaning today -- `False` otherwise. A key absent from `keymap` is
+    silently ignored (matches the prior hardcoded behavior of both
+    clients' old private key tables). Any OTHER `client.*` value (a
+    keymap.toml typo, or a future pseudo-action this client build doesn't
+    know about yet) is likewise treated as a harmless local no-op --
+    NEVER sent to the engine, which would just reject it as an "unknown
+    action" (`client.*` names are never registered in the engine's
+    `ActionRegistry` at all, see `engine/keymap.py`'s own "Pseudo-actions"
+    section) and needlessly cost the caller a round trip/exception for a
+    name that was never meant to leave this process. A rejected REAL
+    action (e.g. a stale keymap entry naming an action this build's
+    roster doesn't have) surfaces via the normal `ClientError` path --
+    non-fatal to the caller's render loop, same as before this task."""
+    action = keymap.get(key)
+    if action is None:
+        return False
+    if action.startswith("client."):
+        return action == CLIENT_QUIT_ACTION
+    client.action(action)
+    return False
 
 
 def switch_topic(client: EngineClient, old_topic: str, new_topic: str, max_rate: float) -> None:

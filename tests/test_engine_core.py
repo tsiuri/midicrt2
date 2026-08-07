@@ -1370,3 +1370,129 @@ def test_a_solo_harmony_page_still_gets_its_own_working_analyzer():
     eng = Engine(Config(pages=["eventlog", "harmony"]))
     eng._handle(ev(type="note_on", data1=60, data2=100, channel=0))
     assert eng.pages["harmony"].view_model()["key"] == "C maj"
+
+
+# -- config-served keymap (Phase 4 Task 1, docs/phase4-notes.md) ------------
+#
+# `Engine.keymap` is computed ONCE at construction (`keymap.load_keymap` +
+# `keymap.filter_known_actions`, gated on a nonexistent path by default so
+# these tests never touch a real `~/.config/midicrt/keymap.toml`) and
+# refreshed by the `config.reload` action below. `known_actions` for the
+# filter step is `set(self.actions.describe())` -- built AFTER every
+# action (engine-owned and page-declared) is registered, so it correctly
+# reflects THIS build's roster-dependent vocabulary.
+
+def test_engine_keymap_defaults_when_no_keymap_file(tmp_path):
+    from midicrt.engine import keymap as keymap_mod
+
+    eng = Engine(Config(), keymap_path=str(tmp_path / "nope.toml"))
+    assert eng.keymap == keymap_mod.DEFAULT_KEYMAP
+
+
+def test_engine_keymap_reads_a_real_keymap_file(tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys]\nv = "eventlog.clear"\n')
+    eng = Engine(Config(), keymap_path=str(p))
+    assert eng.keymap["v"] == "eventlog.clear"
+    assert eng.keymap["q"] == "client.quit"   # untouched default, merge semantics
+
+
+def test_engine_keymap_filters_out_an_action_absent_from_this_roster(tmp_path, caplog):
+    # "sendnotes.key" only exists when "sendnotes" is in the roster (see
+    # engine/core.py's own guarded registration) -- a minimal roster
+    # without it makes this keymap entry genuinely unknown to THIS build.
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys]\nz = "sendnotes.key"\n')
+    with caplog.at_level("WARNING"):
+        eng = Engine(Config(pages=["eventlog"]), keymap_path=str(p))
+    assert "z" not in eng.keymap
+    assert "sendnotes.key" in caplog.text
+
+
+def test_engine_keymap_keeps_client_pseudo_action_regardless_of_roster(tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys]\nx = "client.quit"\n')
+    eng = Engine(Config(pages=["eventlog"]), keymap_path=str(p))
+    assert eng.keymap["x"] == "client.quit"
+
+
+def test_engine_default_keymap_path_is_the_real_config_dir_path():
+    # No keymap_path override -- must fall back to keymap.DEFAULT_PATH
+    # (~/.config/midicrt/keymap.toml), the same default `config.py`'s own
+    # DEFAULT_PATH convention establishes, rather than silently going
+    # unbound.
+    from midicrt.engine import keymap as keymap_mod
+
+    eng = Engine(Config())
+    assert eng._keymap_path == keymap_mod.DEFAULT_PATH
+
+
+def test_describe_style_action_registry_contains_config_reload():
+    eng = Engine(Config())
+    assert "config.reload" in eng.actions.describe()
+
+
+# -- config.reload action (Phase 4 Task 1) -----------------------------------
+
+async def test_config_reload_rereads_keymap_and_emits_keymap_changed(tmp_path):
+    keymap_path = tmp_path / "keymap.toml"
+    eng = Engine(Config(), keymap_path=str(keymap_path))
+    assert eng.keymap["n"] == "page.next"   # pre-reload: built-in default
+
+    got = []
+    eng.add_listener(got.append)
+    keymap_path.write_text('[keys]\nn = "page.prev"\n')
+    result = await eng.actions.dispatch("config.reload", {})
+
+    assert eng.keymap["n"] == "page.prev"
+    assert result["keymap"]["n"] == "page.prev"
+    events = [m for m in got if m.get("kind") == "event" and m.get("name") == "keymap_changed"]
+    assert events, "config.reload must emit a keymap_changed event"
+    assert events[-1]["data"]["keymap"]["n"] == "page.prev"
+
+
+async def test_config_reload_with_no_keymap_file_stays_at_defaults(tmp_path):
+    from midicrt.engine import keymap as keymap_mod
+
+    eng = Engine(Config(), keymap_path=str(tmp_path / "nope.toml"))
+    result = await eng.actions.dispatch("config.reload", {})
+    assert result["keymap"] == keymap_mod.DEFAULT_KEYMAP
+
+
+async def test_config_reload_warns_when_config_toml_pages_roster_changed(tmp_path, caplog):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('pages = ["eventlog", "voices"]\n')
+    eng = Engine(Config(pages=["eventlog", "voices"]), config_path=str(config_path))
+    original_roster = list(eng.pages)
+
+    config_path.write_text('pages = ["eventlog"]\n')
+    with caplog.at_level("WARNING"):
+        result = await eng.actions.dispatch("config.reload", {})
+
+    # The live roster is NEVER rebuilt from a reload -- restart required.
+    assert list(eng.pages) == original_roster
+    assert any("restart" in w for w in result["warnings"])
+    assert "restart" in caplog.text.lower()
+
+
+async def test_config_reload_updates_voices_instruments_from_config_toml(tmp_path):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('instruments = ["Custom One"]\n')
+    eng = Engine(Config(), config_path=str(config_path))
+    assert eng.pages["voices"].view_model()["rows"][0]["name"] == "Kawai XD5"
+
+    await eng.actions.dispatch("config.reload", {})
+
+    vm = eng.pages["voices"].view_model()
+    assert vm["rows"][0]["name"] == "Custom One"
+    assert vm["rows"][1]["name"] == "CH 2"   # falls back same as VoicesPage always has
+    assert eng._dirty >= {"page.voices"}
+
+
+async def test_config_reload_is_a_noop_convenience_when_no_config_toml_exists(tmp_path):
+    # `config_path` points at a file that doesn't exist -- config_mod.load()
+    # itself already tolerates that (returns Config() defaults), so this
+    # must not raise or spuriously warn about a "roster change".
+    eng = Engine(Config(), config_path=str(tmp_path / "nope.toml"))
+    result = await eng.actions.dispatch("config.reload", {})
+    assert result["warnings"] == []

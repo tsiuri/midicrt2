@@ -74,6 +74,7 @@ import logging
 import math
 import queue
 import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from midicrt import config as config_mod
@@ -83,7 +84,9 @@ from midicrt.clients.base import (
     ClientError,
     EngineClient,
     current_page_topic,
+    dispatch_key,
     drain_latest,
+    fetch_keymap,
     switch_topic,
     wait_first_snapshot,
 )
@@ -1060,6 +1063,20 @@ def _read_fb_geometry() -> tuple[int, int, int]:
 
 
 # -- evdev input (background thread; never fatal) --------------------------
+#
+# Key dispatch (Phase 4 Task 1, docs/phase4-notes.md): `_input_loop` used to
+# hardcode three `if event.code == evdev.ecodes.KEY_*` branches (Q=quit
+# locally, C=`eventlog.clear`, N=`page.next`). All three are now driven by
+# the engine's OWN keymap (`engine/keymap.py`), fetched once via `describe`
+# at connect (`fetch_keymap`, `clients/base.py`) and re-fetched whenever a
+# `keymap_changed` event arrives (`_make_page_switcher`'s `on_event` below
+# now handles that alongside its existing `page_changed` case). This module
+# still deliberately keeps its `import evdev` LOCAL (never top-level) --
+# same "don't require evdev to succeed at import time" convention `_run_
+# device`/`_find_input_device` already established, now shared by
+# `_build_evdev_char_table` too (it takes the already-imported module as a
+# plain parameter rather than importing it a second time).
+
 
 def _find_input_device():
     """Return the first evdev device exposing KEY_Q, or None if none do."""
@@ -1072,13 +1089,41 @@ def _find_input_device():
     return None
 
 
-def _input_loop(client: EngineClient, quit_event: threading.Event) -> None:
+def _build_evdev_char_table(evdev) -> dict[int, str]:
+    """Evdev keycode -> single ASCII char lookup table for `_input_loop`'s
+    generic `dispatch_key` call below -- covers the ASCII letters a-z and
+    digits 0-9 (documented here as the full range: any `keymap.toml` entry
+    naming a key outside that set has no physical-keyboard scancode this
+    table can ever produce, and simply never matches -- same "unmapped ->
+    silently ignored" contract `dispatch_key` itself already has for a
+    char with no keymap entry). Pure and directly testable with the REAL
+    `evdev` module (a hard runtime dependency, see pyproject.toml) -- no
+    real input device needed, unlike `_find_input_device`/`_input_loop`
+    themselves."""
+    table = {}
+    for ch in "abcdefghijklmnopqrstuvwxyz0123456789":
+        code = getattr(evdev.ecodes, f"KEY_{ch.upper()}", None)
+        if code is not None:
+            table[code] = ch
+    return table
+
+
+def _input_loop(client: EngineClient, quit_event: threading.Event,
+                 get_keymap: Callable[[], dict[str, str]]) -> None:
     """Background-thread evdev reader (brief: "Input runs in a thread").
-    `q` sets `quit_event` for a clean exit; `c` fires `eventlog.clear`; `n`
-    fires `page.next` (the resulting `page_changed` event and resubscribe
-    are handled by the render loop's `drain_latest(on_event=...)`, not
-    here). Any discovery/permission/IO failure logs one line and returns --
-    input is a nice-to-have, never fatal to the render loop.
+    Every keydown is translated through `_build_evdev_char_table` into a
+    single char, then resolved via the SAME `dispatch_key` (`clients/
+    base.py`) the TUI client uses -- `get_keymap()` is a zero-arg callable
+    (not a frozen dict) so a `keymap_changed` refetch landing on the MAIN
+    thread mid-read-loop (via `_make_page_switcher`'s `on_event`, which
+    reassigns `state["keymap"]` rather than mutating it in place) is picked
+    up on this thread's very next keypress -- same "callable, not a frozen
+    snapshot" pattern `drain_latest`/`wait_first_snapshot` already use for
+    `topics`/`topic` elsewhere in this module. `dispatch_key` returning
+    `True` (the `client.quit` pseudo-action) sets `quit_event` for a clean
+    exit, exactly like the old hardcoded `KEY_Q` branch did. Any discovery/
+    permission/IO failure logs one line and returns -- input is a
+    nice-to-have, never fatal to the render loop.
     """
     try:
         import evdev
@@ -1090,23 +1135,20 @@ def _input_loop(client: EngineClient, quit_event: threading.Event) -> None:
     if dev is None:
         _LOG.info("no input device with KEY_Q capability found; continuing without input")
         return
+    char_table = _build_evdev_char_table(evdev)
     try:
         for event in dev.read_loop():
             if event.type != evdev.ecodes.EV_KEY or event.value != 1:  # key-down only
                 continue
-            if event.code == evdev.ecodes.KEY_Q:
-                quit_event.set()
-                return
-            if event.code == evdev.ecodes.KEY_C:
-                try:
-                    client.action("eventlog.clear")
-                except ClientError:
-                    pass  # connection loss surfaces via the render loop's EOF check
-            if event.code == evdev.ecodes.KEY_N:
-                try:
-                    client.action("page.next")
-                except ClientError:
-                    pass  # connection loss surfaces via the render loop's EOF check
+            key = char_table.get(event.code)
+            if key is None:
+                continue
+            try:
+                if dispatch_key(client, key, get_keymap()):
+                    quit_event.set()
+                    return
+            except ClientError:
+                pass  # connection loss surfaces via the render loop's EOF check
     except OSError as exc:
         _LOG.info("input device error (%s); continuing without input", exc)
 
@@ -1125,7 +1167,16 @@ def _input_loop(client: EngineClient, quit_event: threading.Event) -> None:
 def _make_page_switcher(client: EngineClient, state: dict, max_rate: float):
     """Return a `drain_latest(on_event=...)` callback that reacts to
     `page_changed` by resubscribing and updating `state["page"]`/`
-    state["topic"]` in place."""
+    state["topic"]` in place, and (Phase 4 Task 1, docs/phase4-notes.md)
+    to `keymap_changed` by REASSIGNING `state["keymap"]` to a freshly
+    fetched table -- reassignment, not in-place mutation, is deliberate:
+    `_input_loop`'s background thread reads `state["keymap"]` through a
+    `get_keymap` callable (`lambda: state["keymap"]`) on every keypress
+    with no lock, and CPython's GIL makes a single dict-KEY read/write
+    atomic -- swapping in a whole new dict object is therefore safe to
+    observe from that other thread without any synchronization of its
+    own, whereas mutating the SAME dict's contents key-by-key would risk
+    the input thread observing a half-updated table mid-swap."""
 
     def on_event(msg: dict) -> None:
         if msg.get("kind") == "event" and msg.get("name") == "page_changed":
@@ -1133,12 +1184,15 @@ def _make_page_switcher(client: EngineClient, state: dict, max_rate: float):
             new_topic = f"page.{new_page}"
             switch_topic(client, state["topic"], new_topic, max_rate)
             state["page"], state["topic"] = new_page, new_topic
+        elif msg.get("kind") == "event" and msg.get("name") == "keymap_changed":
+            state["keymap"] = fetch_keymap(client)
 
     return on_event
 
 
 def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
-                 no_input: bool, fps: float, page: str, topic: str) -> int:
+                 no_input: bool, fps: float, page: str, topic: str,
+                 keymap: dict[str, str]) -> int:
     """Real-/dev/fb0 render loop. Coded per the task brief's geometry spec
     but NOT exercised by this task's tests -- v1 owns the CRT until Task
     4's supervised smoke window runs this path for real.
@@ -1154,7 +1208,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
     width, height, stride = _read_fb_geometry()
     surface = Surface(width, height)
     font = load_font()
-    state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM),
+    state = {"page": page, "topic": topic, "keymap": dict(keymap),
+             "status_vm": dict(chrome.DEFAULT_STATUS_VM),
              "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
              "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
@@ -1172,7 +1227,15 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             # forever (this was the actual freeze: the input thread calling
             # client.action() while the main thread's own switch_topic() call
             # from a later on_event races it over the same connection).
-            threading.Thread(target=_input_loop, args=(client, quit_event), daemon=True).start()
+            # `lambda: state["keymap"]` (Phase 4 Task 1): a callable, not a
+            # frozen dict, so a `keymap_changed` refetch (via `on_event`
+            # above, reassigning `state["keymap"]`) is visible to this
+            # thread's very next keypress -- see `_make_page_switcher`'s own
+            # docstring for why reassignment (not in-place mutation) is
+            # what makes that safe with no lock.
+            threading.Thread(target=_input_loop,
+                            args=(client, quit_event, lambda: state["keymap"]),
+                            daemon=True).start()
 
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
         vm_topic = state["topic"]
@@ -1305,7 +1368,11 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
                          beatprogress["beatflash_vm"], beatprogress["loopprogress_vm"])
             surface.save_png(out_path)
             return 0
-        return _run_device(client, inbox, fb_path, no_input, fps, page, topic)
+        # Fetched only on this (interactive-device) path -- the headless
+        # `--out` branch above never dispatches a key at all, so a
+        # `describe` round trip for it there would be pure overhead.
+        keymap = fetch_keymap(client)
+        return _run_device(client, inbox, fb_path, no_input, fps, page, topic, keymap)
     except ClientError as exc:
         print(f"midicrt-fb: {exc}")
         return 1

@@ -1798,7 +1798,8 @@ def test_run_device_survives_page_switch_before_new_topics_snapshot_arrives(tmp_
 
     fb_path = str(tmp_path / "fb0")
     try:
-        app._run_device(FakeClient(), inbox, fb_path, True, 1000.0, "screensaver", "page.screensaver")
+        app._run_device(FakeClient(), inbox, fb_path, True, 1000.0, "screensaver", "page.screensaver",
+                        {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"})
     except ClientError:
         pass  # expected clean shutdown via the `None` sentinel
     finally:
@@ -1810,3 +1811,76 @@ def test_run_device_survives_page_switch_before_new_topics_snapshot_arrives(tmp_
         if page == "eventlog":
             assert "count" in vm, (
                 f"eventlog page painted with a non-eventlog (stale) vm: {vm!r}")
+
+
+# -- evdev keymap dispatch (Phase 4 Task 1, docs/phase4-notes.md) -----------
+#
+# `_build_evdev_char_table` is pure and needs no real input device -- `evdev`
+# is a hard runtime dependency (pyproject.toml), importable in any test env
+# this suite runs in. `_input_loop`'s own `dev.read_loop()` consumption is
+# NOT unit tested here, matching the pre-existing convention (it never was
+# either, before this task -- see this file's own module docstring: real
+# hardware I/O is exercised only in supervised smoke windows, not pytest).
+
+def test_build_evdev_char_table_covers_letters_and_digits():
+    import evdev
+
+    table = app._build_evdev_char_table(evdev)
+    assert table[evdev.ecodes.KEY_N] == "n"
+    assert table[evdev.ecodes.KEY_Q] == "q"
+    assert table[evdev.ecodes.KEY_C] == "c"
+    assert table[evdev.ecodes.KEY_1] == "1"
+    assert table[evdev.ecodes.KEY_0] == "0"
+    assert len(table) == 36   # 26 letters + 10 digits, one entry each
+
+
+def test_build_evdev_char_table_values_are_all_single_lowercase_chars():
+    import evdev
+
+    table = app._build_evdev_char_table(evdev)
+    assert all(len(ch) == 1 and ch == ch.lower() for ch in table.values())
+
+
+def test_run_device_refetches_keymap_on_keymap_changed_event(tmp_path, monkeypatch):
+    """Twin of clients/tui.py's own
+    test_run_tui_refetches_keymap_on_keymap_changed_event: a `keymap_changed`
+    event delivered through `_run_device`'s `on_event` (`_make_page_switcher`)
+    must trigger a real `fetch_keymap` re-fetch (a growing `describe()` call
+    count is direct, unambiguous proof), not a value cached at startup."""
+    monkeypatch.setattr(app, "_read_fb_geometry", lambda: (10, 10, 20))
+
+    describe_calls = []
+
+    class FakeClient:
+        def request(self, cmd):
+            if cmd == "describe":
+                describe_calls.append(cmd)
+                keymap = ({"n": "page.prev"} if len(describe_calls) > 1
+                         else {"n": "page.next"})
+                return {"data": {"keymap": keymap}}
+            return {"data": {}}
+
+        def subscribe(self, topics, max_rate):
+            pass
+
+        def unsubscribe(self, topics):
+            pass
+
+    inbox = queue.Queue()
+    inbox.put({"kind": "snapshot", "topic": "page.eventlog", "data": EMPTY_VM})
+    inbox.put({"kind": "event", "name": "keymap_changed", "data": {}})
+    timer = threading.Timer(0.05, inbox.put, args=(None,))
+    timer.start()
+
+    fb_path = str(tmp_path / "fb0")
+    try:
+        app._run_device(FakeClient(), inbox, fb_path, True, 1000.0, "eventlog", "page.eventlog",
+                        {"n": "page.next"})
+    except ClientError:
+        pass  # expected clean shutdown via the `None` sentinel
+    finally:
+        timer.cancel()
+
+    assert len(describe_calls) >= 1, (
+        "expected a fetch_keymap() re-fetch (a describe() call) after keymap_changed"
+    )
