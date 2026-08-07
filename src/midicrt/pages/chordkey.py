@@ -39,18 +39,29 @@ presentation gap:
    v1 quirk: `"maj".startswith("m")` lower-cases even MAJOR-chord
    numerals in the real, deployed CHORDS asset).
 
-Separate analyzer INSTANCE (disclosed, mirrors pages/ccmonitor.py's own
-precedent)
+Separate analyzer INSTANCE, historical (superseded 2026-08-07, finding 2b
+perf fix -- see analyzers/harmony.py's own docstring)
 ---------------------------------------------------------------------------
 `zharmony.py::get_recent_pcs()` is v1's SAME chord/scale-detection input
-window `pages/harmony.py` already wraps via `HarmonyAnalyzer`. v2 has no
-cross-page/analyzer state-sharing mechanism yet (the same "currently
-latent" gap that module's own docstring calls out for cross-analyzer BPM
-reads) -- so this page owns its OWN `HarmonyAnalyzer()` instance rather
-than reaching into `pages/harmony.py`'s. Both pages see the identical
-event stream (`Engine._handle` calls every page's `handle(ev)`, not just
-the current page's), so they always agree; this just duplicates the
-(cheap) computation, not the underlying MIDI data.
+window `pages/harmony.py` already wraps via `HarmonyAnalyzer`. At Task 12
+landing time, v2 had no cross-page/analyzer state-sharing mechanism yet
+(the same "currently latent" gap that module's own docstring calls out
+for cross-analyzer BPM reads) -- so this page originally owned its OWN
+`HarmonyAnalyzer()` instance rather than reaching into `pages/harmony.
+py`'s. Both pages always saw the identical event stream (`Engine._handle`
+calls every page's `handle(ev)`, not just the current page's) and so
+always agreed -- but a live phase-3-close review measured this
+duplication as ~90% of note_on's 3.86ms cost (two independent chord/scale
+detections computing byte-identical answers from the same input every
+time). `__init__` now accepts an OPTIONAL `analyzer` param (default: still
+build an independent instance, so standalone/test construction is
+unchanged) -- `engine/core.py`'s `Engine.__init__` passes the SAME
+instance already handed to `pages/harmony.py`'s `HarmonyPage` when both
+pages make the roster, and `analyzers/harmony.py::HarmonyAnalyzer.
+handle()`'s own shared-instance dedup guard is what makes two pages
+delegating to one instance CORRECT (not just cheaper) -- see that
+method's docstring for why a naive share would otherwise double-process
+every note.
 
 v1-field -> VM-field mapping
 ---------------------------------------------------------------------------
@@ -86,8 +97,18 @@ def _pct(ratio: float) -> int:
 class ChordKeyPage:
     name = "chordkey"
 
-    def __init__(self) -> None:
-        self._analyzer = HarmonyAnalyzer()
+    def __init__(self, analyzer: HarmonyAnalyzer | None = None) -> None:
+        # Finding 2b perf fix (2026-08-07 fix wave): `analyzer` is
+        # OPTIONAL, defaulting to a fresh, independent instance -- see
+        # this module's own docstring for the full history, and
+        # pages/harmony.py's matching __init__ comment.
+        self._analyzer = analyzer if analyzer is not None else HarmonyAnalyzer()
+
+    @property
+    def analyzer(self) -> HarmonyAnalyzer:
+        """Exposes the underlying analyzer so Engine.__init__ can confirm/
+        wire sharing with pages/harmony.py's HarmonyPage."""
+        return self._analyzer
 
     def handle(self, ev) -> bool:
         return self._analyzer.handle(ev)

@@ -18,6 +18,20 @@ DEFAULT_INSTRUMENTS = [
 ]
 
 
+class ConfigError(ValueError):
+    """Raised when a `Config` cannot support a working engine, even though
+    it loaded/constructed without error. The one current use (2026-08-07
+    fix wave, "Must-fix" finding): `Engine.__init__` raises this when
+    `config.pages` resolves to an EMPTY roster (an empty list, or every
+    name unknown to `_PAGE_FACTORIES`) -- see engine/core.py's own
+    docstring at the raise site for why an empty roster must fail loudly
+    at startup rather than silently limping along with no pages to serve.
+    A `ValueError` subclass (not a bare new `Exception`) so anything that
+    already does broad `except ValueError` config-validation handling
+    catches this too, while `except ConfigError` stays available for
+    callers that want to be specific."""
+
+
 @dataclass
 class Config:
     socket_path: str = "/run/midicrt/ctl.sock"

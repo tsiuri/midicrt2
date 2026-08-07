@@ -285,9 +285,50 @@ class HarmonyAnalyzer:
         self._stable_key_conf: float = 0.0
         self._stable_key_alt: list[dict] = []
 
+        # -- shared-instance dedup guard (finding 2b perf fix, 2026-08-07
+        # fix wave) -- see handle()'s own docstring below for the full
+        # rationale.
+        self._last_handled_event: object | None = None
+        self._last_handled_dirty: bool = False
+
     # -- event handling ---------------------------------------------------
 
     def handle(self, ev: MidiEvent) -> bool:
+        """Shared-instance dedup guard (finding 2b perf fix): engine/
+        core.py's `Engine.__init__` now hands ONE `HarmonyAnalyzer`
+        instance to BOTH `pages/harmony.py`'s `HarmonyPage` and
+        `pages/chordkey.py`'s `ChordKeyPage` when both make the roster (a
+        live-measured perf fix -- each page used to own an independent
+        instance, doubling every note_on's chord/scale detection cost for
+        no behavioral benefit, since both pages already see the identical
+        event stream). `Engine._handle()` still calls EVERY page's own
+        `handle(ev)` once per real event (the "every page sees every
+        event" dirty-tracking contract, engine/core.py's own module
+        docstring) -- so when this analyzer is shared, BOTH pages' calls
+        land here, with the exact SAME `MidiEvent` object reference
+        (`Engine._handle`'s `for name, page in self.pages.items(): page.
+        handle(ev)` loop passes one shared `ev` to the whole roster for a
+        given tick). Without a guard, one real note would be processed
+        TWICE against this analyzer's mutable history (duplicate
+        `_recent_notes` entries, doubled `_key_counts`), corrupting state,
+        not just wasting cycles.
+
+        `ev is self._last_handled_event` is a safe, O(1) dedup key: valid
+        for exactly the lifetime of one `Engine._handle()` call (the event
+        object stays reachable on that call's stack the whole time, so no
+        `id()`-reuse risk), and a pure no-op when this analyzer is used
+        standalone -- every test in this file and in
+        test_pages_harmony.py/test_pages_chordkey.py constructs a fresh
+        `MidiEvent` object per call, so identity never accidentally
+        matches there."""
+        if ev is self._last_handled_event:
+            return self._last_handled_dirty
+        self._last_handled_event = ev
+        dirty = self._handle_uncached(ev)
+        self._last_handled_dirty = dirty
+        return dirty
+
+    def _handle_uncached(self, ev: MidiEvent) -> bool:
         if ev.type == "note_on":
             if ev.channel is None:
                 return False
@@ -354,8 +395,13 @@ class HarmonyAnalyzer:
     def _update_harmony_detection(self, ts: float) -> None:
         pcs = {n % 12 for n, _ts in self._recent_notes}
         self._recent_pcs = pcs
-        chord, scale = theory.detect_harmony_info(
-            pcs,
+        # Finding 2a perf fix (2026-08-07 fix wave): the cached wrapper
+        # requires a hashable `frozenset` -- see analyzers/theory.py's own
+        # docstring on `detect_harmony_info_cached` for why this call site
+        # always passes the SAME four threshold constants (still real
+        # cache-key params, not hardcoded into the cache itself).
+        chord, scale = theory.detect_harmony_info_cached(
+            frozenset(pcs),
             min_chord_notes=MIN_UNIQUE_FOR_CHORD,
             min_scale_notes=MIN_UNIQUE_FOR_SCALE,
             chord_min_ratio=CHORD_MIN_RATIO,

@@ -15,6 +15,15 @@ section itself have been updated in place (not just appended to) so this
 document reflects the CURRENT state, not a stale gap list — see each
 affected row for the individual v1→v2 mapping and any disclosed quirks.
 
+**Fix-wave update (2026-08-07, same day, base HEAD `8a44deb`, 929 tests
+green):** a final whole-branch review of Phase 3 found five more findings
+(two Important perf regressions, a docs-accuracy gap, a Must-fix startup
+crash, and a Minor perf-tripwire gap) — all five fixed in one commit. See
+the new §8 "Performance at phase-3 close" below for the measured pre-fix/
+post-fix numbers, the updated `pagecycle.py` row (§2) and its new Sign-off
+DEFERRED bullet for the newly-disclosed pagecycle/screensaver composition
+gap, and §7's new SysEx re-verification checklist item.
+
 ## Method
 
 Built from three sources, cross-checked against each other rather than
@@ -93,7 +102,7 @@ of today's `pianoroll.py`).
 | `bootlogo.py.bak` | — | **Intentionally dropped: dead code.** Never loaded (`.bak` suffix excludes it from the plugin glob); its `main()`-executes-at-import shape predates the `draw()`/`handle()` plugin contract every live plugin follows. Task 9 confirmed via source read; a review pass additionally found a stale orphaned `.pyc` in `__pycache__` (leftover from when it *was* live, pre-`.bak`) — does not change the disposition. |
 | `loopprogress.py` | `analyzers/loopprogress.py`, `overlay.loopprogress` | **Ported (bar/beat half only)**, Task 9. The 8-cell progress bar ported (`TOTAL_BEATS=32` reproducing v1's `TOTAL_TICKS=768` at v2's beat-only clock granularity). v1's *other* half — scheduler-health + recent-SysEx diagnostic text drawn to the left of the bar — **not ported — disclosed**: no v2 scheduler-health metric exists, and this specific chrome-row sub-feature (a text summary of recent SysEx traffic, distinct from `sysex.py`'s own command-dispatch feature below) was out of Task 9's scope. *(Corrected 2026-08-07, Task 12: `engine/midi_in.py` DOES now surface a `"sysex"` MidiEvent type with a `sysex_data` payload field, per the `sysex.py` row below — the original "no SysEx event type surfaced" reasoning here is stale; the diagnostic-TEXT sub-feature itself remains unbuilt, just for a different reason.)* |
 | `meters.py.bak` | — | **Intentionally dropped: dead code.** Never loaded (`.bak` suffix); per-channel velocity+note inline display, superseded/disabled in v1 itself. Found during this task's inventory sweep, not mentioned in any prior task report. |
-| `pagecycle.py` | `behaviors/pagecycle.py` | **Ported, re-interpreted**, Task 9 (disclosed, not a literal port — the task brief's own explicit contract). v1: unconditional interval-based rotation through a *curated subset* (`cycle_pages=[1,6,8,9]`), suppressed only by a recent **keypress**. v2: idle-*triggered* (no MIDI activity for `pagecycle_idle_s`) cycling through the **whole roster**, since MIDI activity is the only engine-observable "someone's using this" signal and v2's roster has no page-ID subset to hardcode against. `cycle_pages`/`user_pause` have no v2 analog. |
+| `pagecycle.py` | `behaviors/pagecycle.py` | **Ported, re-interpreted**, Task 9 (disclosed, not a literal port — the task brief's own explicit contract). v1: unconditional interval-based rotation through a *curated subset* (`cycle_pages=[1,6,8,9]`), suppressed only by a recent **keypress**. v2: idle-*triggered* (no MIDI activity for `pagecycle_idle_s`) cycling through the **whole roster**, since MIDI activity is the only engine-observable "someone's using this" signal and v2's roster has no page-ID subset to hardcode against. `cycle_pages`/`user_pause` have no v2 analog. **New disclosure (2026-08-07 fix-wave review): under Config()'s shipped defaults, this behavior can never actually fire.** `pagecycle_idle_s` (300s) and `screensaver_after_s` (60s) are two independent clocks measured off the SAME `last_activity_ts`; a genuinely idle engine always crosses the screensaver's 60s threshold first, and `PageCycleBehavior.tick()` unconditionally refuses to act while `current_page` is the screensaver page (see that module's own "Arbitration with the screensaver" docstring section — a DIFFERENT, deliberate fix for a DIFFERENT failure mode, task 9's review pass). The net *composition* of these two individually-correct behaviors is that pagecycle's own 300s threshold is now unreachable during any idle stretch that starts from an active state under stock config: the screensaver activates and blocks pagecycle at 60s, every time, before pagecycle's clock ever reaches 300s. v1's ambient "rotate through a curated page subset while nobody's touching it" experience is therefore effectively **lost** under a stock deploy, not merely re-scoped to the whole roster as this row's Task 9 disposition originally implied — pending an explicit user decision (e.g. raising `screensaver_after_s` above `pagecycle_idle_s`, disabling one of the two behaviors, or accepting the screensaver-wins composition as-is). See the Sign-off section's "Accept as DEFERRED" list. |
 | `polydisplay.py` | `analyzers/voices.py` | **Merged**, Task 4 (see `zvoicemonitor.py` row — both merge into one analyzer). |
 | `polydisplay.py.bak` | — | **Dead code**, never loaded (co-exists with the live `polydisplay.py`; found during this sweep, harmless). |
 | `sysex.py` | `engine/sysex.py` (pure parse/reply-build) + `Engine._handle_sysex`/dispatch helpers (engine/core.py) | **Ported**, Task 12. `MidiEvent` gained a `sysex_data` field (raw payload bytes, no F0/F7 framing); `engine/midi_in.py::translate()` populates it. `engine/sysex.py::parse_command`/`build_reply` port `handle()`'s prefix-check + version-negotiation and `_send_reply`'s frame construction byte-for-byte (pure, no side effects — same split as `analyzers/theory.py` vs `analyzers/harmony.py`). `Engine._handle_sysex` is the DISPATCH half: `CMD_SWITCH_PAGE` resolves v1's numeric page IDs through a new `_SYSEX_PAGE_ID_MAP` covering every v2 page this whole phase-3 pass built, dispatched through the SAME `_page_goto` a normal `page.goto` action uses; `CMD_PAGE_CYCLE` dispatches through a new, unconditionally-registered `pagecycle.enable` action (one capability, two entry points — same precedent as `page.goto`); `CMD_SCREENSAVER`'s "wake" needs no direct code at all (any matched-prefix command already bumps engine activity, mirroring v1's own unconditional wake, letting `ScreensaverBehavior`'s existing real-activity-advance restore path fire normally), while "force on" dispatches `page.goto screensaver` directly — inheriting (not introducing) that call's pre-existing "no auto-restore for a manual goto" property, disclosed in the method's own docstring. `CMD_CAPTURE_RECENT` correctly replies error, not fake success — capture is Phase 5, unbuilt. `CMD_CAPABILITIES`'s payload adapts v1's profile/backend bytes (disclosed `0`, no v2 analog — fb/tui are separate client binaries here, not engine-side profiles) and reports the real v1 page-ID vocabulary this build can reach. Replies flow through `engine/midi_out.py::MidiOutput.send_sysex` — the SAME shared output port `pages/sendnotes.py` uses (v1 used two DIFFERENT mechanisms for these two features; a disclosed consolidation, see that module's own docstring). A v2 addition: every matched-prefix command emits a `sysex_command` engine event (real-time visibility for any connected client), replacing v1's file-logging (`sysex.log`/`sysex.d/`), which this task does not port. Tests use real captured `.syx` fixtures copied out of `sysex.d/` on the Pi (`tests/fixtures/sysex_captures/`) — four midicrt-addressed legacy commands plus two non-matching frames proving unrelated Cirklon traffic passes through silently unrecognised. Verified live against the real running daemon: a genuine legacy switch-page-8 frame (byte-identical to a real capture) correctly switched the daemon's current page. |
@@ -176,6 +185,70 @@ Screensaver correctly suppresses **all three** chrome rows (fixed in Task
   rule. **Before cutover, a real reboot must be performed and audio capture
   (`midicrt-fb --out` showing `available: true` with a real device) verified
   post-boot**, not just simulated.
+- **Post-fix SysEx positive-path live re-verification** (2026-08-07 fix
+  wave): this fix wave touched `Engine.run()`'s dirty-flush loop (finding
+  1, extracted into `_flush_dirty()` and gated on subscriber refcount) and
+  the page-roster construction path (finding 2b, `Engine.__init__` now
+  replaces `chordkey`'s constructed page with one sharing `harmony`'s
+  `HarmonyAnalyzer`) — neither touches `engine/sysex.py`'s parse/dispatch
+  code directly, but both sit between a SysEx-triggered `page.goto` (e.g.
+  `CMD_SWITCH_PAGE`) and the snapshot a subscribed client actually
+  receives for the new current page. Task 12's own live verification (a
+  real captured `.syx` frame switching the daemon's current page) predates
+  this fix wave. **Before Phase 7 cutover, re-run that same live positive-
+  path check** (a real legacy switch-page SysEx frame against the live
+  daemon with a subscribed client watching `describe`'s `current_page` and
+  the destination page's own topic) to confirm the fix wave introduced no
+  regression on that path, not just re-trust the pre-fix-wave result.
+
+---
+
+## 8. Performance at phase-3 close (2026-08-07 fix wave)
+
+A whole-branch review of Phase 3 (HEAD `8a44deb`, 901 tests) measured two
+real performance defects on the Pi, both fixed in this same fix wave (one
+commit, 929 tests). Numbers below are all real measurements (in-process
+benchmarks for the note_on figures; live daemon CPU sampling via
+`/proc/<pid>/stat` deltas, not `ps`'s cumulative-since-start average, for
+the CPU figures), not estimates.
+
+**note_on cost** (`Engine._handle`, warm path — a repeated C-major-triad
+play pattern, not a degenerate always-different-pitch-classes worst case):
+
+| | note_on (warm) |
+|---|---|
+| Pre-fix (HEAD `8a44deb`) | **3.86ms** — ~90% of it two independent `HarmonyAnalyzer` instances (`harmony` + `chordkey` pages) each re-running `theory.detect_harmony_info`'s full chord/scale best-match/tie scoring from scratch on every qualifying note. |
+| Post-fix | **~0.8ms** (`tests/test_engine_perf.py::test_warm_note_on_handle_is_fast`) — finding 2's fix: one shared `HarmonyAnalyzer` instance (engine/core.py wiring) plus a bounded LRU cache on `detect_harmony_info` keyed on `frozenset(pcs)` (`analyzers/theory.py::detect_harmony_info_cached`). ~4.8x faster; short of the finding's own "<0.5ms" expectation but a decisive fix of the measured regression, with the remaining cost spread across the other 13 pages'/5 analyzers' own real per-note work (voices, pianoroll, stucknotes, timesig, etc.), none of which this fix wave touched. |
+
+**Idle daemon CPU** (`midicrtd.service`, zero connected clients):
+
+| | Idle CPU |
+|---|---|
+| Pre-fix (HEAD `8a44deb`) | **35-40%** (reviewer-measured; independently corroborated live at **38.7%** before this fix wave's changes were deployed) — root cause: `Img2TxtVizAnalyzer.tick()` always returns `True` by design (a continuous animation, no "nothing changed" state), so `page.img2txtviz` was dirty every tick at `tick_hz=30`, and the old `run()` loop materialized its ~6.94ms `view_model()` unconditionally, with or without a single subscriber. |
+| Post-fix, live production daemon (audio + MIDI enabled, matching the deployed shape) | **~20-21%** (`/proc/<pid>/stat` delta sampling, 10s windows, converged) |
+| Post-fix, isolated engine floor (`--no-midi --no-audio`, zero subscribers) | **~2%** — matches the finding's own "low single digits" expectation exactly once isolated from an unrelated, pre-existing always-on cost (below). |
+
+**Disclosed, unrelated finding from this measurement work:** the
+~20-21% gap between the live production number and the isolated ~2%
+floor is **not** a shortfall of this fix — it is `pages/spectrum.py`'s
+continuous audio-capture/FFT thread (started unconditionally by
+`daemon.py::run()` whenever the `spectrum` page is in the roster and
+`--no-audio` isn't passed, independent of whether anyone subscribes to
+`page.spectrum`), confirmed by an isolated A/B measurement
+(`midicrtd --no-midi` with vs. without `--no-audio`: ~20% vs. ~2%). This
+was already present, unchanged, in the pre-fix 35-40% baseline — finding
+1 never touched `analyzers/spectrum.py` or its capture thread — and is
+**out of this fix wave's scope**, noted here only so the ~20-21%
+post-fix production number isn't misread as this fix underperforming.
+Gating the spectrum capture thread itself on subscriber presence (mirror-
+ing finding 1's own snapshot-materialization gate) would be a reasonable
+future optimization, not scheduled here.
+
+**Live selectivity check** (proving the fix skips-when-idle and
+resumes-when-watched, not just "broken"): with the live daemon idling at
+~20-21%, subscribing a real client to `page.img2txtviz` raised CPU to
+**~30%**; disconnecting that client brought it back to **~20%** within
+the next sampling window.
 
 ---
 
@@ -209,3 +282,5 @@ and disclosed quirks; nothing below remains open for these six.
 - Web client (`midicrt-web`) — fully built (221 tests) on an isolated branch, review/merge deferred to Phase 6.
 - Capture/replay, MIDI-learn/keymap — Phase 5 and Phase 4 respectively, per the original design spec's phasing; untouched by design, not oversight.
 - **REAL-REBOOT audio verification** — must happen at the Phase 7 cutover window (§7 above), not before.
+- **Post-fix SysEx positive-path live re-verification** — must happen at the Phase 7 cutover window (§7 above), not before; see that checklist item for why this fix wave's changes (subscriber-aware snapshot gating, harmony/chordkey roster wiring) warrant re-checking a path Task 12 already verified once, pre-fix-wave.
+- **`pagecycle` vs `screensaver` composition under shipped defaults (new, 2026-08-07 fix-wave review)** — see §2's `pagecycle.py` row above for the full mechanism: with `Config()`'s stock `pagecycle_idle_s=300`/`screensaver_after_s=60` (both enabled), the screensaver always activates and blocks pagecycle first, so pagecycle's own idle-rotation never actually fires under a stock deploy. v1's ambient "rotate through pages while idle" experience is effectively lost, not merely re-scoped. **Pending an explicit user decision** — options include raising `screensaver_after_s` above `pagecycle_idle_s`, disabling one behavior by default, or accepting the current screensaver-wins composition as intentional; no task is currently scheduled to change this without that decision.

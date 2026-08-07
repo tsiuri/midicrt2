@@ -92,6 +92,42 @@ def test_best_matches_ambiguous_tie_returns_none_beyond_max_ties():
     assert hits is None
 
 
+# -- detect_harmony_info_cached (finding 2a perf fix, 2026-08-07 fix wave) ---
+#
+# Live-measured root cause: note_on cost 3.86ms, ~90% of it two eager
+# HarmonyAnalyzer instances (harmony page + chordkey page) each re-running
+# detect_harmony_info's full chord/scale best-match/tie scoring on every
+# qualifying note_on. A bounded LRU cache keyed on frozenset(pcs) (+ the
+# threshold params) turns a repeated chord/cluster within a session into a
+# cache hit instead of a full re-scan of CHORDS/SCALES.
+
+def test_detect_harmony_info_cached_hits_on_repeated_input():
+    theory.detect_harmony_info_cached.cache_clear()
+    pcs = frozenset({0, 4, 7})
+    theory.detect_harmony_info_cached(pcs, 2, 3, 0.6, 0.7)
+    theory.detect_harmony_info_cached(pcs, 2, 3, 0.6, 0.7)
+    info = theory.detect_harmony_info_cached.cache_info()
+    assert info.hits >= 1
+
+
+def test_detect_harmony_info_cached_matches_the_uncached_function():
+    theory.detect_harmony_info_cached.cache_clear()
+    pcs = {0, 4, 7}
+    cached_chord, cached_scale = theory.detect_harmony_info_cached(frozenset(pcs), 2, 3, 0.6, 0.7)
+    direct_chord, direct_scale = theory.detect_harmony_info(
+        pcs, min_chord_notes=2, min_scale_notes=3, chord_min_ratio=0.6, scale_min_ratio=0.7)
+    assert cached_chord == direct_chord
+    assert cached_scale == direct_scale
+
+
+def test_detect_harmony_info_cached_distinguishes_different_pitch_class_sets():
+    theory.detect_harmony_info_cached.cache_clear()
+    c_major, _ = theory.detect_harmony_info_cached(frozenset({0, 4, 7}), 2, 3, 0.6, 0.7)
+    a_minor, _ = theory.detect_harmony_info_cached(frozenset({9, 0, 4}), 2, 3, 0.6, 0.7)
+    assert any(c["label"] == "C maj" for c in c_major)
+    assert any(c["label"] == "A m" for c in a_minor)
+
+
 # -- chord_candidates_all_roots (phase-3 task 12, gap ports) -----------------
 #
 # Ported from v1's `pages/chordkey.py::_chord_candidates` -- a SEPARATE

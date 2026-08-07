@@ -22,6 +22,7 @@ being an unnoticed regression with a sanity check that `CHORDS`/`SCALES`
 are non-empty after a real import.
 """
 import csv
+import functools
 from pathlib import Path
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
@@ -186,6 +187,48 @@ def detect_harmony_info(pcs: set[int], min_chord_notes: int = 2, min_scale_notes
         scale = _make_info_list(hits, SCALES, pcs=pcs)
 
     return chord, scale
+
+
+# -- detect_harmony_info_cached (finding 2a perf fix, 2026-08-07 fix wave) ---
+#
+# Live-measured root cause: note_on cost 3.86ms on the real Pi, ~90% of it
+# TWO eager HarmonyAnalyzer instances (analyzers/harmony.py's own
+# `_update_harmony_detection`, called once per page that owns an instance --
+# see that module's/pages/harmony.py's/pages/chordkey.py's docstrings)
+# each re-running detect_harmony_info's full CHORDS/SCALES best-match/tie
+# scoring from scratch on every qualifying note_on, even when the pitch-
+# class window hasn't actually changed shape (e.g. a repeated chord, or a
+# note added that doesn't change the modulo-12 set). A bounded LRU cache
+# turns that repeat case into an O(1) dict lookup instead of a full
+# re-scan. `set`s aren't hashable (can't `lru_cache` `detect_harmony_info`
+# itself), hence this separate module-level wrapper taking a `frozenset`.
+@functools.lru_cache(maxsize=512)
+def detect_harmony_info_cached(pcs: frozenset[int], min_chord_notes: int = 2,
+                                min_scale_notes: int = 3, chord_min_ratio: float = 0.6,
+                                scale_min_ratio: float = 0.7
+                                ) -> tuple[list[dict] | None, list[dict] | None]:
+    """Bounded-LRU-cached wrapper around `detect_harmony_info` above, keyed
+    on `frozenset(pcs)` plus the four threshold params (kept as real
+    cache-key params, not hardcoded, so this stays a general-purpose
+    cached entry point rather than one hand-tuned to
+    `analyzers/harmony.py`'s specific constants -- even though that
+    analyzer's one call site always passes the same four values today).
+    `maxsize=512` comfortably covers the full `2**12 = 4096`-frozenset
+    universe of a single fixed threshold tuple without pinning it all in
+    memory permanently; real playing revisits a small, repeating set of
+    chords/clusters far more than it explores new ones, so hits dominate
+    in practice (see tests/test_engine_perf.py's warm note_on benchmark).
+
+    Returned lists/dicts are the SAME objects on a cache hit, which is
+    safe only because nothing downstream ever mutates a
+    `detect_harmony_info` result -- verified:
+    `analyzers/harmony.py::_update_harmony_detection` only ever READS
+    `chord`/`scale` (building its OWN new `set`s/copies when it needs
+    one), and `analyzers/theory.py::roman_numeral_for_chord` only ever
+    reads `.get(...)` off a chord-info dict, never assigns into it."""
+    return detect_harmony_info(set(pcs), min_chord_notes=min_chord_notes,
+                                min_scale_notes=min_scale_notes,
+                                chord_min_ratio=chord_min_ratio, scale_min_ratio=scale_min_ratio)
 
 
 # -- phase-3 task 12 (gap ports, v1 page 11 "Chord+Key") --------------------

@@ -133,7 +133,7 @@ from midicrt.analyzers.timesig import TimesigAnalyzer
 from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
-from midicrt.config import Config
+from midicrt.config import Config, ConfigError
 from midicrt.engine import sysex as sysex_mod
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.engine.midi_out import MidiOutput
@@ -360,7 +360,48 @@ class Engine:
             for name in config.pages
             if name in _PAGE_FACTORIES
         }
-        self.current_page = next(iter(self.pages), "eventlog")
+        # Must-fix (2026-08-07 fix wave): fail LOUDLY, at startup, before
+        # anything else in this method runs -- an empty resolved roster
+        # (config.pages == [] outright, or every listed name unknown to
+        # _PAGE_FACTORIES, e.g. a typo'd config.toml) used to silently fall
+        # through to `next(iter(self.pages), "eventlog")` below, seeding
+        # `self.current_page` with a page name that does NOT actually exist
+        # in `self.pages`. That was harmless until the first autonomous
+        # `page.next` (behaviors/pagecycle.py's own idle-triggered dispatch,
+        # `_tick_behaviors`) called `_page_next` -> `order.index(self.
+        # current_page)` against an EMPTY `order` list -- a bare ValueError
+        # that escapes `_tick_behaviors`'s `except ActionError` guard
+        # entirely (see that method's own docstring: it only ever expects
+        # ActionError there) and kills the whole `run()` loop, live, with no
+        # client ever having done anything wrong. Raising here instead means
+        # `daemon.py` never gets an Engine to hand to ProtocolServer/run()
+        # at all -- the daemon fails at boot with a readable message instead
+        # of dying later, silently, mid-idle.
+        if not self.pages:
+            raise ConfigError(
+                f"config.pages resolved to an empty page roster "
+                f"(config.pages={config.pages!r}); known page names: "
+                f"{sorted(_PAGE_FACTORIES)}. The engine cannot start with no "
+                "pages to serve -- fix config.toml's `pages` list."
+            )
+        # Important perf fix (2026-08-07 fix wave, finding 2b): "harmony"
+        # and "chordkey" each independently constructed their OWN
+        # HarmonyAnalyzer above (via _PAGE_FACTORIES) -- a live review
+        # measured that duplication as ~90% of note_on's 3.86ms cost (two
+        # instances computing byte-identical chord/scale detections from
+        # the same event stream). When BOTH make the roster, replace
+        # chordkey's independently-constructed analyzer with harmony's
+        # SAME instance -- mirrors the "config"/"help"/"sendnotes"
+        # post-construction wiring pattern below (no page factory has
+        # visibility into the REST of the roster being built, only
+        # __init__ does). Safe, not just cheaper, only because
+        # analyzers/harmony.py::HarmonyAnalyzer.handle() has its own
+        # shared-instance dedup guard (see that method's docstring) --
+        # Engine._handle() still calls EVERY page's handle(ev) once per
+        # event, so both pages' calls land on this one instance.
+        if "harmony" in self.pages and "chordkey" in self.pages:
+            self.pages["chordkey"] = ChordKeyPage(self.pages["harmony"].analyzer)
+        self.current_page = next(iter(self.pages))
         # Phase-3 task 10: wire the config page's LIVE engine-info callback
         # (version/uptime/current_page/live pages+analyzers roster) --
         # see pages/configview.py's own "Engine-info wiring" docstring
@@ -391,6 +432,9 @@ class Engine:
         self._seq: dict[str, int] = {}
         self._dirty: set[str] = set()
         self._running = False
+        # Important perf fix (2026-08-07 fix wave, finding 1): see
+        # set_topic_refcount_provider's own docstring and _flush_dirty's.
+        self._topic_refcount_provider: Callable[[str], int] | None = None
         # Phase-3 task 9: seeded to "now", NOT epoch 0 -- see the module
         # docstring's "Behaviors + activity tracking" section for why a
         # freshly booted engine must not look infinitely idle on its very
@@ -640,6 +684,41 @@ class Engine:
 
     def emit_event(self, name: str, data: dict) -> None:
         self._broadcast(proto.event(name, data))
+
+    def set_topic_refcount_provider(self, provider: Callable[[str], int]) -> None:
+        """Engine<->server seam for the finding-1 perf fix (2026-08-07 fix
+        wave): `ProtocolServer` is the only thing that actually knows which
+        topics have live subscribers (its own `conn.topics` sets across all
+        connected clients) -- it calls this once, at its own construction,
+        with a callable `topic -> subscriber count`. `_flush_dirty()`
+        consults it before calling `snapshot_now` for each dirty topic,
+        skipping `view_model()` materialization entirely for a topic with a
+        refcount of exactly 0 (see that method's own docstring for the
+        root-cause measurement: Img2TxtVizAnalyzer.tick() always returns
+        True, so `page.img2txtviz` was dirty every tick at 30Hz and paying
+        its 6.94ms view_model() cost even with zero clients ever attached).
+
+        No provider wired (the default -- e.g. a bare `Engine` in a unit
+        test with no `ProtocolServer` attached at all, or any of this
+        file's own `add_listener()`-based tests) means "nobody has ever
+        told me who's subscribed", which is NOT the same claim as "nobody
+        is subscribed" -- the unwired default therefore always
+        materializes every dirty topic, preserving every such test's
+        existing behavior unchanged. This is deliberately a PULL seam (the
+        engine asks, on its own schedule) rather than the server pushing
+        refcount updates into the engine -- the engine already owns the
+        single `_flush_dirty()` call site that needs the answer, and a
+        pull avoids a second synchronization surface between the two.
+
+        Note what this does NOT gate: `snapshot_now()` itself (the
+        subscribe-time initial-delivery path in `ProtocolServer._dispatch`
+        calls it directly) and `emit_event()` (events, unlike snapshots,
+        are never gated by subscriber presence at the engine level --
+        server.py's own slow-client high-water check is the only
+        backpressure events ever get) are both untouched by this seam --
+        see test_engine_core.py::
+        test_snapshot_now_is_never_gated_by_the_refcount_provider."""
+        self._topic_refcount_provider = provider
 
     def snapshot_now(self, topic: str) -> dict | None:
         if topic.startswith("page."):
@@ -984,6 +1063,23 @@ class Engine:
                 # than one skipped auto-action; see module docstring.
                 pass
 
+    def _flush_dirty(self) -> None:
+        """Broadcast a snapshot for every topic marked dirty this tick --
+        extracted from `run()`'s own loop body (finding-1 fix, 2026-08-07
+        fix wave) so it's directly callable from a synchronous test with no
+        real asyncio `run()` task needed. Skips `snapshot_now`
+        materialization entirely for any topic a wired
+        `_topic_refcount_provider` reports as having zero subscribers --
+        see that setter's own docstring for the full root-cause writeup and
+        why the unwired default (no provider) must never skip anything."""
+        for topic in sorted(self._dirty):
+            if self._topic_refcount_provider is not None and self._topic_refcount_provider(topic) <= 0:
+                continue
+            snap = self.snapshot_now(topic)
+            if snap:
+                self._broadcast(snap)
+        self._dirty.clear()
+
     async def run(self) -> None:
         self._running = True
         tick = 1.0 / max(self.config.tick_hz, 1.0)
@@ -999,8 +1095,4 @@ class Engine:
             self._tick_analyzers(now)
             self._tick_pages(now)
             await self._tick_behaviors(now)
-            for topic in sorted(self._dirty):
-                snap = self.snapshot_now(topic)
-                if snap:
-                    self._broadcast(snap)
-            self._dirty.clear()
+            self._flush_dirty()

@@ -323,3 +323,123 @@ async def test_slow_client_dropped_on_event_write_buffer_high_water(tmp_path):
     assert conn not in srv._conns
     assert fake_writer.closed
     eng.stop(); await task; await srv.close()
+
+
+# -- subscriber-aware snapshot materialization, server half (Important,
+# 2026-08-07 fix wave, finding 1) --------------------------------------
+#
+# test_engine_core.py covers the engine-side gate (_flush_dirty +
+# set_topic_refcount_provider) in isolation. These tests prove the OTHER
+# half end-to-end over the real wire protocol: ProtocolServer actually
+# increments/decrements the refcount on subscribe/unsubscribe/disconnect,
+# and a page's view_model() genuinely stops (and resumes) being called as
+# a real client subscribes/unsubscribes/disconnects.
+
+class _CountingPage:
+    """Counts view_model() calls -- observes materialization directly,
+    mirrors test_engine_core.py's own _SpyPage."""
+
+    def __init__(self):
+        self.view_model_calls = 0
+
+    def handle(self, ev) -> bool:
+        return True
+
+    def view_model(self) -> dict:
+        self.view_model_calls += 1
+        return {"n": self.view_model_calls}
+
+
+async def test_topic_refcount_increments_on_subscribe_and_decrements_on_unsubscribe(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    assert srv._topic_refcount("page.eventlog") == 0
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    await c.request("subscribe", topics=["page.eventlog"], max_rate=50.0)
+    assert srv._topic_refcount("page.eventlog") == 1
+    await c.request("unsubscribe", topics=["page.eventlog"])
+    assert srv._topic_refcount("page.eventlog") == 0
+    eng.stop(); await task; await srv.close()
+
+
+async def test_topic_refcount_decrements_on_client_disconnect(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    await c.request("subscribe", topics=["page.eventlog"], max_rate=50.0)
+    assert srv._topic_refcount("page.eventlog") == 1
+    c.writer.close()
+    await asyncio.sleep(0.1)
+    assert srv._topic_refcount("page.eventlog") == 0
+    eng.stop(); await task; await srv.close()
+
+
+async def test_topic_refcount_is_shared_correctly_across_two_subscribers(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    c1, c2 = Client(), Client()
+    await c1.connect(srv.socket_path); await c1.hello()
+    await c2.connect(srv.socket_path); await c2.hello()
+    await c1.request("subscribe", topics=["page.eventlog"], max_rate=50.0)
+    await c2.request("subscribe", topics=["page.eventlog"], max_rate=50.0)
+    assert srv._topic_refcount("page.eventlog") == 2
+    await c1.request("unsubscribe", topics=["page.eventlog"])
+    assert srv._topic_refcount("page.eventlog") == 1   # c2 still subscribed
+    c2.writer.close()
+    await asyncio.sleep(0.1)
+    assert srv._topic_refcount("page.eventlog") == 0
+    eng.stop(); await task; await srv.close()
+
+
+async def test_page_with_no_subscriber_is_never_materialized_end_to_end(tmp_path):
+    eng, srv, task = await make(tmp_path, tick_hz=50.0)
+    spy = _CountingPage()
+    eng.register_page("spy", spy)
+    await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 60, 1, "x"))
+    await asyncio.sleep(0.3)
+    assert spy.view_model_calls == 0   # nobody ever subscribed to page.spy
+    eng.stop(); await task; await srv.close()
+
+
+async def test_subscribing_starts_materialization_and_unsubscribing_stops_it(tmp_path):
+    eng, srv, task = await make(tmp_path, tick_hz=50.0)
+    spy = _CountingPage()
+    eng.register_page("spy", spy)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    await c.request("subscribe", topics=["page.spy"], max_rate=50.0)
+    calls_after_subscribe = spy.view_model_calls
+    assert calls_after_subscribe >= 1   # initial snapshot delivered immediately
+
+    await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 60, 1, "x"))
+    await asyncio.sleep(0.3)
+    assert spy.view_model_calls > calls_after_subscribe   # materialized while subscribed
+
+    await c.request("unsubscribe", topics=["page.spy"])
+    calls_at_unsub = spy.view_model_calls
+    await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 61, 1, "y"))
+    await asyncio.sleep(0.3)
+    assert spy.view_model_calls == calls_at_unsub   # stopped after unsubscribe
+
+    eng.stop(); await task; await srv.close()
+
+
+async def test_disconnecting_the_last_subscriber_stops_materialization(tmp_path):
+    eng, srv, task = await make(tmp_path, tick_hz=50.0)
+    spy = _CountingPage()
+    eng.register_page("spy", spy)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.hello()
+    await c.request("subscribe", topics=["page.spy"], max_rate=50.0)
+    c.writer.close()
+    await asyncio.sleep(0.1)
+    calls_at_disconnect = spy.view_model_calls
+
+    await eng.queue.put(MidiEvent(0, "t", "note_on", 0, 60, 1, "x"))
+    await asyncio.sleep(0.3)
+    assert spy.view_model_calls == calls_at_disconnect
+
+    eng.stop(); await task; await srv.close()

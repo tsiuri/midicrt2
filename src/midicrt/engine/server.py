@@ -42,11 +42,44 @@ class ProtocolServer:
         self.socket_path = socket_path
         self._server: asyncio.Server | None = None
         self._conns: set[_ClientConn] = set()
+        # Important perf fix (2026-08-07 fix wave, finding 1): a real,
+        # incrementally-maintained per-topic subscriber refcount (NOT a
+        # live O(n_conns) scan over self._conns -- run()'s dirty-flush loop
+        # calls the provider once per dirty topic every tick, so this needs
+        # to be a cheap dict lookup, not a scan repeated many times a
+        # second). Incremented in `_dispatch`'s "subscribe" branch,
+        # decremented in "unsubscribe" and in `_drop` (covers a client
+        # disconnect too -- see `_drop`'s own comment for why it's
+        # idempotent-safe to decrement here). Wired into the engine via
+        # `set_topic_refcount_provider` so `Engine._flush_dirty()` can skip
+        # materializing a dirty topic's view_model() when this reports 0 --
+        # see that setter's own docstring in engine/core.py for the full
+        # root-cause writeup (Img2TxtVizAnalyzer.tick() always dirty at
+        # 30Hz, 35-40% idle CPU with zero subscribers).
+        self._topic_refcounts: dict[str, int] = {}
         engine.add_listener(self._on_engine_message)
+        engine.set_topic_refcount_provider(self._topic_refcount)
 
     @property
     def clients(self) -> int:
         return len(self._conns)
+
+    # -- per-topic subscriber refcount (finding 1) -------------------------
+
+    def _topic_refcount(self, topic: str) -> int:
+        return self._topic_refcounts.get(topic, 0)
+
+    def _incref_topics(self, topics: set[str]) -> None:
+        for topic in topics:
+            self._topic_refcounts[topic] = self._topic_refcounts.get(topic, 0) + 1
+
+    def _decref_topics(self, topics: set[str]) -> None:
+        for topic in topics:
+            count = self._topic_refcounts.get(topic, 0) - 1
+            if count <= 0:
+                self._topic_refcounts.pop(topic, None)
+            else:
+                self._topic_refcounts[topic] = count
 
     async def start(self) -> None:
         with contextlib.suppress(FileNotFoundError):
@@ -105,7 +138,19 @@ class ProtocolServer:
             await self._drop(conn)
 
     async def _drop(self, conn: _ClientConn) -> None:
-        self._conns.discard(conn)
+        # `conn in self._conns` guards the refcount decrement so it only
+        # ever runs ONCE per connection even though `_drop` can legitimately
+        # be called twice for the same conn (a real pre-existing shape:
+        # `close()` iterates every tracked conn calling `_drop`, and closing
+        # a conn's writer there can independently wake its own `_handle`
+        # coroutine's read loop into ALSO reaching its `finally: await
+        # self._drop(conn)`). Without this guard the second call would
+        # double-decrement `_topic_refcounts` for topics this conn was
+        # subscribed to, under-counting a DIFFERENT conn's still-live
+        # subscription to the same topic.
+        if conn in self._conns:
+            self._conns.discard(conn)
+            self._decref_topics(conn.topics)
         if conn.pusher:
             conn.pusher.cancel()
         with contextlib.suppress(Exception):
@@ -157,14 +202,26 @@ class ProtocolServer:
                 conn.send(proto.error_response(id, "max_rate must be > 0"))
                 return
             conn.max_rate = min(max(rate, 0.1), 60.0)
-            conn.topics |= set(msg.get("topics", []))
+            requested = set(msg.get("topics", []))
+            new_topics = requested - conn.topics
+            conn.topics |= requested
+            # Refcount incremented BEFORE the initial-snapshot delivery loop
+            # below -- not because snapshot_now() itself checks the
+            # refcount (it deliberately never does, see Engine.
+            # set_topic_refcount_provider's docstring), but so the very
+            # NEXT run() tick's _flush_dirty() already sees this
+            # subscription if this topic goes dirty again before this
+            # method returns.
+            self._incref_topics(new_topics)
             for topic in conn.topics:
                 snap = self.engine.snapshot_now(topic)
                 if snap:
                     conn.latest[topic] = snap
             conn.send(proto.response(id, {"topics": sorted(conn.topics)}))
         elif cmd == "unsubscribe":
-            conn.topics -= set(msg.get("topics", []))
+            removed = set(msg.get("topics", [])) & conn.topics
+            conn.topics -= removed
+            self._decref_topics(removed)
             conn.send(proto.response(id, {"topics": sorted(conn.topics)}))
         elif cmd == "action":
             try:

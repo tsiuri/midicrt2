@@ -450,3 +450,60 @@ def test_key_detail_matches_view_models_own_key_fields_once_established():
     assert detail["label"] == vm["key"]
     assert detail["confidence"] == vm["key_conf"]
     assert [alt["label"] for alt in detail["alternatives"]] == vm["key_alternatives"]
+
+
+# -- shared-instance dedup guard (Important, finding 2b, 2026-08-07 fix
+# wave) -------------------------------------------------------------------
+#
+# engine/core.py now shares ONE HarmonyAnalyzer instance between
+# pages/harmony.py's HarmonyPage and pages/chordkey.py's ChordKeyPage when
+# both make the roster (a live-measured perf fix: each page used to own an
+# independent instance, doubling every note_on's chord/scale detection
+# cost for no behavioral benefit -- both pages see the identical event
+# stream regardless). Engine._handle() still calls EVERY page's own
+# handle(ev) once per event (the "every page sees every event" dirty-
+# tracking contract, engine/core.py's own module docstring) -- so both
+# pages' handle() calls land on this SAME analyzer, with the exact SAME
+# MidiEvent object reference (Engine passes one shared `ev` to the whole
+# roster for a given tick). Without a dedup guard this analyzer would
+# process one real note TWICE, corrupting `_recent_notes`/`_key_counts`
+# (duplicate entries), not merely wasting cycles.
+
+def test_handle_is_idempotent_for_the_same_event_object():
+    # `view_model()`'s public fields (key_conf/tension/etc.) are computed
+    # from SETS that don't distinguish "seen once" from "seen twice" for
+    # the exact same pitch class -- `_recent_notes`'s length is the most
+    # direct observable of the dedup guard actually doing its job,
+    # deliberately checked at the internal-state level here since no
+    # black-box observable cleanly isolates this specific invariant.
+    a = HarmonyAnalyzer()
+    ev = note_on(0, 60)
+    first = a.handle(ev)
+    second = a.handle(ev)          # SAME object reference -- must be a no-op
+    assert first is True
+    assert second is True          # reports the SAME dirty result, not False
+    assert len(a._recent_notes) == 1
+
+
+def test_handle_processes_two_distinct_event_objects_normally():
+    # Two DIFFERENT MidiEvent objects (as every real distinct MIDI event
+    # naturally is, even with identical field values) must both be
+    # processed -- the dedup guard keys on object IDENTITY, not equality.
+    a = HarmonyAnalyzer()
+    a.handle(note_on(0, 60))
+    a.handle(note_on(0, 60))       # a DIFFERENT object, same field values
+    assert len(a._recent_notes) == 2
+
+
+def test_handle_reprocesses_normally_after_an_intervening_different_event():
+    # The dedup guard must only ever suppress the IMMEDIATELY-repeated
+    # same object, not latch permanently -- a real engine tick always
+    # moves on to a genuinely new MidiEvent next.
+    a = HarmonyAnalyzer()
+    ev1 = note_on(0, 60)
+    ev2 = note_on(0, 64)
+    a.handle(ev1)
+    a.handle(ev1)   # dedup no-op
+    a.handle(ev2)
+    a.handle(ev1)   # a THIRD, later call with the original object -- processes again
+    assert len(a._recent_notes) == 3

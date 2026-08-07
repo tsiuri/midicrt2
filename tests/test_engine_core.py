@@ -3,7 +3,7 @@ import time
 
 import pytest
 
-from midicrt.config import Config
+from midicrt.config import Config, ConfigError
 from midicrt.engine.actions import ActionError
 from midicrt.engine.core import Engine, MidiEvent
 
@@ -221,6 +221,47 @@ def test_handle_marks_non_current_page_dirty_too():
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
         "page.img2txtviz", "page.chordkey", "page.loud", "overlay.alerts",
     }
+
+
+# -- empty/invalid roster guard (Must-fix, 2026-08-07 fix wave) --------------
+#
+# Before this fix: an empty (or all-unknown-name) `config.pages` resolved to
+# an empty `self.pages` dict, but `self.current_page` still fell back to the
+# HARDCODED string "eventlog" (`next(iter(self.pages), "eventlog")`) -- a
+# page that, in this scenario, does NOT actually exist in the roster.
+# `PageCycleBehavior`'s autonomous `page.next` dispatch (behaviors/
+# pagecycle.py) then calls `Engine._page_next` -> `order.index(self.
+# current_page)` against an EMPTY `order` list, raising a bare `ValueError`
+# that escapes `_tick_behaviors`'s `except ActionError` guard entirely and
+# kills the whole `run()` loop -- an unattended background behavior tick
+# crashing the daemon. Fixed by failing fast, loudly, and BEFORE any of
+# that ever gets a chance to run: Engine.__init__ now raises `ConfigError`
+# the moment the resolved roster is empty, so a misconfigured `config.toml`
+# (or a test) never even gets an `Engine` instance to hand to `daemon.py`'s
+# `ProtocolServer`/`run()` at all.
+
+def test_empty_pages_list_raises_configerror_at_construction():
+    with pytest.raises(ConfigError):
+        Engine(Config(pages=[]))
+
+
+def test_all_unknown_page_names_raises_configerror_at_construction():
+    # Every name here is a typo/nonsense -- none matches a _PAGE_FACTORIES
+    # key, so the resolved roster is empty exactly like `pages=[]` above,
+    # just reached via a different, arguably more realistic, misconfig.
+    with pytest.raises(ConfigError):
+        Engine(Config(pages=["totally-bogus", "also-not-a-page"]))
+
+
+def test_configerror_message_is_readable_and_names_the_bad_config():
+    with pytest.raises(ConfigError, match="empty"):
+        Engine(Config(pages=[]))
+
+
+def test_a_single_known_page_name_is_not_an_empty_roster():
+    # Sanity check the guard's boundary: one real page is enough to pass.
+    eng = Engine(Config(pages=["eventlog"]))
+    assert list(eng.pages) == ["eventlog"]
 
 
 # -- transport analyzer / overlay wiring (phase-3 task 3) --------------------
@@ -1106,3 +1147,165 @@ def test_engine_stop_with_no_pending_notes_sends_no_note_offs():
     eng._midi_out = fake
     eng.stop()
     assert fake.note_off_calls == []
+
+
+# -- subscriber-aware snapshot materialization (Important, 2026-08-07 fix
+# wave, finding 1) ------------------------------------------------------
+#
+# Root cause (live-measured on the Pi): Img2TxtVizAnalyzer.tick() ALWAYS
+# returns True by design (its own docstring: "a continuous animation with
+# no 'nothing changed' state"), so `page.img2txtviz` is in `self._dirty`
+# EVERY tick at tick_hz=30 regardless of whether a single client has ever
+# subscribed to it -- and the old `run()` loop called `snapshot_now(topic)`
+# (materializing the page's 6.94ms view_model()) for EVERY dirty topic
+# unconditionally, burning 35-40% idle CPU with zero subscribers. Fix:
+# `Engine._flush_dirty()` (extracted from `run()`'s own loop body so it's
+# directly callable from a synchronous test, no real asyncio run() task
+# needed) now skips `snapshot_now` for any topic a wired
+# `_topic_refcount_provider` reports as having zero subscribers.
+# `events`/`describe` are untouched -- this only ever gates the dirty-topic
+# SNAPSHOT loop, never `emit_event`/`snapshot_now` itself (see the
+# dedicated "subscribe-time path bypasses the gate" tests below).
+
+class _SpyPage:
+    """Counts view_model() calls -- the thing finding 1 needs to observe
+    directly (a snapshot topic's cost lives entirely in materializing this
+    return value, not in marking the topic dirty)."""
+
+    def __init__(self):
+        self.view_model_calls = 0
+
+    def handle(self, ev) -> bool:
+        return True
+
+    def view_model(self) -> dict:
+        self.view_model_calls += 1
+        return {"n": self.view_model_calls}
+
+
+def test_flush_dirty_with_no_provider_wired_always_materializes():
+    # Default (unwired) behavior MUST be preserved exactly: a bare Engine
+    # with no ProtocolServer ever attached (e.g. every add_listener()-based
+    # test earlier in this very file, none of which ever call
+    # set_topic_refcount_provider) has nobody who could possibly report
+    # subscriber counts -- "nobody told me who's subscribed" is NOT the
+    # same claim as "nobody is subscribed", so the unwired default must
+    # keep materializing every dirty topic exactly like before this fix.
+    eng = Engine(Config())
+    spy = _SpyPage()
+    eng.register_page("spy", spy)
+    eng._dirty.add("page.spy")
+    eng._flush_dirty()
+    assert spy.view_model_calls == 1
+    assert eng._dirty == set()   # still cleared either way
+
+
+def test_flush_dirty_skips_materialization_when_refcount_is_zero():
+    eng = Engine(Config())
+    spy = _SpyPage()
+    eng.register_page("spy", spy)
+    eng.set_topic_refcount_provider(lambda topic: 0)
+    eng._dirty.add("page.spy")
+    eng._flush_dirty()
+    assert spy.view_model_calls == 0   # the whole point of the fix
+    assert eng._dirty == set()
+
+
+def test_flush_dirty_materializes_when_refcount_is_positive():
+    eng = Engine(Config())
+    spy = _SpyPage()
+    eng.register_page("spy", spy)
+    eng.set_topic_refcount_provider(lambda topic: 1)
+    eng._dirty.add("page.spy")
+    eng._flush_dirty()
+    assert spy.view_model_calls == 1
+
+
+def test_flush_dirty_respects_refcount_independently_per_topic():
+    eng = Engine(Config())
+    subscribed, unsubscribed = _SpyPage(), _SpyPage()
+    eng.register_page("has_sub", subscribed)
+    eng.register_page("no_sub", unsubscribed)
+    eng.set_topic_refcount_provider(lambda topic: 1 if topic == "page.has_sub" else 0)
+    eng._dirty |= {"page.has_sub", "page.no_sub"}
+    eng._flush_dirty()
+    assert subscribed.view_model_calls == 1
+    assert unsubscribed.view_model_calls == 0
+
+
+def test_flush_dirty_stops_materializing_after_refcount_drops_back_to_zero():
+    # Simulates an unsubscribe/disconnect mid-run: a mutable counter the
+    # provider reads live (matching how ProtocolServer's own refcount dict
+    # works -- see engine/server.py), not a value baked in at subscribe
+    # time.
+    eng = Engine(Config())
+    spy = _SpyPage()
+    eng.register_page("spy", spy)
+    refcount = {"page.spy": 1}
+    eng.set_topic_refcount_provider(lambda topic: refcount.get(topic, 0))
+
+    eng._dirty.add("page.spy")
+    eng._flush_dirty()
+    assert spy.view_model_calls == 1
+
+    refcount["page.spy"] = 0
+    eng._dirty.add("page.spy")
+    eng._flush_dirty()
+    assert spy.view_model_calls == 1   # unchanged -- no new materialization
+
+
+def test_snapshot_now_is_never_gated_by_the_refcount_provider():
+    # A NEW subscriber must still get its initial snapshot via
+    # ProtocolServer._dispatch's own subscribe-time `engine.snapshot_now
+    # (topic)` call -- that path is DELIBERATELY separate from
+    # `_flush_dirty()`'s dirty-loop and must never consult the refcount
+    # provider at all (a fresh subscriber is, by definition, not yet
+    # counted for a topic it just asked for -- gating snapshot_now itself
+    # would starve every subscribe of its very first frame). Proven here
+    # with a provider that reports zero for everything.
+    eng = Engine(Config())
+    eng.set_topic_refcount_provider(lambda topic: 0)
+    snap = eng.snapshot_now("page.eventlog")
+    assert snap is not None
+
+
+# -- harmony/chordkey shared HarmonyAnalyzer (Important, finding 2b,
+# 2026-08-07 fix wave) -----------------------------------------------------
+#
+# analyzers/harmony.py's own module docstring covers the dedup guard that
+# makes sharing safe (not just cheaper). These tests cover the OTHER half:
+# Engine actually wires the SAME instance to both pages when both make the
+# roster.
+
+def test_harmony_and_chordkey_pages_share_one_analyzer_instance():
+    eng = Engine(Config())
+    assert eng.pages["harmony"].analyzer is eng.pages["chordkey"].analyzer
+
+
+def test_harmony_and_chordkey_do_not_double_count_a_shared_event():
+    eng = Engine(Config())
+    shared = eng.pages["harmony"].analyzer
+    eng._handle(ev(type="note_on", data1=60, data2=100, channel=0))
+    # "harmony" precedes "chordkey" in the default roster (config.py) --
+    # Engine._handle() calls harmony's handle(ev) first (real processing),
+    # then chordkey's (the dedup guard's no-op branch, same ev object).
+    assert len(shared._recent_notes) == 1
+    assert shared.recent_pcs == {0}
+
+
+def test_harmony_and_chordkey_report_the_same_underlying_key_after_a_shared_note():
+    eng = Engine(Config())
+    eng._handle(ev(type="note_on", data1=60, data2=100, channel=0))
+    # Same C-major-tonic key fact, surfaced through each page's own VM
+    # shape (harmony.py's bare label vs chordkey.py's {label, pct, ...}) --
+    # both derive from the SAME shared analyzer instance.
+    assert eng.pages["harmony"].view_model()["key"] == "C maj"
+    assert eng.pages["chordkey"].view_model()["key"]["label"] == "C maj"
+
+
+def test_a_solo_harmony_page_still_gets_its_own_working_analyzer():
+    # Boundary case: a custom roster with "harmony" but not "chordkey" --
+    # nothing to share WITH, but harmony must still work exactly as before.
+    eng = Engine(Config(pages=["eventlog", "harmony"]))
+    eng._handle(ev(type="note_on", data1=60, data2=100, channel=0))
+    assert eng.pages["harmony"].view_model()["key"] == "C maj"

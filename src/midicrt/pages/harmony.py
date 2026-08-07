@@ -62,8 +62,24 @@ from midicrt.analyzers.harmony import HarmonyAnalyzer
 class HarmonyPage:
     name = "harmony"
 
-    def __init__(self) -> None:
-        self._analyzer = HarmonyAnalyzer()
+    def __init__(self, analyzer: HarmonyAnalyzer | None = None) -> None:
+        # Finding 2b perf fix (2026-08-07 fix wave): `analyzer` is
+        # OPTIONAL, defaulting to a fresh, independent instance -- every
+        # existing standalone use (this page's own tests, any custom
+        # roster with "harmony" but no "chordkey") keeps working exactly
+        # as before. `engine/core.py`'s `Engine.__init__` passes in a
+        # SHARED instance (also handed to `pages/chordkey.py`'s
+        # `ChordKeyPage`) when both pages make the roster -- see that
+        # wiring site's own comment and `analyzers/harmony.py`'s
+        # shared-instance dedup guard for why sharing is safe, not just
+        # cheaper.
+        self._analyzer = analyzer if analyzer is not None else HarmonyAnalyzer()
+
+    @property
+    def analyzer(self) -> HarmonyAnalyzer:
+        """Exposes the underlying analyzer so Engine.__init__ can hand the
+        SAME instance to ChordKeyPage -- see __init__'s own comment."""
+        return self._analyzer
 
     def handle(self, ev) -> bool:
         return self._analyzer.handle(ev)
