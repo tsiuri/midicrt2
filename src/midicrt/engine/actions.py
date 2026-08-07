@@ -49,7 +49,7 @@ class ActionError(Exception):
 
 class ActionRegistry:
     def __init__(self):
-        self._actions: dict[str, tuple[Callable, str, dict[str, str]]] = {}
+        self._actions: dict[str, tuple[Callable, str, dict[str, str], bool]] = {}
         # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md): an
         # OPTIONAL hook, set at most once (`Engine.__init__` wires it to
         # `Engine._on_action_dispatched`) and fired after every SUCCESSFUL
@@ -69,7 +69,22 @@ class ActionRegistry:
         self._on_dispatch: Callable[[str, dict, str, dict], None] | None = None
 
     def register(self, name, handler, description="", args=None):
-        self._actions[name] = (handler, description, dict(args or {}))
+        # Fix-wave addition (docs/phase5-notes.md, capture mark-
+        # completeness review): register-time introspection for an
+        # OPT-IN "this handler wants its own dispatch origin" signal --
+        # a handler is origin-aware iff it declares a parameter literally
+        # named `origin` (checked ONCE here, not on every dispatch).
+        # `Engine._capture_stop_action` is the one handler that needs
+        # this today: it must record its OWN action mark BEFORE actually
+        # stopping (the NORMAL post-dispatch hook fires too late for
+        # capture.stop specifically -- see that method's own docstring),
+        # which requires knowing its origin before `dispatch()` would
+        # otherwise report it. `origin` is NEVER exposed as a client-
+        # suppliable wire arg -- see `dispatch`'s own comment at the
+        # injection site for why it's kept out of `args`/`schema`
+        # entirely.
+        wants_origin = "origin" in inspect.signature(handler).parameters
+        self._actions[name] = (handler, description, dict(args or {}), wants_origin)
 
     def set_dispatch_hook(self, callback: Callable[[str, dict, str, dict], None] | None) -> None:
         self._on_dispatch = callback
@@ -77,13 +92,13 @@ class ActionRegistry:
     def describe(self) -> dict:
         return {
             name: {"description": desc, "args": args}
-            for name, (_, desc, args) in sorted(self._actions.items())
+            for name, (_, desc, args, _wants_origin) in sorted(self._actions.items())
         }
 
     async def dispatch(self, name: str, args: dict, *, origin: str = "unknown") -> dict:
         if name not in self._actions:
             raise ActionError(f"unknown action: {name}")
-        handler, _, schema = self._actions[name]
+        handler, _, schema, wants_origin = self._actions[name]
         if set(args) - set(schema):
             raise ActionError(f"unknown args: {sorted(set(args) - set(schema))}")
         coerced = {}
@@ -94,7 +109,15 @@ class ActionRegistry:
                 coerced[arg] = _COERCERS[type_name](args[arg])
             except (ValueError, TypeError) as exc:
                 raise ActionError(f"bad value for {arg}: {exc}") from exc
-        result = handler(**coerced)
+        # `origin` is injected into a SEPARATE kwargs dict for the actual
+        # handler call -- `coerced` itself (the schema-only args) is what
+        # the post-dispatch hook below receives as the recorded mark's
+        # `args`, so an origin-aware handler never leaks `origin` into
+        # its own action mark's `args` field.
+        handler_kwargs = dict(coerced)
+        if wants_origin:
+            handler_kwargs["origin"] = origin
+        result = handler(**handler_kwargs)
         if inspect.isawaitable(result):
             result = await result
         result = result if isinstance(result, dict) else {}

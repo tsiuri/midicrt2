@@ -742,6 +742,18 @@ class Engine:
             # `capture_auto_start`) -- this branch only ever fires when a
             # config.toml explicitly opts in.
             self._capture_start_action()
+            # Fix-wave addition (Important finding: an auto-started
+            # session got NO `capture.start` mark at all) -- this call is
+            # a direct Python method call, not an `ActionRegistry.
+            # dispatch(...)`, so the normal post-dispatch hook (which is
+            # what stamps a mark for every OTHER `capture.start` origin --
+            # client/binding/behavior all go through the registry) never
+            # fires here. `"auto"` joins the documented origin set
+            # (`binding:<id>` / `client` / `behavior` / `sysex` / `auto` /
+            # `shutdown` -- see `_capture_stop_action`'s own docstring for
+            # the last one) as the one origin that can ONLY ever appear on
+            # a session's very first action mark, at construction time.
+            self._capture.record_action("capture.start", {}, "auto")
         # Phase 4 Task 1 (config-served keymap, docs/phase4-notes.md):
         # registered LAST, after every other action above (engine-owned
         # AND page-declared) -- both because `config.reload` itself is a
@@ -1046,32 +1058,132 @@ class Engine:
         client; sysex bypasses the registry entirely, see
         `_handle_sysex`'s own handlers). `CaptureSink.record_action` is
         itself a no-op when not recording, so this is cheap even outside a
-        capture session."""
+        capture session.
+
+        Does NOT cover `capture.stop`'s own mark (see
+        `_capture_stop_action`'s own docstring for why that one records
+        itself explicitly, before this hook would even see it) --
+        harmless overlap either way, since by the time this hook fires for
+        `capture.stop`, recording has already ended and `record_action`'s
+        own guard makes this a no-op."""
         self._capture.record_action(name, args, origin)
+
+    def _capture_write_failed(self, exc: OSError) -> dict:
+        """Shared write-failure containment (fix wave, Critical finding:
+        see `CaptureSink.fail`'s own docstring for the full incident and
+        "why disable instead of retry" rationale) -- called from BOTH
+        `_tick_capture_flush` (the background per-tick flush call site in
+        `run()`) and `_capture_stop_action`'s own `except OSError` branch
+        (a foreground `capture.stop` whose `CaptureSink.stop()` raised
+        synchronously). Flips the `rec` chrome flag off, logs exactly ONE
+        error, and emits an `alert` event -- the log line is invisible to
+        anyone not tailing `journalctl`; the alert is what a connected
+        client actually sees. Also emits `capture_stopped` (with an
+        `error` field) when a session genuinely was active, matching the
+        normal `capture.stop` action's own event shape as closely as
+        possible so a client doesn't need a special code path to notice
+        "the session ended, just abnormally"."""
+        result = self._capture.fail(exc)
+        self.analyzers["status"].set_rec(False)
+        self._dirty.add("overlay.status")
+        _LOG.error("capture: write failed (%s); capture disabled", exc)
+        self.emit_event("alert", {
+            "source": "capture", "level": "crit",
+            "message": f"capture write failed: {exc}; capture disabled",
+        })
+        if result.get("session_id"):
+            self.emit_event("capture_stopped", {
+                "id": result["session_id"], "counts": result.get("counts", {}),
+                "error": result.get("error"),
+            })
+        return result
+
+    def _tick_capture_flush(self, now: float) -> None:
+        """Wraps `CaptureSink.maybe_flush(now)` -- called from `run()`
+        once per tick. Critical fix (docs/phase5-notes.md fix wave): this
+        call used to be `self._capture.maybe_flush(now)` directly inline
+        in `run()`, completely UNGUARDED and outside `run()`'s own
+        try/except -- an `OSError` from `os.fsync` inside `flush()`
+        (ENOSPC/EIO) propagated straight out of the WHOLE `while self.
+        _running:` loop, killing the `run()` asyncio task with NO log
+        line at all (the daemon stayed "active" to systemd -- no crash,
+        no restart -- and MIDI processing simply stopped forever;
+        reproduced live by test_engine_core.py::
+        test_flush_write_failure_does_not_kill_the_run_loop_and_disables_capture).
+        Mirrors `_dispatch_bindings`'s own "never let a single failure
+        escape and kill the loop" precedent exactly."""
+        try:
+            self._capture.maybe_flush(now)
+        except OSError as exc:
+            self._capture_write_failed(exc)
 
     def _capture_start_action(self) -> dict:
         """`capture.start` action handler (also called directly from
-        `__init__` for `config.capture_auto_start`, and internally by
-        `_capture_stop_action`'s sibling docstring note -- see
-        `CaptureSink.start`'s own "implicitly stops a running session
-        first" behavior). Stamps the `rec` chrome flag on the ALWAYS-
-        present "status" analyzer and marks `overlay.status` dirty
+        `__init__` for `config.capture_auto_start` -- see that call
+        site's own comment for why it must ALSO explicitly record an
+        `origin="auto"` mark, since a direct method call bypasses the
+        dispatch hook entirely). Stamps the `rec` chrome flag on the
+        ALWAYS-present "status" analyzer and marks `overlay.status` dirty
         directly (mirrors `_sendnotes_key`'s own "engine-level state
         change marks its page dirty itself" precedent -- there is no
-        `MidiEvent` here for `TransportAnalyzer.handle()` to react to)."""
-        result = self._capture.start()
+        `MidiEvent` here for `TransportAnalyzer.handle()` to react to).
+
+        Fix wave (Important finding): `CaptureSink.start()` can raise
+        `OSError` (an unwritable/unreachable sessions directory) --
+        converted here into a clean `ActionError` rather than letting the
+        raw `OSError` escape `ActionRegistry.dispatch` past its own
+        `except ActionError` narrowing and tear down the requesting
+        client connection (`engine/server.py::ProtocolServer._dispatch`'s
+        own `action` branch only ever catches `ActionError`)."""
+        try:
+            result = self._capture.start()
+        except OSError as exc:
+            _LOG.error("capture.start failed: %s", exc)
+            raise ActionError(f"capture.start failed: {exc}") from exc
         self.analyzers["status"].set_rec(True)
         self._dirty.add("overlay.status")
         self.emit_event("capture_started", {"id": result["session_id"]})
         return {"recording": True, **result}
 
-    def _capture_stop_action(self) -> dict:
+    def _capture_stop_action(self, *, origin: str = "unknown") -> dict:
         """`capture.stop` action handler. A no-op-shaped result (mirrors
         `CaptureSink.stop`'s own "stopping nothing is harmless" precedent)
         when nothing was recording -- no `capture_stopped` event in that
         case either, matching `bind.cancel`'s own "no event for a no-op"
-        precedent right above."""
-        result = self._capture.stop()
+        precedent right above.
+
+        `origin` (fix wave, Important finding) -- INJECTED by
+        `ActionRegistry.dispatch` (register-time introspection over this
+        method's own signature, see `ActionRegistry.register`'s own
+        docstring), never a client-suppliable arg. Needed because this
+        handler must record its OWN `capture.stop` action mark EXPLICITLY,
+        BEFORE actually stopping: `CaptureSink.stop()` flips `is_recording`
+        False as its very first observable effect, and `record_action`'s
+        own guard (`if not self._recording: return`) would otherwise
+        silently swallow a stop mark reported through the NORMAL
+        post-dispatch hook (which only ever fires AFTER this handler
+        returns, by which point recording has already stopped) -- this is
+        the asymmetry fix versus `capture.start` (which happens to work
+        without any special handling: `_capture.start()` flips recording
+        ON before the hook fires). `Engine.stop()` (a clean daemon
+        shutdown, bypassing the registry entirely like the auto-start
+        case) calls this directly with `origin="shutdown"` -- both
+        `"auto"` and `"shutdown"` join the documented origin set
+        (`binding:<id>` / `client` / `behavior` / `sysex` / `auto` /
+        `shutdown`).
+
+        Fix wave (Important finding): `CaptureSink.stop()` can also raise
+        `OSError` (the final `flush()` inside it fails) -- routed through
+        the SAME `_capture_write_failed` containment path a background
+        flush failure uses, then re-raised as a clean `ActionError` for
+        the requesting client (same "never let a raw OSError past
+        ActionRegistry.dispatch" reasoning as `_capture_start_action`)."""
+        self._capture.record_action("capture.stop", {}, origin)
+        try:
+            result = self._capture.stop()
+        except OSError as exc:
+            result = self._capture_write_failed(exc)
+            raise ActionError(f"capture.stop failed: {exc}") from exc
         self.analyzers["status"].set_rec(False)
         self._dirty.add("overlay.status")
         if result.get("session_id"):
@@ -1777,9 +1889,14 @@ class Engine:
         # (`CaptureSink.stop`'s own guard). Reuses `_capture_stop_action`
         # itself (not a hand-rolled duplicate) so shutdown gets the exact
         # same `rec`-flag/dirty-marking/`capture_stopped` event behavior a
-        # normal `capture.stop` action gets.
+        # normal `capture.stop` action gets. `origin="shutdown"` -- this
+        # call bypasses `ActionRegistry.dispatch` entirely (a direct
+        # method call, like the auto-start case in `__init__`), so it
+        # must supply its own origin explicitly (see
+        # `_capture_stop_action`'s own docstring for the full origin-
+        # injection mechanism this is the one exception to).
         if self._capture.is_recording:
-            self._capture_stop_action()
+            self._capture_stop_action(origin="shutdown")
         # Phase-3 task 12 fix (Important, live-reproduced): flush any
         # still-gated Send Notes BEFORE closing midi_out -- a routine
         # restart mid-note used to just close the port out from under
@@ -1948,6 +2065,10 @@ class Engine:
             # self.queue.empty()` loop above), so a MIDI storm doesn't
             # starve the flush cadence, and `tick_hz`'s default 30Hz
             # (~33ms) comfortably services a ~1s cadence without a second
-            # concurrency domain to reason about.
-            self._capture.maybe_flush(now)
+            # concurrency domain to reason about. Critical fix
+            # (docs/phase5-notes.md fix wave): calls `_tick_capture_flush`
+            # (NOT `self._capture.maybe_flush(now)` directly anymore) --
+            # see that method's own docstring for the write-failure
+            # containment this now guards against.
+            self._tick_capture_flush(now)
             self._flush_dirty()

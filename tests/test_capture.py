@@ -129,6 +129,108 @@ def test_stop_writes_index_row_with_counts(tmp_path):
     assert row["ended_ts"] >= row["started_ts"]
 
 
+# -- status(): live counts vs last_session (Minor fix-wave finding) --------
+
+def test_status_counts_is_empty_and_last_session_is_none_before_any_session(tmp_path):
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    status = sink.status()
+    assert status["counts"] == {}
+    assert status["last_session"] is None
+
+
+def test_status_reports_last_session_counts_after_stop_not_under_live_counts(tmp_path):
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    result = sink.start()
+    sink.record_event(make_event(type="note_on"))
+    sink.stop()
+    status = sink.status()
+    # Live `counts` reflects the (now idle) active session -- empty, not a
+    # stale carryover from the session that just ended.
+    assert status["counts"] == {}
+    assert status["last_session"]["id"] == result["session_id"]
+    assert status["last_session"]["counts"] == {"note_on": 1}
+    assert status["last_session"]["ended_ts"] >= status["last_session"]["started_ts"]
+
+
+def test_status_last_session_persists_across_a_later_idle_period(tmp_path):
+    # last_session is sticky -- it's not cleared by anything except a NEW
+    # stop()/fail() (there's no "clear history" operation).
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    result = sink.start()
+    sink.stop()
+    first_status = sink.status()
+    second_status = sink.status()
+    assert first_status["last_session"] == second_status["last_session"]
+    assert second_status["last_session"]["id"] == result["session_id"]
+
+
+# -- fail(): write-failure containment (Critical fix-wave finding) ---------
+
+def test_fail_disables_recording_and_clears_the_buffer(tmp_path):
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    sink.start()
+    sink.record_event(make_event())   # buffered, never flushed
+    result = sink.fail(OSError(28, "No space left on device"))
+    assert sink.is_recording is False
+    assert result["error"] == "[Errno 28] No space left on device"
+    assert len(sink._buffer) == 0
+
+
+def test_fail_notes_the_session_in_index_json_with_an_error_field(tmp_path):
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    result = sink.start()
+    sink.fail(OSError(28, "No space left on device"))
+    rows = read_index(tmp_path)
+    assert len(rows) == 1
+    assert rows[0]["id"] == result["session_id"]
+    assert "No space left" in rows[0]["error"]
+
+
+def test_fail_reports_last_session_with_error(tmp_path):
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    result = sink.start()
+    sink.fail(OSError(28, "No space left on device"))
+    status = sink.status()
+    assert status["recording"] is False
+    assert status["last_session"]["id"] == result["session_id"]
+    assert "No space left" in status["last_session"]["error"]
+
+
+def test_fail_when_nothing_was_recording_is_harmless(tmp_path):
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    result = sink.fail(OSError(28, "No space left on device"))
+    assert result["session_id"] is None
+    assert sink.is_recording is False
+    # Nothing to note -- no session was active, so index.json is never
+    # even touched (not written as an empty list either).
+    assert not os.path.exists(os.path.join(tmp_path, "index.json"))
+
+
+def test_fail_never_raises_even_if_the_index_write_also_fails(tmp_path, monkeypatch):
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    sink.start()
+
+    def broken_save_index(rows):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(sink, "_save_index", broken_save_index)
+    result = sink.fail(OSError(28, "No space left on device"))   # must not raise
+    assert sink.is_recording is False
+    assert result["error"]
+
+
+def test_a_fresh_start_after_fail_works_normally(tmp_path):
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    sink.start()
+    sink.fail(OSError(28, "No space left on device"))
+    result = sink.start()
+    assert sink.is_recording is True
+    sink.record_event(make_event())
+    sink.flush()
+    lines = read_jsonl(sink.session_path(result["session_id"]))
+    assert any(line["kind"] == "event" for line in lines)
+
+
 # -- writer: queued, flushed on a cadence (loss window is documented, not
 # tested -- see engine/capture.py's own module docstring) ------------------
 

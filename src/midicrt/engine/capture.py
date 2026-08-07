@@ -76,6 +76,39 @@ meaningfully); the "buffer then flush" behavior itself IS unit-tested
 (inject without flushing, assert nothing on disk yet; flush; assert it
 lands) -- see test_capture.py.
 
+Write-failure containment (disk full / EIO -- NOT a crash)
+-------------------------------------------------------------------------
+Distinct from the loss window above (which is about an UNCLEAN shutdown):
+`flush()` itself can raise `OSError` (ENOSPC, EIO, a yanked drive) on a
+perfectly healthy, still-running daemon. Before this was caught, `Engine.
+run()` called `maybe_flush(now)` completely unguarded -- the exception
+propagated straight out of the WHOLE tick loop, silently killing the
+`run()` asyncio task with no log line at all (systemd still reported the
+unit "active"; no restart; MIDI processing simply stopped forever).
+`Engine._tick_capture_flush` now wraps that call in `try/except OSError`
+(mirroring `_dispatch_bindings`'s own "never let one failure kill the
+loop" precedent) and routes it to `CaptureSink.fail` (see that method's
+own docstring for the full "why disable instead of retry" rationale) via
+`Engine._capture_write_failed`, which also flips the `rec` chrome flag
+off, logs ONE error, and emits an `alert` event. The SAME `fail()` path
+also catches a `capture.start`/`.stop` action call whose own I/O raised
+`OSError` synchronously (`Engine._capture_start_action`/
+`_capture_stop_action` both convert that into a clean `ActionError`
+instead of an uncaught exception tearing down the requesting client
+connection).
+
+`_atomic_write_json`'s tempfile (`.index-*.json.tmp`, same directory as
+`index.json`) can be left behind if the process is `SIGKILL`ed between
+`tempfile.mkstemp` and the `os.replace` a few lines later -- a real,
+accepted risk with no cleanup code written for it (a `SIGKILL` mid-write
+is already an unclean-shutdown scenario the loss-window section above
+already asks an operator to tolerate; an orphaned, harmless `.tmp` file
+sitting next to `index.json` is the same class of "an operator can clean
+this up by hand" residue, not a correctness bug -- the NEXT successful
+`_atomic_write_json` call always writes its OWN fresh tempfile name
+(`tempfile.mkstemp`'s own uniqueness), so a stale one is never read back
+by anything).
+
 Session index (`index.json`)
 -------------------------------------------------------------------------
 One row per FINISHED session (`id`/`started_ts`/`ended_ts`/`counts`/
@@ -220,6 +253,14 @@ class CaptureSink:
         self._counts: dict[str, int] = {}
         self._last_bpm: float | None = None
         self._last_flush_ts: float = 0.0
+        # Fix-wave addition (Minor finding: `status()` used to leave a
+        # just-ended session's `counts` sitting under the LIVE `counts`
+        # key even after `session_id` went back to `None`, which reads
+        # as stale/orphaned data with nothing to attribute it to) --
+        # `stop()`/`fail()` both populate this; `status()` reports it
+        # under its own `last_session` key instead, so the LIVE `counts`
+        # key always accurately reflects "nothing" while idle.
+        self._last_session: dict | None = None
 
     # -- introspection ------------------------------------------------------
 
@@ -235,11 +276,21 @@ class CaptureSink:
         return os.path.join(self._dir, f"{session_id}.jsonl")
 
     def status(self) -> dict:
+        """`capture.status` action handler's data. `counts` reflects ONLY
+        the currently-active session (empty `{}` while idle -- never a
+        stale carryover from whatever session most recently ended);
+        `last_session` (`None` until the very first `stop()`/`fail()`)
+        is where a just-ended session's own final `id`/`counts`/
+        `started_ts`/`ended_ts` (and `error`, if it ended via `fail()`)
+        live instead, so a client can still show "last capture: N
+        events" while idle without that data being ambiguously mixed
+        into the live-session key."""
         return {
             "recording": self._recording,
             "session_id": self._session_id,
             "started_ts": self._started_ts,
-            "counts": dict(self._counts),
+            "counts": dict(self._counts) if self._recording else {},
+            "last_session": dict(self._last_session) if self._last_session else None,
         }
 
     # -- lifecycle ------------------------------------------------------------
@@ -298,11 +349,81 @@ class CaptureSink:
             with contextlib.suppress(OSError):
                 self._fh.close()
         self._update_index_on_stop(session_id, started_ts, ended_ts, counts)
+        self._last_session = {
+            "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
+            "counts": counts,
+        }
         self._recording = False
         self._fh = None
         self._session_id = None
         self._started_ts = None
+        self._counts = {}
         return {"session_id": session_id, "counts": counts}
+
+    def fail(self, error: BaseException) -> dict:
+        """Write-failure containment (fix wave, Critical finding): an
+        unguarded `flush()` `OSError` (ENOSPC/EIO) used to propagate
+        straight out of `Engine.run()`'s tick loop with NO log line at
+        all, silently killing the whole `run()` asyncio task forever --
+        the daemon stayed "active" to systemd (no crash, no restart), and
+        MIDI processing simply stopped. `Engine._capture_write_failed`
+        calls this from BOTH the background flush-tick call site
+        (`run()`) and a foreground `capture.start`/`.stop` action call
+        that raised `OSError` synchronously -- either way, THIS is the
+        one place capture actually gets disabled.
+
+        Deliberately does NOT retry -- contrast `analyzers/spectrum.py`'s
+        own audio-capture retry/cooldown supervisor (the "audio pattern"
+        this is modeled after IN SPIRIT, not literally): a vanished USB
+        audio device can plausibly reappear on its own; a full disk or a
+        read-only filesystem cannot self-heal within seconds, and
+        retrying at tick rate would spam log lines far faster than that
+        supervisor's 5s cooldown while accomplishing nothing an operator
+        can't already fix by hand (free space, remount, replace the
+        drive). Disabling immediately is what makes this naturally
+        "log ONE error" per incident without needing its own cooldown
+        timer: once `self._recording` is `False`, every hot-path
+        `record_*` call and the next `maybe_flush` are cheap no-ops, so
+        there is nothing left to keep failing (and thus nothing left to
+        keep logging) until a genuinely NEW `capture.start` begins a
+        genuinely NEW incident.
+
+        Never itself raises -- a SECOND write failure while trying to
+        note the first one (the disk is STILL full) is swallowed;
+        `index.json` may be left exactly as it was at the moment of the
+        original failure, which is the honest outcome of an unwritable
+        filesystem. Whatever was still buffered (appended but not yet
+        flushed) at the moment of failure is dropped -- the same loss-
+        window disclosure the module docstring already makes for an
+        unclean shutdown, just triggered by a write error instead of a
+        crash."""
+        session_id = self._session_id
+        started_ts = self._started_ts
+        counts = dict(self._counts)
+        ended_ts = time.time()
+        if self._fh is not None:
+            with contextlib.suppress(Exception):
+                self._fh.close()
+        self._recording = False
+        self._fh = None
+        self._session_id = None
+        self._started_ts = None
+        self._counts = {}
+        self._buffer.clear()
+        error_text = str(error)
+        if session_id:
+            self._last_session = {
+                "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
+                "counts": counts, "error": error_text,
+            }
+            with contextlib.suppress(Exception):
+                rows = [r for r in self._load_index() if r.get("id") != session_id]
+                rows.append({
+                    "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
+                    "counts": counts, "pinned": False, "error": error_text,
+                })
+                self._save_index(rows)
+        return {"session_id": session_id, "counts": counts, "error": error_text}
 
     def pin(self, session_id: str) -> dict:
         """`capture.pin {id}`: only ever targets a row already in

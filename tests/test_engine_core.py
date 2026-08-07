@@ -1,4 +1,5 @@
 import asyncio
+import errno
 import json
 import time
 
@@ -2504,6 +2505,89 @@ def test_capture_stop_action_when_nothing_recording_is_a_noop_no_event():
     assert events == []
 
 
+# -- mark completeness (fix wave: Important findings) ------------------------
+
+async def test_capture_stop_records_its_own_action_mark_with_the_calling_origin():
+    # Bug: `_capture_stop_action` flipped `_recording` False (inside
+    # `CaptureSink.stop()`) BEFORE the normal post-dispatch hook fires --
+    # `record_action`'s own guard then silently swallowed the mark. Fixed
+    # by recording it explicitly, before stopping, with whatever origin
+    # actually triggered this dispatch (here: "client", via
+    # `ActionRegistry.dispatch`'s register-time origin injection).
+    eng = Engine(Config())
+    await eng.actions.dispatch("capture.start", {})
+    result = await eng.actions.dispatch("capture.stop", {}, origin="client")
+    lines = _read_session_lines(eng, result["session_id"])
+    stop_marks = [line for line in lines if line["kind"] == "action" and line["name"] == "capture.stop"]
+    assert len(stop_marks) == 1
+    assert stop_marks[0]["origin"] == "client"
+    # It's the LAST line -- nothing else was recorded after the session's
+    # own stop mark.
+    assert lines[-1] is stop_marks[0]
+
+
+async def test_engine_stop_records_a_shutdown_origin_stop_mark():
+    eng = Engine(Config())
+    result = eng._capture_start_action()
+    eng.stop()
+    lines = _read_session_lines(eng, result["session_id"])
+    stop_marks = [line for line in lines if line["kind"] == "action" and line["name"] == "capture.stop"]
+    assert stop_marks and stop_marks[0]["origin"] == "shutdown"
+
+
+def test_capture_auto_start_records_its_own_start_mark_with_origin_auto():
+    # Bug: __init__'s auto-start branch calls `_capture_start_action()`
+    # directly (never through `ActionRegistry.dispatch`), so the normal
+    # post-dispatch hook that stamps every OTHER `capture.start` origin
+    # never fires for it. Fixed by recording the mark explicitly with
+    # `origin="auto"` right after starting.
+    eng = Engine(Config(capture_auto_start=True))
+    result = eng._capture_stop_action()
+    lines = _read_session_lines(eng, result["session_id"])
+    start_marks = [line for line in lines if line["kind"] == "action" and line["name"] == "capture.start"]
+    assert len(start_marks) == 1
+    assert start_marks[0]["origin"] == "auto"
+    assert lines[0]["kind"] == "header"
+    assert lines[1] is start_marks[0]   # the very first thing after the header
+
+
+# -- cold-path OSError containment (fix wave: Important finding) -------------
+
+async def test_capture_start_action_raises_action_error_on_oserror(monkeypatch):
+    eng = Engine(Config())
+
+    def broken_start():
+        raise OSError(13, "Permission denied")
+
+    monkeypatch.setattr(eng._capture, "start", broken_start)
+    with pytest.raises(ActionError, match="Permission denied"):
+        await eng.actions.dispatch("capture.start", {})
+    assert eng._capture.is_recording is False
+
+
+async def test_capture_stop_action_raises_action_error_on_oserror_and_disables_capture(
+        monkeypatch):
+    eng = Engine(Config())
+    await eng.actions.dispatch("capture.start", {})
+    assert eng._capture.is_recording is True
+
+    def broken_stop():
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(eng._capture, "stop", broken_stop)
+    got = []
+    eng.add_listener(got.append)
+
+    with pytest.raises(ActionError, match="No space left"):
+        await eng.actions.dispatch("capture.stop", {})
+
+    # Cleanly disabled, not left half-recording.
+    assert eng._capture.is_recording is False
+    assert eng.analyzers["status"].view_model()["rec"] is False
+    alerts = [m for m in got if m.get("kind") == "event" and m.get("name") == "alert"]
+    assert alerts and alerts[-1]["data"]["source"] == "capture"
+
+
 async def test_capture_status_action_reports_live_recording_state():
     eng = Engine(Config())
     assert (await eng.actions.dispatch("capture.status", {}))["recording"] is False
@@ -2563,7 +2647,10 @@ async def test_capture_records_no_action_mark_for_a_binding_dispatch_that_raises
     # "capture stamps marks at DISPATCH time") -- a binding referencing an
     # action absent from this roster is the SAME graceful-skip case
     # test_dispatch_bindings_skips_roster_absent_action_and_logs_without_crashing
-    # already covers; it must not leave an action mark behind either.
+    # already covers; it must not leave an action mark behind either. The
+    # session's OWN `capture.stop` mark (fix wave: `_capture_stop_action`
+    # now records itself explicitly) is expected here too -- that's a
+    # SEPARATE, deliberate mark, not the skipped binding's.
     p = tmp_path / "bindings.toml"
     _write_trigger_binding(p, action="sendnotes.key", args_toml='key = "z"')
     eng = Engine(Config(pages=["eventlog"]), bindings_path=str(p))
@@ -2572,7 +2659,9 @@ async def test_capture_records_no_action_mark_for_a_binding_dispatch_that_raises
     await eng._dispatch_bindings()
     result = eng._capture_stop_action()
     lines = _read_session_lines(eng, result["session_id"])
-    assert not [line for line in lines if line["kind"] == "action"]
+    action_names = [line["name"] for line in lines if line["kind"] == "action"]
+    assert "sendnotes.key" not in action_names
+    assert action_names == ["capture.stop"]
 
 
 async def test_capture_records_provenance_for_all_four_dispatch_origins(tmp_path):
@@ -2636,3 +2725,67 @@ async def test_run_loop_flushes_capture_to_disk_on_its_own_cadence():
     eng.stop()
     await task
     assert any(line["kind"] == "event" and line["type"] == "note_on" for line in lines)
+
+
+# -- capture write-failure containment (fix wave: Critical finding) --------
+#
+# `CaptureSink.flush()` can raise `OSError` (ENOSPC/EIO) from `os.fsync` --
+# BEFORE this fix, `Engine.run()` called `self._capture.maybe_flush(now)`
+# completely unguarded, outside any try/except, so that exception escaped
+# the WHOLE `while self._running:` loop: the `run()` asyncio task died
+# silently (no log line at all), the daemon stayed "active" to systemd (no
+# crash, no restart), and MIDI processing stopped forever. This is the
+# reviewer-reproduced headline regression test for that fix -- mirrors
+# `_dispatch_bindings`'s own "never let a single failure escape and kill
+# the loop" precedent.
+
+async def test_flush_write_failure_does_not_kill_the_run_loop_and_disables_capture(
+        tmp_path, caplog):
+    eng = Engine(Config(tick_hz=200.0))
+    eng._capture_start_action()
+    eng._capture._flush_interval_s = 0.01
+
+    def failing_flush():
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    real_flush = eng._capture.flush
+    eng._capture.flush = failing_flush
+
+    got = []
+    eng.add_listener(got.append)
+
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100))
+    with caplog.at_level("ERROR"):
+        await asyncio.sleep(0.15)   # long enough for maybe_flush to fire and raise
+
+    # 1. The run() loop must still be ALIVE -- a subsequent event is still
+    # processed (events_total advances), proving the task never died.
+    events_before = eng.events_total
+    await eng.queue.put(ev(type="note_on", data1=61, data2=100))
+    await asyncio.sleep(0.05)
+    assert eng.events_total == events_before + 1
+    assert not task.done()   # the run() task itself is still running
+
+    # 2. Capture was stopped cleanly (not left half-alive/half-broken).
+    assert eng._capture.is_recording is False
+    assert eng.analyzers["status"].view_model()["rec"] is False
+
+    # 3. Exactly ONE alert event, describing the write failure.
+    alerts = [m for m in got if m.get("kind") == "event" and m.get("name") == "alert"]
+    assert len(alerts) == 1
+    assert alerts[0]["data"]["source"] == "capture"
+    assert "write failed" in alerts[0]["data"]["message"]
+
+    # 4. Exactly ONE error logged (not spammed every tick).
+    error_logs = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(error_logs) == 1
+    assert "capture" in error_logs[0].message.lower()
+
+    # 5. A fresh capture.start works once writes succeed again.
+    eng._capture.flush = real_flush
+    result = await eng.actions.dispatch("capture.start", {})
+    assert result["recording"] is True
+
+    eng.stop()
+    await task
