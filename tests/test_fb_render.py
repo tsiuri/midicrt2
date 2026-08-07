@@ -3,13 +3,16 @@ end-to-end path (the acceptance path for this task -- real device writes are
 coded but NOT exercised here; v1 owns /dev/fb0 until Task 4's supervised
 smoke window).
 """
+import queue
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
 from PIL import Image
 
+from midicrt.clients.base import ClientError
 from midicrt.clients.chrome import DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM
 from midicrt.clients.fb import app
 from midicrt.clients.fb.surface import Surface
@@ -1310,3 +1313,71 @@ def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     finally:
         daemon.terminate()
         daemon.wait(timeout=5)
+
+
+def test_run_device_survives_page_switch_before_new_topics_snapshot_arrives(tmp_path, monkeypatch):
+    """Regression (found live, phase-3 task 11 supervised CRT smoke): the
+    redraw loop only refreshed `vm` `if page_updated` (a fresh snapshot for
+    the CURRENT topic arrived THIS tick), but `state["page"]`/`state["topic"]`
+    flip immediately on a `page_changed` event via `on_event`. Per
+    docs/phase2-notes.md, a (re)subscribed topic's own first snapshot can
+    arrive "up to 1/max_rate later" -- not synchronously with the event that
+    triggered the resubscribe. Any of the four independently-ticking overlay
+    topics (status/alerts/timesig/beatflash/loopprogress) firing in that gap
+    used to trigger `_paint_frame` anyway, pairing the NEW page name with the
+    OLD page's stale vm -- e.g. page="eventlog" painted with
+    vm={"title": "SCREENSAVER"}, crashing `render_frame` on the missing
+    `vm['count']` key. Reproduced live against the real daemon/fb0; this test
+    reproduces it deterministically via a scripted inbox."""
+    monkeypatch.setattr(app, "_read_fb_geometry", lambda: (10, 10, 20))
+
+    calls = []
+    real_paint_frame = app._paint_frame
+
+    def spy_paint_frame(surface, page, vm, *rest):
+        calls.append((page, dict(vm)))
+        return real_paint_frame(surface, page, vm, *rest)
+
+    monkeypatch.setattr(app, "_paint_frame", spy_paint_frame)
+
+    class FakeClient:
+        def subscribe(self, topics, max_rate):
+            pass
+
+        def unsubscribe(self, topics):
+            pass
+
+    inbox = queue.Queue()
+    # 1) Initial snapshot for the STARTING page (screensaver) -- lets
+    #    wait_first_snapshot return immediately, self-consistent.
+    inbox.put({"kind": "snapshot", "topic": "page.screensaver", "data": {"title": "SCREENSAVER"}})
+    # 2) A page_changed event -- flips state to eventlog -- with NO
+    #    accompanying "page.eventlog" snapshot in this same batch (the
+    #    real-world delivery gap this test reproduces).
+    inbox.put({"kind": "event", "name": "page_changed", "data": {"page": "eventlog"}})
+    # 3) An unrelated overlay update in the SAME batch -- this alone must
+    #    not be sufficient to repaint the page body against the stale vm.
+    inbox.put({"kind": "snapshot", "topic": "overlay.status",
+               "data": {"bpm": 120.0, "bar": 1, "beat": 1, "running": True, "source": "test"}})
+    # 4) Clean-shutdown sentinel, queued from a timer so it lands on a
+    #    LATER tick than 2+3 above -- `drain_latest` drains the whole queue
+    #    in one non-blocking pass, so a sentinel queued up-front would be
+    #    consumed (and raise) in the SAME batch as 2+3, before `_run_device`
+    #    ever reaches the `_paint_frame` call this test is checking.
+    timer = threading.Timer(0.05, inbox.put, args=(None,))
+    timer.start()
+
+    fb_path = str(tmp_path / "fb0")
+    try:
+        app._run_device(FakeClient(), inbox, fb_path, True, 1000.0, "screensaver", "page.screensaver")
+    except ClientError:
+        pass  # expected clean shutdown via the `None` sentinel
+    finally:
+        timer.cancel()
+
+    # The fix's actual contract: _paint_frame must never be called with
+    # page="eventlog" paired with a vm that isn't eventlog-shaped.
+    for page, vm in calls:
+        if page == "eventlog":
+            assert "count" in vm, (
+                f"eventlog page painted with a non-eventlog (stale) vm: {vm!r}")

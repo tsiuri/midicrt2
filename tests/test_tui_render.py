@@ -1,3 +1,7 @@
+import queue
+import threading
+
+from midicrt.clients import tui
 from midicrt.clients.chrome import (
     DEFAULT_ALERTS_VM,
     DEFAULT_BEATFLASH_VM,
@@ -31,6 +35,7 @@ from midicrt.clients.tui import (
     render_status_row,
     render_tuner_lines,
     render_voices_lines,
+    run_tui,
     screensaver_row_texts,
 )
 
@@ -759,3 +764,77 @@ def test_render_config_lines_cuts_off_extra_rows_when_height_is_short():
 
 def test_config_renderers_dispatch_table_has_config():
     assert RENDERERS["config"] is render_config_lines
+
+
+def test_run_tui_survives_page_switch_before_new_topics_snapshot_arrives(monkeypatch):
+    """TUI's twin of fb/app.py::_run_device's regression (same phase-3 task
+    11 finding, found live against the real daemon): a page_changed event
+    can flip state["page"]/state["topic"] before that new topic's own first
+    snapshot arrives (delivery can lag "up to 1/max_rate",
+    docs/phase2-notes.md). `render_lines` (the eventlog renderer) crashes on
+    `vm['count']` the same way `render_frame` did if an unrelated overlay-
+    only update (e.g. overlay.status, which ticks independently) triggers a
+    repaint against a `vm` that still belongs to the OLD page.
+
+    Run in a background thread with a generous observation window (rather
+    than a queued shutdown sentinel): a sentinel present in the inbox from
+    the start would be drained in the SAME `drain_latest` batch as the
+    page_changed + overlay.status messages below (that function drains the
+    whole queue in one non-blocking pass), short-circuiting via ClientError
+    before `run_tui` ever reaches the render call this test exists to
+    exercise -- confirmed by hand while developing this test. Queuing the
+    sentinel only AFTER the observation window avoids that."""
+    inbox = queue.Queue()
+    inbox.put({"kind": "snapshot", "topic": "page.screensaver", "data": {"title": "SCREENSAVER"}})
+    inbox.put({"kind": "event", "name": "page_changed", "data": {"page": "eventlog"}})
+    inbox.put({"kind": "snapshot", "topic": "overlay.status",
+               "data": {"bpm": 120.0, "bar": 1, "beat": 1, "running": True, "source": "test"}})
+
+    class FakeEngineClient:
+        def __init__(self, socket_path):
+            pass
+
+        def connect(self):
+            pass
+
+        def request(self, cmd):
+            return {"data": {"current_page": "screensaver"}}
+
+        def subscribe(self, topics, max_rate):
+            pass
+
+        def unsubscribe(self, topics):
+            pass
+
+        def start_reader(self):
+            return inbox
+
+        def action(self, name):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(tui, "EngineClient", FakeEngineClient)
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = run_tui("/tmp/unused.sock")
+        except BaseException as exc:  # noqa: BLE001 -- capture ANY crash, not just ClientError
+            outcome["exception"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)  # generous: blessed startup + the drain above, Pi3-safe
+
+    assert "exception" not in outcome, (
+        f"run_tui crashed on the mismatched page/vm pairing: {outcome.get('exception')!r}")
+
+    # Clean shutdown: now that the observation window has passed (msg2/msg3
+    # long since drained), a sentinel is unambiguous.
+    inbox.put(None)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive(), "run_tui did not exit after the shutdown sentinel"
+    assert outcome.get("result") == 1

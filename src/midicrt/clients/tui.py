@@ -622,6 +622,7 @@ def run_tui(socket_path: str) -> int:
         # first) -- without on_event, that page_changed would be silently
         # dropped and the client would stay on the stale topic forever.
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
+        vm_topic = state["topic"]
     except ClientError:
         print("midicrt tui: engine connection lost")
         client.close()
@@ -647,7 +648,7 @@ def run_tui(socket_path: str) -> int:
                     lost = True
                     return 1
                 if state["topic"] in drained:
-                    vm, dirty = drained[state["topic"]], True
+                    vm, dirty, vm_topic = drained[state["topic"]], True, state["topic"]
                 if chrome.OVERLAY_STATUS_TOPIC in drained:
                     state["status_vm"] = drained[chrome.OVERLAY_STATUS_TOPIC]
                     dirty = True
@@ -663,7 +664,18 @@ def run_tui(socket_path: str) -> int:
                 if chrome.OVERLAY_LOOPPROGRESS_TOPIC in drained:
                     state["loopprogress_vm"] = drained[chrome.OVERLAY_LOOPPROGRESS_TOPIC]
                     dirty = True
-                if dirty:
+                # Same fix as fb/app.py::_run_device (phase-3 task 11,
+                # found live in the supervised CRT smoke): a page_changed
+                # event can flip state["page"]/state["topic"] before that
+                # new topic's own first snapshot arrives (delivery can lag
+                # "up to 1/max_rate", docs/phase2-notes.md). An unrelated
+                # overlay-only update must not repaint the body against
+                # `vm` while it still belongs to the OLD topic -- `render_
+                # lines`' eventlog renderer crashes on `vm['count']` the
+                # same way `render_frame` did. `dirty` deliberately stays
+                # True when skipped, so the render fires as soon as
+                # vm_topic catches up.
+                if dirty and vm_topic == state["topic"]:
                     # Chrome reserves the LAST THREE rows (phase-3 task 9
                     # adds the beatflash/loopprogress row BELOW the
                     # original status row, matching v1's own bottom-to-top

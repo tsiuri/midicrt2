@@ -900,6 +900,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             threading.Thread(target=_input_loop, args=(client, quit_event), daemon=True).start()
 
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
+        vm_topic = state["topic"]
         _paint_frame(surface, state["page"], vm, font, state["status_vm"],
                      state["alerts_vm"], state["timesig_vm"],
                      state["beatflash_vm"], state["loopprogress_vm"])
@@ -923,6 +924,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             page_updated = state["topic"] in drained
             if page_updated:
                 vm = drained[state["topic"]]
+                vm_topic = state["topic"]
             status_updated = chrome.OVERLAY_STATUS_TOPIC in drained
             if status_updated:
                 state["status_vm"] = drained[chrome.OVERLAY_STATUS_TOPIC]
@@ -940,7 +942,24 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             if chrome.OVERLAY_LOOPPROGRESS_TOPIC in drained:
                 state["loopprogress_vm"] = drained[chrome.OVERLAY_LOOPPROGRESS_TOPIC]
                 beatprogress_updated = True
-            if page_updated or status_updated or secondary_updated or beatprogress_updated:
+            # `page_changed` (via `on_event`, inside `drain_latest` above)
+            # can flip `state["page"]`/`state["topic"]` immediately, but the
+            # NEW topic's own first snapshot can arrive "up to 1/max_rate
+            # later" (docs/phase2-notes.md) -- not necessarily this same
+            # tick. `vm`/`vm_topic` still describe the OLD page in that gap.
+            # An unrelated overlay-only update (status/alerts/timesig/
+            # beatflash/loopprogress, each ticking independently) must not
+            # repaint the body against that stale, mismatched vm -- found
+            # live in phase-3 task 11's supervised CRT smoke (page="eventlog"
+            # painted with a screensaver vm, crashing `render_frame` on the
+            # missing `vm['count']`; see test_run_device_survives_page_
+            # switch_before_new_topics_snapshot_arrives). Skip the WHOLE
+            # repaint (chrome included -- body+chrome are one `_paint_frame`
+            # call) until vm_topic catches up; the overlay update itself
+            # isn't lost, it just gets folded into the next tick that also
+            # carries (or already has) a topic-matching vm.
+            vm_is_current = vm_topic == state["topic"]
+            if vm_is_current and (page_updated or status_updated or secondary_updated or beatprogress_updated):
                 # `render_frame` clears the WHOLE surface, so all THREE
                 # chrome strips must be repainted on every redraw, not just
                 # when their own vm changed (`_paint_frame` skips them
