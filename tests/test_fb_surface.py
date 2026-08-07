@@ -146,3 +146,239 @@ def test_save_png_roundtrip(tmp_path):
     reloaded = Image.open(out_path)
     assert reloaded.size == (6, 4)
     assert reloaded.convert("RGB").getpixel((0, 0)) == RED
+
+
+# -- new primitives (Phase 3 Task 2): hline / vline / box / fill_column ----
+
+
+def test_hline_draws_horizontal_run():
+    surf = Surface(6, 4)
+    surf.clear(BLACK)
+    surf.hline(1, 2, 3, RED)  # x in [1,3], y=2
+    px = surf.image.load()
+    for x in range(1, 4):
+        assert px[x, 2] == RED
+    assert px[0, 2] == BLACK
+    assert px[4, 2] == BLACK
+    assert px[1, 1] == BLACK
+    assert px[1, 3] == BLACK
+
+
+def test_hline_clips_to_surface_bounds():
+    surf = Surface(4, 4)
+    surf.clear(BLACK)
+    surf.hline(-2, 1, 4, WHITE)  # only x in [0,1] on-surface
+    px = surf.image.load()
+    assert px[0, 1] == WHITE
+    assert px[1, 1] == WHITE
+    assert px[2, 1] == BLACK
+
+
+def test_vline_draws_vertical_run():
+    surf = Surface(4, 6)
+    surf.clear(BLACK)
+    surf.vline(2, 1, 3, RED)  # y in [1,3], x=2
+    px = surf.image.load()
+    for y in range(1, 4):
+        assert px[2, y] == RED
+    assert px[2, 0] == BLACK
+    assert px[2, 4] == BLACK
+    assert px[1, 1] == BLACK
+    assert px[3, 1] == BLACK
+
+
+def test_vline_clips_to_surface_bounds():
+    surf = Surface(4, 4)
+    surf.clear(BLACK)
+    surf.vline(1, -2, 4, WHITE)  # only y in [0,1] on-surface
+    px = surf.image.load()
+    assert px[1, 0] == WHITE
+    assert px[1, 1] == WHITE
+    assert px[1, 2] == BLACK
+
+
+def test_box_draws_outline_leaving_interior_untouched():
+    surf = Surface(6, 5)
+    surf.clear(BLACK)
+    surf.box(1, 1, 4, 3, RED)  # covers x in [1,4], y in [1,3]
+    px = surf.image.load()
+    for x in range(1, 5):
+        assert px[x, 1] == RED
+        assert px[x, 3] == RED
+    for y in range(1, 4):
+        assert px[1, y] == RED
+        assert px[4, y] == RED
+    # interior stays background
+    assert px[2, 2] == BLACK
+    assert px[3, 2] == BLACK
+    # outside the box stays background
+    assert px[0, 0] == BLACK
+    assert px[5, 4] == BLACK
+
+
+def test_box_clips_to_surface_bounds():
+    surf = Surface(4, 4)
+    surf.clear(BLACK)
+    # box spans x in [-2,1], y in [-2,1]; only its bottom edge (y=1) and
+    # right edge (x=1) fall on-surface -- the top/left edges are fully
+    # clipped away, so (0,0) is genuine box INTERIOR (2 in from each of
+    # those off-canvas edges) and must stay background, not filled.
+    surf.box(-2, -2, 4, 4, WHITE)
+    px = surf.image.load()
+    assert px[0, 0] == BLACK
+    assert px[0, 1] == WHITE  # bottom edge
+    assert px[1, 0] == WHITE  # right edge
+    assert px[1, 1] == WHITE  # corner where bottom and right edges meet
+
+
+def test_box_non_positive_size_draws_nothing():
+    surf = Surface(4, 4)
+    surf.clear(BLACK)
+    surf.box(1, 1, 0, 3, RED)
+    surf.box(1, 1, 3, -1, RED)
+    px = surf.image.load()
+    for x in range(4):
+        for y in range(4):
+            assert px[x, y] == BLACK
+
+
+def test_fill_column_grows_upward_from_bottom_row():
+    surf = Surface(4, 6)
+    surf.clear(BLACK)
+    surf.fill_column(1, 5, 3, RED)  # bottom-aligned at row 5, height 3 -> rows 3,4,5
+    px = surf.image.load()
+    for y in (3, 4, 5):
+        assert px[1, y] == RED
+    assert px[1, 2] == BLACK
+    assert px[0, 5] == BLACK
+    assert px[2, 5] == BLACK
+
+
+def test_fill_column_width_spans_multiple_columns():
+    surf = Surface(6, 4)
+    surf.clear(BLACK)
+    surf.fill_column(1, 3, 2, RED, width=3)  # x in [1,3], y in [2,3]
+    px = surf.image.load()
+    for x in range(1, 4):
+        for y in (2, 3):
+            assert px[x, y] == RED
+    assert px[0, 3] == BLACK
+    assert px[4, 3] == BLACK
+
+
+def test_fill_column_clips_like_rect():
+    surf = Surface(4, 4)
+    surf.clear(BLACK)
+    surf.fill_column(1, 10, 3, WHITE)  # bar entirely below the surface -> nothing drawn
+    px = surf.image.load()
+    for x in range(4):
+        for y in range(4):
+            assert px[x, y] == BLACK
+    surf.fill_column(1, 1, 5, WHITE)  # bar's top clips off the top edge
+    px = surf.image.load()
+    assert px[1, 0] == WHITE
+    assert px[1, 1] == WHITE
+    assert px[1, 2] == BLACK
+
+
+# -- mmap device-loop primitives (Phase 3 Task 2) --------------------------
+
+
+def test_write_to_mmap_matches_write_fb_output(tmp_path):
+    from midicrt.clients.fb.surface import open_fb_mmap
+
+    surf = Surface(4, 1)
+    px = surf.image.load()
+    px[0, 0] = RED
+    px[1, 0] = GREEN
+    px[2, 0] = BLUE
+    px[3, 0] = WHITE
+
+    size = surf.width * 2 * surf.height
+    path = tmp_path / "fb_mmap.bin"
+    f, mm = open_fb_mmap(str(path), size)
+    try:
+        surf.write_to_mmap(mm)
+    finally:
+        mm.close()
+        f.close()
+    assert path.read_bytes() == surf.to_rgb565()
+
+
+def test_write_to_mmap_pads_rows_to_stride(tmp_path):
+    from midicrt.clients.fb.surface import open_fb_mmap
+
+    surf = Surface(4, 2)
+    px = surf.image.load()
+    for x in range(4):
+        px[x, 0] = RED
+        px[x, 1] = BLUE
+    stride = 16
+    size = stride * surf.height
+    path = tmp_path / "fb_mmap_strided.bin"
+    f, mm = open_fb_mmap(str(path), size)
+    try:
+        surf.write_to_mmap(mm, stride=stride)
+    finally:
+        mm.close()
+        f.close()
+    written = path.read_bytes()
+    assert len(written) == size
+    row0 = written[0:16]
+    row1 = written[16:32]
+    assert row0[0:8] == RED_565_LE * 4
+    assert row0[8:16] == b"\x00" * 8
+    assert row1[0:8] == BLUE_565_LE * 4
+    assert row1[8:16] == b"\x00" * 8
+
+
+def test_open_fb_mmap_reuses_across_multiple_writes(tmp_path):
+    # The whole point of the device loop's mmap path: open the map ONCE and
+    # write many frames into it, unlike write_fb which reopens every call.
+    from midicrt.clients.fb.surface import open_fb_mmap
+
+    surf = Surface(2, 1)
+    size = surf.width * 2 * surf.height
+    path = tmp_path / "fb_mmap_reuse.bin"
+    f, mm = open_fb_mmap(str(path), size)
+    try:
+        surf.clear(RED)
+        surf.write_to_mmap(mm)
+        assert path.read_bytes() == surf.to_rgb565()
+
+        surf.clear(BLUE)
+        surf.write_to_mmap(mm)
+        assert path.read_bytes() == surf.to_rgb565()
+    finally:
+        mm.close()
+        f.close()
+
+
+def test_open_fb_mmap_sizes_a_fresh_file(tmp_path):
+    from midicrt.clients.fb.surface import open_fb_mmap
+
+    path = tmp_path / "fresh_fb.bin"
+    assert not path.exists()
+    size = 32
+    f, mm = open_fb_mmap(str(path), size)
+    try:
+        assert len(mm) == size
+        assert path.stat().st_size == size
+    finally:
+        mm.close()
+        f.close()
+
+
+def test_open_fb_mmap_resizes_pre_existing_file(tmp_path):
+    from midicrt.clients.fb.surface import open_fb_mmap
+
+    path = tmp_path / "existing_fb.bin"
+    path.write_bytes(b"\xaa" * 5)  # wrong size, simulating a stale fixture
+    size = 16
+    f, mm = open_fb_mmap(str(path), size)
+    try:
+        assert len(mm) == size
+        assert path.stat().st_size == size
+    finally:
+        mm.close()
+        f.close()

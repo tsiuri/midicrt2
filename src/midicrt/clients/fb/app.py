@@ -36,7 +36,7 @@ from midicrt.clients.base import (
     switch_topic,
     wait_first_snapshot,
 )
-from midicrt.clients.fb.surface import Surface
+from midicrt.clients.fb.surface import Surface, open_fb_mmap
 from midicrt.clients.fb.text import draw_text, load_font
 from midicrt.clients.tui import _tail
 
@@ -201,44 +201,57 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
     """Real-/dev/fb0 render loop. Coded per the task brief's geometry spec
     but NOT exercised by this task's tests -- v1 owns the CRT until Task
     4's supervised smoke window runs this path for real.
+
+    Opens and mmaps the framebuffer device ONCE for the life of this loop
+    (`open_fb_mmap`) and writes each frame into that mapping
+    (`Surface.write_to_mmap`) rather than `write_fb()`'s reopen-the-device-
+    every-frame path -- reopening a character device 30 times a second is
+    needless syscall overhead once the pixel pack itself is fast (see
+    surface.py's module docstring for the to_rgb565 benchmark that made
+    this worth doing).
     """
     width, height, stride = _read_fb_geometry()
     surface = Surface(width, height)
     state = {"page": page, "topic": topic}
     on_event = _make_page_switcher(client, state, fps)
 
-    quit_event = threading.Event()
-    if not no_input:
-        # `on_event` is already constructed above (before this thread
-        # starts): the input thread can fire `page.next` immediately, and
-        # the main thread is about to block in `wait_first_snapshot` below
-        # -- without event-awareness there, that page_changed would be
-        # silently dropped and the client would stay on the stale topic
-        # forever (this was the actual freeze: the input thread calling
-        # client.action() while the main thread's own switch_topic() call
-        # from a later on_event races it over the same connection).
-        threading.Thread(target=_input_loop, args=(client, quit_event), daemon=True).start()
+    fb_file, fb_mm = open_fb_mmap(fb_path, stride * height)
+    try:
+        quit_event = threading.Event()
+        if not no_input:
+            # `on_event` is already constructed above (before this thread
+            # starts): the input thread can fire `page.next` immediately, and
+            # the main thread is about to block in `wait_first_snapshot` below
+            # -- without event-awareness there, that page_changed would be
+            # silently dropped and the client would stay on the stale topic
+            # forever (this was the actual freeze: the input thread calling
+            # client.action() while the main thread's own switch_topic() call
+            # from a later on_event races it over the same connection).
+            threading.Thread(target=_input_loop, args=(client, quit_event), daemon=True).start()
 
-    vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
-    renderer = RENDERERS.get(state["page"], _render_unknown)
-    renderer(vm, surface)
-    surface.write_fb(fb_path, stride=stride)
+        vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
+        renderer = RENDERERS.get(state["page"], _render_unknown)
+        renderer(vm, surface)
+        surface.write_to_mmap(fb_mm, stride=stride)
 
-    period = 1.0 / fps
-    while not quit_event.is_set():
-        if quit_event.wait(period):
-            break
-        # Callable, not a frozen `{state["topic"]}` snapshot: `on_event`
-        # (invoked from inside this very call) can switch `state["topic"]`
-        # mid-drain, and a same-batch snapshot for the NEW topic must
-        # still be recognised, not dropped by a stale membership check.
-        drained = drain_latest(inbox, lambda: {state["topic"]}, on_event=on_event)
-        if state["topic"] in drained:
-            vm = drained[state["topic"]]
-            renderer = RENDERERS.get(state["page"], _render_unknown)
-            renderer(vm, surface)
-            surface.write_fb(fb_path, stride=stride)
-    return 0
+        period = 1.0 / fps
+        while not quit_event.is_set():
+            if quit_event.wait(period):
+                break
+            # Callable, not a frozen `{state["topic"]}` snapshot: `on_event`
+            # (invoked from inside this very call) can switch `state["topic"]`
+            # mid-drain, and a same-batch snapshot for the NEW topic must
+            # still be recognised, not dropped by a stale membership check.
+            drained = drain_latest(inbox, lambda: {state["topic"]}, on_event=on_event)
+            if state["topic"] in drained:
+                vm = drained[state["topic"]]
+                renderer = RENDERERS.get(state["page"], _render_unknown)
+                renderer(vm, surface)
+                surface.write_to_mmap(fb_mm, stride=stride)
+        return 0
+    finally:
+        fb_mm.close()
+        fb_file.close()
 
 
 def run(socket_path: str, fb_path: str, out_path: str | None,

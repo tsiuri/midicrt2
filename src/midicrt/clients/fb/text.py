@@ -28,14 +28,14 @@ from pathlib import Path
 
 from PIL import Image
 
+from midicrt.clients.fb.surface import Color
+
 PSF1_MAGIC = 0x0436
 PSF2_MAGIC = 0x864AB572
 
 # assets/ lives at the repo root, a sibling of src/ (see this file's path:
 # src/midicrt/clients/fb/text.py -> parents[4] is the repo root).
 _DEFAULT_FONT_PATH = Path(__file__).resolve().parents[4] / "assets" / "Lat2-VGA8.psf.gz"
-
-Color = tuple[int, int, int]
 
 
 class Font:
