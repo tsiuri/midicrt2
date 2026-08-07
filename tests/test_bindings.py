@@ -1,0 +1,683 @@
+"""TDD for engine/bindings.py: the MIDI binding dispatcher (Phase 4 Task 2,
+docs/phase4-notes.md). Mirrors test_keymap.py's split -- pure, registry-
+unaware pieces tested here (`BindingDispatcher.handle`, `BindingsFile.load`/
+`save`, `validate_binding`); the registry-aware engine WIRING (zero-client
+firing, `bind.list`/`bind.remove` actions, `config.reload` extension) lives
+in test_engine_core.py, same precedent as test_keymap.py vs
+test_engine_core.py's own keymap section.
+"""
+import logging
+import time
+
+import pytest
+
+from midicrt.engine.bindings import (
+    CONTINUOUS_FILL_TOKEN,
+    Binding,
+    BindingDispatcher,
+    BindingMatch,
+    BindingsFile,
+    validate_binding,
+)
+from midicrt.engine.core import MidiEvent
+
+
+def ev(**kw):
+    base = {"ts": time.time(), "source": "Midi Through:Midi Through Port-0 14:0",
+            "type": "note_on", "channel": 0, "data1": 60, "data2": 100,
+            "summary": "note_on ch1 n60 v100"}
+    base.update(kw)
+    return MidiEvent(**base)
+
+
+def trigger_binding(**kw):
+    match_kw = kw.pop("match", {})
+    match = BindingMatch(type=match_kw.pop("type", "note_on"),
+                         number=match_kw.pop("number", 60), **match_kw)
+    defaults = {"id": "b1", "match": match, "action": "page.next", "args": {}}
+    defaults.update(kw)
+    return Binding(**defaults)
+
+
+# -- match semantics ----------------------------------------------------------
+
+def test_note_on_matches_by_type_and_number():
+    b = trigger_binding(match={"type": "note_on", "number": 60})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(data1=60)) == [("page.next", {})]
+    assert d.handle(ev(data1=61)) == []
+
+
+def test_note_on_does_not_match_control_change_event():
+    b = trigger_binding(match={"type": "note_on", "number": 60})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(type="control_change", data1=60, data2=100)) == []
+
+
+def test_channel_none_matches_any_channel():
+    b = trigger_binding(match={"type": "note_on", "number": 60, "channel": None})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(channel=0)) == [("page.next", {})]
+    assert d.handle(ev(channel=5)) == [("page.next", {})]
+
+
+def test_channel_set_only_matches_that_channel():
+    b = trigger_binding(match={"type": "note_on", "number": 60, "channel": 3})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(channel=3)) == [("page.next", {})]
+    assert d.handle(ev(channel=0)) == []
+
+
+def test_port_pattern_none_matches_any_source():
+    b = trigger_binding(match={"type": "note_on", "number": 60, "port_pattern": None})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(source="anything at all")) == [("page.next", {})]
+
+
+def test_port_pattern_fnmatch_on_source():
+    b = trigger_binding(match={"type": "note_on", "number": 60, "port_pattern": "Midi Through*"})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(source="Midi Through:Midi Through Port-0 14:0")) == [("page.next", {})]
+    assert d.handle(ev(source="USB MIDI Interface 20:0")) == []
+
+
+# -- trigger: note_on (velocity > 0 only) --------------------------------------
+
+def test_trigger_note_on_fires_with_positive_velocity():
+    b = trigger_binding(match={"type": "note_on", "number": 60})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(data1=60, data2=100)) == [("page.next", {})]
+
+
+def test_trigger_note_on_does_not_fire_with_zero_velocity():
+    # A note_on with velocity 0 is a running-status note-off, not a real
+    # trigger -- see module docstring.
+    b = trigger_binding(match={"type": "note_on", "number": 60})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(data1=60, data2=0)) == []
+
+
+def test_trigger_note_on_passes_through_its_static_args():
+    b = trigger_binding(match={"type": "note_on", "number": 60},
+                        action="page.goto", args={"name": "screensaver"})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(data1=60, data2=100)) == [("page.goto", {"name": "screensaver"})]
+
+
+# -- trigger: CC crossing threshold upward only --------------------------------
+
+def test_cc_trigger_fires_on_upward_crossing():
+    b = trigger_binding(match={"type": "control_change", "number": 20}, threshold=64)
+    d = BindingDispatcher([b])
+    cc = lambda v: ev(type="control_change", data1=20, data2=v)
+    assert d.handle(cc(10)) == []    # baseline only -- no edge yet, see module docstring
+    assert d.handle(cc(30)) == []    # still below threshold
+    assert d.handle(cc(70)) == [("page.next", {})]   # crossed upward: fires
+    assert d.handle(cc(90)) == []    # still above -- no re-fire while staying up
+
+
+def test_cc_trigger_resets_below_threshold_and_can_refire():
+    b = trigger_binding(match={"type": "control_change", "number": 20}, threshold=64)
+    d = BindingDispatcher([b])
+    cc = lambda v: ev(type="control_change", data1=20, data2=v)
+    d.handle(cc(70))                          # baseline above threshold -- no edge
+    assert d.handle(cc(90)) == []             # still above, no baseline-below yet
+    assert d.handle(cc(30)) == []             # drops below -- resets
+    assert d.handle(cc(80)) == [("page.next", {})]   # crosses upward again: fires
+
+
+def test_cc_trigger_first_ever_message_never_fires_regardless_of_value():
+    # No prior sample means no "lo" side to have crossed FROM -- an "edge"
+    # is only detectable once a second sample arrives (see module
+    # docstring's "no prior value" note). A knob already sitting high when
+    # the daemon boots must not spuriously fire on its very first message.
+    b = trigger_binding(match={"type": "control_change", "number": 20}, threshold=64)
+    d = BindingDispatcher([b])
+    assert d.handle(ev(type="control_change", data1=20, data2=127)) == []
+
+
+def test_cc_trigger_exact_threshold_value_counts_as_crossed():
+    b = trigger_binding(match={"type": "control_change", "number": 20}, threshold=64)
+    d = BindingDispatcher([b])
+    cc = lambda v: ev(type="control_change", data1=20, data2=v)
+    d.handle(cc(10))
+    assert d.handle(cc(64)) == [("page.next", {})]
+
+
+def test_cc_trigger_tracks_state_independently_per_source_and_channel():
+    b = trigger_binding(match={"type": "control_change", "number": 20, "channel": None},
+                        threshold=64)
+    d = BindingDispatcher([b])
+    d.handle(ev(type="control_change", data1=20, data2=10, channel=0, source="A"))
+    d.handle(ev(type="control_change", data1=20, data2=10, channel=1, source="A"))
+    # Channel 0 crosses; channel 1's independent baseline is untouched.
+    assert d.handle(ev(type="control_change", data1=20, data2=70, channel=0, source="A")) == \
+        [("page.next", {})]
+    assert d.handle(ev(type="control_change", data1=20, data2=70, channel=1, source="B")) == []
+
+
+def test_cc_trigger_state_is_independent_per_binding():
+    # Two different bindings both watching the same physical CC/channel with
+    # different thresholds must not share an edge-detection baseline.
+    lo = trigger_binding(id="lo", match={"type": "control_change", "number": 20},
+                         threshold=32, action="page.next")
+    hi = trigger_binding(id="hi", match={"type": "control_change", "number": 20},
+                         threshold=100, action="page.prev")
+    d = BindingDispatcher([lo, hi])
+    cc = lambda v: ev(type="control_change", data1=20, data2=v)
+    d.handle(cc(0))                                    # baseline for both
+    assert d.handle(cc(50)) == [("page.next", {})]     # crosses "lo" only
+    assert d.handle(cc(110)) == [("page.prev", {})]    # crosses "hi" only (lo stays above)
+
+
+def test_set_bindings_clears_edge_state():
+    b = trigger_binding(match={"type": "control_change", "number": 20}, threshold=64)
+    d = BindingDispatcher([b])
+    d.handle(ev(type="control_change", data1=20, data2=70))   # establishes a baseline above
+    d.set_bindings([b])
+    # After set_bindings, the baseline is gone -- next message is a fresh
+    # "first ever", never fires regardless of value (see module docstring:
+    # a reload's edge state is deliberately reset, not migrated).
+    assert d.handle(ev(type="control_change", data1=20, data2=90)) == []
+
+
+# -- continuous: CC value lerped into [lo, hi], filling the args template -----
+
+def continuous_binding(**kw):
+    match_kw = kw.pop("match", {})
+    match = BindingMatch(type=match_kw.pop("type", "control_change"),
+                         number=match_kw.pop("number", 21), **match_kw)
+    defaults = {"id": "c1", "match": match, "action": "chrome.brightness",
+                "args": {"level": None}, "mode": "continuous", "range": (0.0, 1.0)}
+    defaults.update(kw)
+    return Binding(**defaults)
+
+
+def test_continuous_lerps_full_range():
+    b = continuous_binding(range=(0.0, 1.0))
+    d = BindingDispatcher([b])
+    name, args = d.handle(ev(type="control_change", data1=21, data2=0))[0]
+    assert name == "chrome.brightness" and args["level"] == pytest.approx(0.0)
+    name, args = d.handle(ev(type="control_change", data1=21, data2=127))[0]
+    assert args["level"] == pytest.approx(1.0)
+    name, args = d.handle(ev(type="control_change", data1=21, data2=64))[0]
+    assert args["level"] == pytest.approx(64 / 127)
+
+
+def test_continuous_lerps_an_arbitrary_range():
+    b = continuous_binding(range=(-40.0, 20.0))
+    d = BindingDispatcher([b])
+    _, args = d.handle(ev(type="control_change", data1=21, data2=0))[0]
+    assert args["level"] == pytest.approx(-40.0)
+    _, args = d.handle(ev(type="control_change", data1=21, data2=127))[0]
+    assert args["level"] == pytest.approx(20.0)
+
+
+def test_continuous_lerps_an_inverted_range():
+    # range=[hi, lo] -- CC=0 maps to the FIRST endpoint regardless of which
+    # is numerically larger; the lerp formula needs no special-casing for
+    # this (see module docstring).
+    b = continuous_binding(range=(1.0, 0.0))
+    d = BindingDispatcher([b])
+    _, args = d.handle(ev(type="control_change", data1=21, data2=0))[0]
+    assert args["level"] == pytest.approx(1.0)
+    _, args = d.handle(ev(type="control_change", data1=21, data2=127))[0]
+    assert args["level"] == pytest.approx(0.0)
+
+
+def test_continuous_fills_the_named_template_arg_and_keeps_other_static_args():
+    b = continuous_binding(action="chrome.tint", args={"channel": "warm", "level": None},
+                           range=(0.0, 1.0))
+    d = BindingDispatcher([b])
+    name, args = d.handle(ev(type="control_change", data1=21, data2=127))[0]
+    assert name == "chrome.tint"
+    assert args["channel"] == "warm"
+    assert args["level"] == pytest.approx(1.0)
+
+
+def test_continuous_every_call_produces_an_intent_no_edge_detection():
+    # Unlike trigger-mode CC, continuous mode has no threshold/edge concept
+    # -- every matching event produces an intent, including the very first.
+    b = continuous_binding()
+    d = BindingDispatcher([b])
+    assert len(d.handle(ev(type="control_change", data1=21, data2=10))) == 1
+    assert len(d.handle(ev(type="control_change", data1=21, data2=11))) == 1
+
+
+# -- BindingMatch / Binding defaults -------------------------------------------
+
+def test_binding_match_defaults_channel_and_port_pattern_to_none():
+    m = BindingMatch(type="note_on", number=60)
+    assert m.channel is None
+    assert m.port_pattern is None
+
+
+def test_binding_defaults_mode_trigger_threshold_64():
+    b = Binding(id="x", match=BindingMatch(type="note_on", number=60), action="page.next")
+    assert b.mode == "trigger"
+    assert b.threshold == 64
+    assert b.args == {}
+
+
+# -- BindingsFile: load ---------------------------------------------------------
+
+def test_bindingsfile_load_missing_file_returns_empty():
+    bf = BindingsFile.load("/nonexistent/path/bindings.toml")
+    assert bf.bindings == []
+
+
+def test_bindingsfile_load_a_trigger_note_binding(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.b1]\n'
+        'action = "page.next"\n'
+        'mode = "trigger"\n'
+        '\n'
+        '[bindings.b1.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+        'channel = 2\n'
+        'port_pattern = "Midi Through*"\n'
+    )
+    bf = BindingsFile.load(str(p))
+    assert len(bf.bindings) == 1
+    b = bf.bindings[0]
+    assert b.id == "b1"
+    assert b.action == "page.next"
+    assert b.mode == "trigger"
+    assert b.match == BindingMatch(type="note_on", number=60, channel=2,
+                                   port_pattern="Midi Through*")
+
+
+def test_bindingsfile_load_omits_optional_match_fields_as_none(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.b1]\n'
+        'action = "page.next"\n'
+        '\n'
+        '[bindings.b1.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+    )
+    bf = BindingsFile.load(str(p))
+    b = bf.bindings[0]
+    assert b.match.channel is None
+    assert b.match.port_pattern is None
+
+
+def test_bindingsfile_load_a_continuous_binding_with_fill_token(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.c1]\n'
+        'action = "chrome.brightness"\n'
+        'mode = "continuous"\n'
+        'range = [0.0, 1.0]\n'
+        '\n'
+        '[bindings.c1.args]\n'
+        f'level = "{CONTINUOUS_FILL_TOKEN}"\n'
+        '\n'
+        '[bindings.c1.match]\n'
+        'type = "control_change"\n'
+        'number = 21\n'
+    )
+    bf = BindingsFile.load(str(p))
+    b = bf.bindings[0]
+    assert b.mode == "continuous"
+    assert b.range == (0.0, 1.0)
+    assert b.args == {"level": None}   # sentinel translated to real None in memory
+
+
+def test_bindingsfile_load_tolerates_unknown_keys(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.b1]\n'
+        'action = "page.next"\n'
+        'some_future_field = "whatever"\n'
+        '\n'
+        '[bindings.b1.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+        'also_unknown = 5\n'
+    )
+    bf = BindingsFile.load(str(p))
+    assert len(bf.bindings) == 1
+    assert bf.bindings[0].action == "page.next"
+
+
+def test_bindingsfile_load_raises_valueerror_when_bindings_is_not_a_table(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text('bindings = "oops"\n')
+    with pytest.raises(ValueError, match="bindings"):
+        BindingsFile.load(str(p))
+
+
+def test_bindingsfile_load_no_bindings_table_at_all_is_empty(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text('# nothing here\n')
+    bf = BindingsFile.load(str(p))
+    assert bf.bindings == []
+
+
+def test_bindingsfile_load_skips_entry_missing_action_and_keeps_the_rest(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.bad]\n'
+        '[bindings.bad.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+        '\n'
+        '[bindings.good]\n'
+        'action = "page.next"\n'
+        '[bindings.good.match]\n'
+        'type = "note_on"\n'
+        'number = 61\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        bf = BindingsFile.load(str(p))
+    assert [b.id for b in bf.bindings] == ["good"]
+    assert "bad" in caplog.text
+
+
+def test_bindingsfile_load_skips_entry_with_bad_match_shape(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.bad]\n'
+        'action = "page.next"\n'
+        'match = "oops"\n'
+        '\n'
+        '[bindings.good]\n'
+        'action = "page.next"\n'
+        '[bindings.good.match]\n'
+        'type = "note_on"\n'
+        'number = 61\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        bf = BindingsFile.load(str(p))
+    assert [b.id for b in bf.bindings] == ["good"]
+    assert "bad" in caplog.text
+
+
+def test_bindingsfile_load_skips_entry_with_unknown_match_type(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.bad]\n'
+        'action = "page.next"\n'
+        '[bindings.bad.match]\n'
+        'type = "sysex"\n'
+        'number = 1\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        bf = BindingsFile.load(str(p))
+    assert bf.bindings == []
+    assert "sysex" in caplog.text
+
+
+def test_bindingsfile_load_skips_continuous_entry_missing_range(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.bad]\n'
+        'action = "chrome.brightness"\n'
+        'mode = "continuous"\n'
+        '\n'
+        '[bindings.bad.args]\n'
+        f'level = "{CONTINUOUS_FILL_TOKEN}"\n'
+        '\n'
+        '[bindings.bad.match]\n'
+        'type = "control_change"\n'
+        'number = 21\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        bf = BindingsFile.load(str(p))
+    assert bf.bindings == []
+    assert "range" in caplog.text.lower()
+
+
+def test_bindingsfile_load_skips_continuous_entry_with_no_fill_marker(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.bad]\n'
+        'action = "chrome.brightness"\n'
+        'mode = "continuous"\n'
+        'range = [0.0, 1.0]\n'
+        '\n'
+        '[bindings.bad.args]\n'
+        'level = "0.5"\n'
+        '\n'
+        '[bindings.bad.match]\n'
+        'type = "control_change"\n'
+        'number = 21\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        bf = BindingsFile.load(str(p))
+    assert bf.bindings == []
+    assert "fill" in caplog.text.lower()
+
+
+# -- wrong-SHAPED (but syntactically valid) values never crash the loader ----
+# (self-review, before this bug got live-reproduced the way keymap.py's own
+# re-review round found the analogous `keys = "oops"` class: an unhashable
+# raw TOML value -- e.g. a list -- in a set-membership check raises an
+# uncaught TypeError instead of a clean validation failure. Guarded in
+# `_parse_binding_entry`/`_parse_match` with an isinstance check BEFORE the
+# `in` test, not by widening a catch tuple.)
+
+def test_bindingsfile_load_skips_entry_with_a_list_valued_mode(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.bad]\n'
+        'action = "page.next"\n'
+        'mode = ["oops"]\n'
+        '[bindings.bad.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        bf = BindingsFile.load(str(p))   # must not raise
+    assert bf.bindings == []
+    assert "mode" in caplog.text.lower()
+
+
+def test_bindingsfile_load_skips_entry_with_a_list_valued_match_type(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.bad]\n'
+        'action = "page.next"\n'
+        '[bindings.bad.match]\n'
+        'type = ["oops"]\n'
+        'number = 60\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        bf = BindingsFile.load(str(p))   # must not raise
+    assert bf.bindings == []
+    assert "type" in caplog.text.lower()
+
+
+def test_bindingsfile_load_or_warn_never_raises_on_list_valued_mode(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.bad]\n'
+        'action = "page.next"\n'
+        'mode = ["oops"]\n'
+        '[bindings.bad.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+    )
+    bf, warning = BindingsFile.load_or_warn(str(p))   # must not raise
+    assert warning is None   # a per-entry skip, not a file-level failure
+    assert bf.bindings == []
+
+
+def test_bindingsfile_load_or_warn_success(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text('[bindings.b1]\naction = "page.next"\n[bindings.b1.match]\n'
+                 'type = "note_on"\nnumber = 60\n')
+    bf, warning = BindingsFile.load_or_warn(str(p))
+    assert warning is None
+    assert bf.bindings[0].id == "b1"
+
+
+def test_bindingsfile_load_or_warn_malformed_toml_returns_none_and_warning(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text("this is not valid toml {{{ [[[ ===\n")
+    bf, warning = BindingsFile.load_or_warn(str(p))
+    assert bf is None
+    assert warning is not None
+    assert "bindings.toml" in warning.lower()
+
+
+def test_bindingsfile_load_or_warn_never_raises_when_bindings_is_wrong_shaped(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text('bindings = 5\n')
+    bf, warning = BindingsFile.load_or_warn(str(p))   # must not raise
+    assert bf is None
+    assert warning is not None
+
+
+# -- BindingsFile: atomic save + roundtrip -------------------------------------
+
+def test_bindingsfile_save_writes_a_machine_managed_header(tmp_path):
+    p = tmp_path / "bindings.toml"
+    bf = BindingsFile([], path=str(p))
+    bf.save()
+    text = p.read_text()
+    assert text.startswith("#")
+    assert "machine-managed" in text.lower()
+
+
+def test_bindingsfile_save_is_atomic_no_leftover_tmp_file(tmp_path):
+    p = tmp_path / "bindings.toml"
+    bf = BindingsFile([trigger_binding()], path=str(p))
+    bf.save()
+    leftovers = [f for f in tmp_path.iterdir() if f.name != "bindings.toml"]
+    assert leftovers == []
+
+
+def test_bindingsfile_save_creates_parent_directory(tmp_path):
+    p = tmp_path / "nested" / "dir" / "bindings.toml"
+    bf = BindingsFile([trigger_binding()], path=str(p))
+    bf.save()
+    assert p.exists()
+
+
+def test_bindingsfile_roundtrip_trigger_binding(tmp_path):
+    p = tmp_path / "bindings.toml"
+    original = trigger_binding(match={"type": "note_on", "number": 60, "channel": 2,
+                                      "port_pattern": "Midi Through*"},
+                               action="page.goto", args={"name": "harmony"}, threshold=99)
+    bf = BindingsFile([original], path=str(p))
+    bf.save()
+    reloaded = BindingsFile.load(str(p))
+    assert reloaded.bindings == [original]
+
+
+def test_bindingsfile_roundtrip_continuous_binding_with_fill_marker(tmp_path):
+    p = tmp_path / "bindings.toml"
+    original = continuous_binding(args={"level": None}, range=(-1.0, 1.0))
+    bf = BindingsFile([original], path=str(p))
+    bf.save()
+    reloaded = BindingsFile.load(str(p))
+    assert reloaded.bindings == [original]
+
+
+def test_bindingsfile_roundtrip_multiple_bindings_preserves_all(tmp_path):
+    p = tmp_path / "bindings.toml"
+    b1 = trigger_binding(id="b1")
+    b2 = continuous_binding(id="c1")
+    bf = BindingsFile([b1, b2], path=str(p))
+    bf.save()
+    reloaded = BindingsFile.load(str(p))
+    assert {b.id for b in reloaded.bindings} == {"b1", "c1"}
+
+
+# -- BindingsFile: add/get/remove -----------------------------------------------
+
+def test_bindingsfile_get_by_id():
+    b = trigger_binding(id="b1")
+    bf = BindingsFile([b])
+    assert bf.get("b1") is b
+    assert bf.get("nope") is None
+
+
+def test_bindingsfile_remove_returns_true_and_drops_it():
+    b = trigger_binding(id="b1")
+    bf = BindingsFile([b])
+    assert bf.remove("b1") is True
+    assert bf.bindings == []
+
+
+def test_bindingsfile_remove_unknown_id_returns_false_and_is_a_noop():
+    b = trigger_binding(id="b1")
+    bf = BindingsFile([b])
+    assert bf.remove("nope") is False
+    assert bf.bindings == [b]
+
+
+def test_bindingsfile_add_appends():
+    bf = BindingsFile([])
+    b = trigger_binding(id="b1")
+    bf.add(b)
+    assert bf.bindings == [b]
+
+
+# -- validate_binding -----------------------------------------------------------
+
+def test_validate_binding_unknown_action():
+    b = trigger_binding(action="bogus.action")
+    err = validate_binding(b, {"page.next": {"description": "", "args": {}}})
+    assert err is not None
+    assert "bogus.action" in err
+
+
+def test_validate_binding_trigger_action_with_no_args_is_valid():
+    b = trigger_binding(action="page.next", args={})
+    err = validate_binding(b, {"page.next": {"description": "", "args": {}}})
+    assert err is None
+
+
+def test_validate_binding_trigger_missing_required_arg():
+    b = trigger_binding(action="page.goto", args={})
+    actions = {"page.goto": {"description": "", "args": {"name": "str"}}}
+    err = validate_binding(b, actions)
+    assert err is not None
+    assert "name" in err
+
+
+def test_validate_binding_trigger_with_satisfied_args_is_valid():
+    b = trigger_binding(action="page.goto", args={"name": "screensaver"})
+    actions = {"page.goto": {"description": "", "args": {"name": "str"}}}
+    assert validate_binding(b, actions) is None
+
+
+def test_validate_binding_trigger_unknown_extra_arg():
+    b = trigger_binding(action="page.next", args={"bogus": "x"})
+    actions = {"page.next": {"description": "", "args": {}}}
+    err = validate_binding(b, actions)
+    assert err is not None
+    assert "bogus" in err
+
+
+def test_validate_binding_continuous_valid_fill_arg():
+    b = continuous_binding(action="chrome.brightness", args={"level": None})
+    actions = {"chrome.brightness": {"description": "", "args": {"level": "float"}}}
+    assert validate_binding(b, actions) is None
+
+
+def test_validate_binding_continuous_fill_arg_not_declared_float():
+    b = continuous_binding(action="page.goto", args={"name": None})
+    actions = {"page.goto": {"description": "", "args": {"name": "str"}}}
+    err = validate_binding(b, actions)
+    assert err is not None
+    assert "float" in err.lower()
+
+
+def test_validate_binding_continuous_no_fill_marker_is_invalid():
+    b = continuous_binding(action="chrome.brightness", args={"level": 0.5})
+    actions = {"chrome.brightness": {"description": "", "args": {"level": "float"}}}
+    err = validate_binding(b, actions)
+    assert err is not None
+
+
+def test_validate_binding_continuous_with_extra_static_arg_satisfied():
+    b = continuous_binding(action="chrome.tint", args={"channel": "warm", "level": None})
+    actions = {"chrome.tint": {"description": "", "args": {"channel": "str", "level": "float"}}}
+    assert validate_binding(b, actions) is None

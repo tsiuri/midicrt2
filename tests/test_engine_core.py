@@ -1586,3 +1586,273 @@ async def test_config_reload_is_a_noop_convenience_when_no_config_toml_exists(tm
     eng = Engine(Config(), config_path=str(tmp_path / "nope.toml"))
     result = await eng.actions.dispatch("config.reload", {})
     assert result["warnings"] == []
+
+
+# -- MIDI bindings (Phase 4 Task 2, docs/phase4-notes.md) --------------------
+#
+# Pure BindingDispatcher/BindingsFile/validate_binding logic is tested in
+# test_bindings.py (same split as test_keymap.py vs this file's own keymap
+# section above) -- everything below is registry-aware ENGINE wiring: the
+# dispatch-context split (`_handle` collects, `_dispatch_bindings` -- called
+# from `run()` -- actually dispatches), `bind.list`/`bind.remove`,
+# `config.reload`'s bindings.toml half, and the headline zero-client-firing
+# proof (docs/phase4-notes.md's whole reason this task exists).
+
+def _write_trigger_binding(path, binding_id="b1", action="page.next", args_toml="", **match):
+    match.setdefault("type", "note_on")
+    match.setdefault("number", 60)
+    match_lines = "\n".join(f"{k} = {v!r}" if not isinstance(v, str) else f'{k} = "{v}"'
+                            for k, v in match.items() if v is not None)
+    args_section = f"\n[bindings.{binding_id}.args]\n{args_toml}\n" if args_toml else ""
+    path.write_text(
+        f'[bindings.{binding_id}]\n'
+        f'action = "{action}"\n'
+        f'{args_section}'
+        f'\n[bindings.{binding_id}.match]\n'
+        f'{match_lines}\n'
+    )
+
+
+def test_engine_bindings_path_default_is_the_real_config_dir_path():
+    from midicrt.engine import bindings as bindings_mod
+
+    eng = Engine(Config())
+    assert eng._bindings_path == bindings_mod.DEFAULT_PATH
+
+
+def test_engine_starts_with_no_bindings_file_present(tmp_path):
+    eng = Engine(Config(), bindings_path=str(tmp_path / "nope.toml"))
+    assert eng._bindings_file.bindings == []
+
+
+def test_engine_loads_a_real_bindings_file(tmp_path):
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p)
+    eng = Engine(Config(), bindings_path=str(p))
+    assert [b.id for b in eng._bindings_file.bindings] == ["b1"]
+
+
+def test_engine_bindings_falls_back_to_empty_when_file_is_malformed_at_startup(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text("this is not valid toml {{{ [[[ ===\n")
+    with caplog.at_level("WARNING"):
+        eng = Engine(Config(), bindings_path=str(p))   # must not raise
+    assert eng._bindings_file.bindings == []
+    assert "bindings.toml" in caplog.text.lower()
+
+
+def test_engine_startup_keeps_a_roster_absent_binding_but_logs_a_warning(tmp_path, caplog):
+    # "kept-but-inert" (bind.list's own docstring, engine/bindings.py's
+    # validate_binding docstring): a binding referencing an action absent
+    # from THIS build's roster is NOT dropped at load, unlike a keymap
+    # entry -- it stays visible (e.g. to `bind.list`) so a user can
+    # diagnose it, and simply never fires (see the dispatch-time test
+    # below).
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="sendnotes.key", args_toml='key = "z"')
+    with caplog.at_level("WARNING"):
+        eng = Engine(Config(pages=["eventlog"]), bindings_path=str(p))
+    assert [b.id for b in eng._bindings_file.bindings] == ["b1"]   # kept
+    assert "sendnotes.key" in caplog.text
+
+
+def test_describe_style_action_registry_contains_bind_list_and_remove():
+    eng = Engine(Config())
+    actions = eng.actions.describe()
+    assert "bind.list" in actions
+    assert "bind.remove" in actions
+    assert actions["bind.remove"]["args"] == {"id": "str"}
+
+
+# -- zero-client firing: the headline proof --------------------------------
+
+async def test_binding_fires_action_and_changes_engine_state_with_zero_clients(tmp_path):
+    # THE proof this whole task exists for: a real Engine, a real run()
+    # loop, a real queued MidiEvent -- and NO `add_listener()` call at all
+    # (unlike test_engine_publishes_dirty_snapshots above, which always
+    # attaches one). A sequencer/controller can drive page navigation with
+    # nobody watching a fb/tui client.
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="page.next")
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    assert eng.current_page == "eventlog"
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+    assert eng.current_page == "voices"   # page.next advanced -- zero clients ever attached
+
+
+async def test_binding_cc_trigger_fires_with_zero_clients(tmp_path):
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="page.next", type="control_change", number=20)
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="control_change", data1=20, data2=10))   # baseline only
+    await asyncio.sleep(0.05)
+    assert eng.current_page == "eventlog"
+    await eng.queue.put(ev(type="control_change", data1=20, data2=90))   # crosses threshold 64
+    await asyncio.sleep(0.05)
+    eng.stop()
+    await task
+    assert eng.current_page == "voices"
+
+
+async def test_binding_continuous_fills_a_real_float_arg_with_zero_clients(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.c1]\n'
+        'action = "pianoroll.zoom"\n'
+        'mode = "continuous"\n'
+        'range = [-0.5, 0.5]\n'
+        '\n'
+        '[bindings.c1.args]\n'
+        'delta = "$midicrt_fill_from_cc$"\n'
+        '\n'
+        '[bindings.c1.match]\n'
+        'type = "control_change"\n'
+        'number = 22\n'
+    )
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    assert eng.pages["pianoroll"].view_model()["window"]["zoom"] == 1.0
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="control_change", data1=22, data2=127))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+    assert eng.pages["pianoroll"].view_model()["window"]["zoom"] == pytest.approx(1.5)
+
+
+# -- dispatch-time graceful skip (never crash the loop, no alert storm) -----
+
+async def test_dispatch_bindings_skips_roster_absent_action_and_logs_without_crashing(
+        tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="sendnotes.key", args_toml='key = "z"')
+    eng = Engine(Config(pages=["eventlog"]), bindings_path=str(p))
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    with caplog.at_level("WARNING"):
+        await eng._dispatch_bindings()   # must not raise
+    assert "sendnotes.key" in caplog.text
+    assert eng.current_page == "eventlog"
+
+
+async def test_dispatch_bindings_never_emits_an_alert_event_for_a_skipped_action(tmp_path):
+    # Task-2 brief: "log + skip, NOT an alert storm" -- a stale binding
+    # firing repeatedly must never spam the alert channel every time it's
+    # (harmlessly) triggered.
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="sendnotes.key", args_toml='key = "z"')
+    eng = Engine(Config(pages=["eventlog"]), bindings_path=str(p))
+    got = []
+    eng.add_listener(got.append)
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    await eng._dispatch_bindings()
+    alerts = [m for m in got if m.get("kind") == "event" and m.get("name") == "alert"]
+    assert alerts == []
+
+
+async def test_dispatch_bindings_is_a_noop_when_nothing_pending():
+    eng = Engine(Config())
+    await eng._dispatch_bindings()   # must not raise with nothing queued
+
+
+# -- bind.list / bind.remove actions -----------------------------------------
+
+async def test_bind_list_reports_a_valid_binding():
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(type="note_on", number=60),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert len(result["bindings"]) == 1
+    entry = result["bindings"][0]
+    assert entry["id"] == "b1"
+    assert entry["action"] == "page.next"
+    assert entry["valid"] is True
+    assert entry["error"] is None
+
+
+async def test_bind_list_reports_an_invalid_roster_absent_binding(tmp_path):
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="sendnotes.key", args_toml='key = "z"')
+    eng = Engine(Config(pages=["eventlog"]), bindings_path=str(p))
+    result = await eng.actions.dispatch("bind.list", {})
+    entry = result["bindings"][0]
+    assert entry["valid"] is False
+    assert "sendnotes.key" in entry["error"]
+
+
+async def test_bind_remove_drops_the_binding_and_persists_atomically(tmp_path):
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="page.next")
+    eng = Engine(Config(), bindings_path=str(p))
+    result = await eng.actions.dispatch("bind.remove", {"id": "b1"})
+    assert result["removed"] is True
+    assert eng._bindings_file.bindings == []
+    # Persisted -- reloading the file from disk shows it gone too.
+    from midicrt.engine.bindings import BindingsFile
+    assert BindingsFile.load(str(p)).bindings == []
+
+
+async def test_bind_remove_disarms_the_dispatcher_immediately():
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(type="note_on", number=60),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    await eng.actions.dispatch("bind.remove", {"id": "b1"})
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    await eng._dispatch_bindings()
+    assert eng.current_page == "eventlog"   # the removed binding no longer fires
+
+
+async def test_bind_remove_unknown_id_raises_action_error():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="b1"):
+        await eng.actions.dispatch("bind.remove", {"id": "b1"})
+
+
+def _binding_module():
+    from midicrt.engine import bindings
+    return bindings
+
+
+# -- config.reload also reloads bindings.toml --------------------------------
+
+async def test_config_reload_picks_up_a_newly_added_binding(tmp_path):
+    p = tmp_path / "bindings.toml"
+    p.write_text("# empty -- no bindings yet\n")
+    eng = Engine(Config(), bindings_path=str(p))
+    assert eng._bindings_file.bindings == []
+
+    _write_trigger_binding(p, action="page.next")
+    await eng.actions.dispatch("config.reload", {})
+
+    assert [b.id for b in eng._bindings_file.bindings] == ["b1"]
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    await eng._dispatch_bindings()
+    assert eng.current_page == "voices"
+
+
+async def test_config_reload_malformed_bindings_toml_keeps_last_good_and_warns(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="page.next")
+    eng = Engine(Config(), bindings_path=str(p))
+    good = list(eng._bindings_file.bindings)
+
+    p.write_text("this is not valid toml {{{ [[[ ===\n")
+    with caplog.at_level("WARNING"):
+        result = await eng.actions.dispatch("config.reload", {})   # must not raise
+
+    assert eng._bindings_file.bindings == good
+    assert any("bindings.toml" in w.lower() for w in result["warnings"])
+
+
+async def test_config_reload_with_no_bindings_file_is_a_noop_convenience(tmp_path):
+    eng = Engine(Config(), bindings_path=str(tmp_path / "nope.toml"))
+    result = await eng.actions.dispatch("config.reload", {})
+    assert eng._bindings_file.bindings == []
+    assert result["warnings"] == []

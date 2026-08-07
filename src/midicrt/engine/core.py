@@ -136,6 +136,7 @@ from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config, ConfigError
+from midicrt.engine import bindings as bindings_mod
 from midicrt.engine import keymap as keymap_mod
 from midicrt.engine import sysex as sysex_mod
 from midicrt.engine.actions import ActionError, ActionRegistry
@@ -397,7 +398,7 @@ _SYSEX_PAGE_ID_MAP: dict[int, str] = {
 
 class Engine:
     def __init__(self, config: Config, *, keymap_path: str | None = None,
-                 config_path: str | None = None):
+                 config_path: str | None = None, bindings_path: str | None = None):
         self.config = config
         # Phase 4 Task 1 (config-served keymap, docs/phase4-notes.md):
         # `self._keymap_path` is eagerly resolved to a concrete path (never
@@ -417,6 +418,12 @@ class Engine:
         # actually started with, not always the hardcoded default path.
         self._keymap_path = keymap_path or keymap_mod.DEFAULT_PATH
         self._config_path = config_path
+        # Phase 4 Task 2 (MIDI bindings, docs/phase4-notes.md): eagerly
+        # resolved to a concrete path, same reasoning as `self._keymap_path`
+        # right above -- `_config_reload` and `bind.list`/`bind.remove`'s
+        # own `self._bindings_file.save()` calls both need "what file does
+        # THIS engine actually read/write" to be unambiguous.
+        self._bindings_path = bindings_path or bindings_mod.DEFAULT_PATH
         self.queue: asyncio.Queue = asyncio.Queue()
         self.actions = ActionRegistry()
         self.analyzers: dict[str, Analyzer] = {
@@ -504,6 +511,13 @@ class Engine:
         self._listeners: list[Callable[[dict], None]] = []
         self._seq: dict[str, int] = {}
         self._dirty: set[str] = set()
+        # Phase 4 Task 2 (MIDI bindings): every `(action_name, args)` intent
+        # `_handle` collects from `self._binding_dispatcher.handle(ev)`,
+        # awaiting dispatch by `_dispatch_bindings` (called from `run()`
+        # right after `_handle` returns -- see the module docstring's
+        # "dispatch context decision" and `_dispatch_bindings`'s own
+        # docstring for why `_handle` itself can never dispatch directly).
+        self._pending_binding_dispatches: list[tuple[str, dict]] = []
         self._running = False
         # Important perf fix (2026-08-07 fix wave, finding 1): see
         # set_topic_refcount_provider's own docstring and _flush_dirty's.
@@ -617,6 +631,29 @@ class Engine:
                 self.actions.register(
                     action_name, self._wrap_page_action(page_name, handler),
                     description=description, args=args_schema)
+        # Phase 4 Task 2 (MIDI bindings, docs/phase4-notes.md): `bind.list`/
+        # `bind.remove` are registered BEFORE the keymap-filtering block
+        # below for the exact same reason `config.reload` already is (its
+        # own comment right below) -- `self.keymap`'s construction needs
+        # `self.actions.describe()` to already include every action this
+        # build will ever have, and a user COULD (if oddly) bind a key to
+        # `bind.list`. `bindings_mod.load_or_warn` never raises (mirrors
+        # `keymap_mod.load_keymap_or_warn` exactly, same live-reproduced-
+        # incident rationale: a malformed OPTIONAL file must never prevent
+        # boot) -- an empty `BindingsFile` is the natural "last-good" at
+        # construction time, since there is no earlier value to fall back
+        # to (mirrors the keymap block's own `DEFAULT_KEYMAP` fallback).
+        bindings_file, bindings_warning = bindings_mod.BindingsFile.load_or_warn(
+            self._bindings_path)
+        if bindings_warning:
+            _LOG.warning("startup: %s; starting with no bindings", bindings_warning)
+            bindings_file = bindings_mod.BindingsFile(path=self._bindings_path)
+        self._bindings_file = bindings_file
+        self._binding_dispatcher = bindings_mod.BindingDispatcher(self._bindings_file.bindings)
+        self.actions.register("bind.list", self._bind_list,
+                              description="List MIDI bindings and their validity")
+        self.actions.register("bind.remove", self._bind_remove,
+                              description="Remove a MIDI binding by id", args={"id": "str"})
         # Phase 4 Task 1 (config-served keymap, docs/phase4-notes.md):
         # registered LAST, after every other action above (engine-owned
         # AND page-declared) -- both because `config.reload` itself is a
@@ -643,6 +680,28 @@ class Engine:
             initial_keymap = dict(keymap_mod.DEFAULT_KEYMAP)
         self.keymap: dict[str, str] = keymap_mod.filter_known_actions(
             initial_keymap, self.actions.describe())
+        # Phase 4 Task 2 (MIDI bindings): log-only, "kept-but-inert" pass
+        # (see `validate_binding`'s own docstring for why this is NOT a
+        # filter -- unlike `keymap_mod.filter_known_actions` right above,
+        # nothing is ever dropped from `self._bindings_file.bindings` here).
+        # Placed at the very END of `__init__`, after every action
+        # (including `config.reload` right above) is registered, so this
+        # check runs against THIS build's truly complete action registry.
+        self._log_invalid_bindings()
+
+    def _log_invalid_bindings(self) -> None:
+        """Warn (never drop -- see `validate_binding`'s own docstring for
+        the "kept-but-inert" disposition) about any binding whose action is
+        absent from this build's roster or whose `args` template doesn't
+        satisfy that action's schema. Called at construction and again
+        after every successful `config.reload` bindings.toml re-read (see
+        `_config_reload`) so a newly-introduced problem is always logged
+        loudly, not just at boot."""
+        for binding in self._bindings_file.bindings:
+            error = bindings_mod.validate_binding(binding, self.actions.describe())
+            if error:
+                _LOG.warning("bindings: binding %r may not fire correctly: %s",
+                             binding.id, error)
 
     def _config_reload(self) -> dict:
         """`config.reload` action handler (Phase 4 Task 1, docs/phase4-
@@ -686,6 +745,19 @@ class Engine:
         a parse failure here keeps `self.keymap` exactly as it was BEFORE
         this call (the real "last-good" value, unlike startup) and adds a
         `warnings` entry instead.
+
+        Phase 4 Task 2 (MIDI bindings): also unconditionally re-reads
+        `bindings.toml` (`self._bindings_path`), same "last-good on failure,
+        never raise" discipline as the keymap half right above -- a
+        malformed `bindings.toml` at reload time appends a `warnings` entry
+        and leaves `self._bindings_file`/`self._binding_dispatcher`
+        untouched rather than tearing down the connection. Unlike the
+        keymap half, there is no `bindings_changed` event (docs/phase4-
+        notes.md's own task-2 scope: "no new events this task" -- learn,
+        Task 3, is what actually needs clients to react live to a bindings
+        change; nothing consumes one yet). A successful reload re-runs
+        `_log_invalid_bindings` so a newly-stale binding is logged again,
+        matching construction time's own behavior.
         """
         warnings: list[str] = []
         new_keymap, keymap_warning = keymap_mod.load_keymap_or_warn(self._keymap_path)
@@ -694,6 +766,15 @@ class Engine:
             _LOG.warning("config.reload: %s; keeping last-good keymap", keymap_warning)
         else:
             self.keymap = keymap_mod.filter_known_actions(new_keymap, self.actions.describe())
+        new_bindings_file, bindings_warning = bindings_mod.BindingsFile.load_or_warn(
+            self._bindings_path)
+        if bindings_warning:
+            warnings.append(f"{bindings_warning}; keeping last-good bindings")
+            _LOG.warning("config.reload: %s; keeping last-good bindings", bindings_warning)
+        else:
+            self._bindings_file = new_bindings_file
+            self._binding_dispatcher.set_bindings(self._bindings_file.bindings)
+            self._log_invalid_bindings()
         try:
             new_config = config_mod.load(self._config_path)
         except (OSError, ValueError) as exc:
@@ -716,6 +797,97 @@ class Engine:
             self._dirty.add("page.config")   # cheap; the viewer's own facts may have shifted
         self.emit_event("keymap_changed", {"keymap": self.keymap, "warnings": warnings})
         return {"keymap": self.keymap, "warnings": warnings}
+
+    def _bind_list(self) -> dict:
+        """`bind.list` action handler (Phase 4 Task 2): every persisted
+        binding, serialized, each carrying a live `valid`/`error` pair
+        computed FRESH against THIS call's `self.actions.describe()` --
+        never cached, so a binding that was valid at load time but went
+        stale after this (there is no live roster-change path today, but
+        `validate_binding` costs nothing to just always recompute) is
+        always reported accurately. See `validate_binding`'s own docstring
+        for why an invalid binding is listed here rather than silently
+        absent -- "kept-but-inert" only means something if a human can
+        actually SEE the inert entry."""
+        actions = self.actions.describe()
+        bindings = []
+        for b in self._bindings_file.bindings:
+            error = bindings_mod.validate_binding(b, actions)
+            bindings.append({
+                "id": b.id,
+                "match": {"type": b.match.type, "number": b.match.number,
+                         "channel": b.match.channel, "port_pattern": b.match.port_pattern},
+                "action": b.action,
+                "args": dict(b.args),
+                "mode": b.mode,
+                "threshold": b.threshold,
+                "range": list(b.range),
+                "valid": error is None,
+                "error": error,
+            })
+        return {"bindings": bindings}
+
+    def _bind_remove(self, id: str) -> dict:
+        """`bind.remove` action handler: drops the binding by id, persists
+        the file (atomic save, `BindingsFile.save`), and immediately
+        disarms the live dispatcher (`set_bindings`) -- a removed binding
+        must never fire again even if a MIDI event matching it is already
+        in flight when this dispatches. Raises `ActionError` for an unknown
+        id, matching `_page_goto`'s own "unknown named resource" precedent
+        (engine/core.py) rather than silently reporting `{"removed":
+        False}` -- `bind.remove` is always issued BY NAME (a CLI/TUI
+        operator picking an id off `bind.list`), so an unknown id here is a
+        genuine caller error worth surfacing loudly, unlike e.g.
+        `sendnotes.key`'s own "unrecognized key -> applied: false"
+        convention for input that's allowed to just not match anything."""
+        if self._bindings_file.get(id) is None:
+            raise ActionError(f"unknown binding id: {id!r}")
+        self._bindings_file.remove(id)
+        self._bindings_file.save()
+        self._binding_dispatcher.set_bindings(self._bindings_file.bindings)
+        return {"removed": True}
+
+    async def _dispatch_bindings(self) -> None:
+        """Dispatch every binding-triggered action intent collected by
+        `_handle` (via `self._binding_dispatcher.handle(ev)`) since the
+        last call -- the async half of the dispatch-context split
+        docs/phase4-notes.md calls for (`_handle` is synchronous and
+        cannot itself await `ActionRegistry.dispatch`; `behaviors/
+        pagecycle.py`'s own `tick()` -> `_tick_behaviors` split is the
+        identical precedent this reuses -- see the module docstring's
+        "dispatch context decision"). Called once per `run()` iteration,
+        unconditionally (a cheap no-op when nothing fired this tick).
+
+        Exception containment (task-2 brief: "never crash the loop", "log
+        + skip, NOT an alert storm"): an `ActionError` -- the EXPECTED
+        failure mode for a persisted binding whose action doesn't exist in
+        THIS build's roster (docs/phase4-notes.md's "action vocabulary is
+        roster-dependent ... fail gracefully at dispatch" architecture
+        fact) or whose stored `args` no longer satisfy that action's
+        schema -- is logged at WARNING and swallowed, mirroring
+        `_tick_behaviors`'s own `except ActionError: pass` (this adds the
+        log line that one doesn't have -- see below for why). Any OTHER
+        exception (a genuine bug in an action handler) is ALSO swallowed
+        here, logged at ERROR instead -- a STRONGER guarantee than
+        `_tick_behaviors` gives itself, justified because a binding's
+        trigger is arbitrary EXTERNAL MIDI input arriving at MIDI rates,
+        not an internal idle timer: one misbehaving handler must never be
+        able to kill the whole engine `run()` loop from a single crafted or
+        unlucky MIDI message. Neither case emits an `alert` event -- an
+        `alert` is chrome meant for a human to notice on screen; a stale
+        binding failing every time a knob moves would spam that channel
+        into uselessness. The log is the record of this, not the UI (and
+        is why this logs at all, unlike `_tick_behaviors`'s fully silent
+        swallow -- a MIDI-triggered failure is much harder to notice/
+        diagnose otherwise than an idle timer's occasional skip)."""
+        pending, self._pending_binding_dispatches = self._pending_binding_dispatches, []
+        for name, args in pending:
+            try:
+                await self.actions.dispatch(name, args)
+            except ActionError as exc:
+                _LOG.warning("binding dispatch skipped: action %r: %s", name, exc)
+            except Exception:  # noqa: BLE001 -- see docstring: MIDI-driven, must never kill run()
+                _LOG.exception("binding dispatch: unexpected error dispatching action %r", name)
 
     def _sendnotes_device_info(self) -> dict:
         """Bound into `pages/sendnotes.py`'s `SendNotesPage` at construction
@@ -966,6 +1138,17 @@ class Engine:
         # our configured port name in backend-specific client/port framing.
         if ev.source and self._midi_out.port_name in ev.source:
             return
+        # Phase 4 Task 2 (MIDI bindings, docs/phase4-notes.md): bindings
+        # consume every event BEFORE analyzers/pages get it -- `_handle` is
+        # synchronous and `ActionRegistry.dispatch` is a coroutine, so this
+        # only ever COLLECTS intents here; `_dispatch_bindings` (called
+        # from `run()` right after `_handle` returns, see that method's own
+        # docstring) is the one place they actually fire. Collected even
+        # for a `clock_tick`/`sysex`/etc event -- harmless, since
+        # `BindingDispatcher._matches` only ever matches `note_on`/
+        # `control_change` types, so every other event type is a guaranteed
+        # no-op pass-through here.
+        self._pending_binding_dispatches.extend(self._binding_dispatcher.handle(ev))
         self.events_total += 1
         if ev.type in _ACTIVITY_EVENT_TYPES:
             self._last_activity_ts = ev.ts
@@ -1312,6 +1495,12 @@ class Engine:
                     self._handle(self.queue.get_nowait())
             except TimeoutError:
                 pass
+            # Phase 4 Task 2 (MIDI bindings): dispatch every intent this
+            # iteration's `_handle` call(s) collected, right after the
+            # event-draining block above and before the wall-clock ticks
+            # below -- see `_dispatch_bindings`'s own docstring for why
+            # this can't happen synchronously inside `_handle` itself.
+            await self._dispatch_bindings()
             now = time.time()
             self._tick_analyzers(now)
             self._tick_pages(now)
