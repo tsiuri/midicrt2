@@ -259,6 +259,136 @@ def test_out_mode_renders_one_frame_and_exits_against_real_daemon(tmp_path):
         daemon.wait(timeout=5)
 
 
+# -- voices page (phase-3 task 4) --------------------------------------------
+
+GOLDEN_VOICES_FRAME = FIXTURES / "fb_voices_frame_golden.png"
+VOICES_SURFACE_SIZE = (240, 216)   # header(12) + 16 rows*12 + status strip(12)
+
+VOICES_ROWS = [
+    {"ch": i, "name": f"Instr{i}", "active": 0, "peak": 0, "notes": []}
+    for i in range(1, 17)
+]
+VOICES_ROWS[0] = {"ch": 1, "name": "Kawai XD5", "active": 3, "peak": 8, "notes": [60, 64, 67]}
+VOICES_ROWS[2] = {"ch": 3, "name": "BassStaRack", "active": 8, "peak": 12, "notes": list(range(30, 38))}
+VOICES_VM = {"title": "VOICES", "total": 11, "total_peak": 20, "rows": VOICES_ROWS}
+
+VOICES_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+
+
+def test_voices_renderers_dispatch_table_has_voices():
+    assert app.RENDERERS["voices"] is app.render_voices_frame
+
+
+def test_render_voices_frame_header_bar_is_reverse_video():
+    surf = Surface(*VOICES_SURFACE_SIZE)
+    app.render_voices_frame(VOICES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._voices_header_text(VOICES_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+    assert any(
+        px[x, y] == app.BG
+        for x in range(app.LEFT_MARGIN, text_px_end)
+        for y in range(app.HEADER_PAD, app.HEADER_PAD + font.height)
+    )
+
+
+def test_render_voices_frame_empty_rows_does_not_crash():
+    surf = Surface(*VOICES_SURFACE_SIZE)
+    app.render_voices_frame({"title": "VOICES", "total": 0, "total_peak": 0, "rows": []}, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    assert px[0, header_h + 2] == app.BG   # nothing drawn below the header
+
+
+def test_render_voices_frame_draws_a_meter_box_outline_per_row():
+    surf = Surface(*VOICES_SURFACE_SIZE)
+    app.render_voices_frame(VOICES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._status_strip_height(font) - header_h
+    row_h = usable_h // len(VOICES_ROWS)
+    bar_x = app.LEFT_MARGIN + app.NAME_COL_CHARS * font.width + app.BAR_GAP
+    for i in range(len(VOICES_ROWS)):
+        row_y = header_h + i * row_h
+        bar_y = row_y + app.ROW_PAD
+        # top-left corner of the box outline for this row's meter.
+        assert px[bar_x, bar_y] == app.NORMAL_FG
+
+
+def test_render_voices_frame_live_fill_reflects_active_count():
+    # Channel 3 (index 2) is maxed at BAR_MAX active voices -> the topmost
+    # interior row of its meter box must be filled; an idle channel's must
+    # stay background.
+    surf = Surface(*VOICES_SURFACE_SIZE)
+    app.render_voices_frame(VOICES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._status_strip_height(font) - header_h
+    row_h = usable_h // len(VOICES_ROWS)
+    bar_x = app.LEFT_MARGIN + app.NAME_COL_CHARS * font.width + app.BAR_GAP
+
+    maxed_row_y = header_h + 2 * row_h   # channel 3, active=8=BAR_MAX
+    top_interior_y = maxed_row_y + app.ROW_PAD + 1
+    assert px[bar_x + 1, top_interior_y] == app.ACCENT_FG
+
+    idle_row_y = header_h + 3 * row_h   # channel 4, active=0
+    idle_top_interior_y = idle_row_y + app.ROW_PAD + 1
+    assert px[bar_x + 1, idle_top_interior_y] == app.BG
+
+
+def test_render_voices_frame_peak_tick_visible_above_live_fill():
+    # Channel 1: active=3, peak=8 (maxed scale) -- the peak tick must sit
+    # ABOVE (smaller y than) the live fill's top edge.
+    surf = Surface(*VOICES_SURFACE_SIZE)
+    app.render_voices_frame(VOICES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._status_strip_height(font) - header_h
+    row_h = usable_h // len(VOICES_ROWS)
+    bar_x = app.LEFT_MARGIN + app.NAME_COL_CHARS * font.width + app.BAR_GAP
+
+    row_y = header_h + 0 * row_h   # channel 1
+    bar_y = row_y + app.ROW_PAD
+    bar_h = row_h - 2 * app.ROW_PAD
+    inner_h = bar_h - 2
+    fill_h = round(inner_h * 3 / app.BAR_MAX)
+    peak_h = round(inner_h * 8 / app.BAR_MAX)
+    assert peak_h > fill_h   # sanity: this fixture actually exercises the tick-above-fill case
+    peak_y = bar_y + bar_h - 1 - peak_h
+    assert px[bar_x + 1, peak_y] == app.ACCENT_FG
+
+
+def test_render_voices_frame_reserves_the_bottom_status_strip_as_background():
+    surf = Surface(*VOICES_SURFACE_SIZE)
+    app.render_voices_frame(VOICES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    strip_h = app._status_strip_height(font)
+    y_in_strip = surf.height - strip_h + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_render_voices_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_VOICES_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-4-report.md"
+    )
+    surf = Surface(*VOICES_SURFACE_SIZE)
+    app.render_voices_frame(VOICES_VM, surf)
+    app._draw_status(surf, VOICES_STATUS_VM, load_font())
+
+    golden = Image.open(GOLDEN_VOICES_FRAME).convert("RGB")
+    assert golden.size == VOICES_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
     # rejected by the server's max_rate check, and then hang forever in

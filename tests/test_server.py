@@ -57,8 +57,9 @@ async def test_hello_and_describe(tmp_path):
     assert r["ok"] is True
     d = await c.request("describe")
     assert "eventlog.clear" in d["data"]["actions"]
-    assert d["data"]["pages"] == ["eventlog"]
-    assert d["data"]["topics"] == ["page.eventlog", "overlay.status"]
+    # Phase-3 task 4: "voices" is live by default (config.py's Config.pages).
+    assert d["data"]["pages"] == ["eventlog", "voices"]
+    assert d["data"]["topics"] == ["page.eventlog", "page.voices", "overlay.status"]
     eng.stop(); await task; await srv.close()
 
 
@@ -227,7 +228,9 @@ class _FakePage:
 async def test_page_next_action_emits_page_changed_event(tmp_path):
     # The first real event producer (phase3-notes.md item 3): dispatching an
     # action that changes the page must land a `page_changed` event on a
-    # subscribed client's socket.
+    # subscribed client's socket. Roster is eventlog, voices (default since
+    # phase-3 task 4), then the dynamically-registered "second" -- page.next
+    # from eventlog lands on "voices" first.
     eng, srv, task = await make(tmp_path)
     eng.register_page("second", _FakePage())
     c = Client()
@@ -241,7 +244,7 @@ async def test_page_next_action_emits_page_changed_event(tmp_path):
     await c.read_msgs(0.3)
     evs = [m for m in c.inbox if m.get("kind") == "event" and m.get("name") == "page_changed"]
     assert evs, "expected a page_changed event on the wire"
-    assert evs[-1]["data"]["page"] == "second"
+    assert evs[-1]["data"]["page"] == "voices"
     eng.stop(); await task; await srv.close()
 
 

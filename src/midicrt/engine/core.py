@@ -3,7 +3,8 @@
 Page roster
 -----------
 `Engine.pages` is an ordered dict (`name -> page instance`) built from
-`config.pages` (default `["eventlog"]`), filtered against `_PAGE_FACTORIES`
+`config.pages` (default `["eventlog", "voices"]` as of phase-3 task 4),
+filtered against `_PAGE_FACTORIES`
 -- the module-level registry of known page constructors. Dict insertion
 order is preserved and IS the cycle order used by the `page.next`/
 `page.prev` actions. Later phase-3 tasks add real pages by adding an entry
@@ -58,6 +59,7 @@ from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.eventlog import EventLogPage
+from midicrt.pages.voices import VoicesPage
 
 
 @dataclass
@@ -101,6 +103,10 @@ AnalyzerFactory = Callable[[Config], Analyzer]
 # Add an entry here as each phase-3 parity page lands.
 _PAGE_FACTORIES: dict[str, PageFactory] = {
     "eventlog": lambda config: EventLogPage(capacity=config.eventlog_capacity),
+    # Phase-3 task 4: v1's main screen, the first second page -- see
+    # pages/voices.py + analyzers/voices.py. `config.pages` now defaults to
+    # ["eventlog", "voices"] (config.py) so it's live without a config.toml.
+    "voices": lambda config: VoicesPage(instruments=config.instruments),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`

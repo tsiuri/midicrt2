@@ -121,7 +121,80 @@ def _render_unknown(vm: dict, surface: Surface) -> None:
     surface.clear(BG)
 
 
-RENDERERS = {"eventlog": render_frame}
+# -- voices page (phase-3 task 4) --------------------------------------------
+#
+# Layout: the same reverse-video header convention as `render_frame`'s
+# eventlog header, then one row per channel -- "<ch> <name>" text plus a
+# bordered vertical poly-meter (`box` for the frame, `fill_column` for the
+# live fill, `hline` for the peak-hold tick) and a numeric "<active>/<peak>"
+# readout. BAR_MAX=8 matches v1's zvoicemonitor.py per-channel poly-limit
+# default (POLY_LIMIT_CH) -- a fixed visual scale only, not an enforced
+# limit (no limit/warning behavior is ported -- see analyzers/voices.py's
+# module docstring); a channel with 8+ held voices just shows a full meter,
+# the numeric label stays exact. Deliberately NOT sharing bar math with the
+# TUI renderer's own `_voices_bar` (see that function's comment) -- this
+# isn't the page-agnostic chrome status text clients/chrome.py exists to
+# keep byte-identical across clients.
+ROW_PAD = 1            # vertical inset (top+bottom) inside each row's meter box, px
+NAME_COL_CHARS = 15    # "01 " + up to a 12-char instrument name
+BAR_GAP = 8            # px between the name column and the meter, and meter and label
+BAR_W = 40             # px, includes the 1px outline on each side
+BAR_MAX = 8            # visual scale -- see comment above
+
+
+def _voices_header_text(vm: dict) -> str:
+    return f"{vm['title']}  (poly {vm['total']}/{vm['total_peak']})"
+
+
+def render_voices_frame(vm: dict, surface: Surface) -> None:
+    """Render the voices page view-model (pages/voices.py, wrapping
+    analyzers/voices.py's VoiceMonitorAnalyzer) onto `surface`. Pure: reads
+    only `vm` and the cached default font, writes only to `surface`'s
+    pixels -- no I/O, no clock, no global state beyond the font's
+    (side-effect-free) glyph cache. See module docstring for the layout.
+    """
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _voices_header_text(vm), BG, font)
+
+    rows = vm["rows"]
+    if not rows:
+        return
+    usable_h = surface.height - _status_strip_height(font) - header_h
+    row_h = usable_h // len(rows)
+    if row_h <= 0:
+        return
+
+    bar_x = LEFT_MARGIN + NAME_COL_CHARS * font.width + BAR_GAP
+    for i, row in enumerate(rows):
+        row_y = header_h + i * row_h
+        text_y = row_y + max(0, (row_h - font.height) // 2)
+        draw_text(surface, LEFT_MARGIN, text_y, f"{row['ch']:02d} {row['name']}", NORMAL_FG, font)
+
+        bar_y = row_y + ROW_PAD
+        bar_h = row_h - 2 * ROW_PAD
+        if bar_h <= 0:
+            continue
+        surface.box(bar_x, bar_y, BAR_W, bar_h, NORMAL_FG)
+        inner_h = max(0, bar_h - 2)
+        inner_w = max(0, BAR_W - 2)
+        fill_h = round(inner_h * min(row["active"], BAR_MAX) / BAR_MAX)
+        if fill_h > 0:
+            fill_color = ACCENT_FG if row["active"] > 0 else NORMAL_FG
+            surface.fill_column(bar_x + 1, bar_y + bar_h - 2, fill_h, fill_color, width=inner_w)
+        peak_h = round(inner_h * min(row["peak"], BAR_MAX) / BAR_MAX)
+        if peak_h > 0:
+            peak_y = bar_y + bar_h - 1 - peak_h
+            surface.hline(bar_x + 1, peak_y, inner_w, ACCENT_FG)
+
+        label_x = bar_x + BAR_W + BAR_GAP
+        draw_text(surface, label_x, text_y, f"{row['active']}/{row['peak']}", NORMAL_FG, font)
+
+
+RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

@@ -83,7 +83,48 @@ def render_status_row(vm: dict, width: int) -> str:
     return _fit(chrome.status_text(vm), width)
 
 
-RENDERERS = {"eventlog": render_lines}
+# -- voices page (phase-3 task 4) --------------------------------------------
+#
+# Bar scale: 8 segments matches v1's zvoicemonitor.py per-channel poly-limit
+# default (POLY_LIMIT_CH) -- a fixed visual scale only, not an enforced
+# limit (no limit/warning behavior is ported here -- see
+# analyzers/voices.py's module docstring), so 8+ simultaneously held voices
+# on one channel just shows a full bar rather than clipping or flagging.
+# Deliberately NOT shared with the fb renderer's own bar math below (unlike
+# clients/chrome.py's status text, which both clients must render
+# word-for-word identically): a per-page body widget isn't the page-agnostic
+# chrome status bar phase3-notes.md's sharing contract is about.
+_VOICES_BAR_SEGMENTS = 8
+_VOICES_NAME_WIDTH = 12
+
+
+def _voices_bar(active: int, segments: int = _VOICES_BAR_SEGMENTS) -> str:
+    filled = min(max(active, 0), segments)
+    return "▓" * filled + "░" * (segments - filled)
+
+
+def _voices_row_text(row: dict) -> str:
+    bar = _voices_bar(row["active"])
+    name = f"{row['name']:<{_VOICES_NAME_WIDTH}.{_VOICES_NAME_WIDTH}}"
+    return f"{row['ch']:02d} {name} {bar} {row['active']:>2d}/{row['peak']:<2d}"
+
+
+def render_voices_lines(vm: dict, width: int, height: int) -> list[str]:
+    """16 fixed channel rows (not a scrolling tail like `render_lines`'s
+    eventlog): channels 1..16 always render top-down in that order, padded
+    with blank rows at the BOTTOM if `height` leaves more room than 16 rows,
+    and simply cut off after the Nth row (channels stay in order, extras at
+    the bottom are dropped) if there's less."""
+    header = f"{vm['title']}  (poly {vm['total']}/{vm['total_peak']})  [n]ext page [q]uit"
+    body_h = height - 1
+    rows = [_fit(_voices_row_text(r), width) for r in vm["rows"]]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [_fit(header, width)] + body
+
+
+RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
