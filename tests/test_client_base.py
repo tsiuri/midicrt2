@@ -325,9 +325,6 @@ async def test_page_next_action_drives_real_resubscribe_to_voices(tmp_path):
     eng.stop(); await task; await srv.close()
     await asyncio.to_thread(client.close)
 
-    eng.stop(); await task; await srv.close()
-    await asyncio.to_thread(client.close)
-
 
 async def test_malformed_json_drops_only_that_client(tmp_path):
     eng, srv, task = await make(tmp_path)
