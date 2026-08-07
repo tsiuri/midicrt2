@@ -102,6 +102,17 @@ class SendNotesPage:
         page constructed directly by a test (see module docstring)."""
         self._device_info_provider = provider
 
+    def bind_info(self, provider) -> None:
+        """Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md):
+        formalized name `engine/core.py::PageHooks` discovers generically
+        (one hasattr-based pass over the whole page roster, replacing the
+        old name-keyed `if "sendnotes" in self.pages: ...bind_device_info`
+        special case in `Engine.__init__`) -- a thin delegate to
+        `bind_device_info` above, which stays the page's own real,
+        directly-tested method (test_pages_sendnotes.py calls it by that
+        more descriptive name)."""
+        self.bind_device_info(provider)
+
     def handle(self, ev) -> bool:
         return False   # not MIDI-driven at all -- v1's sendnotes.py has no handle()
 
@@ -177,6 +188,17 @@ class SendNotesPage:
             entry = self._active.popleft()
             expired.append((entry["note"], entry["ch"]))
         return expired
+
+    def drain_outputs(self, now: float) -> list[tuple[int, int]]:
+        """Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md):
+        formalized name `engine/core.py::PageHooks` discovers generically
+        in `_tick_pages` (one hasattr-based pass over the whole page
+        roster, replacing the old `self.pages.get("sendnotes")` name-keyed
+        special case) -- a thin delegate to `drain_expired` above, which
+        stays the page's own real, directly-tested method
+        (test_pages_sendnotes.py's whole "expiry" section exercises it by
+        that more descriptive name, including the front-only FIFO quirk)."""
+        return self.drain_expired(now)
 
     def flush_all(self) -> list[tuple[int, int]]:
         """Unconditionally release EVERY still-gated active note,

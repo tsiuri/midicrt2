@@ -188,6 +188,49 @@ class MidiEvent:
     sysex_data: tuple[int, ...] | None = None
 
 
+@dataclass
+class PageHooks:
+    """A page's OPTIONAL protocol hooks, discovered ONCE via `hasattr` right
+    here at `Engine.__init__` construction time (see that method's own
+    "Formalized optional Page hooks" comment) -- Phase 4 Task 0's engine
+    consolidation (docs/phase4-notes.md), replacing what had accreted by
+    phase-3's close into hasattr checks scattered across `_tick_pages` (a
+    name-keyed `self.pages.get("sendnotes")` special case for the one hook
+    that needed draining) AND three separate, near-identically-shaped
+    bind-wiring blocks in `__init__` (config/help/sendnotes, each guarding
+    on its own page name and calling a DIFFERENTLY-named bind method).
+    Every field is `None` for a page that doesn't implement the
+    corresponding optional method -- every call site checks for that
+    before calling, exactly like the old hasattr checks did, just computed
+    once instead of on every `_tick_pages` call.
+
+    - `tick(now: float) -> bool`: wall-clock progress hook (phase-3 task
+      7), unchanged in shape -- `pages/pianoroll.py`, `pages/img2txtviz.py`,
+      `pages/spectrum.py`, `pages/ccdashboard.py` all implement it.
+    - `drain_outputs(now: float) -> list[tuple[int, int]]`: the formalized,
+      GENERIC name for the one hook `_tick_pages` used to reach only via
+      `self.pages.get("sendnotes")` -- any future output-producing page
+      implementing this same name is now picked up automatically, no new
+      name-keyed branch needed. `pages/sendnotes.py::SendNotesPage` keeps
+      its own more descriptive `drain_expired(now)` as the real,
+      directly-tested method; `drain_outputs` there is a thin delegate
+      (see that page's own docstring for why the rename wasn't worth
+      touching test_pages_sendnotes.py's whole "expiry" test section).
+    - `bind_info(provider: Callable[[], dict]) -> None`: called ONCE here,
+      right after this dataclass is built for each page, with a
+      page-specific ENGINE-facts provider (see `page_info_providers` in
+      `__init__` below) -- generalizes what used to be THREE differently
+      named methods (`ConfigPage.bind_engine_info`, `SendNotesPage.
+      bind_device_info`, and `HelpPage.bind_info` -- which already used
+      this exact name, unchanged). The other two pages keep their own
+      real, directly-tested methods and add a thin `bind_info` delegate
+      (see each page's own docstring) for this generic discovery to find.
+    """
+    tick: Callable[[float], bool] | None
+    drain_outputs: Callable[[float], list[tuple[int, int]]] | None
+    bind_info: Callable[[Callable[[], dict]], None] | None
+
+
 class Page(Protocol):
     def handle(self, ev: MidiEvent) -> bool: ...
     def view_model(self) -> dict: ...
@@ -402,30 +445,36 @@ class Engine:
         if "harmony" in self.pages and "chordkey" in self.pages:
             self.pages["chordkey"] = ChordKeyPage(self.pages["harmony"].analyzer)
         self.current_page = next(iter(self.pages))
-        # Phase-3 task 10: wire the config page's LIVE engine-info callback
-        # (version/uptime/current_page/live pages+analyzers roster) --
-        # see pages/configview.py's own "Engine-info wiring" docstring
-        # section for why this is the one page that needs a reference back
-        # into the engine at all. Guarded on presence like every other
-        # page-specific wiring here (a custom config could drop "config"
-        # from the roster entirely).
-        if "config" in self.pages:
-            self.pages["config"].bind_engine_info(self._config_engine_info)
-        # Phase-3 task 12: same "engine facts no page can derive from its
-        # own constructor args alone" wiring as the config page above --
-        # see pages/help.py's own "Engine-info wiring" docstring section.
-        if "help" in self.pages:
-            self.pages["help"].bind_info(self._help_info)
         # Phase-3 task 12: a single lazily-opened MIDI output, shared by
         # "sendnotes" (real note sends) and, when the roster reaches it,
         # engine/sysex.py's versioned reply frames -- see engine/
         # midi_out.py's own module docstring for why ONE port covers both
         # v1 capabilities. Constructed unconditionally (mirrors
         # `_pagecycle_behavior`/`_screensaver_behavior` below): no I/O
-        # happens until a real send is attempted.
+        # happens until a real send is attempted. Built BEFORE the
+        # PageHooks discovery pass right below so `_sendnotes_device_info`
+        # (wired into "sendnotes" via that pass) can read its state once
+        # actually CALLED later -- the bound-method reference itself
+        # doesn't need `self._midi_out` to exist yet, just `self`.
         self._midi_out = MidiOutput()
-        if "sendnotes" in self.pages:
-            self.pages["sendnotes"].bind_device_info(self._sendnotes_device_info)
+        # Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md):
+        # `self._page_info_providers` is the one genuinely irreducible
+        # per-page bit left after formalizing PageHooks -- each of these
+        # three pages needs a DIFFERENT shape of engine fact
+        # (version/uptime/roster for config, the action registry for help,
+        # MIDI-output open state for sendnotes). `_discover_page_hooks`
+        # (below) is the ONE hasattr-based discovery pass this dict feeds
+        # into -- see `PageHooks`' own docstring for the full "what this
+        # replaces" writeup (three near-duplicated bind-wiring blocks, one
+        # per page name, each calling a differently-named bind method).
+        self._page_info_providers: dict[str, Callable[[], dict]] = {
+            "config": self._config_engine_info,
+            "help": self._help_info,
+            "sendnotes": self._sendnotes_device_info,
+        }
+        self._page_hooks: dict[str, PageHooks] = {}
+        for name, page in self.pages.items():
+            self._discover_page_hooks(name, page)
         self.events_total = 0
         self.started_at = time.monotonic()
         self._listeners: list[Callable[[dict], None]] = []
@@ -477,70 +526,73 @@ class Engine:
         # module's own docstring ("Re-arming after a manual escape" /
         # "A manual override now buys a FRESH after_s grace period").
         self._behaviors: list = [self._pagecycle_behavior, self._screensaver_behavior]
-        self.actions.register("eventlog.clear", self._clear_eventlog,
-                              description="Clear the event log")
         # Phase-3 task 12 (gap ports): registered UNCONDITIONALLY --
         # `_pagecycle_behavior` always exists regardless of `config.pages`
-        # (unlike page-specific actions below, which guard on their own
-        # page being in the roster). Gives `engine/sysex.py`'s
-        # CMD_PAGE_CYCLE (v1's own `03 <0|1>` command) a real action to
-        # dispatch through, and is independently reachable via `midicrt
-        # action pagecycle.enable` too -- one capability, two entry points,
-        # matching "page.goto"'s own dual reachability (a normal client
-        # action AND CMD_SWITCH_PAGE's own dispatch target).
+        # (unlike page-declared actions below, which are only advertised
+        # when their owning page is actually in the roster). Gives
+        # `engine/sysex.py`'s CMD_PAGE_CYCLE (v1's own `03 <0|1>` command)
+        # a real action to dispatch through, and is independently reachable
+        # via `midicrt action pagecycle.enable` too -- one capability, two
+        # entry points, matching "page.goto"'s own dual reachability (a
+        # normal client action AND CMD_SWITCH_PAGE's own dispatch target).
         self.actions.register("pagecycle.enable", self._pagecycle_enable,
                               description="Enable or disable idle page cycling",
                               args={"enabled": "bool"})
+        # Roster-wide navigation -- no single page owns "the next/previous/
+        # named page in the WHOLE cycle order", so these three stay
+        # registered directly here rather than through any one page's
+        # `actions()` (see the page-declared-actions loop's own comment
+        # below for the full engine-owned-vs-page-declared split).
         self.actions.register("page.next", self._page_next,
                               description="Advance to the next page in the roster")
         self.actions.register("page.prev", self._page_prev,
                               description="Go back to the previous page in the roster")
         self.actions.register("page.goto", self._page_goto,
                               description="Jump to a named page", args={"name": "str"})
-        # Phase-3 task 7: pianoroll-specific actions, mirroring the
-        # "eventlog.clear" precedent above (a page-specific action
-        # registered directly here, its handler reaching into
-        # self.pages[...] and hand-marking that page's topic dirty since
-        # these mutations happen outside the normal handle(ev) dirty-flow).
-        # Guarded on the page actually being in the roster (like "tuner",
-        # "pianoroll" is reachable via config.toml/register_page even when
-        # not in the default roster) so dispatching these against a build
-        # with pianoroll disabled fails with a clear "unknown action"
-        # rather than a KeyError.
-        if "pianoroll" in self.pages:
-            self.actions.register("pianoroll.zoom", self._pianoroll_zoom,
-                                  description="Adjust the pianoroll's zoom level",
-                                  args={"delta": "float"})
-            self.actions.register("pianoroll.projection", self._pianoroll_projection,
-                                  description="Switch the pianoroll's projection mode "
-                                              "(wallclock|tempo)",
-                                  args={"mode": "str"})
-            self.actions.register("pianoroll.channels", self._pianoroll_channels,
-                                  description="Set the pianoroll's visible-channel filter "
-                                              "(comma/range spec, empty = all)",
-                                  args={"spec": "str"})
-        # Phase-3 task 10: img2txtviz's runtime-adjustable controls (spec
-        # §5) -- ported from v1's real keypress()-driven 'c' (charset
-        # cycle) and 'i' (invert toggle), see pages/img2txtviz.py's own
-        # module docstring. Same guarded-registration/hand-marked-dirty
-        # shape as the pianoroll actions above.
-        if "img2txtviz" in self.pages:
-            self.actions.register("img2txtviz.charset", self._img2txtviz_charset,
-                                  description="Cycle the img2txtviz ASCII charset")
-            self.actions.register("img2txtviz.invert", self._img2txtviz_invert,
-                                  description="Toggle the img2txtviz invert flag")
         # Phase-3 task 12: sendnotes' one interactive entry point -- ported
         # from v1's real per-keystroke `keypress()` (see pages/sendnotes.py's
         # own module docstring for the full v1 branch-order/KEYMAP-shadowing
         # notes). Reachable via `midicrt action sendnotes.key --arg key=z`,
-        # same "no client-side keyboard binding yet" precedent as
-        # "pianoroll.zoom"/"img2txtviz.charset" above (Phase 4's key->action
-        # table, phase3-notes.md's own known-latent item).
+        # same "no client-side keyboard binding yet" precedent as the
+        # page-declared actions below (Phase 4's key->action table,
+        # phase3-notes.md's own known-latent item). Stays registered
+        # directly here rather than through `SendNotesPage.actions()` --
+        # docs/phase4-notes.md's own binding-architecture notes call this
+        # exact shape out as "the template for key-driven engine actions":
+        # it needs to read the wall clock ONCE (the engine's job) and send
+        # a real note through `self._midi_out`, both engine-level I/O a
+        # page is architecturally never given (see this file's module
+        # docstring) -- so unlike eventlog.clear/pianoroll.*/img2txtviz.*
+        # below, this one genuinely isn't page-scoped state alone.
         if "sendnotes" in self.pages:
             self.actions.register("sendnotes.key", self._sendnotes_key,
                                   description="Send one Send-Notes keystroke "
                                               "(note or control key)",
                                   args={"key": "str"})
+        # Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md):
+        # PAGE-DECLARED actions -- replaces what used to be `eventlog.clear`
+        # registered unconditionally plus two more guarded blocks here
+        # (`if "pianoroll" in self.pages: ...` x3 actions, `if "img2txtviz"
+        # in self.pages: ...` x2 actions), each hand-marking its own page's
+        # topic dirty and (pianoroll only) hand-translating a ValueError
+        # into ActionError. Any page exposing `actions() -> [(name, handler,
+        # description, args_schema), ...]` (see pages/eventlog.py,
+        # pages/pianoroll.py, pages/img2txtviz.py for the concrete
+        # examples) gets every action it declares registered here, in ONE
+        # loop, with the roster itself as the ONLY guard -- a page not in
+        # `self.pages` is never asked for its actions at all, so there is
+        # no more per-page `if` to keep in sync as new pages grow their own
+        # actions. `_wrap_page_action` (below) is what now does the
+        # dirty-marking and ValueError->ActionError translation, uniformly,
+        # for every action registered through this loop.
+        for page_name, page in self.pages.items():
+            declare_actions = getattr(page, "actions", None)
+            if declare_actions is None:
+                continue
+            for action_name, handler, description, args_schema in declare_actions():
+                self.actions.register(
+                    action_name, self._wrap_page_action(page_name, handler),
+                    description=description, args=args_schema)
 
     def _sendnotes_device_info(self) -> dict:
         """Bound into `pages/sendnotes.py`'s `SendNotesPage` at construction
@@ -566,19 +618,44 @@ class Engine:
             self._midi_out.note_on(result["note"], result["vel"], result["ch"])
         return {"applied": result is not None}
 
-    def _clear_eventlog(self):
-        self.pages["eventlog"].clear()
-        self._dirty.add("page.eventlog")
+    def _wrap_page_action(self, page_name: str, handler: Callable[..., dict]) -> Callable[..., dict]:
+        """Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md): the
+        ONE place that now does what used to be hand-written, per-action,
+        inside each of the removed `_pianoroll_zoom`/`_pianoroll_projection`/
+        `_pianoroll_channels`/`_img2txtviz_charset`/`_img2txtviz_invert`/
+        `_clear_eventlog` methods -- called by the page-declared-actions
+        loop in `__init__` to wrap every `(name, handler, description,
+        args_schema)` a page's own `actions()` declares, so the page's
+        handler itself can stay a small, pure dict-shaping method (see
+        pages/pianoroll.py's/pages/img2txtviz.py's own `actions()`
+        docstrings) with no idea an `Engine` or a dirty-set even exists:
 
-    def _img2txtviz_charset(self) -> dict:
-        charset = self.pages["img2txtviz"].cycle_charset()
-        self._dirty.add("page.img2txtviz")
-        return {"charset": charset}
+        1. Marks `page.<page_name>` dirty after a SUCCESSFUL call --
+           exactly the "this page-scoped action always dirties its own
+           page" rule every removed handler above hand-coded individually.
+        2. Translates a plain `ValueError` the handler raises (a page's own
+           input-validation failure -- today only `pianoroll.projection`/
+           `.channels`' `set_projection`/`set_channels`) into the
+           client-facing `ActionError`, matching what `_pianoroll_projection`/
+           `_pianoroll_channels` used to do by hand. Order matters: a raise
+           here skips the dirty-marking below entirely, exactly like the
+           old try/except-then-mark-dirty shape did (state didn't actually
+           change, so it must not be reported dirty).
 
-    def _img2txtviz_invert(self) -> dict:
-        invert = self.pages["img2txtviz"].toggle_invert()
-        self._dirty.add("page.img2txtviz")
-        return {"invert": invert}
+        Engine-owned actions that need real engine state (I/O, cross-
+        roster navigation) -- `sendnotes.key`, `page.next`/`.prev`/`.goto`,
+        `pagecycle.enable` -- are registered directly in `__init__` instead
+        and never pass through here; see that method's own comments for
+        why each one doesn't fit "one page's own pure state" alone.
+        """
+        def wrapped(**kwargs):
+            try:
+                result = handler(**kwargs)
+            except ValueError as exc:
+                raise ActionError(str(exc)) from exc
+            self._dirty.add(f"page.{page_name}")
+            return result
+        return wrapped
 
     def _config_engine_info(self) -> dict:
         """Bound into `pages/configview.py`'s `ConfigPage` at construction
@@ -602,26 +679,24 @@ class Engine:
         the wire (see `engine/server.py`), just rendered on-screen."""
         return {"pages": list(self.pages), "actions": self.actions.describe()}
 
-    def _pianoroll_zoom(self, delta: float) -> dict:
-        zoom = self.pages["pianoroll"].zoom_by(delta)
-        self._dirty.add("page.pianoroll")
-        return {"zoom": zoom}
-
-    def _pianoroll_projection(self, mode: str) -> dict:
-        try:
-            applied = self.pages["pianoroll"].set_projection(mode)
-        except ValueError as exc:
-            raise ActionError(str(exc)) from exc
-        self._dirty.add("page.pianoroll")
-        return {"mode": applied}
-
-    def _pianoroll_channels(self, spec: str) -> dict:
-        try:
-            channels = self.pages["pianoroll"].set_channels(spec)
-        except ValueError as exc:
-            raise ActionError(str(exc)) from exc
-        self._dirty.add("page.pianoroll")
-        return {"channels": channels}
+    def _discover_page_hooks(self, name: str, page: Page) -> None:
+        """The ONE hasattr-based `PageHooks` discovery pass (Phase 4 Task
+        0, docs/phase4-notes.md) -- called for every page in the initial
+        roster (the loop in `__init__`) AND, so a page arriving later via
+        `register_page` gets the exact same treatment (not a stale,
+        hooks-less entry `_tick_pages` would silently skip forever), from
+        `register_page` itself below. Also performs the one-shot
+        `bind_info` wiring for whichever page names have a matching entry
+        in `self._page_info_providers` -- see `PageHooks`' own docstring."""
+        hooks = PageHooks(
+            tick=getattr(page, "tick", None),
+            drain_outputs=getattr(page, "drain_outputs", None),
+            bind_info=getattr(page, "bind_info", None),
+        )
+        self._page_hooks[name] = hooks
+        provider = self._page_info_providers.get(name)
+        if hooks.bind_info is not None and provider is not None:
+            hooks.bind_info(provider)
 
     def register_page(self, name: str, page: Page) -> None:
         """Append `page` to the live roster under `name`. Production pages
@@ -629,6 +704,7 @@ class Engine:
         for pages with no factory yet (tests today; dynamically-arriving
         overlays later)."""
         self.pages[name] = page
+        self._discover_page_hooks(name, page)
 
     def register_analyzer(self, name: str, analyzer: Analyzer) -> None:
         """Append `analyzer` to the live roster under `name`, publishing it
@@ -1011,32 +1087,30 @@ class Engine:
         slide toward the window's left edge even with ZERO new MIDI events,
         which a pure `handle(ev)` can never produce on its own (same
         "needs an injected clock" problem `_tick_analyzers`'s own docstring
-        describes for `analyzers/stucknotes.py`'s escalation). No page
-        needs `drain_alerts()` (an analyzer-only, phase-3 task 6 concept),
-        so this is the strict `tick()`-only subset of `_tick_analyzers`,
-        applied to `self.pages` instead of `self.analyzers`.
+        describes for `analyzers/stucknotes.py`'s escalation).
 
-        Phase-3 task 12 (gap ports): "sendnotes" is the one exception to
-        "no page needs draining" above -- `SendNotesPage.drain_expired(now)`
-        (a `drain_alerts()`-shaped hook, deliberately NOT named `tick()`
-        since it reports expired notes rather than a dirty bool) is polled
-        here every tick alongside the generic loop below, and each expired
-        `(note, ch)` pair gets a REAL `MidiOutput.note_off` -- the one place
-        in this whole method that does I/O, mirroring `_tick_analyzers`'s
-        own `drain_alerts()` -> `emit_event` split (pure module reports,
-        engine acts). Guarded on presence like every other page-specific
-        hook here (a custom config could drop "sendnotes" from the roster).
+        Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md): both
+        loops below now read `self._page_hooks` (built once, at
+        construction, by the `PageHooks` discovery pass in `__init__` --
+        see that dataclass's own docstring) instead of re-checking
+        `hasattr(page, "tick")` on every single tick, and `drain_outputs`
+        is looked up the SAME generic way rather than the old
+        `self.pages.get("sendnotes")` name-keyed special case this method
+        used to have (the one page needing `drain_outputs()` today is
+        still "sendnotes" -- `SendNotesPage.drain_outputs` delegates to its
+        own real, directly-tested `drain_expired`, see that page's own
+        docstring -- but this loop no longer needs to know that by name).
+        Each expired `(note, ch)` pair still gets a REAL `MidiOutput.
+        note_off` here -- the one place in this whole method that does
+        I/O, mirroring `_tick_analyzers`'s own `drain_alerts()` ->
+        `emit_event` split (pure module reports, engine acts).
         """
-        for name, page in self.pages.items():
-            tick_fn = getattr(page, "tick", None)
-            if tick_fn is not None and tick_fn(now):
+        for name, hooks in self._page_hooks.items():
+            if hooks.tick is not None and hooks.tick(now):
                 self._dirty.add(f"page.{name}")
-        sendnotes = self.pages.get("sendnotes")
-        if sendnotes is not None:
-            expired = sendnotes.drain_expired(now)
-            if expired:
-                self._dirty.add("page.sendnotes")
-                for note, ch in expired:
+            if hooks.drain_outputs is not None:
+                for note, ch in hooks.drain_outputs(now):
+                    self._dirty.add(f"page.{name}")
                     self._midi_out.note_off(note, ch)
 
     async def _tick_behaviors(self, now: float) -> None:

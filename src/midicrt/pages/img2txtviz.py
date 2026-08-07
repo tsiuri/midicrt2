@@ -47,3 +47,27 @@ class Img2TxtVizPage:
 
     def toggle_invert(self) -> bool:
         return self._analyzer.toggle_invert()
+
+    # -- page-declared actions (Phase 4 Task 0, docs/phase4-notes.md) -------
+    #
+    # These two used to be registered directly in `Engine.__init__`
+    # (`_img2txtviz_charset`/`_img2txtviz_invert`), guarded by their own
+    # `if "img2txtviz" in self.pages:` block and hand-marking
+    # `page.img2txtviz` dirty themselves -- see pages/pianoroll.py's own
+    # `actions()` docstring for the full rationale (same consolidation,
+    # same generic dirty-marking now done once by `Engine._wrap_page_action`
+    # instead of per-handler).
+
+    def _action_charset(self) -> dict:
+        return {"charset": self.cycle_charset()}
+
+    def _action_invert(self) -> dict:
+        return {"invert": self.toggle_invert()}
+
+    def actions(self) -> list[tuple[str, object, str, dict[str, str]]]:
+        return [
+            ("img2txtviz.charset", self._action_charset,
+             "Cycle the img2txtviz ASCII charset", {}),
+            ("img2txtviz.invert", self._action_invert,
+             "Toggle the img2txtviz invert flag", {}),
+        ]

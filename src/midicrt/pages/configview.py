@@ -102,6 +102,17 @@ class ConfigPage:
         page constructed directly by a test (see module docstring)."""
         self._engine_info = provider
 
+    def bind_info(self, provider) -> None:
+        """Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md):
+        formalized name `engine/core.py::PageHooks` discovers generically
+        (one hasattr-based pass over the whole page roster, replacing the
+        old name-keyed `if "config" in self.pages: ...bind_engine_info`
+        special case in `Engine.__init__`) -- a thin delegate to
+        `bind_engine_info` above, which stays the page's own real,
+        directly-tested method (test_pages_config.py calls it by that more
+        descriptive name)."""
+        self.bind_engine_info(provider)
+
     def handle(self, ev) -> bool:
         return False   # a read-only viewer never changes from a MIDI event
 

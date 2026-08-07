@@ -566,3 +566,42 @@ class PianorollPage:
 
     def set_channels(self, spec: str) -> list[int]:
         return self._state.set_channels(spec)
+
+    # -- page-declared actions (Phase 4 Task 0, docs/phase4-notes.md) -------
+    #
+    # These three used to be registered directly in `Engine.__init__`
+    # (`_pianoroll_zoom`/`_pianoroll_projection`/`_pianoroll_channels`),
+    # each hand-guarded with its own `if "pianoroll" in self.pages:` block
+    # and hand-marking `page.pianoroll` dirty itself. `actions()` below is
+    # what `Engine.__init__` now discovers generically (one loop over the
+    # whole page roster -- the roster IS the guard, no per-page `if` left)
+    # -- dirty-marking moved to that loop's own generic wrapper (applies to
+    # every page-declared action uniformly, not just these three), and a
+    # plain `ValueError` from `set_projection`/`set_channels` below (an
+    # invalid mode/channel spec) is translated to the client-facing
+    # `ActionError` by that SAME generic wrapper, not by this page --
+    # see `Engine._wrap_page_action`'s own docstring. Only the dict-shaping
+    # (`{"zoom": ...}` etc, matching the wire format `midicrt describe`/
+    # dispatch clients already expect byte-for-byte) is this page's own
+    # job, same as it always was.
+
+    def _action_zoom(self, delta: float) -> dict:
+        return {"zoom": self.zoom_by(delta)}
+
+    def _action_projection(self, mode: str) -> dict:
+        return {"mode": self.set_projection(mode)}
+
+    def _action_channels(self, spec: str) -> dict:
+        return {"channels": self.set_channels(spec)}
+
+    def actions(self) -> list[tuple[str, object, str, dict[str, str]]]:
+        return [
+            ("pianoroll.zoom", self._action_zoom,
+             "Adjust the pianoroll's zoom level", {"delta": "float"}),
+            ("pianoroll.projection", self._action_projection,
+             "Switch the pianoroll's projection mode (wallclock|tempo)",
+             {"mode": "str"}),
+            ("pianoroll.channels", self._action_channels,
+             ("Set the pianoroll's visible-channel filter (comma/range spec, "
+              "empty = all)"), {"spec": "str"}),
+        ]
