@@ -61,8 +61,9 @@ def alerts_text(vm: dict) -> str:
     analyzer doesn't carry that history (see analyzers/stucknotes.py's
     module docstring), so the row goes blank the instant the alert list
     empties. Note numbers are shown raw (`n060`), not v1's octave-letter
-    name (`_fmt_note`, e.g. "C4(060)") -- see analyzers/stucknotes.py's
-    module docstring for why that convention isn't reproduced.
+    name (`_fmt_note`, e.g. note 60 -> "C6(060)") -- see analyzers/
+    stucknotes.py's module docstring for why that convention isn't
+    reproduced.
     """
     alerts = vm.get("alerts") or []
     if not alerts:

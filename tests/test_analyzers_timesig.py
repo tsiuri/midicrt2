@@ -172,6 +172,48 @@ def test_note_before_any_beat_boundary_projects_to_tick_zero():
     assert a._events[-1][0] == 0
 
 
+def test_stop_then_continue_invalidates_beat_boundary_before_next_clock_tick():
+    # Regression (review finding): a note_on arriving between "continue"
+    # and the next REAL clock_tick must not be projected against the beat
+    # boundary from BEFORE the stop -- the elapsed pause duration would
+    # make `frac` (and thus `tick_in_beat`) an arbitrary function of how
+    # long the transport sat stopped, not the note's real musical
+    # position. `_beat_start_ts`/`_last_beat_dur` must be invalidated by
+    # "stop" (see analyzers/timesig.py's own comment for why "stop" and
+    # not "continue"), so `_project_tick` falls back to its existing
+    # tick-0 bootstrap default until a fresh clock_tick re-establishes the
+    # boundary -- same "report unknown rather than trust a stale
+    # reference" precedent as `analyzers/transport.py`'s bpm=None on a
+    # missing prior clock boundary.
+    a = TimesigAnalyzer()
+    a.handle(transport("start", ts=0.0))
+    a.handle(clock_tick(ts=0.5, batch_start=None))    # beat 1 completes
+    a.handle(clock_tick(ts=1.0, batch_start=0.5))      # beat 2 completes, 0.5s/beat known
+    a.handle(note_on(ts=1.0, vel=100))                 # sane: exactly on the boundary
+    assert a._events[-1][0] == 2 * PPQN
+
+    a.handle(transport("stop", ts=1.1))
+    # A long, arbitrary pause -- nothing may carry the OLD beat_start_ts/
+    # beat_dur across this gap.
+    a.handle(transport("continue", ts=50.0))
+    a.handle(note_on(ts=50.05, vel=100))               # BEFORE any new clock_tick
+    # Bounded bootstrap default (tick 0 of the current beat), NOT a huge/
+    # meaningless projection computed against the pre-stop boundary (which,
+    # pre-fix, works out to tick_in_beat=2 here -- a value with no relation
+    # to the note's real position, just an artifact of the 49s pause).
+    assert a._events[-1][0] == 2 * PPQN
+
+    # A fresh clock_tick after resume re-establishes the boundary; a
+    # second one restores real fractional-position tracking (not just the
+    # tick-0 bootstrap) -- tracking is genuinely sane again, not merely
+    # "not crashing".
+    a.handle(clock_tick(ts=50.5, batch_start=None))    # first tick post-resume -- no prior ref
+    a.handle(clock_tick(ts=51.0, batch_start=50.5))    # beat duration known again: 0.5s
+    a.handle(note_on(ts=51.125, vel=100))              # 1/4 of the way into the beat
+    tick = a._events[-1][0]
+    assert tick == 4 * PPQN + round(0.25 * PPQN)
+
+
 def test_collapse_same_tick_merges_chord_notes_into_one_event():
     a = TimesigAnalyzer()
     a.handle(transport("start", ts=0.0))

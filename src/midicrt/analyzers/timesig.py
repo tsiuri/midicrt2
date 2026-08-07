@@ -215,6 +215,28 @@ class TimesigAnalyzer:
             if not self._running:
                 return False   # already stopped -- true no-op
             self._running = False   # v1 keeps the last known signature
+            # Invalidate the beat-boundary reference HERE, not on the later
+            # "continue" -- these two fields track a beat boundary that is
+            # only being kept fresh by an ACTIVELY ARRIVING clock (each
+            # `clock_tick` overwrites them unconditionally, even while
+            # stopped, in the rare case a free-running clock master keeps
+            # sending pulses through a stop). The moment the transport
+            # itself reports stopped, treat that boundary as unknown
+            # immediately: if clock really did keep flowing, the very next
+            # `clock_tick` re-establishes both fields anyway (this reset
+            # costs nothing in that edge case); if clock genuinely paused
+            # (the common case), this is what prevents a note_on arriving
+            # after the LATER "continue" (but before any fresh clock_tick)
+            # from being projected against a boundary that is now stale by
+            # the entire pause duration -- `_project_tick` would otherwise
+            # compute `frac = (ts - stale_beat_start_ts) / stale_beat_dur`
+            # over that whole gap, producing a `tick_in_beat` with no
+            # relation to the note's real position. Same "report unknown
+            # rather than trust a stale reference" precedent as
+            # `analyzers/transport.py`'s bpm=None when no prior clock
+            # boundary exists yet.
+            self._beat_start_ts = None
+            self._last_beat_dur = None
             return True
         if ev.type == "continue":
             if self._running:
@@ -263,8 +285,26 @@ class TimesigAnalyzer:
     def _on_note(self, tick: int, ts: float, velocity: int) -> None:
         w = 1.0 + (velocity / 127.0)
         if COLLAPSE_SAME_TICK and self._events and self._events[-1][0] == tick:
-            prev_tick, prev_ts, prev_w = self._events[-1]
-            self._events[-1] = (prev_tick, prev_ts, max(prev_w, w))
+            # Refresh the stored timestamp to THIS note's `ts`, not v1's
+            # verbatim `prev_ts` (v1's `ztimesig.py` keeps the OLDER
+            # timestamp on a same-tick merge too -- but v1's tick values
+            # come from a monotonically-increasing raw pulse counter that
+            # can only coincide for notes genuinely at the same instant, so
+            # `prev_ts`/`ts` were always equal in practice there; this
+            # port's tick RECONSTRUCTION (see module docstring) can, in a
+            # narrow case, project two temporally-distant notes to the same
+            # global tick -- e.g. a note right after a stop/continue but
+            # before any fresh clock_tick falls back to the same tick-0
+            # bootstrap default a much earlier note also landed on. Keeping
+            # the stale `prev_ts` there would let the very next window-purge
+            # (right below, keyed on `ts - self._events[0][1]`) evict the
+            # just-touched event for looking "too old", silently dropping a
+            # real, current onset. Using the newest `ts` is also strictly
+            # more correct for `_estimate`'s decay weighting, which should
+            # treat a merged event's recency as "last touched", not "first
+            # touched".
+            prev_tick, _prev_ts, prev_w = self._events[-1]
+            self._events[-1] = (prev_tick, ts, max(prev_w, w))
         else:
             self._events.append((tick, ts, w))
             self._total_events += 1

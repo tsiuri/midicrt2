@@ -55,6 +55,25 @@ independent of the dirty/view_model path) and turns each drained dict into
 its own `emit_event("alert", ...)` call. This mirrors the `tick()` hook's
 own "engine does I/O, analyzer stays pure" split.
 
+Alert-storm potential (disclosed, not fixed -- inherited from v1 verbatim)
+---------------------------------------------------------------------------
+Rapidly toggling CC64 (sustain) on a channel with an already-stuck note
+fires a fresh "warn"/"crit" `_pending_alerts` entry -- and therefore a
+fresh engine `alert` event -- on every up/down toggle that crosses back
+into an alert level, with no cooldown/debounce of its own: sustain-down
+forces the level to "none" (see `tick()`), and the very next sustain-up
+tick re-escalates it as a "new" transition (prev was "none"). v1 has the
+identical vector and the identical absence of any per-note cooldown for
+this specific case (v1's own `PANIC_COOLDOWN` only throttles the separate,
+not-ported MIDI panic-output side effect, never the `_log()` call this
+`alert` event mirrors) -- this is not a v2 regression. The bound that
+exists is at the transport layer, not here: `engine/server.py`'s
+slow-client write-buffer high-water check (task 1) drops any client that
+can't keep up with a burst of `alert` events rather than let its socket
+buffer grow without bound, so a toggle storm degrades to "that client gets
+disconnected and resubscribes," not an unbounded memory/queue growth.
+Analyzer-level debouncing, if ever wanted, is future work.
+
 Ported thresholds/semantics (v1 defaults; v2 has no config.toml section
 for these yet -- same "hardcode v1's defaults" precedent as
 analyzers/harmony.py's RECENT_NOTE_COUNT etc.)
@@ -95,9 +114,10 @@ Not ported (disclosed, not silently dropped)
   (`{"ch", "note", "held_s"}`) with no "recently cleared" field to carry
   that history into, so a renderer sees the alert list go empty
   immediately on release rather than lingering, unlike v1.
-- **v1's octave-letter note naming** (`_fmt_note`, e.g. "C4(060)", which
-  v1's own comment says is an intentionally off-by-2-octave convention
-  "to match polydisplay's octave shift") -- not reproduced; this
+- **v1's octave-letter note naming** (`_fmt_note`, e.g. note 60 ->
+  "C6(060)" -- v1's own comment says the "+2" is an intentional
+  off-by-2-octave convention "to match polydisplay's octave shift", two
+  octaves above the standard MIDI convention's "C4") -- not reproduced; this
   analyzer's VM reports raw MIDI note numbers only, matching
   `analyzers/voices.py`'s own `notes` field convention. A renderer
   wanting note names can already reuse `analyzers.theory.NOTE_NAMES`
