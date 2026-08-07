@@ -1,6 +1,7 @@
 import asyncio
 import json
 import queue
+import threading
 import time
 
 import pytest
@@ -272,3 +273,189 @@ async def test_malformed_json_drops_only_that_client(tmp_path):
     await asyncio.to_thread(good.close)
 
     eng.stop(); await task; await srv.close()
+
+
+# -- review fixes: request-id lock, event-aware startup wait, live topic ----
+# -- filter (all dormant under today's single-page config; the moment a    --
+# -- second page ships, fb's main thread (switch_topic via on_event) and   --
+# -- the input thread (client.action()) issue requests concurrently)      --
+
+def test_register_pending_is_one_atomic_critical_section(monkeypatch):
+    """Deterministic structural proof (not timing-dependent luck): force
+    thread A to pause *inside* the alloc+register critical section (while
+    holding `_pending_lock`) and assert thread B's concurrent call to the
+    same method is blocked entirely -- not just its id-allocation step --
+    until A releases. This is the actual shape of the fb race: the main
+    thread's switch_topic()->request() and the input thread's
+    client.action()->request() must never be able to interleave their id
+    allocation with their `_pending` registration."""
+    client = EngineClient("/nonexistent")
+    entered = threading.Event()
+    release = threading.Event()
+
+    real_alloc = client._alloc_id_locked
+
+    def slow_alloc_locked():
+        entered.set()
+        assert release.wait(timeout=2), "test setup: release was never signalled"
+        return real_alloc()
+
+    monkeypatch.setattr(client, "_alloc_id_locked", slow_alloc_locked)
+
+    result = {}
+
+    def thread_a():
+        result["a"] = client._register_pending()
+
+    ta = threading.Thread(target=thread_a)
+    ta.start()
+    assert entered.wait(timeout=1), "thread A should have entered the critical section"
+
+    b_done = threading.Event()
+
+    def thread_b():
+        result["b"] = client._register_pending()
+        b_done.set()
+
+    tb = threading.Thread(target=thread_b)
+    tb.start()
+    # Thread B must be unable to even START its own critical section while A
+    # is inside `_pending_lock` -- if alloc and pending-insert were two
+    # separate lock acquisitions, B could sneak its own alloc in here.
+    assert not b_done.wait(timeout=0.2), "thread B must block while A holds _pending_lock"
+
+    release.set()
+    ta.join(timeout=2)
+    tb.join(timeout=2)
+    assert b_done.is_set(), "thread B should complete once A releases the lock"
+
+    id_a, q_a = result["a"]
+    id_b, q_b = result["b"]
+    assert id_a != id_b
+    assert client._pending[id_a] is q_a
+    assert client._pending[id_b] is q_b
+
+
+def test_register_pending_stress_no_duplicate_ids_under_contention():
+    """Secondary, less deterministic net: many threads hammering
+    `_register_pending()` concurrently must never produce a duplicate id --
+    a duplicate would silently clobber `self._pending[req_id]` and strand
+    whichever caller's queue got overwritten."""
+    client = EngineClient("/nonexistent")
+    ids: list[int] = []
+    ids_lock = threading.Lock()
+
+    def worker():
+        for _ in range(200):
+            req_id, _ = client._register_pending()
+            with ids_lock:
+                ids.append(req_id)
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert len(ids) == 8 * 200
+    assert len(set(ids)) == len(ids), "duplicate request id allocated under contention"
+
+
+async def test_request_timeout_raises_client_error_on_expiry(tmp_path):
+    # The other half of the fb-freeze bug: even with unique ids, a request
+    # that never gets an answer (server hangs, connection half-open, etc.)
+    # must not block the caller (the render loop) forever.
+    sock_path = str(tmp_path / "blackhole.sock")
+
+    async def handle(reader, writer):
+        writer.write(proto.encode(proto.hello()))
+        await writer.drain()
+        line = await reader.readline()
+        msg = json.loads(line)
+        writer.write(proto.encode(proto.response(msg["id"], {"ok": "hello"})))
+        await writer.drain()
+        await reader.readline()  # swallow the next request, never respond
+        await asyncio.sleep(5)
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(handle, path=sock_path)
+    async with server:
+        client = EngineClient(sock_path)
+        await asyncio.to_thread(client.connect)
+        client.start_reader()
+        with pytest.raises(ClientError, match="timed out"):
+            await asyncio.to_thread(client.request, "status", timeout=0.2)
+        await asyncio.to_thread(client.close)
+
+
+async def test_request_default_timeout_none_is_unchanged_blocking_behavior(tmp_path):
+    # Regression: omitting `timeout` must behave exactly as before (block
+    # until the real response arrives), proven against a real engine/server.
+    eng, srv, task = await make(tmp_path)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    client.start_reader()
+    resp = await asyncio.to_thread(client.request, "status")
+    assert resp["ok"] is True
+    await asyncio.to_thread(client.close)
+    eng.stop(); await task; await srv.close()
+
+
+def test_wait_first_snapshot_retargets_on_page_changed_during_wait():
+    """Regression: a page_changed arriving before the first snapshot for the
+    ORIGINAL topic must retarget the wait via on_event, not get silently
+    dropped while wait_first_snapshot keeps blocking on a topic nobody's
+    steering toward anymore (the fb-startup race: the input thread is
+    already live while the main thread blocks here waiting for the first
+    snapshot of the page it subscribed to before startup)."""
+    q: queue.Queue = queue.Queue()
+    state = {"topic": "page.eventlog"}
+
+    def on_event(msg):
+        if msg.get("kind") == "event" and msg.get("name") == "page_changed":
+            state["topic"] = f"page.{msg['data']['page']}"
+
+    q.put({"kind": "event", "name": "page_changed", "data": {"page": "second"}})
+    # A stale snapshot for the ORIGINAL topic, arriving after the switch
+    # (the known transient-artifact case from task-1's report) -- must NOT
+    # satisfy the wait now that the target has moved on.
+    q.put({"kind": "snapshot", "topic": "page.eventlog", "seq": 9, "data": {"stale": True}})
+    q.put({"kind": "snapshot", "topic": "page.second", "seq": 1, "data": {"marker": "fake"}})
+
+    vm = wait_first_snapshot(q, lambda: state["topic"], on_event)
+    assert vm == {"marker": "fake"}
+
+
+def test_wait_first_snapshot_still_accepts_a_plain_string_topic():
+    # Backward-compat: a fixed string target (no on_event) is still valid --
+    # every existing call site that never needs mid-wait retargeting.
+    q: queue.Queue = queue.Queue()
+    q.put({"kind": "snapshot", "topic": "page.eventlog", "seq": 1, "data": {"n": 1}})
+    assert wait_first_snapshot(q, "page.eventlog") == {"n": 1}
+
+
+def test_drain_latest_self_heals_within_same_batch_on_page_change():
+    """Regression: `on_event` mutates `state["topic"]` mid-drain via
+    switch_topic(), and a same-batch snapshot for the NEW topic must not be
+    dropped by a topics-membership check frozen once at call-entry."""
+    q: queue.Queue = queue.Queue()
+    state = {"topic": "page.eventlog"}
+
+    def on_event(msg):
+        if msg.get("kind") == "event" and msg.get("name") == "page_changed":
+            state["topic"] = f"page.{msg['data']['page']}"
+
+    q.put({"kind": "event", "name": "page_changed", "data": {"page": "second"}})
+    q.put({"kind": "snapshot", "topic": "page.second", "seq": 1, "data": {"marker": "fake"}})
+
+    out = drain_latest(q, lambda: {state["topic"]}, on_event=on_event)
+    assert out == {"page.second": {"marker": "fake"}}
+
+
+def test_drain_latest_still_accepts_a_plain_set_of_topics():
+    # Backward-compat: a fixed set (no retargeting) behaves exactly as
+    # before -- every existing call site that subscribes to one static topic.
+    q: queue.Queue = queue.Queue()
+    q.put({"kind": "snapshot", "topic": "page.eventlog", "seq": 1, "data": {"n": 1}})
+    assert drain_latest(q, {"page.eventlog"}) == {"page.eventlog": {"n": 1}}

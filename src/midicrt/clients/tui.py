@@ -86,7 +86,13 @@ def run_tui(socket_path: str) -> int:
             state["page"], state["topic"] = new_page, new_topic
 
     try:
-        vm = wait_first_snapshot(inbox, state["topic"])
+        # `on_event` is wired in HERE, before the startup wait, not just for
+        # the main loop below: the input thread analogue in fb/app.py can
+        # fire `page.next` while this blocks for the first snapshot (and
+        # even here, another connected client could dispatch page.next
+        # first) -- without on_event, that page_changed would be silently
+        # dropped and the client would stay on the stale topic forever.
+        vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
     except ClientError:
         print("midicrt tui: engine connection lost")
         client.close()
@@ -99,7 +105,11 @@ def run_tui(socket_path: str) -> int:
             dirty = True
             while True:
                 try:
-                    drained = drain_latest(inbox, {state["topic"]}, on_event=on_event)
+                    # A callable, not a frozen `{state["topic"]}` snapshot:
+                    # `on_event` (invoked from inside this very call) can
+                    # switch `state["topic"]` mid-drain, and a same-batch
+                    # snapshot for the NEW topic must still be recognised.
+                    drained = drain_latest(inbox, lambda: {state["topic"]}, on_event=on_event)
                 except ClientError:
                     lost = True
                     return 1

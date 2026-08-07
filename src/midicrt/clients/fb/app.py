@@ -209,9 +209,17 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
 
     quit_event = threading.Event()
     if not no_input:
+        # `on_event` is already constructed above (before this thread
+        # starts): the input thread can fire `page.next` immediately, and
+        # the main thread is about to block in `wait_first_snapshot` below
+        # -- without event-awareness there, that page_changed would be
+        # silently dropped and the client would stay on the stale topic
+        # forever (this was the actual freeze: the input thread calling
+        # client.action() while the main thread's own switch_topic() call
+        # from a later on_event races it over the same connection).
         threading.Thread(target=_input_loop, args=(client, quit_event), daemon=True).start()
 
-    vm = wait_first_snapshot(inbox, state["topic"])
+    vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
     renderer = RENDERERS.get(state["page"], _render_unknown)
     renderer(vm, surface)
     surface.write_fb(fb_path, stride=stride)
@@ -220,7 +228,11 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
     while not quit_event.is_set():
         if quit_event.wait(period):
             break
-        drained = drain_latest(inbox, {state["topic"]}, on_event=on_event)
+        # Callable, not a frozen `{state["topic"]}` snapshot: `on_event`
+        # (invoked from inside this very call) can switch `state["topic"]`
+        # mid-drain, and a same-batch snapshot for the NEW topic must
+        # still be recognised, not dropped by a stale membership check.
+        drained = drain_latest(inbox, lambda: {state["topic"]}, on_event=on_event)
         if state["topic"] in drained:
             vm = drained[state["topic"]]
             renderer = RENDERERS.get(state["page"], _render_unknown)
@@ -246,7 +258,10 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
         if out_path is not None:
             # Headless test/acceptance mode: render exactly one frame from
             # the first snapshot and exit -- never touches evdev or a real
-            # fb device regardless of --no-input/--fb.
+            # fb device regardless of --no-input/--fb. No input thread
+            # exists in this path (deliberately, per the docstring above),
+            # so there's no concurrent source of a page_changed here -- a
+            # plain fixed `topic`, no `on_event`, is correct as-is.
             vm = wait_first_snapshot(inbox, topic)
             surface = Surface(*OUT_SIZE)
             renderer = RENDERERS.get(page, _render_unknown)

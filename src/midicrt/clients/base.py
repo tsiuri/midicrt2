@@ -74,11 +74,26 @@ class EngineClient:
                 pass
 
     # -- request/response ---------------------------------------------
-    def request(self, cmd: str, **kw) -> dict:
-        req_id = self._alloc_id()
+    def request(self, cmd: str, *, timeout: float | None = None, **kw) -> dict:
+        """Send `cmd` and block for its response.
+
+        `timeout` (seconds) only applies once `start_reader()` has been
+        called -- that's the path with a per-request queue that can
+        actually be timed out. The pre-reader sync path
+        (`_read_until_sync`) blocks on the raw socket with no timeout
+        mechanism; it's only ever used for the single-threaded
+        connect/hello handshake, which isn't exposed to the concurrent-
+        caller race `timeout` exists to guard against (two threads --
+        e.g. an fb client's render loop calling `switch_topic()` from
+        `on_event` while its input thread calls `client.action()` --
+        both issuing requests over the SAME connection via the reader
+        thread). Raises `ClientError` on expiry, same as any other lost
+        response.
+        """
         if self._reader_thread is not None:
-            resp = self._request_via_reader(req_id, cmd, kw)
+            resp = self._request_via_reader(cmd, kw, timeout)
         else:
+            req_id = self._alloc_id()
             self._send({"id": req_id, "cmd": cmd, **kw})
             resp = self._read_until_sync(req_id)
         if resp is None:
@@ -87,25 +102,57 @@ class EngineClient:
             raise ClientError(resp.get("error", f"{cmd} failed"))
         return resp
 
-    def _request_via_reader(self, req_id: int, cmd: str, kw: dict) -> dict | None:
+    def _register_pending(self) -> tuple[int, queue.Queue]:
+        """Allocate a request id AND register its response queue in
+        `self._pending` as ONE atomic critical section under
+        `_pending_lock`.
+
+        This used to be two separate steps (`_alloc_id()` outside any
+        lock, then a *second*, later `with self._pending_lock:` block to
+        insert into `self._pending`). Two threads calling `request()`
+        concurrently could both read the pre-increment `self._next_id`
+        before either wrote back the increment, allocating the SAME id;
+        each then inserted its own queue into `self._pending[that id]`,
+        the second write clobbering the first -- so the first caller's
+        queue never received a `put()` and `q.get()` blocked forever
+        (the fb render-loop freeze this fixes: `switch_topic()` from the
+        main thread's `on_event` racing `client.action()` from the input
+        thread). Merging both steps into one critical section makes a
+        duplicate id structurally impossible: only one thread can be
+        between "read `_next_id`" and "write `self._pending[id]`" at a
+        time.
+        """
         q: queue.Queue = queue.Queue()
         with self._pending_lock:
+            req_id = self._alloc_id_locked()
             self._pending[req_id] = q
+        return req_id, q
+
+    def _request_via_reader(self, cmd: str, kw: dict,
+                             timeout: float | None = None) -> dict | None:
+        req_id, q = self._register_pending()
         try:
             self._send({"id": req_id, "cmd": cmd, **kw})
-            return q.get()
+            if timeout is None:
+                return q.get()
+            try:
+                return q.get(timeout=timeout)
+            except queue.Empty:
+                raise ClientError(f"{cmd!r} timed out after {timeout}s") from None
         finally:
             with self._pending_lock:
                 self._pending.pop(req_id, None)
 
-    def subscribe(self, topics: list[str], max_rate: float) -> dict:
-        return self.request("subscribe", topics=topics, max_rate=max_rate)
+    def subscribe(self, topics: list[str], max_rate: float,
+                  timeout: float | None = None) -> dict:
+        return self.request("subscribe", topics=topics, max_rate=max_rate, timeout=timeout)
 
-    def unsubscribe(self, topics: list[str]) -> dict:
-        return self.request("unsubscribe", topics=topics)
+    def unsubscribe(self, topics: list[str], timeout: float | None = None) -> dict:
+        return self.request("unsubscribe", topics=topics, timeout=timeout)
 
-    def action(self, name: str, args: dict | None = None) -> dict:
-        return self.request("action", name=name, args=args or {})
+    def action(self, name: str, args: dict | None = None,
+               timeout: float | None = None) -> dict:
+        return self.request("action", name=name, args=args or {}, timeout=timeout)
 
     # -- streaming ------------------------------------------------------
     def start_reader(self) -> queue.Queue:
@@ -187,6 +234,18 @@ class EngineClient:
             self._async_queue.put(msg)  # async message passed over -- buffer it
 
     def _alloc_id(self) -> int:
+        """Thread-safe id allocation for standalone callers (e.g. `connect()`'s
+        hello, or the pre-reader sync path in `request()`). NOT used by
+        `_register_pending()`, which needs the raw `_alloc_id_locked()` so
+        allocation and `self._pending` insertion share one lock acquisition
+        (see `_register_pending`'s docstring) -- calling this method (which
+        acquires the lock itself) from inside a block that already holds
+        `_pending_lock` would deadlock (`threading.Lock` isn't reentrant)."""
+        with self._pending_lock:
+            return self._alloc_id_locked()
+
+    def _alloc_id_locked(self) -> int:
+        """Raw id increment. Caller MUST already hold `_pending_lock`."""
         self._next_id += 1
         return self._next_id
 
@@ -206,25 +265,36 @@ class EngineClient:
 def drain_latest(inbox: queue.Queue, topics, on_event=None) -> dict[str, dict]:
     """Non-blocking drain of every message currently queued on `inbox`.
 
-    For each snapshot whose topic is in `topics`, the returned dict keeps
-    the newest `data` payload (the page view-model) per topic -- latest
-    wins, matching `ProtocolServer._push_loop`'s own coalescing so a client
-    never falls behind processing a burst. Every other message (events, or
-    a snapshot for a topic not in `topics`) is passed to `on_event` if one
-    was given, else silently dropped (this is the pre-existing behaviour of
-    both clients' old private drain loops when `on_event` is omitted).
+    `topics` may be a fixed set/container, or a zero-arg callable returning
+    the CURRENT set of topics of interest -- pass a callable when `topics`
+    can change mid-drain. This matters because `on_event` (see below) can
+    itself call `switch_topic()` and mutate whatever `topics` reads from;
+    membership is re-evaluated PER MESSAGE (calling `topics()` fresh each
+    time it's not a plain container), not once at call-entry, so a
+    same-batch snapshot for a topic `on_event` just switched TO is still
+    recognised instead of silently failing a stale membership check.
+
+    For each snapshot whose topic is a current member of `topics`, the
+    returned dict keeps the newest `data` payload (the page view-model) per
+    topic -- latest wins, matching `ProtocolServer._push_loop`'s own
+    coalescing so a client never falls behind processing a burst. Every
+    other message (events, or a snapshot for a topic not currently in
+    `topics`) is passed to `on_event` if one was given, else silently
+    dropped (this is the pre-existing behaviour of both clients' old
+    private drain loops when `on_event` is omitted).
 
     Raises `ClientError` on the reader thread's `None` EOF sentinel, same
     as a failed connect/subscribe -- callers treat a lost connection
     uniformly everywhere in this module.
     """
+    get_topics = topics if callable(topics) else (lambda: topics)
     snapshots: dict[str, dict] = {}
     try:
         while True:
             msg = inbox.get_nowait()
             if msg is None:
                 raise ClientError("engine connection lost")
-            if msg.get("kind") == "snapshot" and msg.get("topic") in topics:
+            if msg.get("kind") == "snapshot" and msg.get("topic") in get_topics():
                 snapshots[msg["topic"]] = msg["data"]
             elif on_event is not None:
                 on_event(msg)
@@ -233,19 +303,37 @@ def drain_latest(inbox: queue.Queue, topics, on_event=None) -> dict[str, dict]:
     return snapshots
 
 
-def wait_first_snapshot(inbox: queue.Queue, topic: str) -> dict:
-    """Block for the first snapshot on `topic`. `subscribe()`'s response is
-    inline but the snapshot itself arrives via the pusher up to
-    `1/max_rate` later (docs/phase2-notes.md) -- never assume it's already
-    queued right after `subscribe()` returns. Messages for other topics or
-    events seen while waiting are discarded (a caller that cares about them
-    should already have handled them before blocking here)."""
+def wait_first_snapshot(inbox: queue.Queue, topic, on_event=None) -> dict:
+    """Block for the first snapshot matching `topic`.
+
+    `topic` may be a plain string (fixed target), or a zero-arg callable
+    returning the CURRENT target -- pass a callable together with
+    `on_event` when the target can change mid-wait. This closes the
+    fb-startup race: the input thread is already live while the main
+    thread blocks here waiting for the first snapshot of the page it
+    subscribed to before startup, so a `page_changed` firing in that
+    window must retarget the wait instead of being silently dropped while
+    the wait keeps blocking on a topic nobody's steering toward anymore
+    (the client would then stay on the stale topic forever). `on_event` is
+    invoked for every message that isn't a matching snapshot -- including
+    the `page_changed` event itself -- with the SAME semantics as
+    `drain_latest`'s `on_event`, so callers pass the identical callback
+    (typically one that calls `switch_topic()` and mutates the state
+    `topic` reads from) to both functions.
+
+    `subscribe()`'s response is inline but the snapshot itself arrives via
+    the pusher up to `1/max_rate` later (docs/phase2-notes.md) -- never
+    assume it's already queued right after `subscribe()` returns.
+    """
+    get_topic = topic if callable(topic) else (lambda: topic)
     while True:
         msg = inbox.get()
         if msg is None:
             raise ClientError("engine connection lost")
-        if msg.get("kind") == "snapshot" and msg.get("topic") == topic:
+        if msg.get("kind") == "snapshot" and msg.get("topic") == get_topic():
             return msg["data"]
+        if on_event is not None:
+            on_event(msg)
 
 
 def current_page_topic(client: EngineClient) -> tuple[str, str]:
