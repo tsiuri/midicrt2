@@ -155,7 +155,8 @@ def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll_spectru
     eng = Engine(Config())
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
-        "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard", "chordkey",
+        "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
+        "chordkey", "sendnotes",
     ]
     assert eng.current_page == "eventlog"
 
@@ -167,7 +168,7 @@ def test_register_page_appends_to_live_roster():
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
         "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
-        "chordkey", "second",
+        "chordkey", "sendnotes", "second",
     ]
     assert eng.pages["second"] is fake
 
@@ -178,7 +179,8 @@ def test_engine_topics_reflects_roster_order():
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
-        "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.second",
+        "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes",
+        "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
@@ -248,7 +250,7 @@ def test_topics_include_overlay_after_page_topics():
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
-        "page.ccmonitor", "page.ccdashboard", "page.chordkey",
+        "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress",
     ]
@@ -338,16 +340,18 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "chordkey"
     await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "sendnotes"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "chordkey"
+    assert eng.current_page == "sendnotes"
 
     names = [e["name"] for e in events]
-    assert names == ["page_changed"] * 14
+    assert names == ["page_changed"] * 15
     assert [e["data"]["page"] for e in events] == [
         "voices", "harmony", "pianoroll", "spectrum", "screensaver", "img2txtviz",
         "config", "help", "progchanges", "ccmonitor", "ccdashboard", "chordkey",
-        "second", "chordkey",
+        "sendnotes", "second", "sendnotes",
     ]
 
 
@@ -892,3 +896,127 @@ def test_config_page_is_absent_when_not_in_the_roster_has_no_crash_on_engine_ini
     # Engine.__init__'s guarded bind_engine_info() call.
     eng = Engine(Config(pages=["eventlog"]))
     assert "config" not in eng.pages
+
+
+# -- help page (phase-3 task 12) ----------------------------------------------
+
+def test_help_is_in_the_default_roster():
+    eng = Engine(Config())
+    assert "help" in eng.pages
+    assert eng.pages["help"].view_model()["title"] == "HELP"
+
+
+def test_help_page_info_is_wired_to_the_real_engine_roster_and_actions():
+    # Engine.__init__ binds `_help_info` into the page right after building
+    # self.pages -- see pages/help.py's own "Engine-info wiring" docstring.
+    eng = Engine(Config())
+    vm = eng.pages["help"].view_model()
+    labels = {r["label"] for r in vm["action_rows"]}
+    assert "page.goto" in labels and "eventlog.clear" in labels
+    assert "voices" in vm["page_rows"][0]["value"]
+
+
+def test_help_page_is_absent_when_not_in_the_roster_has_no_crash_on_engine_init():
+    eng = Engine(Config(pages=["eventlog"]))
+    assert "help" not in eng.pages
+
+
+# -- send notes page (phase-3 task 12) ----------------------------------------
+
+class _FakeMidiOut:
+    """Test double for engine/midi_out.py::MidiOutput -- captures calls
+    instead of touching real MIDI, mirroring _FakeTickingAnalyzer's own
+    "scripted double, no real I/O" convention above."""
+
+    def __init__(self):
+        self.note_on_calls: list[tuple[int, int, int]] = []
+        self.note_off_calls: list[tuple[int, int]] = []
+        self.closed = False
+        self.port_name = "fake"
+        self.is_open = True
+
+    def note_on(self, note, velocity, channel):
+        self.note_on_calls.append((note, velocity, channel))
+
+    def note_off(self, note, channel):
+        self.note_off_calls.append((note, channel))
+
+    def close(self):
+        self.closed = True
+
+
+def test_sendnotes_is_in_the_default_roster():
+    eng = Engine(Config())
+    assert "sendnotes" in eng.pages
+    assert eng.pages["sendnotes"].view_model()["title"] == "SEND NOTES"
+
+
+def test_sendnotes_action_is_registered_when_the_page_is_present():
+    eng = Engine(Config())
+    assert "sendnotes.key" in eng.actions.describe()
+
+
+def test_sendnotes_action_is_absent_when_the_page_is_not_in_the_roster():
+    eng = Engine(Config(pages=["eventlog"]))
+    assert "sendnotes.key" not in eng.actions.describe()
+    assert "sendnotes" not in eng.pages   # bind_device_info() guard never crashed init
+
+
+async def test_sendnotes_key_action_sends_a_real_note_on_through_midi_out():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    r = await eng.actions.dispatch("sendnotes.key", {"key": "z"})
+    assert r == {"applied": True}
+    assert fake.note_on_calls == [(60, 96, 1)]
+    assert "page.sendnotes" in eng._dirty
+    assert eng.pages["sendnotes"].view_model()["active"] == 1
+
+
+async def test_sendnotes_key_action_control_key_never_touches_midi_out():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    r = await eng.actions.dispatch("sendnotes.key", {"key": "]"})   # octave up
+    assert r == {"applied": True}
+    assert fake.note_on_calls == []
+    assert eng.pages["sendnotes"].view_model()["octave"] == 5
+
+
+async def test_sendnotes_key_action_unrecognized_key_is_disclosed_via_applied_false():
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("sendnotes.key", {"key": "q"})
+    assert r == {"applied": False}
+
+
+def test_tick_pages_drains_expired_sendnotes_and_sends_real_note_off():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng.pages["sendnotes"].apply_key("z", now=1000.0)   # gate_ms=120 -> expires 1000.12
+    eng._tick_pages(1000.5)   # past expiry
+    assert fake.note_off_calls == [(60, 1)]
+    assert "page.sendnotes" in eng._dirty
+    assert eng.pages["sendnotes"].view_model()["active"] == 0
+
+
+def test_tick_pages_does_not_touch_midi_out_when_nothing_has_expired():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng.pages["sendnotes"].apply_key("z", now=1000.0)
+    eng._tick_pages(1000.01)   # well before the 120ms gate elapses
+    assert fake.note_off_calls == []
+
+
+def test_tick_pages_is_a_no_op_when_sendnotes_is_not_in_the_roster():
+    eng = Engine(Config(pages=["eventlog"]))
+    eng._tick_pages(1000.0)   # must not raise (no "sendnotes" key in self.pages)
+
+
+def test_engine_stop_closes_midi_out():
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng.stop()
+    assert fake.closed is True

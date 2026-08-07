@@ -731,6 +731,40 @@ def render_chordkey_lines(vm: dict, width: int, height: int) -> list[str]:
     return [header] + body
 
 
+# -- send notes page (phase-3 task 12, gap ports) -------------------------------
+#
+# Same status-line + keymap-hint layout as fb/app.py's
+# `render_sendnotes_frame` -- see pages/sendnotes.py's own module docstring
+# for the full v1 (`pages/sendnotes.py`) field mapping.
+def _sendnotes_header_text(vm: dict) -> str:
+    return f"{vm['title']}  [n]ext page [q]uit"
+
+
+def _sendnotes_status_text(vm: dict) -> str:
+    dev = vm["device"] or "(not open)"
+    return (f"Dev: {dev}  Ch:{vm['channel']:02d}  Oct:{vm['octave']:+d}  "
+            f"Vel:{vm['velocity']:03d}  Gate:{vm['gate_ms']}ms  Active:{vm['active']}")
+
+
+def _sendnotes_body_lines(vm: dict) -> list[str]:
+    return [
+        _sendnotes_status_text(vm),
+        "",
+        "Keys: z s x d c v g b h n j m (, l . ; /) -- white/black keys",
+        "[,] ch-+/  [-]/[+] oct  [-]/[=] vel  g/h gate",
+    ]
+
+
+def render_sendnotes_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_sendnotes_header_text(vm), width)
+    body_h = height - 1
+    rows = [_fit(ln, width) for ln in _sendnotes_body_lines(vm)]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [header] + body
+
+
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "harmony": render_harmony_lines, "tuner": render_tuner_lines,
              "pianoroll": render_pianoroll_lines, "spectrum": render_spectrum_lines,
@@ -738,7 +772,7 @@ RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "img2txtviz": render_img2txtviz_lines, "config": render_config_lines,
              "help": render_help_lines, "progchanges": render_progchanges_lines,
              "ccmonitor": render_ccmonitor_lines, "ccdashboard": render_ccdashboard_lines,
-             "chordkey": render_chordkey_lines}
+             "chordkey": render_chordkey_lines, "sendnotes": render_sendnotes_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}

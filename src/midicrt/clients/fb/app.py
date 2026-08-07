@@ -890,6 +890,48 @@ def render_chordkey_frame(vm: dict, surface: Surface) -> None:
     _row(f"Function: {vm['function'] or '?'}")
 
 
+# -- send notes page (phase-3 task 12, gap ports) -------------------------------
+#
+# Layout: reverse-video header, then a status line (device/channel/octave/
+# velocity/gate/active, matching v1's own `pages/sendnotes.py::_build_
+# widget_lines`'s status line) plus a keymap hint row -- see that module's
+# module docstring for the full v1 field mapping. No interactive input is
+# wired to this renderer (Phase 4's key->action table, same "reachable via
+# `midicrt action` only" precedent as pianoroll/img2txtviz's own controls).
+def _sendnotes_header_text(vm: dict) -> str:
+    return f"{vm['title']}"
+
+
+def _sendnotes_status_text(vm: dict) -> str:
+    dev = vm["device"] or "(not open)"
+    return (f"Dev: {dev}  Ch:{vm['channel']:02d}  Oct:{vm['octave']:+d}  "
+            f"Vel:{vm['velocity']:03d}  Gate:{vm['gate_ms']}ms  Active:{vm['active']}")
+
+
+def render_sendnotes_frame(vm: dict, surface: Surface) -> None:
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _sendnotes_header_text(vm), BG, font)
+
+    line_h = font.height + LINE_GAP
+    usable_h = surface.height - _reserved_chrome_height(font)
+    y = header_h
+
+    def _row(text: str) -> None:
+        nonlocal y
+        if y + font.height > usable_h:
+            return
+        draw_text(surface, LEFT_MARGIN, y, text, NORMAL_FG, font)
+        y += line_h
+
+    _row(_sendnotes_status_text(vm))
+    _row("Keys: z s x d c v g b h n j m (, l . ; /) -- white/black keys")
+    _row("[,] ch-+/  [-]/[+] oct  [-]/[=] vel  g/h gate")
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
              "harmony": render_harmony_frame, "tuner": render_tuner_frame,
              "pianoroll": render_pianoroll_frame, "spectrum": render_spectrum_frame,
@@ -897,7 +939,7 @@ RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
              "img2txtviz": render_img2txtviz_frame, "config": render_config_frame,
              "help": render_help_frame, "progchanges": render_progchanges_frame,
              "ccmonitor": render_ccmonitor_frame, "ccdashboard": render_ccdashboard_frame,
-             "chordkey": render_chordkey_frame}
+             "chordkey": render_chordkey_frame, "sendnotes": render_sendnotes_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

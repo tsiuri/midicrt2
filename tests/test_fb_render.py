@@ -1657,6 +1657,68 @@ def test_render_chordkey_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
+# -- send notes page (phase-3 task 12, gap ports) -------------------------------
+GOLDEN_SENDNOTES_FRAME = FIXTURES / "fb_sendnotes_frame_golden.png"
+SENDNOTES_SURFACE_SIZE = (300, 100)
+
+SENDNOTES_VM = {
+    "title": "SEND NOTES",
+    "device": "midicrt2 Output",
+    "channel": 1, "octave": 4, "velocity": 96, "gate_ms": 120, "active": 2,
+}
+SENDNOTES_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+SENDNOTES_ALERTS_VM = {"alerts": []}
+SENDNOTES_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                         "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_sendnotes_renderers_dispatch_table_has_sendnotes():
+    assert app.RENDERERS["sendnotes"] is app.render_sendnotes_frame
+
+
+def test_render_sendnotes_frame_header_bar_is_reverse_video():
+    surf = Surface(*SENDNOTES_SURFACE_SIZE)
+    app.render_sendnotes_frame(SENDNOTES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._sendnotes_header_text(SENDNOTES_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+
+
+def test_render_sendnotes_frame_shows_not_open_when_device_is_none():
+    surf = Surface(*SENDNOTES_SURFACE_SIZE)
+    vm = dict(SENDNOTES_VM, device=None)
+    app.render_sendnotes_frame(vm, surf)   # must not raise
+    assert "(not open)" in app._sendnotes_status_text(vm)
+
+
+def test_render_sendnotes_frame_draws_text_for_the_status_row():
+    surf = Surface(*SENDNOTES_SURFACE_SIZE)
+    app.render_sendnotes_frame(SENDNOTES_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    assert any(px[x, header_h] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+
+
+def test_render_sendnotes_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_SENDNOTES_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-12-report.md"
+    )
+    surf = Surface(*SENDNOTES_SURFACE_SIZE)
+    app.render_sendnotes_frame(SENDNOTES_VM, surf)
+    app._draw_secondary(surf, SENDNOTES_ALERTS_VM, SENDNOTES_TIMESIG_VM, load_font())
+    app._draw_status(surf, SENDNOTES_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_SENDNOTES_FRAME).convert("RGB")
+    assert golden.size == SENDNOTES_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # Regression: `--fps 0` (or negative/nan) used to reach the wire, get
     # rejected by the server's max_rate check, and then hang forever in

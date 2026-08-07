@@ -972,6 +972,45 @@ def test_chordkey_renderers_dispatch_table_has_chordkey():
     assert RENDERERS["chordkey"] is render_chordkey_lines
 
 
+# -- send notes page (phase-3 task 12, gap ports) -------------------------------
+SENDNOTES_VM = {
+    "title": "SEND NOTES",
+    "device": "midicrt2 Output",
+    "channel": 1, "octave": 4, "velocity": 96, "gate_ms": 120, "active": 2,
+}
+
+
+def test_sendnotes_status_text_shows_all_fields():
+    text = tui._sendnotes_status_text(SENDNOTES_VM)
+    assert "midicrt2 Output" in text
+    assert "Ch:01" in text
+    assert "Oct:+4" in text
+    assert "Vel:096" in text
+    assert "Gate:120ms" in text
+    assert "Active:2" in text
+
+
+def test_sendnotes_status_text_shows_not_open_when_device_is_none():
+    vm = dict(SENDNOTES_VM, device=None)
+    assert "(not open)" in tui._sendnotes_status_text(vm)
+
+
+def test_render_sendnotes_lines_pads_to_exact_dimensions():
+    out = tui.RENDERERS["sendnotes"](SENDNOTES_VM, width=50, height=6)
+    assert len(out) == 6
+    assert all(len(ln) == 50 for ln in out)
+
+
+def test_render_sendnotes_lines_cuts_off_extra_rows_when_height_is_short():
+    out = tui.RENDERERS["sendnotes"](SENDNOTES_VM, width=50, height=2)
+    assert len(out) == 2   # header + exactly 1 body row
+
+
+def test_sendnotes_renderers_dispatch_table_has_sendnotes():
+    from midicrt.clients.tui import render_sendnotes_lines
+    assert RENDERERS["sendnotes"] is render_sendnotes_lines
+
+
 def test_run_tui_survives_page_switch_before_new_topics_snapshot_arrives(monkeypatch):
     """TUI's twin of fb/app.py::_run_device's regression (same phase-3 task
     11 finding, found live against the real daemon): a page_changed event

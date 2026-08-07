@@ -135,6 +135,7 @@ from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
+from midicrt.engine.midi_out import MidiOutput
 from midicrt.pages.ccdashboard import CCDashboardPage
 from midicrt.pages.ccmonitor import CCMonitorPage
 from midicrt.pages.chordkey import ChordKeyPage
@@ -146,6 +147,7 @@ from midicrt.pages.img2txtviz import Img2TxtVizPage
 from midicrt.pages.pianoroll import PianorollPage
 from midicrt.pages.progchanges import ProgChangesPage
 from midicrt.pages.screensaver import ScreensaverPage
+from midicrt.pages.sendnotes import SendNotesPage
 from midicrt.pages.spectrum import SpectrumPage
 from midicrt.pages.tuner import TunerPage
 from midicrt.pages.voices import VoicesPage
@@ -284,6 +286,14 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # OWN HarmonyAnalyzer instance, same "no cross-page analyzer sharing
     # yet" precedent as "ccmonitor"/"ccdashboard" above.
     "chordkey": lambda config: ChordKeyPage(),
+    # Phase-3 task 12 (gap ports, v1 page 2 "Send Notes"): the only v1
+    # page/plugin that sends real MIDI output -- see pages/sendnotes.py's
+    # own module docstring for why this needed a new engine-level I/O
+    # surface (engine/midi_out.py::MidiOutput) rather than fitting the
+    # existing "pure page" contract. `Engine.__init__` wires this page's
+    # LIVE device-open callback separately (mirrors the "config"/"help"
+    # pages' own bind_*_info() wiring) right after `self.pages` is built.
+    "sendnotes": lambda config: SendNotesPage(),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`
@@ -337,6 +347,16 @@ class Engine:
         # see pages/help.py's own "Engine-info wiring" docstring section.
         if "help" in self.pages:
             self.pages["help"].bind_info(self._help_info)
+        # Phase-3 task 12: a single lazily-opened MIDI output, shared by
+        # "sendnotes" (real note sends) and, when the roster reaches it,
+        # engine/sysex.py's versioned reply frames -- see engine/
+        # midi_out.py's own module docstring for why ONE port covers both
+        # v1 capabilities. Constructed unconditionally (mirrors
+        # `_pagecycle_behavior`/`_screensaver_behavior` below): no I/O
+        # happens until a real send is attempted.
+        self._midi_out = MidiOutput()
+        if "sendnotes" in self.pages:
+            self.pages["sendnotes"].bind_device_info(self._sendnotes_device_info)
         self.events_total = 0
         self.started_at = time.monotonic()
         self._listeners: list[Callable[[dict], None]] = []
@@ -425,6 +445,42 @@ class Engine:
                                   description="Cycle the img2txtviz ASCII charset")
             self.actions.register("img2txtviz.invert", self._img2txtviz_invert,
                                   description="Toggle the img2txtviz invert flag")
+        # Phase-3 task 12: sendnotes' one interactive entry point -- ported
+        # from v1's real per-keystroke `keypress()` (see pages/sendnotes.py's
+        # own module docstring for the full v1 branch-order/KEYMAP-shadowing
+        # notes). Reachable via `midicrt action sendnotes.key --arg key=z`,
+        # same "no client-side keyboard binding yet" precedent as
+        # "pianoroll.zoom"/"img2txtviz.charset" above (Phase 4's key->action
+        # table, phase3-notes.md's own known-latent item).
+        if "sendnotes" in self.pages:
+            self.actions.register("sendnotes.key", self._sendnotes_key,
+                                  description="Send one Send-Notes keystroke "
+                                              "(note or control key)",
+                                  args={"key": "str"})
+
+    def _sendnotes_device_info(self) -> dict:
+        """Bound into `pages/sendnotes.py`'s `SendNotesPage` at construction
+        (see `__init__` above) -- exposes `self._midi_out`'s own open/closed
+        state without handing the page a reference to the I/O object
+        itself (pages never own MidiOutput -- see that page's module
+        docstring)."""
+        return {"is_open": self._midi_out.is_open, "port_name": self._midi_out.port_name}
+
+    def _sendnotes_key(self, key: str) -> dict:
+        """Handler for the `sendnotes.key` action: reads the wall clock
+        ONCE here (the engine's job, mirroring `_tick_pages(time.time())`'s
+        own call site in `run()`) and hands it to `SendNotesPage.apply_key`
+        as an injected value -- the page itself never reads a clock. Any
+        real note trigger the page reports is sent through `self._midi_out`
+        immediately; a control-key adjustment (or an unrecognized key) never
+        touches MIDI output at all."""
+        now = time.time()
+        page = self.pages["sendnotes"]
+        result = page.apply_key(key, now)
+        self._dirty.add("page.sendnotes")
+        if result and result.get("note_on"):
+            self._midi_out.note_on(result["note"], result["vel"], result["ch"])
+        return {"applied": result is not None}
 
     def _clear_eventlog(self):
         self.pages["eventlog"].clear()
@@ -570,6 +626,13 @@ class Engine:
 
     def stop(self) -> None:
         self._running = False
+        # Phase-3 task 12: unlike MidiInput (owned/started/stopped by
+        # daemon.py, injected via self.queue), MidiOutput is constructed
+        # entirely inside Engine.__init__ with no external owner -- so
+        # Engine.stop() closes it directly rather than adding a second
+        # daemon.py-level shutdown call site. A safe no-op if the port was
+        # never actually opened (see MidiOutput.close()'s own docstring).
+        self._midi_out.close()
 
     def _tick_analyzers(self, now: float) -> None:
         """Inject wall-clock progress into any analyzer that needs it, and
@@ -596,11 +659,30 @@ class Engine:
         describes for `analyzers/stucknotes.py`'s escalation). No page
         needs `drain_alerts()` (an analyzer-only, phase-3 task 6 concept),
         so this is the strict `tick()`-only subset of `_tick_analyzers`,
-        applied to `self.pages` instead of `self.analyzers`."""
+        applied to `self.pages` instead of `self.analyzers`.
+
+        Phase-3 task 12 (gap ports): "sendnotes" is the one exception to
+        "no page needs draining" above -- `SendNotesPage.drain_expired(now)`
+        (a `drain_alerts()`-shaped hook, deliberately NOT named `tick()`
+        since it reports expired notes rather than a dirty bool) is polled
+        here every tick alongside the generic loop below, and each expired
+        `(note, ch)` pair gets a REAL `MidiOutput.note_off` -- the one place
+        in this whole method that does I/O, mirroring `_tick_analyzers`'s
+        own `drain_alerts()` -> `emit_event` split (pure module reports,
+        engine acts). Guarded on presence like every other page-specific
+        hook here (a custom config could drop "sendnotes" from the roster).
+        """
         for name, page in self.pages.items():
             tick_fn = getattr(page, "tick", None)
             if tick_fn is not None and tick_fn(now):
                 self._dirty.add(f"page.{name}")
+        sendnotes = self.pages.get("sendnotes")
+        if sendnotes is not None:
+            expired = sendnotes.drain_expired(now)
+            if expired:
+                self._dirty.add("page.sendnotes")
+                for note, ch in expired:
+                    self._midi_out.note_off(note, ch)
 
     async def _tick_behaviors(self, now: float) -> None:
         """Give each behavior (phase-3 task 9) a chance to act, and
