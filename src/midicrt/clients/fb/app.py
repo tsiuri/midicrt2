@@ -461,9 +461,79 @@ def render_pianoroll_frame(vm: dict, surface: Surface) -> None:
         surface.rect(x0, y, w, note_h, _roll_note_color(note["ch"], note["vel"]))
 
 
+# -- spectrum page (phase-3 task 8) -------------------------------------------
+#
+# Layout: same reverse-video header convention as the other pages, then N
+# vertical bars spanning the surface width, one per `vm["bins"]` entry --
+# `Surface.fill_column` (task brief: "fb via fill_column bars" -- its own
+# docstring literally calls out "the shape a spectrum-analyzer bar needs")
+# for the live fill, `Surface.hline` for the peak-hold tick (v2 addition,
+# v1 has no peak-hold at all -- see analyzers/spectrum.py's module
+# docstring), mirroring `render_voices_frame`'s own live-fill-plus-peak-tick
+# convention (that page's per-channel meter, transposed here into one bar
+# per frequency bin instead of one bar per channel). No box outline (unlike
+# voices' bordered meter) -- the task brief only asks for bars + ticks.
+# `available: false` -> v1's "no audio input" placeholder (task brief's
+# explicit degrade-gracefully contract) drawn as plain text, no bars at
+# all.
+SPECTRUM_BAR_GAP = 1     # px gap between adjacent bar columns
+SPECTRUM_MIN_BAR_W = 1
+
+
+def _spectrum_header_text(vm: dict) -> str:
+    if not vm.get("available"):
+        return f"{vm['title']}"
+    device = vm.get("device") or "default"
+    return f"{vm['title']}  (device: {device})"
+
+
+def render_spectrum_frame(vm: dict, surface: Surface) -> None:
+    """Render the spectrum page view-model (pages/spectrum.py, wrapping
+    analyzers/spectrum.py's SpectrumAnalyzer) onto `surface`. Pure: reads
+    only `vm` and the cached default font, writes only to `surface`'s
+    pixels -- no I/O, no clock, no global state beyond the font's
+    (side-effect-free) glyph cache. See module comment above for the
+    fill_column-bars + peak-hold-tick layout.
+    """
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _spectrum_header_text(vm), BG, font)
+
+    usable_h = surface.height - _reserved_chrome_height(font) - header_h
+    if usable_h <= 0:
+        return
+
+    if not vm.get("available"):
+        draw_text(surface, LEFT_MARGIN, header_h + LINE_GAP, "no audio input", NORMAL_FG, font)
+        return
+
+    levels = vm["bins"]
+    n = len(levels)
+    if n == 0:
+        return
+    peaks = vm.get("peak_hold") or [0.0] * n
+    plot_w = max(0, surface.width - 2 * LEFT_MARGIN)
+    col_w = max(SPECTRUM_MIN_BAR_W, plot_w // n)
+    bar_w = max(SPECTRUM_MIN_BAR_W, col_w - SPECTRUM_BAR_GAP)
+    baseline = header_h + usable_h - 1
+    for i, val in enumerate(levels):
+        x = LEFT_MARGIN + i * col_w
+        fill_h = round(usable_h * min(max(val, 0.0), 1.0))
+        if fill_h > 0:
+            surface.fill_column(x, baseline, fill_h, NORMAL_FG, width=bar_w)
+        peak_val = peaks[i] if i < len(peaks) else 0.0
+        peak_h = round(usable_h * min(max(peak_val, 0.0), 1.0))
+        if peak_h > 0:
+            peak_y = header_h + usable_h - peak_h
+            surface.hline(x, peak_y, bar_w, ACCENT_FG)
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
              "harmony": render_harmony_frame, "tuner": render_tuner_frame,
-             "pianoroll": render_pianoroll_frame}
+             "pianoroll": render_pianoroll_frame, "spectrum": render_spectrum_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------

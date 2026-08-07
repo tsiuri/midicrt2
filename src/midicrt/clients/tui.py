@@ -369,9 +369,78 @@ def render_pianoroll_lines(vm: dict, width: int, height: int) -> list[str]:
     return [header] + body
 
 
+# -- spectrum page (phase-3 task 8) -------------------------------------------
+#
+# Block-character bars, per v1's own `_bar_rows` (pages/audiospectrum.py on
+# the Pi, read-only reference): each display column averages a slice of
+# `vm["bins"]` (v1's exact column-averaging math, `n = min(width,
+# len(bins))` columns used -- a terminal WIDER than the bin count leaves
+# the extra trailing columns blank rather than upsampling, matching v1
+# exactly), filled bottom-up with solid "█" for `round(val*height)` rows.
+# `peak_hold` (v2 addition -- v1 has NO peak-hold at all, see analyzers/
+# spectrum.py's module docstring) overlays one "-" tick per column at its
+# own (separately column-averaged) row, only drawn over an otherwise-blank
+# cell so it never hides a live "█" bar-top.
+_SPECTRUM_BAR_GLYPH = "█"
+_SPECTRUM_PEAK_GLYPH = "-"
+
+
+def _spectrum_columns(values: list[float], n: int) -> list[float]:
+    """v1's `_bar_rows` column-averaging step, standalone: reduce `values`
+    (length >= n) down to exactly `n` columns, each the average of its
+    slice (or the single nearest value when `n == len(values)`)."""
+    if n <= 0 or not values:
+        return []
+    step = len(values) / n
+    cols = []
+    for i in range(n):
+        j0, j1 = int(i * step), int((i + 1) * step)
+        cols.append(values[j0] if j1 <= j0 else sum(values[j0:j1]) / (j1 - j0))
+    return cols
+
+
+def _spectrum_bar_rows(height: int, width: int, levels: list[float],
+                        peaks: list[float] | None = None) -> list[str]:
+    """Pure port of v1's `_bar_rows`, extended with an optional peak-hold
+    tick overlay (v2 addition -- see module comment above)."""
+    if height <= 0 or width <= 0 or not levels:
+        return [" " * width for _ in range(max(0, height))]
+    n = min(width, len(levels))
+    rows = [[" "] * width for _ in range(height)]
+    for i, val in enumerate(_spectrum_columns(levels, n)):
+        h = min(height, round(val * height))
+        for r in range(height - 1, height - h - 1, -1):
+            rows[r][i] = _SPECTRUM_BAR_GLYPH
+    if peaks:
+        for i, val in enumerate(_spectrum_columns(peaks, n)):
+            r = height - 1 - min(height - 1, round(val * height))
+            if rows[r][i] == " ":
+                rows[r][i] = _SPECTRUM_PEAK_GLYPH
+    return ["".join(row) for row in rows]
+
+
+def _spectrum_header_text(vm: dict) -> str:
+    if not vm.get("available"):
+        return f"{vm['title']}  [n]ext page [q]uit"
+    device = vm.get("device") or "default"
+    return f"{vm['title']}  (device: {device})  [n]ext page [q]uit"
+
+
+def render_spectrum_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_spectrum_header_text(vm), width)
+    body_h = height - 1
+    if body_h <= 0:
+        return [header]
+    if not vm.get("available"):
+        body = [_fit("no audio input", width)] + [" " * width] * (body_h - 1)
+        return [header, *body[:body_h]]
+    rows = _spectrum_bar_rows(body_h, width, vm["bins"], vm.get("peak_hold"))
+    return [header] + [_fit(r, width) for r in rows]
+
+
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
              "harmony": render_harmony_lines, "tuner": render_tuner_lines,
-             "pianoroll": render_pianoroll_lines}
+             "pianoroll": render_pianoroll_lines, "spectrum": render_spectrum_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}

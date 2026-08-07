@@ -10,6 +10,16 @@ ExecStart=/home/billie/midicrt2-venv/bin/midicrtd
 Restart=on-failure
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
+# Phase-3 task 8 (analyzers/spectrum.py): this is a SYSTEM service (not a
+# user session), so it does not inherit billie's login-session environment
+# -- without XDG_RUNTIME_DIR, sounddevice/PortAudio's default-device query
+# fails outright ("Error querying device -1", verified against this exact
+# unit/user), because the ALSA "default" PCM's pipewire/pulse routing
+# depends on finding the user's PipeWire socket under /run/user/<uid>.
+# billie is a fixed, already-hardcoded uid 1000 throughout this unit
+# (User=billie, RuntimeDirectory=midicrt under /run), so hardcoding the
+# matching runtime dir here is consistent, not a new assumption.
+Environment=XDG_RUNTIME_DIR=/run/user/1000
 
 [Install]
 WantedBy=multi-user.target

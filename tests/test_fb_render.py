@@ -231,7 +231,7 @@ def test_render_frame_golden_matches_frozen_fixture():
 
 def _start_daemon(sock):
     p = subprocess.Popen(
-        [VENVPY, "-m", "midicrt.daemon", "--socket", sock, "--no-midi"],
+        [VENVPY, "-m", "midicrt.daemon", "--socket", sock, "--no-midi", "--no-audio"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     for _ in range(100):
         if subprocess.run(
@@ -811,6 +811,149 @@ def test_pianoroll_tempo_and_wallclock_goldens_share_identical_body_pixels():
     header_h = font.height + 2 * app.HEADER_PAD
     box = (0, header_h, PIANOROLL_SURFACE_SIZE[0], PIANOROLL_SURFACE_SIZE[1])
     assert wallclock.crop(box).tobytes() == tempo.crop(box).tobytes()
+
+
+# -- spectrum page (phase-3 task 8) -------------------------------------------
+
+GOLDEN_SPECTRUM_FRAME = FIXTURES / "fb_spectrum_frame_golden.png"
+SPECTRUM_SURFACE_SIZE = (300, 116)   # header(12) + usable(80) + reserved chrome(24)
+
+SPECTRUM_VM = {
+    "title": "SPECTRUM", "available": True, "device": "USB Audio Device",
+    "bins": [0.0, 0.25, 0.5, 0.75, 1.0, 0.5, 0.25, 0.0],
+    "peak_hold": [0.1, 0.4, 0.6, 0.9, 1.0, 0.7, 0.4, 0.1],
+}
+SPECTRUM_IDLE_VM = {
+    "title": "SPECTRUM", "available": False, "device": None,
+    "bins": [0.0] * 8, "peak_hold": [0.0] * 8,
+}
+SPECTRUM_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+SPECTRUM_ALERTS_VM = {"alerts": []}
+SPECTRUM_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                        "events_window": 24, "events_total": 40, "pending": None}
+
+
+def test_spectrum_renderers_dispatch_table_has_spectrum():
+    assert app.RENDERERS["spectrum"] is app.render_spectrum_frame
+
+
+def test_render_spectrum_frame_header_bar_is_reverse_video():
+    surf = Surface(*SPECTRUM_SURFACE_SIZE)
+    app.render_spectrum_frame(SPECTRUM_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_text = app._spectrum_header_text(SPECTRUM_VM)
+    text_px_end = app.LEFT_MARGIN + len(header_text) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+    assert any(
+        px[x, y] == app.BG
+        for x in range(app.LEFT_MARGIN, text_px_end)
+        for y in range(app.HEADER_PAD, app.HEADER_PAD + font.height)
+    )
+
+
+def test_render_spectrum_frame_idle_shows_no_audio_input_placeholder():
+    surf = Surface(*SPECTRUM_SURFACE_SIZE)
+    app.render_spectrum_frame(SPECTRUM_IDLE_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    # A lit glyph pixel exists somewhere in the placeholder text row.
+    assert any(px[x, header_h + app.LINE_GAP + 2] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+    # No bars anywhere further down -- the whole body below stays background.
+    assert px[app.LEFT_MARGIN, surf.height - app._reserved_chrome_height(font) - 1] == app.BG
+
+
+def test_render_spectrum_frame_empty_bins_does_not_crash():
+    surf = Surface(*SPECTRUM_SURFACE_SIZE)
+    app.render_spectrum_frame({**SPECTRUM_VM, "bins": [], "peak_hold": []}, surf)  # must not raise
+
+
+def test_render_spectrum_frame_tallest_bin_reaches_the_full_usable_height():
+    # Bin 4 has both bins==1.0 and peak_hold==1.0 (a bar currently sitting
+    # at its own peak) -- the peak tick's ACCENT_FG cap is drawn LAST and
+    # lands on the exact same top row as the full-height live fill, so the
+    # very top pixel reads as the (correct, intentional) accent cap; one
+    # row down is unambiguously the live fill's own NORMAL_FG.
+    surf = Surface(*SPECTRUM_SURFACE_SIZE)
+    app.render_spectrum_frame(SPECTRUM_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
+    plot_w = surf.width - 2 * app.LEFT_MARGIN
+    n = len(SPECTRUM_VM["bins"])
+    col_w = max(1, plot_w // n)
+    peak_idx = max(range(n), key=lambda i: SPECTRUM_VM["bins"][i])   # bin index 4, val 1.0
+    x = app.LEFT_MARGIN + peak_idx * col_w + 1
+    assert px[x, header_h] == app.ACCENT_FG                  # peak-at-own-cap tick on top
+    assert px[x, header_h + 1] == app.NORMAL_FG              # live fill immediately below it
+    assert px[x, header_h + usable_h - 1] == app.NORMAL_FG   # bottom row too
+
+
+def test_render_spectrum_frame_silent_bin_draws_no_fill():
+    surf = Surface(*SPECTRUM_SURFACE_SIZE)
+    app.render_spectrum_frame(SPECTRUM_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    plot_w = surf.width - 2 * app.LEFT_MARGIN
+    n = len(SPECTRUM_VM["bins"])
+    col_w = max(1, plot_w // n)
+    zero_idx = 0   # bin 0, val 0.0
+    x = app.LEFT_MARGIN + zero_idx * col_w + 1
+    assert px[x, header_h + 2] == app.BG
+
+
+def test_render_spectrum_frame_peak_tick_visible_above_live_fill():
+    # Bin 1: level=0.25, peak=0.4 -- the peak tick must sit strictly above
+    # (smaller y than) the live fill's own top edge.
+    surf = Surface(*SPECTRUM_SURFACE_SIZE)
+    app.render_spectrum_frame(SPECTRUM_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
+    plot_w = surf.width - 2 * app.LEFT_MARGIN
+    n = len(SPECTRUM_VM["bins"])
+    col_w = max(1, plot_w // n)
+    idx = 1
+    x = app.LEFT_MARGIN + idx * col_w + 1
+    fill_h = round(usable_h * SPECTRUM_VM["bins"][idx])
+    peak_h = round(usable_h * SPECTRUM_VM["peak_hold"][idx])
+    assert peak_h > fill_h   # sanity: this fixture actually exercises the tick-above-fill case
+    fill_top_y = header_h + usable_h - fill_h
+    peak_y = header_h + usable_h - peak_h
+    assert peak_y < fill_top_y
+    assert px[x, peak_y] == app.ACCENT_FG
+    assert px[x, fill_top_y] == app.NORMAL_FG
+
+
+def test_render_spectrum_frame_reserves_the_bottom_chrome_as_background():
+    surf = Surface(*SPECTRUM_SURFACE_SIZE)
+    app.render_spectrum_frame(SPECTRUM_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    reserved = app._reserved_chrome_height(font)
+    y_in_strip = surf.height - reserved + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_render_spectrum_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_SPECTRUM_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-8-report.md"
+    )
+    surf = Surface(*SPECTRUM_SURFACE_SIZE)
+    app.render_spectrum_frame(SPECTRUM_VM, surf)
+    app._draw_secondary(surf, SPECTRUM_ALERTS_VM, SPECTRUM_TIMESIG_VM, load_font())
+    app._draw_status(surf, SPECTRUM_STATUS_VM, load_font())
+
+    golden = Image.open(GOLDEN_SPECTRUM_FRAME).convert("RGB")
+    assert golden.size == SPECTRUM_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
 
 
 def test_fps_zero_rejected_before_connect_no_hang(tmp_path):

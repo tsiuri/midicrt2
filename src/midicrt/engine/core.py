@@ -94,6 +94,7 @@ from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.eventlog import EventLogPage
 from midicrt.pages.harmony import HarmonyPage
 from midicrt.pages.pianoroll import PianorollPage
+from midicrt.pages.spectrum import SpectrumPage
 from midicrt.pages.tuner import TunerPage
 from midicrt.pages.voices import VoicesPage
 
@@ -162,6 +163,19 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # input, matching the "voices"/"harmony" precedent for default-roster
     # inclusion.
     "pianoroll": lambda config: PianorollPage(),
+    # Phase-3 task 8: v1's audio spectrum analyzer (pages/audiospectrum.py)
+    # -- see pages/spectrum.py's + analyzers/spectrum.py's module
+    # docstrings for the full port (real USB audio hardware found on the
+    # Pi, v1's log-band FFT mapping, the v2-only peak-hold addition).
+    # `config.pages` now defaults to [..., "spectrum"] (config.py): unlike
+    # "tuner", this page degrades gracefully (`available: false` -> "no
+    # audio input" placeholder) instead of being permanently idle, so it
+    # joins the default roster despite also depending on audio hardware.
+    # The actual capture thread is NOT started here -- `daemon.py`'s
+    # `run()` calls `SpectrumPage.start_capture()` explicitly, after the
+    # roster is built, guarded by a `--no-audio` opt-out mirroring
+    # `--no-midi`.
+    "spectrum": lambda config: SpectrumPage(device=config.audio_device, bins=config.spectrum_bins),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`

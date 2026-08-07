@@ -140,14 +140,14 @@ async def test_clear_action_and_status():
 
 # -- multi-page roster (phase-3 task 1) --------------------------------------
 
-def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll():
+def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll_spectrum():
     # Phase-3 task 4 added "voices"; task 5 appends "harmony"; task 7
-    # appends "pianoroll" the same way -- all three live by default
-    # (config.py's Config.pages default) so they're reachable with no
-    # config.toml on a stock deploy. "eventlog" stays first/current --
+    # appends "pianoroll"; task 8 appends "spectrum" -- all four live by
+    # default (config.py's Config.pages default) so they're reachable with
+    # no config.toml on a stock deploy. "eventlog" stays first/current --
     # order is preserved from config.pages.
     eng = Engine(Config())
-    assert list(eng.pages) == ["eventlog", "voices", "harmony", "pianoroll"]
+    assert list(eng.pages) == ["eventlog", "voices", "harmony", "pianoroll", "spectrum"]
     assert eng.current_page == "eventlog"
 
 
@@ -155,7 +155,9 @@ def test_register_page_appends_to_live_roster():
     eng = Engine(Config())
     fake = _FakePage()
     eng.register_page("second", fake)
-    assert list(eng.pages) == ["eventlog", "voices", "harmony", "pianoroll", "second"]
+    assert list(eng.pages) == [
+        "eventlog", "voices", "harmony", "pianoroll", "spectrum", "second",
+    ]
     assert eng.pages["second"] is fake
 
 
@@ -163,8 +165,8 @@ def test_engine_topics_reflects_roster_order():
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
     assert eng.topics == [
-        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.second",
-        "overlay.status", "overlay.alerts", "overlay.timesig",
+        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
+        "page.second", "overlay.status", "overlay.alerts", "overlay.timesig",
     ]
 
 
@@ -223,7 +225,7 @@ def test_register_analyzer_appends_to_live_roster():
 def test_topics_include_overlay_after_page_topics():
     eng = Engine(Config())
     assert eng.topics == [
-        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
+        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "overlay.status", "overlay.alerts", "overlay.timesig",
     ]
 
@@ -276,9 +278,9 @@ async def test_clock_tick_does_not_dirty_eventlog_but_dirties_overlay_once_runni
 
 
 async def test_page_next_prev_cycle_and_emit_page_changed():
-    # Roster is now 5 deep by default: eventlog, voices, harmony, pianoroll
-    # (phase-3 tasks 4, 5, and 7's default pages), then the dynamically-
-    # registered "second".
+    # Roster is now 6 deep by default: eventlog, voices, harmony, pianoroll,
+    # spectrum (phase-3 tasks 4, 5, 7, and 8's default pages), then the
+    # dynamically-registered "second".
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
     events = []
@@ -292,14 +294,16 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "pianoroll"
     await eng.actions.dispatch("page.next", {})
+    assert eng.current_page == "spectrum"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "pianoroll"
+    assert eng.current_page == "spectrum"
 
     names = [e["name"] for e in events]
-    assert names == ["page_changed"] * 5
+    assert names == ["page_changed"] * 6
     assert [e["data"]["page"] for e in events] == [
-        "voices", "harmony", "pianoroll", "second", "pianoroll",
+        "voices", "harmony", "pianoroll", "spectrum", "second", "spectrum",
     ]
 
 
@@ -526,3 +530,33 @@ async def test_pianoroll_channels_action_rejects_malformed_spec():
     eng = Engine(Config())
     with pytest.raises(ActionError):
         await eng.actions.dispatch("pianoroll.channels", {"spec": "not-a-channel"})
+
+
+# -- spectrum page (phase-3 task 8) ------------------------------------------
+
+def test_spectrum_is_in_the_default_roster():
+    # Unlike "tuner" (task 6), "spectrum" DOES join the default roster --
+    # see config.py's/pages/spectrum.py's own docstrings for why (graceful
+    # "no audio input" degradation, not a permanently-idle page).
+    eng = Engine(Config())
+    assert "spectrum" in eng.pages
+    vm = eng.pages["spectrum"].view_model()
+    assert vm["title"] == "SPECTRUM"
+    assert vm["available"] is False   # capture is never auto-started by construction
+
+
+def test_spectrum_handle_never_marks_itself_dirty_for_midi_events():
+    # analyzers/spectrum.py's SpectrumAnalyzer.handle() is a true no-op
+    # (not MIDI-driven, mirrors analyzers/tuner.py's TunerAnalyzer) -- a
+    # real note_on must not appear in the dirty set for it.
+    eng = Engine(Config())
+    eng._handle(ev())
+    assert "page.spectrum" not in eng._dirty
+
+
+def test_spectrum_tick_is_wired_through_tick_pages():
+    # SpectrumPage.tick() exists (peak-hold decay) but reports not-dirty
+    # while nothing has ever been captured -- must not raise either way.
+    eng = Engine(Config())
+    eng._tick_pages(1.0)
+    assert "page.spectrum" not in eng._dirty

@@ -11,11 +11,14 @@ from midicrt.clients.tui import (
     _pianoroll_grid,
     _render_unknown,
     _roll_glyph,
+    _spectrum_bar_rows,
+    _spectrum_columns,
     _voices_bar,
     render_harmony_lines,
     render_lines,
     render_pianoroll_lines,
     render_secondary_row,
+    render_spectrum_lines,
     render_status_row,
     render_tuner_lines,
     render_voices_lines,
@@ -483,3 +486,118 @@ def test_pianoroll_grid_zero_dimensions_do_not_crash():
 
 def test_pianoroll_renderers_dispatch_table_has_pianoroll():
     assert RENDERERS["pianoroll"] is render_pianoroll_lines
+
+
+# -- spectrum page (phase-3 task 8) -------------------------------------------
+#
+# A FIXED synthetic bins/peak_hold VM (8 bins, a symmetric "hill" shape) --
+# same "freeze from a real run" discipline as the other pages' golden
+# frames above. Real audio hardware is never touched by this test (or any
+# test in this file) -- see analyzers/spectrum.py's module docstring.
+SPECTRUM_AVAILABLE_VM = {
+    "title": "SPECTRUM", "available": True, "device": "USB Audio Device",
+    "bins": [0.0, 0.25, 0.5, 0.75, 1.0, 0.5, 0.25, 0.0],
+    "peak_hold": [0.1, 0.4, 0.6, 0.9, 1.0, 0.7, 0.4, 0.1],
+}
+SPECTRUM_IDLE_VM = {
+    "title": "SPECTRUM", "available": False, "device": None,
+    "bins": [0.0] * 8, "peak_hold": [0.0] * 8,
+}
+
+# Frozen against an actual run of render_spectrum_lines(SPECTRUM_AVAILABLE_VM,
+# 24, 8) -- same "freeze from a real run" discipline as GOLDEN_VOICES_FRAME/
+# GOLDEN_HARMONY_FRAME/GOLDEN_TUNER_*_FRAME/GOLDEN_PIANOROLL_*_FRAME.
+GOLDEN_SPECTRUM_FRAME = [
+    "SPECTRUM  (device: USB A",
+    "   -█                   ",
+    "    █-                  ",
+    "  -██                   ",
+    " -████-                 ",
+    "  ████                  ",
+    "-██████-                ",
+    " ██████                 ",
+]
+GOLDEN_SPECTRUM_IDLE_FRAME = [
+    "SPECTRUM  [n]ext page [q",
+    "no audio input          ",
+    "                        ",
+    "                        ",
+    "                        ",
+    "                        ",
+    "                        ",
+    "                        ",
+]
+
+
+def test_spectrum_render_matches_frozen_golden_frame_when_available():
+    out = render_spectrum_lines(SPECTRUM_AVAILABLE_VM, width=24, height=8)
+    assert out == GOLDEN_SPECTRUM_FRAME
+    assert all(len(line) == 24 for line in out)
+
+
+def test_spectrum_render_matches_frozen_golden_frame_when_idle():
+    out = render_spectrum_lines(SPECTRUM_IDLE_VM, width=24, height=8)
+    assert out == GOLDEN_SPECTRUM_IDLE_FRAME
+    assert all(len(line) == 24 for line in out)
+
+
+def test_spectrum_render_idle_shows_no_audio_input_placeholder():
+    out = render_spectrum_lines(SPECTRUM_IDLE_VM, width=40, height=5)
+    assert out[1].strip() == "no audio input"
+    assert all(line.strip() == "" for line in out[2:])
+
+
+def test_spectrum_render_header_shows_device_when_available():
+    out = render_spectrum_lines(SPECTRUM_AVAILABLE_VM, width=60, height=5)
+    assert "USB Audio Device" in out[0]
+
+
+def test_spectrum_render_header_falls_back_to_default_when_no_device_name():
+    vm = {**SPECTRUM_AVAILABLE_VM, "device": None}
+    out = render_spectrum_lines(vm, width=60, height=5)
+    assert "device: default" in out[0]
+
+
+def test_spectrum_columns_averages_slices_when_downsampling():
+    assert _spectrum_columns([0.0, 1.0, 2.0, 3.0], 2) == [0.5, 2.5]
+
+
+def test_spectrum_columns_empty_values_returns_empty():
+    assert _spectrum_columns([], 4) == []
+
+
+def test_spectrum_bar_rows_fills_bottom_up_proportionally():
+    rows = _spectrum_bar_rows(4, 1, [1.0])
+    assert rows == ["█", "█", "█", "█"]
+    rows = _spectrum_bar_rows(4, 1, [0.0])
+    assert rows == [" ", " ", " ", " "]
+
+
+def test_spectrum_bar_rows_peak_tick_sits_above_a_lower_live_fill():
+    rows = _spectrum_bar_rows(4, 1, [0.25], peaks=[1.0])
+    column = "".join(row for row in rows)
+    assert column[0] == "-"   # peak at the very top row
+    assert column[-1] == "█"  # live fill occupies the bottom row
+
+
+def test_spectrum_bar_rows_peak_tick_never_overwrites_a_live_bar_cell():
+    # peak == level (a bar that just hit its own peak) -- the live "█"
+    # glyph wins, no separate "-" tick drawn on top of it.
+    rows = _spectrum_bar_rows(4, 1, [1.0], peaks=[1.0])
+    assert "".join(rows) == "████"
+
+
+def test_spectrum_bar_rows_leaves_extra_columns_blank_when_wider_than_bins():
+    # v1's own choice: a terminal wider than the bin count does not
+    # upsample, it just leaves the extra trailing columns blank.
+    rows = _spectrum_bar_rows(2, 5, [1.0, 1.0])
+    assert all(row[2:] == "   " for row in rows)
+
+
+def test_spectrum_bar_rows_empty_bins_is_all_blank():
+    rows = _spectrum_bar_rows(3, 5, [])
+    assert rows == [" " * 5] * 3
+
+
+def test_spectrum_renderers_dispatch_table_has_spectrum():
+    assert RENDERERS["spectrum"] is render_spectrum_lines

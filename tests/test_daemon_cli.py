@@ -8,7 +8,7 @@ VENVPY = sys.executable
 
 def start_daemon(sock):
     p = subprocess.Popen(
-        [VENVPY, "-m", "midicrt.daemon", "--socket", sock, "--no-midi"],
+        [VENVPY, "-m", "midicrt.daemon", "--socket", sock, "--no-midi", "--no-audio"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     for _ in range(100):
         if subprocess.run(

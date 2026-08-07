@@ -57,15 +57,15 @@ async def test_hello_and_describe(tmp_path):
     assert r["ok"] is True
     d = await c.request("describe")
     assert "eventlog.clear" in d["data"]["actions"]
-    # Phase-3 tasks 4/5/7: "voices"/"harmony"/"pianoroll" are live by
-    # default (config.py's Config.pages). "pages" is `sorted()` (display-
-    # only, alphabetical -- see server.py's own comment); "topics" carries
-    # the real roster/cycle order.
-    assert d["data"]["pages"] == ["eventlog", "harmony", "pianoroll", "voices"]
+    # Phase-3 tasks 4/5/7/8: "voices"/"harmony"/"pianoroll"/"spectrum" are
+    # live by default (config.py's Config.pages). "pages" is `sorted()`
+    # (display-only, alphabetical -- see server.py's own comment); "topics"
+    # carries the real roster/cycle order.
+    assert d["data"]["pages"] == ["eventlog", "harmony", "pianoroll", "spectrum", "voices"]
     # Phase-3 task 6 added "alerts"/"timesig" overlays -- see
     # test_engine_core.py::test_topics_include_overlay_after_page_topics.
     assert d["data"]["topics"] == [
-        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
+        "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "overlay.status", "overlay.alerts", "overlay.timesig",
     ]
     eng.stop(); await task; await srv.close()

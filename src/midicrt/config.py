@@ -31,9 +31,26 @@ class Config:
     # data with just a running daemon + MIDI input too, same as those two --
     # unlike "tuner" (task 6), which stays out of this default list since it
     # can only ever show its idle state until a future audio-capture task
-    # lands (see pages/tuner.py's own docstring).
-    pages: list[str] = field(default_factory=lambda: ["eventlog", "voices", "harmony", "pianoroll"])
+    # lands (see pages/tuner.py's own docstring). "spectrum" (phase-3 task 8)
+    # DOES join this list despite also depending on audio hardware --
+    # unlike tuner, it was built with graceful degradation as a first-class
+    # state (`available: false` -> "no audio input" placeholder, see
+    # analyzers/spectrum.py's module docstring), so a stock deploy with no
+    # USB audio device plugged in still shows a real, correct page instead
+    # of a permanently-broken one; tuner has no such fallback to show yet.
+    pages: list[str] = field(
+        default_factory=lambda: ["eventlog", "voices", "harmony", "pianoroll", "spectrum"])
     instruments: list[str] = field(default_factory=lambda: list(DEFAULT_INSTRUMENTS))
+    # Phase-3 task 8 (analyzers/spectrum.py): `audio_device` substring-
+    # matches a PortAudio input device name (case-insensitive, v1's
+    # `_refresh_devices()` approach) -- None (the default) means "use
+    # PortAudio's own system-default input device", matching v1's
+    # `_device_index = None` convention. `spectrum_bins` is v1's
+    # `TARGET_BINS` (default 96), clamped to v1's own [8, 256] keypress
+    # range by `SpectrumAnalyzer.__init__` regardless of what's configured
+    # here.
+    audio_device: str | None = None
+    spectrum_bins: int = 96
 
 
 def load(path: str | None = None) -> Config:
