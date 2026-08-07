@@ -31,6 +31,34 @@ class _FakePage:
         return {"seen": self.seen}
 
 
+class _FakeTickingAnalyzer:
+    """Analyzer double for `_tick_analyzers` wiring tests (phase-3 task 6)
+    -- exposes the OPTIONAL `tick`/`drain_alerts` methods `StuckNotesAnalyzer`
+    added, with fully scripted return values so these tests never need a
+    real wall-clock wait (unlike an end-to-end test against the real
+    2s/10s thresholds, which analyzers/stucknotes.py's own unit tests
+    already cover with synthetic timestamps)."""
+
+    def __init__(self, tick_dirty=True, alerts=None):
+        self._tick_dirty = tick_dirty
+        self._alerts = list(alerts or [])
+        self.ticked_with: list[float] = []
+
+    def handle(self, ev) -> bool:
+        return False
+
+    def tick(self, now: float) -> bool:
+        self.ticked_with.append(now)
+        return self._tick_dirty
+
+    def drain_alerts(self) -> list[dict]:
+        drained, self._alerts = self._alerts, []
+        return drained
+
+    def view_model(self) -> dict:
+        return {}
+
+
 def test_eventlog_page_capacity_and_vm():
     eng = Engine(Config(eventlog_capacity=2))
     page = eng.pages["eventlog"]
@@ -114,20 +142,24 @@ def test_engine_topics_reflects_roster_order():
     eng = Engine(Config())
     eng.register_page("second", _FakePage())
     assert eng.topics == [
-        "page.eventlog", "page.voices", "page.harmony", "page.second", "overlay.status",
+        "page.eventlog", "page.voices", "page.harmony", "page.second",
+        "overlay.status", "overlay.alerts", "overlay.timesig",
     ]
 
 
 def test_handle_marks_dirty_only_for_pages_reporting_true():
-    # `ev()` is a real note_on on channel 1 -- the real "voices" and
-    # "harmony" pages (both live by default) genuinely react to it too, so
-    # they're dirty here alongside eventlog, same as any other real page
-    # would be.
+    # `ev()` is a real note_on on channel 1 -- the real "voices"/"harmony"
+    # pages (both live by default) genuinely react to it too, so they're
+    # dirty here alongside eventlog, same as any other real page would be.
+    # Phase-3 task 6: "alerts" (StuckNotesAnalyzer) is a real analyzer too,
+    # and a fresh note-on genuinely starts tracking it -- dirty for the
+    # same reason. "timesig" does NOT react (TimesigAnalyzer gates note_on
+    # on transport being "running", and no "start" was ever sent here).
     eng = Engine(Config())
     quiet = _FakePage(dirty=False)
     eng.register_page("quiet", quiet)
     eng._handle(ev())
-    assert eng._dirty == {"page.eventlog", "page.voices", "page.harmony"}
+    assert eng._dirty == {"page.eventlog", "page.voices", "page.harmony", "overlay.alerts"}
     assert quiet.seen == 1  # every page still SEES every event...
 
 
@@ -139,27 +171,36 @@ def test_handle_marks_non_current_page_dirty_too():
     eng.register_page("loud", loud)
     assert eng.current_page == "eventlog"  # "loud" is NOT current
     eng._handle(ev())
-    assert eng._dirty == {"page.eventlog", "page.voices", "page.harmony", "page.loud"}
+    assert eng._dirty == {
+        "page.eventlog", "page.voices", "page.harmony", "page.loud", "overlay.alerts",
+    }
 
 
 # -- transport analyzer / overlay wiring (phase-3 task 3) --------------------
 
-def test_default_analyzer_roster_is_status_only():
+def test_default_analyzer_roster_is_status_alerts_timesig():
+    # Phase-3 task 6 added "alerts" (StuckNotesAnalyzer) and "timesig"
+    # (TimesigAnalyzer) the same way task-3 introduced "status" -- both are
+    # v1 chrome-class features (always visible regardless of page), never
+    # config-gated, see engine/core.py's module docstring.
     eng = Engine(Config())
-    assert list(eng.analyzers) == ["status"]
+    assert list(eng.analyzers) == ["status", "alerts", "timesig"]
 
 
 def test_register_analyzer_appends_to_live_roster():
     eng = Engine(Config())
     fake = _FakePage()  # same handle()/view_model() shape as an Analyzer
     eng.register_analyzer("second", fake)
-    assert list(eng.analyzers) == ["status", "second"]
+    assert list(eng.analyzers) == ["status", "alerts", "timesig", "second"]
     assert eng.analyzers["second"] is fake
 
 
 def test_topics_include_overlay_after_page_topics():
     eng = Engine(Config())
-    assert eng.topics == ["page.eventlog", "page.voices", "page.harmony", "overlay.status"]
+    assert eng.topics == [
+        "page.eventlog", "page.voices", "page.harmony",
+        "overlay.status", "overlay.alerts", "overlay.timesig",
+    ]
 
 
 def test_handle_marks_overlay_dirty_when_analyzer_reports_true():
@@ -231,6 +272,114 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     names = [e["name"] for e in events]
     assert names == ["page_changed"] * 4
     assert [e["data"]["page"] for e in events] == ["voices", "harmony", "second", "harmony"]
+
+
+# -- analyzer wall-clock tick + alert events (phase-3 task 6) ---------------
+
+def test_tick_analyzers_calls_tick_with_the_injected_now_and_marks_dirty():
+    eng = Engine(Config())
+    fake = _FakeTickingAnalyzer(tick_dirty=True)
+    eng.register_analyzer("fake", fake)
+    eng._tick_analyzers(12345.0)
+    assert fake.ticked_with == [12345.0]
+    assert "overlay.fake" in eng._dirty
+
+
+def test_tick_analyzers_does_not_mark_dirty_when_tick_reports_false():
+    eng = Engine(Config())
+    fake = _FakeTickingAnalyzer(tick_dirty=False)
+    eng.register_analyzer("fake", fake)
+    eng._tick_analyzers(1.0)
+    assert "overlay.fake" not in eng._dirty
+
+
+def test_tick_analyzers_ignores_analyzers_with_no_tick_method():
+    # "status" (TransportAnalyzer) has no tick() -- must not raise.
+    eng = Engine(Config())
+    eng._tick_analyzers(1.0)   # must not raise
+    assert "overlay.status" not in eng._dirty
+
+
+def test_tick_analyzers_emits_one_alert_event_per_drained_alert():
+    eng = Engine(Config())
+    events = []
+    eng.add_listener(lambda m: events.append(m) if m.get("kind") == "event" else None)
+    fake = _FakeTickingAnalyzer(alerts=[
+        {"ch": 1, "note": 60, "level": "warn", "held_s": 2.1},
+        {"ch": 2, "note": 64, "level": "crit", "held_s": 11.0},
+    ])
+    eng.register_analyzer("fake", fake)
+    eng._tick_analyzers(1.0)
+    alert_events = [e for e in events if e["name"] == "alert"]
+    assert [e["data"] for e in alert_events] == [
+        {"ch": 1, "note": 60, "level": "warn", "held_s": 2.1},
+        {"ch": 2, "note": 64, "level": "crit", "held_s": 11.0},
+    ]
+
+
+def test_tick_analyzers_emits_nothing_when_drain_alerts_is_empty():
+    eng = Engine(Config())
+    events = []
+    eng.add_listener(lambda m: events.append(m) if m.get("kind") == "event" else None)
+    eng.register_analyzer("fake", _FakeTickingAnalyzer(alerts=[]))
+    eng._tick_analyzers(1.0)
+    assert [e for e in events if e["name"] == "alert"] == []
+
+
+def test_tick_analyzers_ignores_analyzers_with_no_drain_alerts_method():
+    eng = Engine(Config())
+    events = []
+    eng.add_listener(lambda m: events.append(m) if m.get("kind") == "event" else None)
+    eng.register_analyzer("plain", _FakePage())   # no tick, no drain_alerts
+    eng._tick_analyzers(1.0)   # must not raise
+    assert events == []
+
+
+async def test_run_loop_calls_tick_analyzers_and_publishes_stucknotes_alert_end_to_end():
+    # End-to-end proof (real StuckNotesAnalyzer, real run() loop, real
+    # wall-clock `time.time()` reads from the engine -- NOT a scripted
+    # fake) that a note held with no new MIDI event still escalates and
+    # reaches a subscribed client as both an `overlay.alerts` snapshot AND
+    # an `alert` event, using a near-zero WARN_AFTER override so the test
+    # doesn't need to sleep for the real 2s default.
+    import midicrt.analyzers.stucknotes as stucknotes_mod
+
+    original_warn_after = stucknotes_mod.WARN_AFTER
+    stucknotes_mod.WARN_AFTER = 0.05
+    try:
+        eng = Engine(Config(tick_hz=200.0))
+        got = []
+        eng.add_listener(got.append)
+        task = asyncio.create_task(eng.run())
+        await eng.queue.put(ev(type="note_on", channel=0, data1=60, data2=100))
+        await asyncio.sleep(0.2)
+        eng.stop()
+        await task
+    finally:
+        stucknotes_mod.WARN_AFTER = original_warn_after
+
+    alert_events = [m for m in got if m.get("kind") == "event" and m.get("name") == "alert"]
+    assert alert_events and alert_events[0]["data"]["note"] == 60
+    alert_snaps = [m for m in got if m.get("kind") == "snapshot" and m["topic"] == "overlay.alerts"]
+    assert alert_snaps and alert_snaps[-1]["data"]["alerts"][0]["note"] == 60
+
+
+# -- tuner page (phase-3 task 6) ---------------------------------------------
+
+def test_tuner_is_not_in_the_default_roster():
+    # Disclosed scope choice (pages/tuner.py's module docstring): the tuner
+    # page can only ever show v1's idle state until a separate, not-yet-
+    # built audio-capture task feeds it real pitch samples, so it is NOT
+    # forced into config.py's default `pages` list the way voices/harmony
+    # were in tasks 4/5.
+    eng = Engine(Config())
+    assert "tuner" not in eng.pages
+
+
+def test_tuner_is_reachable_via_config_pages():
+    eng = Engine(Config(pages=["eventlog", "tuner"]))
+    assert list(eng.pages) == ["eventlog", "tuner"]
+    assert eng.pages["tuner"].view_model()["title"] == "TUNER"
 
 
 async def test_page_goto_valid_and_unknown():

@@ -47,6 +47,27 @@ read an analyzer's derived state within the same event tick; today the two
 sets are independent and order has no observable effect.
 `Engine.register_analyzer()` mirrors `register_page()` for the same
 test/dynamically-arriving-overlay reasons.
+
+Analyzer wall-clock tick + alert events (phase-3 task 6)
+--------------------------------------------------------
+Every analyzer to date derives all timing from `MidiEvent.ts` deltas alone
+-- but `analyzers/stucknotes.py`'s escalation (a note going "stuck" after
+N seconds with no note-off) can cross a threshold with NO new MIDI event
+at all, and a pure `handle(ev)` can only ever react to events. `run()`
+therefore calls `_tick_analyzers(now)` once per `tick_hz` period (using
+`time.time()` -- the SAME clock domain as `MidiEvent.ts`, see
+`engine/midi_in.py`), which: (1) calls `analyzer.tick(now)` for any
+analyzer exposing that OPTIONAL method (duck-typed via `hasattr`, not
+added to the `Analyzer` Protocol itself since most analyzers don't need
+it -- `tick` marks its own topic dirty exactly like `handle()`'s bool
+convention), and (2) drains any analyzer exposing an OPTIONAL
+`drain_alerts() -> list[dict]` and turns each drained dict into its own
+`emit_event("alert", ...)` -- reusing task-1's event-broadcast path
+(`ProtocolServer._on_engine_message`'s slow-client high-water check
+applies here unchanged, no new backpressure code needed). Analyzers
+themselves stay "no I/O": `now` is always INJECTED by this method, never
+read by an analyzer internally -- see analyzers/stucknotes.py's own
+docstring for the full rationale.
 """
 import asyncio
 import time
@@ -55,11 +76,14 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from midicrt import proto
+from midicrt.analyzers.stucknotes import StuckNotesAnalyzer
+from midicrt.analyzers.timesig import TimesigAnalyzer
 from midicrt.analyzers.transport import TransportAnalyzer
 from midicrt.config import Config
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.pages.eventlog import EventLogPage
 from midicrt.pages.harmony import HarmonyPage
+from midicrt.pages.tuner import TunerPage
 from midicrt.pages.voices import VoicesPage
 
 
@@ -113,12 +137,27 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # analyzers/harmony.py. `config.pages` now defaults to
     # ["eventlog", "voices", "harmony"] (config.py).
     "harmony": lambda config: HarmonyPage(),
+    # Phase-3 task 6: v1's audio tuner page (pages/tuner.py) -- see
+    # pages/tuner.py's + analyzers/tuner.py's module docstrings for why
+    # this is registered here (reachable via config.toml/register_page)
+    # but deliberately NOT in config.py's default `pages` list: it can
+    # only ever show v1's idle state until a separate, not-yet-built audio-
+    # capture task feeds it real pitch samples.
+    "tuner": lambda config: TunerPage(),
 }
 
 # Known production analyzers, keyed by the name used in the `overlay.<name>`
 # topic. Unlike pages, not config-gated -- see the module docstring.
 _ANALYZER_FACTORIES: dict[str, AnalyzerFactory] = {
     "status": lambda config: TransportAnalyzer(),
+    # Phase-3 task 6: v1's plugins/zstucknotes.py (long-held-note alerts)
+    # and plugins/ztimesig.py (time-signature estimate) -- both are v1
+    # "always visible regardless of page" chrome-class features (see
+    # analyzers/stucknotes.py's/analyzers/timesig.py's own module
+    # docstrings for the v1 layout evidence), so both are registered here
+    # as analyzers/overlays, not pages, matching "status"'s own precedent.
+    "alerts": lambda config: StuckNotesAnalyzer(),
+    "timesig": lambda config: TimesigAnalyzer(),
 }
 
 
@@ -241,6 +280,21 @@ class Engine:
     def stop(self) -> None:
         self._running = False
 
+    def _tick_analyzers(self, now: float) -> None:
+        """Inject wall-clock progress into any analyzer that needs it, and
+        drain/emit any resulting `alert` events -- see the module
+        docstring's "Analyzer wall-clock tick + alert events" section.
+        `now` is read ONCE here (the engine's job); analyzers only ever
+        receive it as a parameter, never read a clock themselves."""
+        for name, analyzer in self.analyzers.items():
+            tick_fn = getattr(analyzer, "tick", None)
+            if tick_fn is not None and tick_fn(now):
+                self._dirty.add(f"overlay.{name}")
+            drain = getattr(analyzer, "drain_alerts", None)
+            if drain is not None:
+                for alert in drain():
+                    self.emit_event("alert", alert)
+
     async def run(self) -> None:
         self._running = True
         tick = 1.0 / max(self.config.tick_hz, 1.0)
@@ -252,6 +306,7 @@ class Engine:
                     self._handle(self.queue.get_nowait())
             except TimeoutError:
                 pass
+            self._tick_analyzers(time.time())
             for topic in sorted(self._dirty):
                 snap = self.snapshot_now(topic)
                 if snap:

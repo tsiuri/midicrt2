@@ -1,4 +1,10 @@
-from midicrt.clients.chrome import DEFAULT_STATUS_VM, status_text
+from midicrt.clients.chrome import (
+    DEFAULT_ALERTS_VM,
+    DEFAULT_STATUS_VM,
+    DEFAULT_TIMESIG_VM,
+    secondary_status_text,
+    status_text,
+)
 from midicrt.clients.tui import (
     _KEY_ACTIONS,
     RENDERERS,
@@ -6,7 +12,9 @@ from midicrt.clients.tui import (
     _voices_bar,
     render_harmony_lines,
     render_lines,
+    render_secondary_row,
     render_status_row,
+    render_tuner_lines,
     render_voices_lines,
 )
 
@@ -74,6 +82,34 @@ def test_render_status_row_matches_shared_chrome_text_when_it_fits():
     text = status_text(vm)
     row = render_status_row(vm, width=len(text) + 10)
     assert row.strip() == text
+
+
+# -- secondary row: alerts/timesig (phase-3 task 6) --------------------------
+
+def test_render_secondary_row_is_exactly_width_wide():
+    row = render_secondary_row(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, width=15)
+    assert len(row) == 15
+
+
+def test_render_secondary_row_shows_timesig_when_no_alerts():
+    row = render_secondary_row(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, width=60)
+    assert row.strip() == "Time Signature: (no lock)"
+
+
+def test_render_secondary_row_prefers_alerts_when_present():
+    alerts_vm = {"alerts": [{"ch": 1, "note": 60, "level": "crit", "held_s": 11.0}]}
+    timesig_vm = {"labels": ["4/4"], "confidence": 0.9, "events": 20,
+                  "events_window": 20, "events_total": 20, "pending": None}
+    row = render_secondary_row(alerts_vm, timesig_vm, width=60)
+    assert row.strip() == secondary_status_text(alerts_vm, timesig_vm)
+    assert row.strip().startswith("STUCK CRIT:")
+
+
+def test_render_secondary_row_truncates_to_width():
+    alerts_vm = {"alerts": [{"ch": 1, "note": 60, "level": "warn", "held_s": 2.0}]}
+    row = render_secondary_row(alerts_vm, DEFAULT_TIMESIG_VM, width=6)
+    assert len(row) == 6
+    assert row == secondary_status_text(alerts_vm, DEFAULT_TIMESIG_VM)[:6]
 
 
 # -- voices page (phase-3 task 4) --------------------------------------------
@@ -258,3 +294,72 @@ def test_harmony_render_cuts_off_extra_rows_when_height_is_short():
 
 def test_harmony_renderers_dispatch_table_has_harmony():
     assert RENDERERS["harmony"] is render_harmony_lines
+
+
+# -- tuner page (phase-3 task 6) ----------------------------------------------
+
+TUNER_IDLE_VM = {"title": "TUNER", "note": "", "cents": 0.0, "hz": 0.0,
+                 "confidence": 0.0, "db": -120.0, "has_signal": False}
+TUNER_LOCKED_VM = {"title": "TUNER", "note": "A4", "cents": -3.2, "hz": 439.2,
+                   "confidence": 0.82, "db": -18.4, "has_signal": True}
+
+# Frozen against an actual run of render_tuner_lines(TUNER_LOCKED_VM, 60, 5)
+# and render_tuner_lines(TUNER_IDLE_VM, 60, 5) -- same "freeze from a real
+# run" discipline as GOLDEN_VOICES_FRAME/GOLDEN_HARMONY_FRAME above.
+GOLDEN_TUNER_LOCKED_FRAME = [
+    "TUNER  [n]ext page [q]uit                                   ",
+    "Note:A4    Pitch: 439.20 Hz  Cents:  -3.2  Conf:0.82  Level:",
+    "Tuning: -------------------^|-------------------            ",
+    "                                                            ",
+    "                                                            ",
+]
+GOLDEN_TUNER_IDLE_FRAME = [
+    "TUNER  [n]ext page [q]uit                                   ",
+    "Listening...  Conf:0.00  Level:-120.0 dB                    ",
+    "                                                            ",
+    "                                                            ",
+    "                                                            ",
+]
+
+
+def test_tuner_render_matches_frozen_golden_frame_when_locked():
+    out = render_tuner_lines(TUNER_LOCKED_VM, width=60, height=5)
+    assert out == GOLDEN_TUNER_LOCKED_FRAME
+    assert all(len(line) == 60 for line in out)
+
+
+def test_tuner_render_matches_frozen_golden_frame_when_idle():
+    out = render_tuner_lines(TUNER_IDLE_VM, width=60, height=5)
+    assert out == GOLDEN_TUNER_IDLE_FRAME
+    assert all(len(line) == 60 for line in out)
+
+
+def test_tuner_render_idle_state_has_no_note_or_meter():
+    out = render_tuner_lines(TUNER_IDLE_VM, width=60, height=5)
+    assert "Listening" in out[1]
+    assert "Note:" not in out[1]
+    assert out[2].strip() == ""
+
+
+def test_tuner_render_locked_state_shows_note_cents_and_meter():
+    out = render_tuner_lines(TUNER_LOCKED_VM, width=60, height=5)
+    assert "Note:A4" in out[1]
+    assert "Cents:  -3.2" in out[1]
+    assert "Tuning:" in out[2]
+    assert "^" in out[2] and "|" in out[2]
+
+
+def test_tuner_render_pads_blank_rows_when_height_exceeds_body():
+    out = render_tuner_lines(TUNER_IDLE_VM, width=20, height=6)
+    assert len(out) == 6
+    assert out[-1] == " " * 20
+
+
+def test_tuner_render_cuts_off_extra_rows_when_height_is_short():
+    out = render_tuner_lines(TUNER_LOCKED_VM, width=20, height=2)
+    assert len(out) == 2
+    assert "Note:" in out[1]
+
+
+def test_tuner_renderers_dispatch_table_has_tuner():
+    assert RENDERERS["tuner"] is render_tuner_lines

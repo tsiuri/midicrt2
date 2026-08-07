@@ -35,6 +35,19 @@ separately, right after the page renderer, same "page owns everything
 except the reserved strip" split as tui.py's `render_lines`/
 `render_status_row`. Both clients subscribe to `overlay.status` ALONGSIDE
 the current page's topic (multi-topic subscribe).
+
+Chrome, part 2 (phase 3 task 6): a second strip for alerts/time-signature
+--------------------------------------------------------------------------
+A second reserved strip (`_draw_secondary`, same height convention as
+`_draw_status`) sits directly ABOVE the status strip, painting
+`clients/chrome.py`'s `secondary_status_text()` -- v1's stuck-note
+warnings (`overlay.alerts`) when any are active, else the time-signature
+estimate (`overlay.timesig`); see that shared function's own docstring for
+why the two share one row instead of getting a row each. Every page
+renderer's usable-height math now subtracts BOTH strips
+(`_secondary_strip_height(font) + _status_strip_height(font)`); the run
+loops subscribe to both new overlay topics alongside `overlay.status` and
+call `_draw_secondary` right after `_draw_status`.
 """
 import argparse
 import logging
@@ -88,9 +101,10 @@ def render_frame(vm: dict, surface: Surface) -> None:
     `BG` so it reads as inverted) showing "<title>  (<count> events)", then
     event lines below it, oldest-to-newest top-to-bottom, tailed to
     whatever fits the remaining height at one text-line per row. The
-    bottom `_status_strip_height(font)` px are reserved (left as
-    background -- NOT drawn here, see `_draw_status`) so the page body
-    never overlaps the chrome status strip the run loops paint after this.
+    bottom `_reserved_chrome_height(font)` px (BOTH chrome strips, phase-3
+    task 6) are reserved (left as background -- NOT drawn here, see
+    `_draw_status`/`_draw_secondary`) so the page body never overlaps the
+    chrome the run loops paint after this.
     Tailing reuses `clients.tui._tail`'s exact slicing (imported, not
     duplicated) so the fb and TUI clients agree on "what's visible" for
     the same view-model. Accent-styled lines (currently note_on events --
@@ -105,7 +119,7 @@ def render_frame(vm: dict, surface: Surface) -> None:
     draw_text(surface, LEFT_MARGIN, HEADER_PAD, header_text, BG, font)
 
     line_h = font.height + LINE_GAP
-    usable_h = surface.height - _status_strip_height(font)
+    usable_h = surface.height - _reserved_chrome_height(font)
     body_h = max(0, (usable_h - header_h) // line_h)
     for i, line in enumerate(_tail(vm["lines"], body_h)):
         color = ACCENT_FG if line["style"] == "accent" else NORMAL_FG
@@ -169,7 +183,7 @@ def render_voices_frame(vm: dict, surface: Surface) -> None:
     rows = vm["rows"]
     if not rows:
         return
-    usable_h = surface.height - _status_strip_height(font) - header_h
+    usable_h = surface.height - _reserved_chrome_height(font) - header_h
     row_h = usable_h // len(rows)
     if row_h <= 0:
         return
@@ -278,7 +292,7 @@ def render_harmony_frame(vm: dict, surface: Surface) -> None:
     draw_text(surface, LEFT_MARGIN, HEADER_PAD, _harmony_header_text(vm), BG, font)
 
     line_h = font.height + LINE_GAP
-    usable_h = surface.height - _status_strip_height(font)
+    usable_h = surface.height - _reserved_chrome_height(font)
     y = header_h
 
     def _row(text: str) -> None:
@@ -315,8 +329,61 @@ def render_harmony_frame(vm: dict, surface: Surface) -> None:
     _row(_harmony_motif_text(vm))
 
 
+# -- tuner page (phase-3 task 6) ----------------------------------------------
+#
+# Layout mirrors v1's `pages/tuner.py::draw()` text rows -- same adaptation
+# clients/tui.py's own tuner renderer makes (see that module's comment):
+# a status line, then either the locked note/cents/meter or a second blank
+# row (idle -- the state this page shows in production today, see
+# pages/tuner.py's/analyzers/tuner.py's module docstrings). The tuning
+# meter is drawn as TEXT (`tuning_meter()`, reused from analyzers/tuner.py)
+# rather than a pixel gauge with box/rect primitives -- unlike
+# `render_harmony_frame`'s tension bar, the task brief does not call for a
+# pixel-primitive meter here, and a monospace ASCII gauge is legible on the
+# CRT font same as any other row; a disclosed, simpler choice.
+
+
+def _tuner_header_text(vm: dict) -> str:
+    return f"{vm['title']}"
+
+
+def render_tuner_frame(vm: dict, surface: Surface) -> None:
+    """Render the tuner page view-model (pages/tuner.py, wrapping
+    analyzers/tuner.py's TunerAnalyzer) onto `surface`. Pure: reads only
+    `vm` and the cached default font, writes only to `surface`'s pixels --
+    no I/O, no clock, no global state beyond the font's (side-effect-free)
+    glyph cache."""
+    from midicrt.analyzers.tuner import tuning_meter
+
+    font = load_font()
+    surface.clear(BG)
+
+    header_h = font.height + 2 * HEADER_PAD
+    surface.rect(0, 0, surface.width, header_h, HEADER_BG)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _tuner_header_text(vm), BG, font)
+
+    line_h = font.height + LINE_GAP
+    usable_h = surface.height - _reserved_chrome_height(font)
+    y = header_h
+
+    def _row(text: str) -> None:
+        nonlocal y
+        if y + font.height > usable_h:
+            return
+        draw_text(surface, LEFT_MARGIN, y, text, NORMAL_FG, font)
+        y += line_h
+
+    if not vm.get("has_signal"):
+        _row(f"Listening...  Conf:{vm['confidence']:.2f}  Level:{vm['db']:5.1f} dB")
+        return
+
+    _row(f"Note:{vm['note']:<4}  Pitch:{vm['hz']:7.2f} Hz  Cents:{vm['cents']:+6.1f}  "
+         f"Conf:{vm['confidence']:.2f}  Level:{vm['db']:5.1f} dB")
+    _row("Tuning: " + tuning_meter(vm["cents"], 40))
+
+
 RENDERERS = {"eventlog": render_frame, "voices": render_voices_frame,
-             "harmony": render_harmony_frame}
+             "harmony": render_harmony_frame, "tuner": render_tuner_frame}
 
 
 # -- chrome: status strip (phase-3 task 3) -----------------------------------
@@ -341,6 +408,33 @@ def _draw_status(surface: Surface, vm: dict, font) -> None:
     y = surface.height - strip_h
     surface.rect(0, y, surface.width, strip_h, HEADER_BG)
     draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, chrome.status_text(vm), BG, font)
+
+
+# -- chrome: secondary (alerts/timesig) strip (phase-3 task 6) ---------------
+
+
+def _secondary_strip_height(font) -> int:
+    """Pixel height of the second reserved strip -- same sizing convention
+    as `_status_strip_height`."""
+    return font.height + 2 * STATUS_PAD
+
+
+def _reserved_chrome_height(font) -> int:
+    """Total px reserved at the bottom of the surface for BOTH chrome
+    strips -- every page renderer's usable-height math subtracts this
+    (see module docstring)."""
+    return _secondary_strip_height(font) + _status_strip_height(font)
+
+
+def _draw_secondary(surface: Surface, alerts_vm: dict, timesig_vm: dict, font) -> None:
+    """Paint the second reserved strip, directly ABOVE the status strip --
+    same reverse-video convention, showing `clients/chrome.py`'s
+    `secondary_status_text()`."""
+    strip_h = _secondary_strip_height(font)
+    y = surface.height - _reserved_chrome_height(font)
+    surface.rect(0, y, surface.width, strip_h, HEADER_BG)
+    text = chrome.secondary_status_text(alerts_vm, timesig_vm)
+    draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, text, BG, font)
 
 
 # -- real-device geometry (coded here, exercised only in Task 4) -----------
@@ -454,7 +548,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
     width, height, stride = _read_fb_geometry()
     surface = Surface(width, height)
     font = load_font()
-    state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM)}
+    state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM),
+             "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM)}
     on_event = _make_page_switcher(client, state, fps)
 
     fb_file, fb_mm = open_fb_mmap(fb_path, stride * height)
@@ -474,6 +569,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
         renderer = RENDERERS.get(state["page"], _render_unknown)
         renderer(vm, surface)
+        _draw_secondary(surface, state["alerts_vm"], state["timesig_vm"], font)
         _draw_status(surface, state["status_vm"], font)
         surface.write_to_mmap(fb_mm, stride=stride)
 
@@ -485,10 +581,11 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             # (invoked from inside this very call) can switch `state["topic"]`
             # mid-drain, and a same-batch snapshot for the NEW topic must
             # still be recognised, not dropped by a stale membership check.
-            # `overlay.status` is a fixed second member -- updates on its own
-            # schedule (once a beat), independent of the page topic.
+            # The three overlay topics are fixed members -- each updates on
+            # its own schedule, independent of the page topic.
             drained = drain_latest(
-                inbox, lambda: {state["topic"], chrome.OVERLAY_STATUS_TOPIC},
+                inbox, lambda: {state["topic"], chrome.OVERLAY_STATUS_TOPIC,
+                                chrome.OVERLAY_ALERTS_TOPIC, chrome.OVERLAY_TIMESIG_TOPIC},
                 on_event=on_event)
             page_updated = state["topic"] in drained
             if page_updated:
@@ -496,12 +593,20 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             status_updated = chrome.OVERLAY_STATUS_TOPIC in drained
             if status_updated:
                 state["status_vm"] = drained[chrome.OVERLAY_STATUS_TOPIC]
-            if page_updated or status_updated:
-                # `render_frame` clears the WHOLE surface, so the status
-                # strip must be repainted on every redraw, not just when
-                # `status_vm` itself changed.
+            secondary_updated = False
+            if chrome.OVERLAY_ALERTS_TOPIC in drained:
+                state["alerts_vm"] = drained[chrome.OVERLAY_ALERTS_TOPIC]
+                secondary_updated = True
+            if chrome.OVERLAY_TIMESIG_TOPIC in drained:
+                state["timesig_vm"] = drained[chrome.OVERLAY_TIMESIG_TOPIC]
+                secondary_updated = True
+            if page_updated or status_updated or secondary_updated:
+                # `render_frame` clears the WHOLE surface, so both chrome
+                # strips must be repainted on every redraw, not just when
+                # their own vm changed.
                 renderer = RENDERERS.get(state["page"], _render_unknown)
                 renderer(vm, surface)
+                _draw_secondary(surface, state["alerts_vm"], state["timesig_vm"], font)
                 _draw_status(surface, state["status_vm"], font)
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
@@ -513,10 +618,12 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
 def run(socket_path: str, fb_path: str, out_path: str | None,
         no_input: bool, fps: float) -> int:
     client = EngineClient(socket_path)
+    overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
+                       chrome.OVERLAY_TIMESIG_TOPIC]
     try:
         client.connect()
         page, topic = current_page_topic(client)
-        client.subscribe([topic, chrome.OVERLAY_STATUS_TOPIC], max_rate=fps)
+        client.subscribe([topic, *overlay_topics], max_rate=fps)
     except ClientError as exc:
         print(f"midicrt-fb: {exc}")
         client.close()
@@ -531,21 +638,30 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
             # exists in this path (deliberately, per the docstring above),
             # so there's no concurrent source of a page_changed here -- a
             # plain fixed `topic` for the PAGE wait is correct as-is; the
-            # overlay.status snapshot (seeded server-side at subscribe()
-            # time, same as the page's) is captured opportunistically via
-            # `on_event` -- both are typically delivered in the very first
-            # push tick, but a sane default covers the case it hasn't
-            # landed yet by the time the page snapshot does.
+            # overlay snapshots (seeded server-side at subscribe() time,
+            # same as the page's) are captured opportunistically via
+            # `on_event` -- typically delivered in the very first push
+            # tick, but a sane default covers the case one hasn't landed
+            # yet by the time the page snapshot does.
+            secondary = {"alerts_vm": dict(chrome.DEFAULT_ALERTS_VM),
+                        "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM)}
             status = {"vm": dict(chrome.DEFAULT_STATUS_VM)}
 
             def _capture_status(msg: dict) -> None:
-                if msg.get("kind") == "snapshot" and msg.get("topic") == chrome.OVERLAY_STATUS_TOPIC:
+                if msg.get("kind") != "snapshot":
+                    return
+                if msg.get("topic") == chrome.OVERLAY_STATUS_TOPIC:
                     status["vm"] = msg["data"]
+                elif msg.get("topic") == chrome.OVERLAY_ALERTS_TOPIC:
+                    secondary["alerts_vm"] = msg["data"]
+                elif msg.get("topic") == chrome.OVERLAY_TIMESIG_TOPIC:
+                    secondary["timesig_vm"] = msg["data"]
 
             vm = wait_first_snapshot(inbox, topic, _capture_status)
             surface = Surface(*OUT_SIZE)
             renderer = RENDERERS.get(page, _render_unknown)
             renderer(vm, surface)
+            _draw_secondary(surface, secondary["alerts_vm"], secondary["timesig_vm"], load_font())
             _draw_status(surface, status["vm"], load_font())
             surface.save_png(out_path)
             return 0

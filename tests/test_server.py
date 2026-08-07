@@ -62,8 +62,11 @@ async def test_hello_and_describe(tmp_path):
     # alphabetical -- see server.py's own comment); "topics" carries the
     # real roster/cycle order.
     assert d["data"]["pages"] == ["eventlog", "harmony", "voices"]
+    # Phase-3 task 6 added "alerts"/"timesig" overlays -- see
+    # test_engine_core.py::test_topics_include_overlay_after_page_topics.
     assert d["data"]["topics"] == [
-        "page.eventlog", "page.voices", "page.harmony", "overlay.status",
+        "page.eventlog", "page.voices", "page.harmony",
+        "overlay.status", "overlay.alerts", "overlay.timesig",
     ]
     eng.stop(); await task; await srv.close()
 

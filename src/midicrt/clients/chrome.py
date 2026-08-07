@@ -32,6 +32,76 @@ def format_bpm(bpm: float | None) -> str:
     return "—" if bpm is None else f"{bpm:.1f}"
 
 
+OVERLAY_ALERTS_TOPIC = "overlay.alerts"
+OVERLAY_TIMESIG_TOPIC = "overlay.timesig"
+
+DEFAULT_ALERTS_VM = {"alerts": []}
+DEFAULT_TIMESIG_VM = {"labels": [], "confidence": 0.0, "events": 0,
+                       "events_window": 0, "events_total": 0, "pending": None}
+
+# Stuck-note alerts (phase-3 task 6) and the time-signature estimate share
+# ONE second chrome row instead of each getting their own -- v1 itself only
+# ever reserves TWO bottom rows total (`plugins/timeclock.py`'s chrome bar
+# + `plugins/zstucknotes.py`'s warning line; see analyzers/stucknotes.py's/
+# analyzers/timesig.py's own module docstrings for why timesig has no v1
+# chrome row of its own to mirror -- its only v1 home is a page v2 never
+# ported). Alerts are rare and urgent -- v1's own zstucknotes.py PANICs and
+# reverse-videos on "crit" -- so they take priority on the shared row
+# whenever any are active; the row falls back to the (routine, far more
+# often shown) time-signature line otherwise. This keeps v2's total chrome
+# footprint at the same two rows v1 actually uses, rather than growing to
+# three.
+MAX_ALERT_LIST = 3   # matches v1's zstucknotes.py MAX_LIST
+
+
+def alerts_text(vm: dict) -> str:
+    """Build v1's "STUCK WARN/CRIT: ..." banner line from an
+    `overlay.alerts` view-model. `""` (blank row) when nothing is stuck --
+    v1 holds its last message for `HOLD_AFTER` (15s) after clearing; this
+    analyzer doesn't carry that history (see analyzers/stucknotes.py's
+    module docstring), so the row goes blank the instant the alert list
+    empties. Note numbers are shown raw (`n060`), not v1's octave-letter
+    name (`_fmt_note`, e.g. "C4(060)") -- see analyzers/stucknotes.py's
+    module docstring for why that convention isn't reproduced.
+    """
+    alerts = vm.get("alerts") or []
+    if not alerts:
+        return ""
+    level = "CRIT" if any(a["level"] == "crit" for a in alerts) else "WARN"
+    parts = [f"CH{a['ch']:02d} n{a['note']:03d} {a['held_s']:4.1f}s" for a in alerts[:MAX_ALERT_LIST]]
+    extra = len(alerts) - MAX_ALERT_LIST
+    if extra > 0:
+        parts.append(f"+{extra} more")
+    return f"STUCK {level}: " + " | ".join(parts)
+
+
+def timesig_text(vm: dict) -> str:
+    """Build v1's "Time Signature: ..." line (`pages/transport.py`'s
+    `_timesig_line()`) from an `overlay.timesig` view-model."""
+    labels = vm.get("labels") or []
+    if not labels:
+        return "Time Signature: (no lock)"
+    conf = vm.get("confidence", 0.0)
+    events = vm.get("events", 0)
+    win = vm.get("events_window", events)
+    total = vm.get("events_total", events)
+    pending = vm.get("pending")
+    ts = labels[0] if len(labels) == 1 else " / ".join(labels)
+    text = f"Time Signature: {ts}  conf:{conf:0.2f}  events:{win}/{total}"
+    if pending:
+        pend = " / ".join(pending) if isinstance(pending, (list, tuple)) else str(pending)
+        text += f"  -> {pend}"
+    return text
+
+
+def secondary_status_text(alerts_vm: dict, timesig_vm: dict) -> str:
+    """The shared second chrome row's text: `alerts_text()` when any alert
+    is active, else `timesig_text()` -- see the module-level comment above
+    `alerts_text` for why these two share one row."""
+    text = alerts_text(alerts_vm)
+    return text if text else timesig_text(timesig_vm)
+
+
 def status_text(vm: dict) -> str:
     """Build the one-line transport status text from an `overlay.status`
     view-model. BAR is 0-indexed, BEAT is 1-indexed within a hardcoded 4/4

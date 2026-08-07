@@ -44,6 +44,14 @@ GOLDEN_SURFACE_SIZE = (220, 60)
 # a start/clock event and so IS the all-defaults case).
 GOLDEN_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
 
+# Phase-3 task 6: a representative ACTIVE alert -- exercises the secondary
+# strip's "alerts win over timesig" branch (clients/chrome.py's
+# `secondary_status_text()`); the timesig VM here is deliberately non-empty
+# too, to prove it's the alert that wins, not merely the only content.
+GOLDEN_ALERTS_VM = {"alerts": [{"ch": 3, "note": 60, "level": "warn", "held_s": 2.3}]}
+GOLDEN_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                      "events_window": 24, "events_total": 40, "pending": None}
+
 
 def test_renderers_dispatch_table_has_eventlog():
     assert app.RENDERERS["eventlog"] is app.render_frame
@@ -93,7 +101,7 @@ def test_render_frame_body_background_untouched_with_no_lines():
 def test_render_frame_tails_to_whatever_fits_newest_only():
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
-    strip_h = app._status_strip_height(font)
+    strip_h = app._reserved_chrome_height(font)   # phase-3 task 6: BOTH chrome strips
     line_h = font.height + app.LINE_GAP
     size = (200, header_h + strip_h + line_h)  # room for exactly one body line
     many = {"title": "EVENT LOG", "count": 5,
@@ -115,7 +123,7 @@ def test_render_frame_tails_to_whatever_fits_newest_only():
 def test_render_frame_orders_tail_oldest_to_newest_top_down():
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
-    strip_h = app._status_strip_height(font)
+    strip_h = app._reserved_chrome_height(font)   # phase-3 task 6: BOTH chrome strips
     line_h = font.height + app.LINE_GAP
     size = (200, header_h + strip_h + 2 * line_h)  # room for exactly two body lines
     many = {"title": "EVENT LOG", "count": 5,
@@ -205,12 +213,15 @@ def test_render_frame_golden_matches_frozen_fixture():
     # Phase-3 task 3: the golden now composes BOTH renderers, page body
     # (render_frame) + chrome status strip (_draw_status), the same way the
     # real run loops do -- "golden updates for both renderers, chrome now
-    # present" (task-3 brief).
+    # present" (task-3 brief). Phase-3 task 6 re-froze it again to add the
+    # secondary alerts/timesig strip (`_draw_secondary`) the run loops now
+    # also always paint.
     assert GOLDEN_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-3-report.md"
+        "golden fixture missing -- see freeze procedure in task-6-report.md"
     )
     surf = Surface(*GOLDEN_SURFACE_SIZE)
     app.render_frame(VM, surf)
+    app._draw_secondary(surf, GOLDEN_ALERTS_VM, GOLDEN_TIMESIG_VM, load_font())
     app._draw_status(surf, GOLDEN_STATUS_VM, load_font())
 
     golden = Image.open(GOLDEN_FRAME).convert("RGB")
@@ -273,6 +284,12 @@ VOICES_ROWS[2] = {"ch": 3, "name": "BassStaRack", "active": 8, "peak": 12, "note
 VOICES_VM = {"title": "VOICES", "total": 11, "total_peak": 20, "rows": VOICES_ROWS}
 
 VOICES_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+# Phase-3 task 6: no active alerts here -- exercises the secondary strip's
+# "falls back to timesig" branch (the voices golden already covers the
+# "alerts win" branch via the eventlog golden above).
+VOICES_ALERTS_VM = {"alerts": []}
+VOICES_TIMESIG_VM = {"labels": ["4/4"], "confidence": 0.85, "events": 24,
+                      "events_window": 24, "events_total": 40, "pending": None}
 
 
 def test_voices_renderers_dispatch_table_has_voices():
@@ -310,7 +327,7 @@ def test_render_voices_frame_draws_a_meter_box_outline_per_row():
     px = surf.image.load()
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
-    usable_h = surf.height - app._status_strip_height(font) - header_h
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
     row_h = usable_h // len(VOICES_ROWS)
     bar_x = app.LEFT_MARGIN + app.NAME_COL_CHARS * font.width + app.BAR_GAP
     for i in range(len(VOICES_ROWS)):
@@ -335,7 +352,7 @@ def test_render_voices_frame_truncates_long_instrument_names():
     px = surf.image.load()
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
-    usable_h = surf.height - app._status_strip_height(font) - header_h
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
     row_h = usable_h // 1
     text_y = header_h + max(0, (row_h - font.height) // 2)
     bar_x = app.LEFT_MARGIN + app.NAME_COL_CHARS * font.width + app.BAR_GAP
@@ -355,7 +372,7 @@ def test_render_voices_frame_live_fill_reflects_active_count():
     px = surf.image.load()
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
-    usable_h = surf.height - app._status_strip_height(font) - header_h
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
     row_h = usable_h // len(VOICES_ROWS)
     bar_x = app.LEFT_MARGIN + app.NAME_COL_CHARS * font.width + app.BAR_GAP
 
@@ -376,7 +393,7 @@ def test_render_voices_frame_peak_tick_visible_above_live_fill():
     px = surf.image.load()
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
-    usable_h = surf.height - app._status_strip_height(font) - header_h
+    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
     row_h = usable_h // len(VOICES_ROWS)
     bar_x = app.LEFT_MARGIN + app.NAME_COL_CHARS * font.width + app.BAR_GAP
 
@@ -404,10 +421,11 @@ def test_render_voices_frame_reserves_the_bottom_status_strip_as_background():
 
 def test_render_voices_frame_golden_matches_frozen_fixture():
     assert GOLDEN_VOICES_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-4-report.md"
+        "golden fixture missing -- see freeze procedure in task-6-report.md"
     )
     surf = Surface(*VOICES_SURFACE_SIZE)
     app.render_voices_frame(VOICES_VM, surf)
+    app._draw_secondary(surf, VOICES_ALERTS_VM, VOICES_TIMESIG_VM, load_font())
     app._draw_status(surf, VOICES_STATUS_VM, load_font())
 
     golden = Image.open(GOLDEN_VOICES_FRAME).convert("RGB")
@@ -451,6 +469,12 @@ HARMONY_EMPTY_VM = {
     "silent": True,
 }
 HARMONY_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+# Phase-3 task 6: exercises the secondary strip's "pending change" text
+# (clients/chrome.py's `timesig_text()` "-> ..." suffix) -- distinct
+# coverage from the eventlog/voices goldens above.
+HARMONY_ALERTS_VM = {"alerts": []}
+HARMONY_TIMESIG_VM = {"labels": ["3/4"], "confidence": 0.5, "events": 12,
+                       "events_window": 12, "events_total": 12, "pending": ["4/4"]}
 
 
 def test_harmony_renderers_dispatch_table_has_harmony():
@@ -544,14 +568,98 @@ def test_render_harmony_frame_reserves_the_bottom_status_strip_as_background():
 
 def test_render_harmony_frame_golden_matches_frozen_fixture():
     assert GOLDEN_HARMONY_FRAME.exists(), (
-        "golden fixture missing -- see freeze procedure in task-5-report.md"
+        "golden fixture missing -- see freeze procedure in task-6-report.md"
     )
     surf = Surface(*HARMONY_SURFACE_SIZE)
     app.render_harmony_frame(HARMONY_VM, surf)
+    app._draw_secondary(surf, HARMONY_ALERTS_VM, HARMONY_TIMESIG_VM, load_font())
     app._draw_status(surf, HARMONY_STATUS_VM, load_font())
 
     golden = Image.open(GOLDEN_HARMONY_FRAME).convert("RGB")
     assert golden.size == HARMONY_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
+# -- tuner page (phase-3 task 6) ----------------------------------------------
+
+GOLDEN_TUNER_FRAME = FIXTURES / "fb_tuner_frame_golden.png"
+TUNER_SURFACE_SIZE = (560, 54)   # header(12) + 2 rows*9 + reserved chrome(24)
+
+TUNER_IDLE_VM = {"title": "TUNER", "note": "", "cents": 0.0, "hz": 0.0,
+                 "confidence": 0.0, "db": -120.0, "has_signal": False}
+TUNER_LOCKED_VM = {"title": "TUNER", "note": "A4", "cents": -3.2, "hz": 439.2,
+                   "confidence": 0.82, "db": -18.4, "has_signal": True}
+TUNER_STATUS_VM = {"bpm": 120.4, "bar": 3, "beat": 2, "running": True, "source": "USB MIDI"}
+TUNER_ALERTS_VM = {"alerts": []}
+TUNER_TIMESIG_VM = {"labels": [], "confidence": 0.0, "events": 0,
+                     "events_window": 0, "events_total": 0, "pending": None}
+
+
+def test_tuner_renderers_dispatch_table_has_tuner():
+    assert app.RENDERERS["tuner"] is app.render_tuner_frame
+
+
+def test_render_tuner_frame_header_bar_is_reverse_video():
+    surf = Surface(*TUNER_SURFACE_SIZE)
+    app.render_tuner_frame(TUNER_LOCKED_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    text_px_end = app.LEFT_MARGIN + len(app._tuner_header_text(TUNER_LOCKED_VM)) * font.width
+    assert text_px_end < surf.width
+    assert px[text_px_end + 4, 0] == app.HEADER_BG
+    assert any(
+        px[x, y] == app.BG
+        for x in range(app.LEFT_MARGIN, text_px_end)
+        for y in range(app.HEADER_PAD, app.HEADER_PAD + font.height)
+    )
+
+
+def test_render_tuner_frame_idle_state_draws_only_one_row():
+    surf = Surface(*TUNER_SURFACE_SIZE)
+    app.render_tuner_frame(TUNER_IDLE_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    # Second body row (the "Tuning:" meter when locked) stays background.
+    assert px[app.LEFT_MARGIN, header_h + line_h] == app.BG
+
+
+def test_render_tuner_frame_locked_state_draws_note_and_meter_rows():
+    surf = Surface(*TUNER_SURFACE_SIZE)
+    app.render_tuner_frame(TUNER_LOCKED_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    # A lit glyph pixel exists on both text rows (not just background).
+    assert any(px[x, header_h + 2] == app.NORMAL_FG for x in range(app.LEFT_MARGIN, surf.width))
+    assert any(px[x, header_h + line_h + 2] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+
+
+def test_render_tuner_frame_reserves_the_bottom_chrome_as_background():
+    surf = Surface(*TUNER_SURFACE_SIZE)
+    app.render_tuner_frame(TUNER_LOCKED_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    reserved = app._reserved_chrome_height(font)
+    y_in_strip = surf.height - reserved + 1
+    for x in (0, surf.width // 2, surf.width - 1):
+        assert px[x, y_in_strip] == app.BG
+
+
+def test_render_tuner_frame_golden_matches_frozen_fixture():
+    assert GOLDEN_TUNER_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-6-report.md"
+    )
+    surf = Surface(*TUNER_SURFACE_SIZE)
+    app.render_tuner_frame(TUNER_LOCKED_VM, surf)
+    app._draw_secondary(surf, TUNER_ALERTS_VM, TUNER_TIMESIG_VM, load_font())
+    app._draw_status(surf, TUNER_STATUS_VM, load_font())
+
+    golden = Image.open(GOLDEN_TUNER_FRAME).convert("RGB")
+    assert golden.size == TUNER_SURFACE_SIZE
     assert surf.image.tobytes() == golden.tobytes()
 
 

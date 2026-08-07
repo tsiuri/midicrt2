@@ -34,6 +34,17 @@ chrome extraction; only the NEW status row is chrome's to own here.
 topic (multi-topic subscribe -- `drain_latest`/`wait_first_snapshot`
 already supported many topics at once, just never asked for more than one
 before this).
+
+Chrome, part 2 (phase 3 task 6): a second row for alerts/time-signature
+------------------------------------------------------------------------
+`overlay.alerts` (stuck-note warnings) and `overlay.timesig` (time-
+signature estimate) share ONE additional row directly above the original
+status row (`render_secondary_row`, `clients/chrome.py`'s
+`secondary_status_text()` -- alerts win whenever any are active, else the
+row shows the time-signature line). `run_tui` now reserves the bottom TWO
+rows for chrome (`render_lines`'s own contract stays unchanged, just
+invoked with `term.height - 2`) and subscribes to both new overlay topics
+alongside `overlay.status`.
 """
 import json
 
@@ -81,6 +92,14 @@ def render_status_row(vm: dict, width: int) -> str:
     `_fit` usage. Reverse-video styling is applied by the caller (run_tui's
     render loop, same as the header) -- stays plain-text/pure/testable."""
     return _fit(chrome.status_text(vm), width)
+
+
+def render_secondary_row(alerts_vm: dict, timesig_vm: dict, width: int) -> str:
+    """TUI's presentation of the shared second chrome row (phase-3 task 6:
+    stuck-note alerts when any are active, else the time-signature
+    estimate -- see clients/chrome.py's `secondary_status_text()`). Same
+    fit/pad treatment as `render_status_row`."""
+    return _fit(chrome.secondary_status_text(alerts_vm, timesig_vm), width)
 
 
 # -- voices page (phase-3 task 4) --------------------------------------------
@@ -227,8 +246,48 @@ def render_harmony_lines(vm: dict, width: int, height: int) -> list[str]:
     return [header] + body
 
 
+# -- tuner page (phase-3 task 6) ----------------------------------------------
+#
+# Layout mirrors v1's `pages/tuner.py::draw()` text rows: a status line
+# ("Input:.../Dev:.../SR:..." in v1 -- adapted here to "Listening... Conf:
+# .../Level:... dB" since this page has no live audio-device readout of its
+# own to report yet, see pages/tuner.py's/analyzers/tuner.py's module
+# docstrings), then either "Note:.../Pitch:.../Cents:.../Conf:.../Level:..."
+# + a "Tuning: <meter>" row (signal locked) or a second blank row (idle --
+# the state this page shows in production today, see those same
+# docstrings). `tuning_meter` is reused from analyzers/tuner.py, not
+# duplicated, same "shared pure function" convention as
+# `analyzers.theory.NOTE_NAMES` in the harmony renderers.
+def _tuner_header_text(vm: dict) -> str:
+    return f"{vm['title']}  [n]ext page [q]uit"
+
+
+def _tuner_body_lines(vm: dict) -> list[str]:
+    if not vm.get("has_signal"):
+        return [
+            f"Listening...  Conf:{vm['confidence']:.2f}  Level:{vm['db']:5.1f} dB",
+            "",
+        ]
+    from midicrt.analyzers.tuner import tuning_meter
+
+    meter = tuning_meter(vm["cents"], 40)
+    line1 = (f"Note:{vm['note']:<4}  Pitch:{vm['hz']:7.2f} Hz  Cents:{vm['cents']:+6.1f}  "
+             f"Conf:{vm['confidence']:.2f}  Level:{vm['db']:5.1f} dB")
+    return [line1, "Tuning: " + meter]
+
+
+def render_tuner_lines(vm: dict, width: int, height: int) -> list[str]:
+    header = _fit(_tuner_header_text(vm), width)
+    body_h = height - 1
+    rows = [_fit(ln, width) for ln in _tuner_body_lines(vm)]
+    body = rows[:body_h] if body_h > 0 else []
+    while len(body) < body_h:
+        body.append(" " * width)
+    return [header] + body
+
+
 RENDERERS = {"eventlog": render_lines, "voices": render_voices_lines,
-             "harmony": render_harmony_lines}
+             "harmony": render_harmony_lines, "tuner": render_tuner_lines}
 
 _SUBSCRIBE_RATE = 10.0
 _KEY_ACTIONS = {"c": "eventlog.clear", "n": "page.next"}
@@ -238,17 +297,20 @@ def run_tui(socket_path: str) -> int:
     import blessed
 
     client = EngineClient(socket_path)
+    overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
+                       chrome.OVERLAY_TIMESIG_TOPIC]
     try:
         client.connect()
         page, topic = current_page_topic(client)
-        client.subscribe([topic, chrome.OVERLAY_STATUS_TOPIC], max_rate=_SUBSCRIBE_RATE)
+        client.subscribe([topic, *overlay_topics], max_rate=_SUBSCRIBE_RATE)
     except ClientError as exc:
         print(f"midicrt tui: {exc}")
         client.close()
         return 1
 
     inbox = client.start_reader()
-    state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM)}
+    state = {"page": page, "topic": topic, "status_vm": dict(chrome.DEFAULT_STATUS_VM),
+             "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM)}
 
     def on_event(msg: dict) -> None:
         if msg.get("kind") == "event" and msg.get("name") == "page_changed":
@@ -281,10 +343,10 @@ def run_tui(socket_path: str) -> int:
                     # `on_event` (invoked from inside this very call) can
                     # switch `state["topic"]` mid-drain, and a same-batch
                     # snapshot for the NEW topic must still be recognised.
-                    # `overlay.status` is a FIXED second member -- it is
-                    # never switched, so it needs no such closure trick.
+                    # The three overlay topics are FIXED members -- never
+                    # switched, so they need no such closure trick.
                     drained = drain_latest(
-                        inbox, lambda: {state["topic"], chrome.OVERLAY_STATUS_TOPIC},
+                        inbox, lambda: {state["topic"], *overlay_topics},
                         on_event=on_event)
                 except ClientError:
                     lost = True
@@ -294,13 +356,22 @@ def run_tui(socket_path: str) -> int:
                 if chrome.OVERLAY_STATUS_TOPIC in drained:
                     state["status_vm"] = drained[chrome.OVERLAY_STATUS_TOPIC]
                     dirty = True
+                if chrome.OVERLAY_ALERTS_TOPIC in drained:
+                    state["alerts_vm"] = drained[chrome.OVERLAY_ALERTS_TOPIC]
+                    dirty = True
+                if chrome.OVERLAY_TIMESIG_TOPIC in drained:
+                    state["timesig_vm"] = drained[chrome.OVERLAY_TIMESIG_TOPIC]
+                    dirty = True
                 if dirty:
-                    # Chrome reserves the LAST row; the page renders header +
-                    # body into the remaining `height - 1` rows (see module
-                    # docstring's "page owns height-2 rows" note).
+                    # Chrome reserves the LAST TWO rows (phase-3 task 6 adds
+                    # the secondary alerts/timesig row above the original
+                    # status row); the page renders header + body into the
+                    # remaining `height - 2` rows.
                     renderer = RENDERERS.get(state["page"], _render_unknown)
-                    page_lines = renderer(vm, term.width, term.height - 1)
+                    page_lines = renderer(vm, term.width, term.height - 2)
                     status_line = render_status_row(state["status_vm"], term.width)
+                    secondary_line = render_secondary_row(
+                        state["alerts_vm"], state["timesig_vm"], term.width)
                     header_line, body_lines = page_lines[0], page_lines[1:]
                     # Accent (bold) highlighting reaches back into the vm's
                     # own "lines"/"style" shape -- eventlog-specific, but
@@ -315,6 +386,8 @@ def run_tui(socket_path: str) -> int:
                         is_accent = i >= pad and shown[i - pad].get("style") == "accent"
                         styled = term.bold(line) if is_accent else line
                         out.append(term.move_xy(0, i + 1) + styled)
+                    out.append(term.move_xy(0, term.height - 2)
+                               + term.reverse(secondary_line) + term.normal)
                     out.append(term.move_xy(0, term.height - 1)
                                + term.reverse(status_line) + term.normal)
                     print("".join(out), end="", flush=True)
