@@ -48,6 +48,45 @@
   #action-args { display: flex; gap: 6px; flex-wrap: wrap; }
   #action-args input { width: 10em; }
   #action-result { font-size: 0.85em; opacity: 0.85; }
+  /* -- REC indicator (phase6-notes item 6): status bar text already
+     carries chrome.py's REC_MARKER glyph; this class is the extra VISUAL
+     cue driven straight off the vm's own `rec` boolean (see renderStatus)
+     rather than re-parsing the rendered string for it. */
+  #status.recording { color: #ff6b6b; }
+  /* -- capture controls (phase6-notes item 6, --allow-control only) ------- */
+  #capture-panel { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  #rec-toggle.recording { background: #4a1f1f; border-color: #7a2b2b; color: #ff8a8a; }
+  #last-session { font-size: 0.85em; opacity: 0.85; }
+  /* -- alert banners (phase6-notes item 4): dismissable, `level`-colored -- */
+  #alerts { padding: 0 12px; }
+  .alert-banner {
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    background: #4a3a1f; color: #ffdca8; border: 1px solid #7a5b2b; border-radius: 4px;
+    padding: 6px 10px; margin: 6px 0; font-size: 0.9em;
+  }
+  .alert-banner.alert-crit { background: #4a1f1f; color: #ffb3b3; border-color: #7a2b2b; }
+  .alert-banner button {
+    background: transparent; border: none; color: inherit; cursor: pointer;
+    font-weight: bold; font-size: 1em; font-family: inherit; padding: 0 4px;
+  }
+  /* -- learn toasts (phase6-notes item 4): transient, auto-dismissing ----- */
+  #toast-container {
+    position: fixed; bottom: 12px; right: 12px; display: flex; flex-direction: column;
+    gap: 6px; z-index: 10;
+  }
+  .toast {
+    background: #123018; color: #7CFF9E; border: 1px solid #2b6b3a; border-radius: 4px;
+    padding: 6px 12px; font-size: 0.85em; box-shadow: 0 2px 6px rgba(0,0,0,0.4);
+  }
+  /* -- harmony page chips (chord/scale history slots) --------------------- */
+  .chip {
+    display: inline-block; background: #123018; border: 1px solid #2b6b3a;
+    border-radius: 3px; padding: 1px 6px; margin: 2px 4px 2px 0; font-size: 0.9em;
+  }
+  /* -- img2txtviz ascii grid: tight monospace, no wrap ---------------------*/
+  .ascii-grid { line-height: 1.05; letter-spacing: 0; font-size: 10px; }
+  /* -- pianoroll / spectrum canvases ---------------------------------------*/
+  #page-body canvas { display: block; width: 100%; height: auto; margin-top: 6px; background: #0b0f0c; }
 </style>
 </head>
 <body>
@@ -56,11 +95,16 @@
   <div id="conn" class="down">disconnected</div>
 </header>
 <nav id="pages"></nav>
+<div id="alerts"></div>
 <main id="page-body">waiting for first snapshot…</main>
 <div id="controls">
   <div>
     <button data-action="page.prev">◀ prev page</button>
     <button data-action="page.next">next page ▶</button>
+  </div>
+  <div id="capture-panel">
+    <button id="rec-toggle" type="button">● start REC</button>
+    <span id="last-session">last session: (none yet)</span>
   </div>
   <form id="action-form">
     <select id="action-select"></select>
@@ -69,6 +113,7 @@
   </form>
   <div id="action-result"></div>
 </div>
+<div id="toast-container"></div>
 <script>
 const ALLOW_CONTROL = __ALLOW_CONTROL__;
 
@@ -81,9 +126,14 @@ const actionSelect = document.getElementById("action-select");
 const actionArgsEl = document.getElementById("action-args");
 const actionResultEl = document.getElementById("action-result");
 const actionForm = document.getElementById("action-form");
+const alertsEl = document.getElementById("alerts");
+const toastContainerEl = document.getElementById("toast-container");
+const recToggleEl = document.getElementById("rec-toggle");
+const lastSessionEl = document.getElementById("last-session");
 
 let describeCache = null;
 let currentPage = null;
+let recording = false;
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
@@ -98,9 +148,100 @@ function escapeHtml(s) {
 // auto-escaped) instead of this page keeping its own JS copy of the
 // format. That old copy had already drifted from chrome.py's real output
 // (no `rec`/REC_MARKER handling at all) -- one rendering path now, so it
-// can never drift again.
-function renderStatus(text) {
+// can never drift again. `rec` (phase6-notes item 6) drives a SEPARATE
+// visual cue (a CSS class) straight off the vm's own boolean -- the
+// rendered TEXT already has chrome.py's REC_MARKER glyph baked in, but a
+// class lets CSS style the whole status bar, not just prepend a glyph.
+function renderStatus(text, rec) {
   statusEl.textContent = text || "connecting…";
+  statusEl.classList.toggle("recording", !!rec);
+  recording = !!rec;
+  if (ALLOW_CONTROL) updateRecToggle();
+}
+
+// -- alert banners (phase6-notes item 4): dismissable, stacked, newest
+// last. Alert payload SHAPE varies by source (engine/core.py's capture
+// write-failure alert carries {source, level, message}; analyzers/
+// stucknotes.py's own alerts carry {ch, note, level, held_s}, no
+// `message` at all) -- formatAlert() copes with either rather than
+// assuming one canonical shape.
+let alerts = [];
+let alertSeq = 0;
+
+function formatAlert(a) {
+  if (a.message) return a.message;
+  if (a.note != null) return `stuck note: ch${a.ch} note${a.note} (${a.held_s}s, ${a.level})`;
+  return JSON.stringify(a);
+}
+
+function renderAlerts() {
+  alertsEl.innerHTML = alerts.map((a) => {
+    const level = a.level === "crit" ? "alert-crit" : "";
+    return `<div class="alert-banner ${level}">` +
+      `<span>${escapeHtml(formatAlert(a))}</span>` +
+      `<button data-dismiss="${a.id}" aria-label="dismiss">×</button></div>`;
+  }).join("");
+}
+
+function pushAlert(data) {
+  alerts.push({ id: ++alertSeq, ...data });
+  renderAlerts();
+}
+
+alertsEl.addEventListener("click", (ev) => {
+  const id = ev.target && ev.target.dataset && ev.target.dataset.dismiss;
+  if (id == null) return;
+  alerts = alerts.filter((a) => String(a.id) !== id);
+  renderAlerts();
+});
+
+// -- learn toasts (phase6-notes item 4): transient, self-dismissing after
+// a few seconds -- unlike alerts (which stay until a human dismisses
+// them), a learn arm/bind/cancel is a momentary confirmation, not an
+// ongoing condition worth pinning to the screen.
+function showToast(text) {
+  const el = document.createElement("div");
+  el.className = "toast";
+  el.textContent = text;
+  toastContainerEl.appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+
+// -- capture controls (phase6-notes item 6, --allow-control only): a
+// dedicated REC toggle (capture.start/.stop, mirroring the generic action
+// dropdown's own capture.* entries but one click instead of two) + a
+// last_session panel kept current by polling capture.status (on control
+// enable, and again whenever a capture_started/capture_stopped event
+// arrives -- see handleMessage below).
+function updateRecToggle() {
+  if (!recToggleEl) return;
+  recToggleEl.textContent = recording ? "■ stop REC" : "● start REC";
+  recToggleEl.classList.toggle("recording", recording);
+}
+
+function renderLastSession(session) {
+  if (!lastSessionEl) return;
+  if (!session) { lastSessionEl.textContent = "last session: (none yet)"; return; }
+  const counts = Object.entries(session.counts || {})
+    .map(([k, v]) => `${k}:${v}`).join(" ") || "(no events)";
+  const errTxt = session.error ? `  error: ${session.error}` : "";
+  lastSessionEl.textContent = `last session: ${session.id}  ${counts}${errTxt}`;
+}
+
+async function refreshCaptureStatus() {
+  if (!ALLOW_CONTROL) return;
+  try {
+    const res = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "capture.status", args: {} }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    recording = !!data.recording;
+    updateRecToggle();
+    renderLastSession(data.last_session);
+  } catch (e) { /* best-effort -- overlay.status will catch up recording state anyway */ }
 }
 
 // -- nav roster: describe's `topics` (page.* entries, roster/cycle order)
@@ -160,6 +301,252 @@ function renderVoices(vm) {
     `<tbody>${rows}</tbody></table>`;
 }
 
+// -- harmony page (pages/harmony.py + analyzers/harmony.py's view-model):
+// chord/scale history chips, inside/outside note sets, key + tension bar --
+// mirrors clients/tui.py's `_harmony_body_lines` layout, just as markup
+// instead of fixed-width text rows.
+function chipsRow(label, items) {
+  const chips = (items || []).map((it) => {
+    const conf = it.conf != null ? ` ${Math.round(it.conf * 100)}%` : "";
+    return `<span class="chip">${escapeHtml(it.name || "--")}${conf}</span>`;
+  }).join("");
+  return `<div><strong>${escapeHtml(label)}</strong> ${chips || "-"}</div>`;
+}
+
+function renderHarmony(vm) {
+  const tensionPct = Math.round((vm.tension || 0) * 100);
+  const worst = vm.tension_worst_interval ? ` [${escapeHtml(vm.tension_worst_interval)}]` : "";
+  const alts = (vm.key_alternatives || []).length
+    ? `  (alts: ${vm.key_alternatives.map(escapeHtml).join(", ")})` : "";
+  const keyConf = vm.key_conf != null ? ` ${Math.round(vm.key_conf * 100)}%` : "";
+  const rhythm = (vm.harmonic_rhythm && vm.harmonic_rhythm.label) || "-";
+  const motif = (vm.motif && vm.motif.found)
+    ? `${escapeHtml(vm.motif.pattern)}  x${vm.motif.count}` : "-";
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    chipsRow("Chords:", vm.chords) +
+    chipsRow("Scales:", vm.scales) +
+    `<div>Inside: ${(vm.inside || []).join(" ") || "-"}` +
+    `&nbsp;&nbsp;Outside: ${(vm.outside || []).join(" ") || "-"}</div>` +
+    `<div>Key: ${escapeHtml(vm.key || "?")}${keyConf}${alts}</div>` +
+    `<div>Tension: <span class="bar-track"><span class="bar-fill active" ` +
+    `style="width:${tensionPct}%"></span></span> ${(vm.tension || 0).toFixed(2)} ` +
+    `${escapeHtml(vm.tension_label || "")}${worst}</div>` +
+    `<div>Harm. rhythm: ${escapeHtml(rhythm)}</div>` +
+    `<div>Motif: ${motif}</div>`;
+}
+
+// -- pianoroll page (pages/pianoroll.py): the engine already emits
+// normalized [0,1] x0/x1/y/vel coordinates -- this renderer's only job is
+// scaling that onto a <canvas>, then coloring each note by channel + a
+// velocity-driven "charred" brightness ramp, the SAME palette/blend
+// clients/fb/app.py's `_ROLL_CHANNEL_PALETTE`/`_roll_note_color` use for
+// its own pixel-CRT rendering (kept in sync by hand -- there is no shared
+// module a browser and a Python framebuffer client can both import).
+const PIANOROLL_CHANNEL_PALETTE = [
+  [255, 60, 60], [255, 170, 40], [255, 230, 40], [80, 230, 80],
+  [60, 200, 255], [90, 110, 255], [200, 90, 255], [255, 90, 190],
+];
+const PIANOROLL_DIM_FRACTION = 0.25;
+
+function rollNoteColor(ch, vel) {
+  const hue = PIANOROLL_CHANNEL_PALETTE[(Math.max(1, ch | 0) - 1) % PIANOROLL_CHANNEL_PALETTE.length];
+  const v = Math.max(0, Math.min(1, vel));
+  const frac = PIANOROLL_DIM_FRACTION + (1 - PIANOROLL_DIM_FRACTION) * v;
+  return `rgb(${Math.round(hue[0] * frac)}, ${Math.round(hue[1] * frac)}, ${Math.round(hue[2] * frac)})`;
+}
+
+function renderPianoroll(vm) {
+  const w = vm.window || {};
+  const r = vm.range || {};
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong> (${escapeHtml(w.mode || "")} zoom ` +
+    `${(w.zoom || 0).toFixed(2)}, range ${r.lo}-${r.hi})</div>` +
+    `<canvas id="pianoroll-canvas" height="360"></canvas>`;
+  const canvas = document.getElementById("pianoroll-canvas");
+  canvas.width = Math.max(200, Math.floor(bodyEl.clientWidth) - 4);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#0b0f0c";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  const rowH = 6;
+  (vm.notes || []).forEach((n) => {
+    const x0 = n.x0 * canvas.width;
+    const x1 = Math.max(x0 + 2, n.x1 * canvas.width);
+    const y = n.y * (canvas.height - rowH);
+    ctx.fillStyle = rollNoteColor(n.ch, n.vel);
+    ctx.fillRect(x0, y, x1 - x0, rowH);
+  });
+}
+
+// -- spectrum page (analyzers/spectrum.py): bar-per-bin canvas + peak-hold
+// ticks -- the canvas equivalent of clients/tui.py's `_spectrum_bar_rows`
+// block-character bars.
+function renderSpectrum(vm) {
+  const deviceLine = vm.available
+    ? `(device: ${escapeHtml(vm.device || "default")})` : "";
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong> ${deviceLine}</div>` +
+    `<canvas id="spectrum-canvas" height="240"></canvas>`;
+  const canvas = document.getElementById("spectrum-canvas");
+  canvas.width = Math.max(200, Math.floor(bodyEl.clientWidth) - 4);
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#0b0f0c";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  if (!vm.available) {
+    ctx.fillStyle = "#7CFF9E";
+    ctx.font = "14px monospace";
+    ctx.fillText("no audio input", 10, canvas.height / 2);
+    return;
+  }
+  const bins = vm.bins || [];
+  const peaks = vm.peak_hold || [];
+  const n = bins.length;
+  if (n === 0) return;
+  const barW = canvas.width / n;
+  ctx.fillStyle = "#2b6b3a";
+  bins.forEach((v, i) => {
+    const h = Math.max(0, Math.min(1, v)) * canvas.height;
+    ctx.fillRect(i * barW, canvas.height - h, Math.max(1, barW - 1), h);
+  });
+  ctx.fillStyle = "#7CFF9E";
+  peaks.forEach((v, i) => {
+    const y = canvas.height - Math.max(0, Math.min(1, v)) * canvas.height;
+    ctx.fillRect(i * barW, Math.max(0, y - 1), Math.max(1, barW - 1), 2);
+  });
+}
+
+// -- CC monitor page (pages/ccmonitor.py): one row per channel, its recent
+// CC:value window as text -- mirrors clients/tui.py's `_ccmonitor_row_text`
+// (no natural bar scale for an arbitrary controller number, same reasoning
+// that renderer's own comment gives).
+function renderCcMonitor(vm) {
+  const rows = (vm.channels || []).map((c) => {
+    const cells = (c.recent || [])
+      .map((e) => `CC${String(e.cc).padStart(2, "0")}:${String(e.value).padStart(3, "0")}`)
+      .join(" ");
+    return `<tr><td>${String(c.ch).padStart(2, "0")}</td><td>${cells || "-"}</td></tr>`;
+  }).join("");
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    `<table><thead><tr><th>ch</th><th>recent CCs</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+// -- CC dashboard page (pages/ccdashboard.py): one row per TRACKED
+// (channel, cc) pair with a value bar + freshness label -- mirrors
+// clients/tui.py's `_ccdashboard_row_text`/`_ccdashboard_bar`.
+function renderCcDashboard(vm) {
+  const rows = (vm.entries || []).map((e) => {
+    const pct = Math.max(0, Math.min(100, Math.round((e.value / 127) * 100)));
+    const age = e.fresh ? "LIVE" : `${e.age_s.toFixed(1)}s`;
+    const fillCls = e.fresh ? "bar-fill active" : "bar-fill";
+    return `<tr>
+      <td>Ch${String(e.ch).padStart(2, "0")}</td>
+      <td>CC${String(e.cc).padStart(3, "0")}</td>
+      <td>${e.value}</td>
+      <td><span class="bar-track"><span class="${fillCls}" style="width:${pct}%"></span></span></td>
+      <td>${age}</td>
+    </tr>`;
+  }).join("");
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    `<table><thead><tr><th>ch</th><th>cc</th><th>value</th><th>level</th><th>age</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`;
+}
+
+// -- chord+key page (pages/chordkey.py): chord candidate table + key line
+// -- mirrors clients/tui.py's `_chordkey_key_lines`/`_chordkey_body_lines`.
+function renderChordKey(vm) {
+  const chordRows = (vm.chords || []).map((c) =>
+    `<tr><td>${escapeHtml(c.label)}</td><td>${c.pct}%</td><td>${(c.missing || []).join(" ") || "-"}</td></tr>`
+  ).join("");
+  const key = vm.key || {};
+  let keyLine;
+  if (!key.label) {
+    keyLine = key.top ? `Key: ?  top:${escapeHtml(key.top.label)} ${key.top.pct}%` : "Key: ?";
+  } else {
+    const tag = key.ambiguous ? "~" : "=";
+    keyLine = `Key${tag} ${escapeHtml(key.label)}  ${key.pct}% (thr ${key.threshold_pct}%)`;
+  }
+  const alts = (key.alternatives || [])
+    .map((a) => `${escapeHtml(a.label)} ${a.pct}%`).join(" | ");
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    `<div>Recent: ${(vm.recent_pcs || []).join(" ") || "-"}</div>` +
+    `<table><thead><tr><th>chord</th><th>match</th><th>missing</th></tr></thead>` +
+    `<tbody>${chordRows}</tbody></table>` +
+    `<div>${keyLine}</div>` +
+    (alts ? `<div>alts: ${alts}</div>` : "") +
+    (vm.function ? `<div>Function: ${escapeHtml(vm.function)}</div>` : "");
+}
+
+// -- send notes page (pages/sendnotes.py): plain status table -- mirrors
+// clients/tui.py's `_sendnotes_status_text`.
+function renderSendNotes(vm) {
+  const rows = [
+    ["device", vm.device || "(not open)"],
+    ["channel", vm.channel],
+    ["octave", vm.octave],
+    ["velocity", vm.velocity],
+    ["gate_ms", vm.gate_ms],
+    ["active notes", vm.active],
+  ];
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    `<table><tbody>${rows.map(([k, v]) => `<tr><td>${k}</td><td>${escapeHtml(v)}</td></tr>`).join("")}</tbody></table>`;
+}
+
+// -- shared label/value table renderer for help/config (both pages/
+// help.py's and pages/configview.py's view-models are already flat
+// {label, value} row lists -- see each page module's own docstring) -----
+function labelValueRows(rows) {
+  return (rows || []).map((r) => `<tr><td>${escapeHtml(r.label)}</td><td>${escapeHtml(r.value)}</td></tr>`).join("");
+}
+
+function renderHelp(vm) {
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    `<table><tbody>${labelValueRows(vm.page_rows)}</tbody></table>` +
+    `<div style="margin-top:8px"><strong>-- Actions --</strong></div>` +
+    `<table><tbody>${labelValueRows(vm.action_rows)}</tbody></table>` +
+    `<div style="margin-top:8px"><strong>-- Keymap --</strong></div>` +
+    `<table><tbody>${labelValueRows(vm.keymap_rows)}</tbody></table>`;
+}
+
+function renderConfig(vm) {
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    `<div><strong>-- Config --</strong></div>` +
+    `<table><tbody>${labelValueRows(vm.config_rows)}</tbody></table>` +
+    `<div style="margin-top:8px"><strong>-- Engine --</strong></div>` +
+    `<table><tbody>${labelValueRows(vm.engine_rows)}</tbody></table>`;
+}
+
+// -- img2txtviz page (analyzers/img2txtviz.py): the engine already emits a
+// fixed grid of final [0,1] brightness values with `invert` baked in --
+// this renderer's only job is quantizing each cell through `vm.charset`
+// (already darkest-to-brightest) into a glyph, same index math as
+// clients/tui.py's `_img2txtviz_grid_lines`, rendered at native grid
+// resolution inside a <pre> instead of upsampled to a terminal raster.
+function renderImg2TxtViz(vm) {
+  const charset = vm.charset || " ";
+  const n = charset.length;
+  const lines = (vm.grid || []).map((row) =>
+    row.map((v) => charset[Math.min(n - 1, Math.max(0, Math.floor(v * n)))]).join("")
+  ).join("\n");
+  const flags = vm.invert ? "INV " : "";
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong> notes:${String(vm.active_notes).padStart(2, "0")} ` +
+    `energy:${vm.energy.toFixed(2)} splash:${vm.vel_splash.toFixed(2)} ${flags}</div>` +
+    `<pre class="ascii-grid">${escapeHtml(lines)}</pre>`;
+}
+
+// -- screensaver page (pages/screensaver.py): deliberately blank, matching
+// every other client's own render_screensaver_lines/_frame (a blank CRT
+// is the intended behavior here, not a missing renderer).
+function renderScreensaver() {
+  bodyEl.innerHTML = "";
+}
+
 // Any future page this build has no dedicated renderer for still shows up
 // (ugly but visible) as raw JSON -- mirrors clients/tui.py's/fb/app.py's
 // own `_render_unknown` fallback contract: wire compat is additive-only.
@@ -169,7 +556,30 @@ function renderUnknown(topic, vm) {
     `<pre class="json">${escapeHtml(JSON.stringify(vm, null, 2))}</pre>`;
 }
 
-const PAGE_RENDERERS = { eventlog: renderEventlog, voices: renderVoices };
+// Observer parity (phase6-notes item 3): one entry per default-roster page
+// name (see config.py::Config.pages for the real 14-name list this must
+// track) -- "progchanges" reuses renderEventlog verbatim since
+// pages/progchanges.py's own module docstring documents it as
+// deliberately sharing eventlog's exact `{title, count, lines}` shape.
+// Keys are quoted strings (not bare identifiers) so the roster-coverage
+// test (test_web_app.py) can grep the served JS for `"<name>":` per page
+// without needing a browser to execute it.
+const PAGE_RENDERERS = {
+  "eventlog": renderEventlog,
+  "progchanges": renderEventlog,
+  "voices": renderVoices,
+  "harmony": renderHarmony,
+  "pianoroll": renderPianoroll,
+  "spectrum": renderSpectrum,
+  "ccmonitor": renderCcMonitor,
+  "ccdashboard": renderCcDashboard,
+  "chordkey": renderChordKey,
+  "sendnotes": renderSendNotes,
+  "help": renderHelp,
+  "config": renderConfig,
+  "img2txtviz": renderImg2TxtViz,
+  "screensaver": renderScreensaver,
+};
 
 function renderPage(topic, vm) {
   const name = topic.replace(/^page\./, "");
@@ -186,15 +596,35 @@ function handleMessage(msg) {
     return;
   }
   if (msg.kind === "snapshot") {
-    if (msg.topic === "overlay.status") { renderStatus(msg.status_text); return; }
+    if (msg.topic === "overlay.status") {
+      renderStatus(msg.status_text, msg.data && msg.data.rec);
+      return;
+    }
     if (typeof msg.topic === "string" && msg.topic.startsWith("page.")) {
       renderPage(msg.topic, msg.data);
     }
     return;
   }
-  if (msg.kind === "event" && msg.name === "page_changed") {
+  if (msg.kind !== "event") return;
+  // -- new-surface events (phase6-notes item 4): alert/learn/capture. Every
+  // OTHER event kind (including any future addition) is silently ignored
+  // here, same additive-only wire-compat stance renderUnknown's own
+  // comment documents for pages -- an unrecognized event name is not an
+  // error, just nothing new to show yet.
+  if (msg.name === "page_changed") {
     currentPage = msg.data.page;
     if (describeCache) renderPageNav(currentPage, pageRoster(describeCache));
+  } else if (msg.name === "alert") {
+    pushAlert(msg.data || {});
+  } else if (msg.name === "learn_armed") {
+    showToast(`learn armed: ${msg.data.action}`);
+  } else if (msg.name === "learn_bound") {
+    const action = (msg.data.binding && msg.data.binding.action) || "?";
+    showToast(`learn bound: ${action}`);
+  } else if (msg.name === "learn_cancelled") {
+    showToast(`learn cancelled (${msg.data.reason || "?"})`);
+  } else if (msg.name === "capture_started" || msg.name === "capture_stopped") {
+    refreshCaptureStatus();  // authoritative source: capture.status, not the event payload alone
   }
 }
 
@@ -265,6 +695,10 @@ if (ALLOW_CONTROL) {
     actionArgsEl.querySelectorAll("input").forEach((inp) => { args[inp.dataset.arg] = inp.value; });
     postAction(actionSelect.value, args);
   });
+  recToggleEl.addEventListener("click", () => {
+    postAction(recording ? "capture.stop" : "capture.start", {});
+  });
+  refreshCaptureStatus();  // seed the REC toggle label + last_session panel on load
 }
 
 // -- websocket connection with auto-reconnect + exponential backoff -------

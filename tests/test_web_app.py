@@ -220,6 +220,76 @@ async def test_ws_overlay_status_snapshot_carries_rendered_status_text(tmp_path)
     eng.stop(); await task; await srv.close()
 
 
+async def test_index_page_renderer_registry_covers_full_default_roster(tmp_path):
+    """Observer parity (phase6-notes item 3): the pre-merge branch shipped
+    dedicated renderers for only 2 of the (now) 14 default-roster pages
+    (eventlog/voices) -- every OTHER page silently fell back to raw JSON.
+    page.html's own `PAGE_RENDERERS` object must have an entry for every
+    one of `config.py::Config.pages`'s real default list, or a stock
+    deploy would show raw JSON for whatever's missing. Server-testable
+    without a browser: the served page's JS source is plain text, and
+    every `PAGE_RENDERERS` key is a literal, greppable quoted string (see
+    page.html's own comment on that object for why the keys are quoted).
+    """
+    eng, srv, task, client = await _client_for(tmp_path)
+    resp = await client.get("/")
+    body = await resp.text()
+
+    for name in eng.config.pages:
+        assert f'"{name}":' in body, f"no PAGE_RENDERERS entry for {name!r}"
+
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
+async def _wait_for_page_snapshot(ws, topic, timeout=3.0):
+    """Same discipline as test_web_bridge.py's `_wait_for_topic`: discard
+    anything that isn't the topic we're waiting for (page_changed events,
+    unrelated overlay.status snapshots from the same tick_hz=100 fixture,
+    etc.) instead of assuming it's the very next frame on the wire."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        msg = await asyncio.wait_for(ws.receive_json(), timeout=timeout)
+        if msg.get("kind") == "snapshot" and msg.get("topic") == topic:
+            return msg
+    raise AssertionError(f"no snapshot for topic {topic!r} within {timeout}s")
+
+
+async def test_ws_full_roster_page_cycle_delivers_real_snapshot_for_every_page(tmp_path):
+    """Observer parity, full-stack e2e (phase6-notes item 3): drives
+    `page.goto` across the ENTIRE default 14-page roster -- not just
+    eventlog/voices, the pre-merge branch's only real renderers -- and
+    proves a real, page-specific snapshot (non-empty `title`, i.e. NOT an
+    empty/error-shaped placeholder a fallback renderer would have to
+    paper over) reaches the actual websocket for every one, extending the
+    "websocket transcript" pattern `test_ws_delivers_hello_then_a_
+    snapshot_end_to_end` already established to the full roster.
+
+    JS rendering itself is deliberately NOT exercised here (no browser,
+    per the task brief: "parse the JS? no") -- page.html's own
+    PAGE_RENDERERS registry coverage is the separate, static
+    `test_index_page_renderer_registry_covers_full_default_roster` test
+    above. This test's job is the SERVER-SIDE half: does the full
+    roster's VM data actually reach the wire correctly, end to end.
+    """
+    eng, srv, task, client = await _client_for(tmp_path, allow_control=True, tick_hz=100.0)
+    ws = await client.ws_connect("/ws")
+    await asyncio.wait_for(ws.receive_json(), timeout=2.0)  # hello
+
+    roster = eng.config.pages
+    assert len(roster) == 14  # sanity: this exercises the REAL stock default roster
+
+    for name in roster:
+        resp = await client.post("/api/action", json={"name": "page.goto", "args": {"name": name}})
+        assert resp.status == 200
+        snap = await _wait_for_page_snapshot(ws, f"page.{name}")
+        assert snap["data"].get("title"), f"empty/fallback-shaped VM for page {name!r}"
+
+    await ws.close()
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
 async def test_index_page_has_no_local_status_format_copy(tmp_path):
     """Regression guard for the exact bug docs/phase6-notes.md item 1
     describes: page.html must not keep its own JS copy of the status
