@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>midicrt-web</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    background: #0b0f0c; color: #7CFF9E;
+  }
+  header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 12px; background: #123018; border-bottom: 1px solid #1f4a29;
+    flex-wrap: wrap; gap: 8px;
+  }
+  #status { font-weight: bold; letter-spacing: 0.02em; }
+  #conn { padding: 2px 8px; border-radius: 4px; font-size: 0.8em; }
+  #conn.up { background: #1f4a29; color: #7CFF9E; }
+  #conn.down { background: #4a1f1f; color: #ff8a8a; }
+  nav { display: flex; gap: 6px; padding: 8px 12px; flex-wrap: wrap; }
+  nav button, #controls button {
+    background: #123018; color: #7CFF9E; border: 1px solid #2b6b3a;
+    padding: 4px 10px; border-radius: 4px; cursor: pointer; font-family: inherit;
+    font-size: 0.9em;
+  }
+  nav button.current { background: #2b6b3a; color: #fff; }
+  nav button:disabled { opacity: 0.5; cursor: default; }
+  nav button:not(:disabled):hover, #controls button:not(:disabled):hover { background: #1f4a29; }
+  main { padding: 12px; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { padding: 2px 8px; text-align: left; }
+  .bar-track { display: inline-block; width: 120px; height: 10px; background: #17251a; vertical-align: middle; }
+  .bar-fill { display: inline-block; height: 10px; background: #2b6b3a; }
+  .bar-fill.active { background: #7CFF9E; }
+  #eventlog { white-space: pre-wrap; font-size: 0.92em; line-height: 1.4; max-height: 65vh; overflow-y: auto; }
+  #eventlog .accent { color: #fff; font-weight: bold; }
+  pre.json { white-space: pre-wrap; word-break: break-all; font-size: 0.85em; }
+  #controls { padding: 10px 12px; border-top: 1px solid #1f4a29; display: none; flex-direction: column; gap: 8px; }
+  #controls.enabled { display: flex; }
+  #controls form { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+  #controls select, #controls input {
+    background: #0b0f0c; color: #7CFF9E; border: 1px solid #2b6b3a; padding: 3px 6px;
+    font-family: inherit;
+  }
+  #action-args { display: flex; gap: 6px; flex-wrap: wrap; }
+  #action-args input { width: 10em; }
+  #action-result { font-size: 0.85em; opacity: 0.85; }
+</style>
+</head>
+<body>
+<header>
+  <div id="status">connecting…</div>
+  <div id="conn" class="down">disconnected</div>
+</header>
+<nav id="pages"></nav>
+<main id="page-body">waiting for first snapshot…</main>
+<div id="controls">
+  <div>
+    <button data-action="page.prev">◀ prev page</button>
+    <button data-action="page.next">next page ▶</button>
+  </div>
+  <form id="action-form">
+    <select id="action-select"></select>
+    <span id="action-args"></span>
+    <button type="submit">run action</button>
+  </form>
+  <div id="action-result"></div>
+</div>
+<script>
+const ALLOW_CONTROL = __ALLOW_CONTROL__;
+
+const statusEl = document.getElementById("status");
+const connEl = document.getElementById("conn");
+const pagesEl = document.getElementById("pages");
+const bodyEl = document.getElementById("page-body");
+const controlsEl = document.getElementById("controls");
+const actionSelect = document.getElementById("action-select");
+const actionArgsEl = document.getElementById("action-args");
+const actionResultEl = document.getElementById("action-result");
+const actionForm = document.getElementById("action-form");
+
+let describeCache = null;
+let currentPage = null;
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[c]);
+}
+
+function fmtBpm(bpm) { return (bpm === null || bpm === undefined) ? "—" : Number(bpm).toFixed(1); }
+
+// -- status bar: mirrors clients/chrome.py's status_text() word-for-word --
+function renderStatus(vm) {
+  if (!vm) { statusEl.textContent = "connecting…"; return; }
+  const bar = String(vm.bar ?? 0).padStart(4, "0");
+  const beat = String(vm.beat ?? 1).padStart(2, "0");
+  const state = vm.running ? "RUN" : "STOP";
+  const source = vm.source || "no clock";
+  statusEl.textContent =
+    `BAR ${bar}  BEAT ${beat}   ${fmtBpm(vm.bpm)} BPM   ${state}   clock: ${source}`;
+}
+
+function renderPageNav(current, pages) {
+  pagesEl.innerHTML = "";
+  (pages || []).forEach((name) => {
+    const btn = document.createElement("button");
+    btn.textContent = name;
+    if (name === current) btn.className = "current";
+    if (ALLOW_CONTROL) {
+      btn.addEventListener("click", () => postAction("page.goto", { name }));
+    } else {
+      btn.disabled = true;
+    }
+    pagesEl.appendChild(btn);
+  });
+}
+
+// -- per-page renderers (thin: markup only, no protocol logic) ------------
+function renderEventlog(vm) {
+  const lines = (vm.lines || []).map((ln) => {
+    const cls = ln.style === "accent" ? "accent" : "";
+    return `<span class="${cls}">${escapeHtml(ln.text)}</span>`;
+  }).join("\n");
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong> (${vm.count} events)</div>` +
+    `<div id="eventlog">${lines}</div>`;
+  const log = document.getElementById("eventlog");
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
+function renderVoices(vm) {
+  const rows = (vm.rows || []).map((r) => {
+    const pct = Math.max(0, Math.min(100, Math.round((r.active / 8) * 100)));
+    const fillCls = r.active > 0 ? "bar-fill active" : "bar-fill";
+    return `<tr>
+      <td>${String(r.ch).padStart(2, "0")}</td>
+      <td>${escapeHtml(r.name)}</td>
+      <td><span class="bar-track"><span class="${fillCls}" style="width:${pct}%"></span></span></td>
+      <td>${r.active}/${r.peak}</td>
+    </tr>`;
+  }).join("");
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong> (poly ${vm.total}/${vm.total_peak})</div>` +
+    `<table><thead><tr><th>ch</th><th>name</th><th>level</th><th>active/peak</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table>`;
+}
+
+// Any future page this build has no dedicated renderer for still shows up
+// (ugly but visible) as raw JSON -- mirrors clients/tui.py's/fb/app.py's
+// own `_render_unknown` fallback contract: wire compat is additive-only.
+function renderUnknown(topic, vm) {
+  bodyEl.innerHTML =
+    `<div>(no renderer for <code>${escapeHtml(topic)}</code> yet -- raw snapshot below)</div>` +
+    `<pre class="json">${escapeHtml(JSON.stringify(vm, null, 2))}</pre>`;
+}
+
+const PAGE_RENDERERS = { eventlog: renderEventlog, voices: renderVoices };
+
+function renderPage(topic, vm) {
+  const name = topic.replace(/^page\./, "");
+  const renderer = PAGE_RENDERERS[name] || ((v) => renderUnknown(topic, v));
+  renderer(vm);
+}
+
+// -- websocket message dispatch --------------------------------------------
+function handleMessage(msg) {
+  if (msg.kind === "hello") {
+    currentPage = msg.page;
+    connEl.textContent = "connected"; connEl.className = "up";
+    if (describeCache) renderPageNav(currentPage, describeCache.pages);
+    return;
+  }
+  if (msg.kind === "snapshot") {
+    if (msg.topic === "overlay.status") { renderStatus(msg.data); return; }
+    if (typeof msg.topic === "string" && msg.topic.startsWith("page.")) {
+      renderPage(msg.topic, msg.data);
+    }
+    return;
+  }
+  if (msg.kind === "event" && msg.name === "page_changed") {
+    currentPage = msg.data.page;
+    if (describeCache) renderPageNav(currentPage, describeCache.pages);
+  }
+}
+
+// -- /api/describe: page list + action schema (control surface) -----------
+async function loadDescribe() {
+  try {
+    const res = await fetch("/api/describe");
+    describeCache = await res.json();
+    renderPageNav(currentPage, describeCache.pages);
+    if (ALLOW_CONTROL) populateActionSelect(describeCache.actions || {});
+  } catch (e) {
+    // describe is a nice-to-have for nav/control; snapshots still render without it.
+  }
+}
+
+function populateActionSelect(actions) {
+  actionSelect.innerHTML = "";
+  Object.keys(actions).sort().forEach((name) => {
+    const opt = document.createElement("option");
+    opt.value = name; opt.textContent = name;
+    actionSelect.appendChild(opt);
+  });
+  actionSelect.addEventListener("change", () => renderActionArgs(actions));
+  renderActionArgs(actions);
+}
+
+function renderActionArgs(actions) {
+  actionArgsEl.innerHTML = "";
+  const schema = (actions[actionSelect.value] || {}).args || {};
+  Object.entries(schema).forEach(([argName, type]) => {
+    const input = document.createElement("input");
+    input.placeholder = `${argName} (${type})`;
+    input.dataset.arg = argName;
+    actionArgsEl.appendChild(input);
+  });
+}
+
+// -- control surface: POST /api/action (hidden entirely when ALLOW_CONTROL
+// is false -- the server independently 403s these even if a browser
+// forges the request, see app.py's _handle_action) ------------------------
+async function postAction(name, args) {
+  try {
+    const res = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, args: args || {} }),
+    });
+    const data = await res.json();
+    actionResultEl.textContent = res.ok ? JSON.stringify(data) : `error: ${data.error}`;
+  } catch (e) {
+    actionResultEl.textContent = `error: ${e}`;
+  }
+}
+
+if (ALLOW_CONTROL) {
+  controlsEl.classList.add("enabled");
+  controlsEl.querySelectorAll("button[data-action]").forEach((btn) => {
+    btn.addEventListener("click", () => postAction(btn.dataset.action, {}));
+  });
+  actionForm.addEventListener("submit", (e) => {
+    e.preventDefault();
+    const args = {};
+    actionArgsEl.querySelectorAll("input").forEach((inp) => { args[inp.dataset.arg] = inp.value; });
+    postAction(actionSelect.value, args);
+  });
+}
+
+// -- websocket connection with auto-reconnect + exponential backoff -------
+let backoff = 500;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.addEventListener("open", () => { backoff = 500; });
+  ws.addEventListener("message", (ev) => {
+    try { handleMessage(JSON.parse(ev.data)); } catch (e) { /* ignore malformed frame */ }
+  });
+  ws.addEventListener("close", () => {
+    connEl.textContent = "disconnected"; connEl.className = "down";
+    setTimeout(connect, backoff);
+    backoff = Math.min(backoff * 2, 10000);
+  });
+  ws.addEventListener("error", () => ws.close());
+}
+
+loadDescribe();
+connect();
+</script>
+</body>
+</html>
