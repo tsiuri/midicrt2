@@ -169,9 +169,17 @@ let alerts = [];
 let alertSeq = 0;
 
 function formatAlert(a) {
-  if (a.message) return a.message;
-  if (a.note != null) return `stuck note: ch${a.ch} note${a.note} (${a.held_s}s, ${a.level})`;
-  return JSON.stringify(a);
+  let text;
+  if (a.message) text = a.message;
+  else if (a.note != null) text = `stuck note: ch${a.ch} note${a.note} (${a.held_s}s, ${a.level})`;
+  else text = JSON.stringify(a);
+  // bridge.py's WebSink._offer_alert stamps a cumulative `dropped_alerts`
+  // count onto every alert offered after its bounded queue (16 outstanding)
+  // has to drop the oldest one to make room -- surface it, since otherwise
+  // a burst-heavy session would silently lose alerts even with the
+  // backend fix (the count exists but nobody would ever see it).
+  if (a.dropped_alerts) text += `  (+${a.dropped_alerts} earlier alert(s) dropped)`;
+  return text;
 }
 
 function renderAlerts() {
@@ -617,12 +625,16 @@ function handleMessage(msg) {
   } else if (msg.name === "alert") {
     pushAlert(msg.data || {});
   } else if (msg.name === "learn_armed") {
-    showToast(`learn armed: ${msg.data.action}`);
+    showToast(`learn armed: ${(msg.data && msg.data.action) || "?"}`);
   } else if (msg.name === "learn_bound") {
-    const action = (msg.data.binding && msg.data.binding.action) || "?";
+    // Review fix (Minor): guard `msg.data` itself, not just its nested
+    // `.binding`, same defensive style renderStatus already uses for
+    // `msg.data && msg.data.rec` -- a malformed/future-shaped frame with
+    // no `data` at all must not throw here.
+    const action = (msg.data && msg.data.binding && msg.data.binding.action) || "?";
     showToast(`learn bound: ${action}`);
   } else if (msg.name === "learn_cancelled") {
-    showToast(`learn cancelled (${msg.data.reason || "?"})`);
+    showToast(`learn cancelled (${(msg.data && msg.data.reason) || "?"})`);
   } else if (msg.name === "capture_started" || msg.name === "capture_stopped") {
     refreshCaptureStatus();  // authoritative source: capture.status, not the event payload alone
   }

@@ -42,9 +42,12 @@ snapshots), so one slow browser tab can never make the bridge -- or any
 OTHER tab -- buffer unboundedly PER KEY; it just misses intermediate
 frames for that key and catches up to the newest one whenever it next
 reads. Snapshot messages key on their own `topic` (bounded by the page
-roster + `overlay.status`, at most ~15 distinct keys ever); everything
-else (events, the EOF sentinel) shares one legacy key, unchanged from the
-original single-slot design.
+roster + `overlay.status`, at most ~15 distinct keys ever); `alert`
+events get their own bounded, sequence-keyed slots (see `WebSink.
+_offer_alert`, below); the EOF sentinel gets one permanently dedicated
+key of its own; every OTHER event (`page_changed`, `learn_*`,
+`capture_*`) shares one remaining legacy key, unchanged from the original
+single-slot design.
 
 Task 1's review flagged a real bug in the ORIGINAL implementation (a
 single, undifferentiated `maxsize=1 asyncio.Queue` for every message
@@ -58,10 +61,32 @@ refill the other. `_CoalescingQueue` fixes this by giving each snapshot
 topic its own slot -- `add_sink()`'s replay loop needs no change at all
 (see its own docstring): offering N cached topics now lands N independent
 deliveries instead of one clobbering the rest.
+
+Task 2's review then reproduced the SAME collision class one level up:
+every non-snapshot message (including `alert` and the EOF sentinel)
+still shared one `_UNKEYED` slot, so two alerts offered back-to-back (or
+an alert immediately followed by EOF) silently dropped everything but
+the last. This matters specifically for `alert` because
+`analyzers/stucknotes.py`'s own "Alert-storm potential" section documents
+a real, undebounced burst mechanism (a held note's sustain toggle
+re-firing the same warn/crit alert repeatedly, all emitted synchronously
+within one `_tick_analyzers` call, before any consumer coroutine gets a
+chance to drain the sink) -- and phase6-notes item 4 requires alerts to
+surface, full stop. Fixed by giving `alert` events their own bounded,
+sequence-keyed slots (`WebSink._offer_alert`) and the EOF sentinel a
+permanently separate key (`_EOF_KEY`) that can never be coalesced with an
+alert or anything else in either direction. `page_changed`/`learn_*`/
+`capture_*` events keep sharing the legacy `_UNKEYED` slot -- a
+deliberate, disclosed scope cut: none of them has an analogous
+documented burst-generating mechanism (each fires from exactly one
+discrete user/engine action, not a recurring per-tick recheck), so
+generalizing further wasn't asked for and isn't exercised by anything in
+this codebase today.
 """
 import asyncio
 import queue
 import threading
+from collections import deque
 
 from midicrt.clients import chrome
 from midicrt.clients.base import (
@@ -79,15 +104,28 @@ from midicrt.clients.base import (
 DEFAULT_SUBSCRIBE_RATE = 5.0
 
 
-# Shared coalescing key for every message that ISN'T a per-topic snapshot
-# (events, the EOF sentinel, and anything else offer() doesn't recognize) --
-# a single object identity, matching the ORIGINAL single-slot WebSink's
-# behavior exactly for these message kinds (see module docstring: only
-# snapshots get split into per-topic slots; nothing here regresses the
-# "one slow tab can't buffer unboundedly" guarantee since events/EOF are
-# rare, discrete occurrences, not a continuous per-tick stream like
-# snapshots are).
+# Shared coalescing key for every message that isn't a per-topic snapshot,
+# a per-sequence alert slot, or the EOF sentinel -- i.e. `page_changed`/
+# `learn_*`/`capture_*` events and anything else offer() doesn't recognize.
+# A single object identity, matching the ORIGINAL single-slot WebSink's
+# behavior exactly for these message kinds (see module docstring for why
+# generalizing further wasn't needed: none of them has a documented
+# burst-generating mechanism the way `alert` does).
 _UNKEYED = object()
+
+# EOF (the `None` sentinel) gets its own PERMANENT key, distinct from
+# `_UNKEYED` and from every alert key -- Task 2's review reproduced an
+# alert immediately followed by EOF losing the alert (both shared
+# `_UNKEYED` before this fix); EOF must always be delivered, and must
+# never clobber -- or be clobbered by -- anything else.
+_EOF_KEY = object()
+
+# Bound on outstanding (undelivered) alert slots per sink (review's "a
+# sane cap ... say 16"). Past this, `WebSink._offer_alert` drops the
+# OLDEST pending alert to make room -- bounded, not unbounded, growth
+# even under analyzers/stucknotes.py's documented undebounced alert-storm
+# case, while still surfacing every alert that fits.
+_ALERT_QUEUE_CAP = 16
 
 
 class _CoalescingQueue:
@@ -101,16 +139,30 @@ class _CoalescingQueue:
     became pending since it was last drained", the natural generalization
     of the old single-key queue's FIFO-of-one.
 
+    `evict(key)` removes a pending key WITHOUT delivering it -- used by
+    `WebSink`'s bounded alert delivery to drop the oldest outstanding
+    alert slot when its cap is exceeded. The evicted key's entry can still
+    be sitting in `_ready` (a plain `asyncio.Queue` has no O(1) random
+    removal) -- `get()`/`get_nowait()` skip any key no longer present in
+    `_pending` rather than assuming every dequeued key is still live.
+
     `get()`/`get_nowait()`/`qsize()` mirror `asyncio.Queue`'s own API
-    exactly (every existing call site -- app.py's websocket handler,
-    every test here -- keeps working unchanged against `sink.queue`).
-    `put_nowait` is deliberately NOT exposed: `offer()` (on `WebSink`) is
-    the only writer, so key selection can never be bypassed.
+    (every existing call site -- app.py's websocket handler, every test
+    here -- keeps working unchanged against `sink.queue`), except `qsize()`
+    now reports `len(self._pending)` (the true count of deliverable items)
+    rather than `self._ready.qsize()`, which would overcount once evicted
+    keys can leave stale entries behind -- equivalent in the non-eviction
+    case, correct in both. `put_nowait` is deliberately NOT exposed:
+    `offer()` (on `WebSink`) is the only writer, so key selection can
+    never be bypassed.
     """
 
     def __init__(self):
         self._pending: dict[object, object] = {}
         self._ready: asyncio.Queue = asyncio.Queue()
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._pending
 
     def offer(self, key: object, msg) -> None:
         is_new_key = key not in self._pending
@@ -118,16 +170,26 @@ class _CoalescingQueue:
         if is_new_key:
             self._ready.put_nowait(key)  # never blocks: unbounded key queue
 
+    def evict(self, key: object) -> None:
+        """Drop `key`'s pending payload without delivering it. A no-op if
+        it's already been delivered or was never pending."""
+        self._pending.pop(key, None)
+
     async def get(self):
-        key = await self._ready.get()
-        return self._pending.pop(key)
+        while True:
+            key = await self._ready.get()
+            if key in self._pending:
+                return self._pending.pop(key)
+            # else: evicted before its turn came up (see evict()) -- skip it
 
     def get_nowait(self):
-        key = self._ready.get_nowait()  # raises asyncio.QueueEmpty, same as before
-        return self._pending.pop(key)
+        while True:
+            key = self._ready.get_nowait()  # raises asyncio.QueueEmpty when truly empty
+            if key in self._pending:
+                return self._pending.pop(key)
 
     def qsize(self) -> int:
-        return self._ready.qsize()
+        return len(self._pending)
 
 
 class WebSink:
@@ -139,23 +201,60 @@ class WebSink:
     -- mirroring `EngineClient`'s own `None` sentinel convention (see
     `clients/base.py`'s `_on_eof`).
 
-    Backed by `_CoalescingQueue` (see module docstring for the multi-topic
-    replay bug this fixes): a snapshot message coalesces on its own
-    `topic`; everything else (events, `None`) shares one legacy slot,
-    identical to the original single-`asyncio.Queue(maxsize=1)` design.
+    Backed by `_CoalescingQueue` (see module docstring for the bugs this
+    fixes): a snapshot message coalesces on its own `topic`; an `alert`
+    event gets its own bounded, sequence-keyed slot (`_offer_alert`); EOF
+    gets one permanently dedicated key; everything else (`page_changed`,
+    `learn_*`, `capture_*`) shares one remaining legacy slot.
     """
 
     def __init__(self):
         self.queue = _CoalescingQueue()
+        self._alert_seq = 0
+        self._pending_alert_keys: deque = deque()
+        self._dropped_alerts = 0
 
     def offer(self, msg) -> None:
-        """Drop-and-replace within the message's coalescing key -- never
-        blocks. A snapshot's key is its own `topic` (so two different
-        topics can never clobber each other, see module docstring); every
-        other message shares `_UNKEYED`, unchanged from before this fix."""
-        key = _UNKEYED
+        """Route to the right coalescing key -- never blocks. See the
+        class docstring / module docstring for what each kind gets."""
+        if msg is None:
+            self.queue.offer(_EOF_KEY, msg)
+            return
         if isinstance(msg, dict) and msg.get("kind") == "snapshot" and "topic" in msg:
-            key = ("snapshot", msg["topic"])
+            self.queue.offer(("snapshot", msg["topic"]), msg)
+            return
+        if isinstance(msg, dict) and msg.get("kind") == "event" and msg.get("name") == "alert":
+            self._offer_alert(msg)
+            return
+        self.queue.offer(_UNKEYED, msg)
+
+    def _offer_alert(self, msg: dict) -> None:
+        """Each alert gets a BRAND NEW, never-reused key (an incrementing
+        sequence number) -- unlike snapshots, alerts must never coalesce
+        with each other; every one is a distinct, meaningful occurrence
+        (phase6-notes item 4: alerts MUST surface). Bounded by
+        `_ALERT_QUEUE_CAP`: once that many are outstanding, the OLDEST is
+        evicted to make room, and a cumulative `dropped_alerts` count is
+        attached to every alert offered from that point forward -- NOT
+        reset back to zero once attached, so the count is never itself
+        lost even if a later burst evicts the very alert message it was
+        first stamped onto (the next surviving alert still carries an
+        equal-or-greater total). Only the alert actually being delivered
+        here is annotated -- a shallow copy, never mutating the caller's
+        `msg` in place, because `Bridge._fan_out` passes the SAME dict
+        instance to every registered sink; mutating it here would leak
+        THIS sink's own drop count into every other sink's copy."""
+        while self._pending_alert_keys and self._pending_alert_keys[0] not in self.queue:
+            self._pending_alert_keys.popleft()  # already delivered elsewhere -- prune stale head
+        if len(self._pending_alert_keys) >= _ALERT_QUEUE_CAP:
+            oldest = self._pending_alert_keys.popleft()
+            self.queue.evict(oldest)
+            self._dropped_alerts += 1
+        self._alert_seq += 1
+        key = ("alert", self._alert_seq)
+        self._pending_alert_keys.append(key)
+        if self._dropped_alerts:
+            msg = {**msg, "dropped_alerts": self._dropped_alerts}
         self.queue.offer(key, msg)
 
 

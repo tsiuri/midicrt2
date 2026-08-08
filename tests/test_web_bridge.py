@@ -39,13 +39,19 @@ async def _wait_until_cached(bridge, topics, timeout=2.0):
 
 async def _wait_for_topic(sink, topic, timeout=2.0):
     """Both `page.eventlog` and `overlay.status` get seeded at subscribe
-    time (phase2-notes.md: "never assume ordering" between topics), and a
-    WebSink's maxsize=1 drop-and-replace queue means whichever snapshot
-    lands last before a slow consumer reads is the one that survives --
-    legitimately racy, not a bridge bug. Tests that care about ONE topic's
-    content must loop past unrelated messages instead of assuming the
-    first thing in the queue is theirs (mirrors test_web_app.py's own
-    `_wait_for_eventlog` helper)."""
+    time (phase2-notes.md: "never assume ordering" between topics).
+    Stale docstring note (Task 2 review, Minor): before the T1-review
+    carried-bug fix, WebSink held a single maxsize=1 drop-and-replace
+    queue, so whichever snapshot landed LAST before a slow consumer read
+    was the only one that survived -- that's no longer true. WebSink now
+    coalesces PER TOPIC (`_CoalescingQueue`, bridge.py) -- two different
+    topics can no longer clobber each other -- but `sink.queue.get()`
+    still delivers whichever topic's slot became ready FIRST, which isn't
+    guaranteed to be the one a given test cares about. Tests that care
+    about ONE topic's content must still loop past unrelated messages
+    (their payloads are just not interesting here, not lost) instead of
+    assuming the first thing off the queue is theirs (mirrors
+    test_web_app.py's own `_wait_for_eventlog` helper)."""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         msg = await asyncio.wait_for(sink.queue.get(), timeout=timeout)
@@ -371,6 +377,75 @@ def test_websink_offer_same_snapshot_topic_still_drops_and_replaces():
     sink.offer({"kind": "snapshot", "topic": "page.eventlog", "data": {"n": 2}})
     assert sink.queue.qsize() == 1
     assert sink.queue.get_nowait()["data"] == {"n": 2}
+
+
+def test_websink_offer_alert_burst_delivers_both_in_order():
+    """Review finding (Task 2 review, Important, reproduced): two `alert`
+    events offered back-to-back, before either is drained, used to share
+    the single `_UNKEYED` bucket -- only the SECOND survived.
+    analyzers/stucknotes.py's own module docstring documents exactly this
+    burst pattern ("Alert-storm potential": a held note's sustain toggle
+    re-firing the SAME warn/crit alert repeatedly with no debounce, all
+    emitted synchronously within one `_tick_analyzers` call before any
+    consumer coroutine gets a chance to drain the sink). Alerts now get
+    their own sequence-keyed slots -- both must survive, in offer order."""
+    sink = WebSink()
+    alert_a = {"kind": "event", "name": "alert", "data": {"message": "a"}}
+    alert_b = {"kind": "event", "name": "alert", "data": {"message": "b"}}
+    sink.offer(alert_a)
+    sink.offer(alert_b)
+    assert sink.queue.qsize() == 2
+
+    first = sink.queue.get_nowait()
+    second = sink.queue.get_nowait()
+    assert first["data"]["message"] == "a"
+    assert second["data"]["message"] == "b"
+
+
+def test_websink_offer_alert_then_eof_delivers_both_alert_first():
+    """Review finding (Task 2 review, Important, reproduced): the EOF
+    sentinel used to share the same `_UNKEYED` bucket as every other
+    non-snapshot message, so an alert immediately followed by EOF (e.g.
+    the engine connection dropping right after a capture write-failure
+    alert -- a realistic pairing, since `_capture_write_failed` can
+    plausibly precede a connection loss) lost the alert entirely -- only
+    EOF survived. EOF now has its own dedicated key, never coalesced with
+    an alert (or anything else) in either direction."""
+    sink = WebSink()
+    alert = {"kind": "event", "name": "alert", "data": {"message": "a"}}
+    sink.offer(alert)
+    sink.offer(None)
+    assert sink.queue.qsize() == 2
+
+    first = sink.queue.get_nowait()
+    second = sink.queue.get_nowait()
+    assert first["data"]["message"] == "a"
+    assert second is None
+
+
+def test_websink_offer_alert_burst_beyond_cap_drops_oldest_and_counts():
+    """Bounded delivery (review's "sane cap ... drop-oldest and increment
+    a `dropped_alerts` counter delivered with the next one"): a burst
+    past the cap must not grow the sink's memory unboundedly -- the
+    OLDEST pending alert is dropped, and a cumulative, monotonically
+    increasing `dropped_alerts` count is attached to every alert offered
+    from that point on (not reset to zero once attached -- so the count
+    survives even if a LATER burst evicts the very alert it was first
+    attached to; see WebSink._offer_alert's own docstring)."""
+    sink = WebSink()
+    for i in range(20):  # well past the 16-slot cap
+        sink.offer({"kind": "event", "name": "alert", "data": {"message": f"a{i}"}})
+    assert sink.queue.qsize() == 16  # capped, never grew past it
+
+    delivered = [sink.queue.get_nowait() for _ in range(16)]
+    messages = [m["data"]["message"] for m in delivered]
+    # a0..a3 (the oldest 4) were evicted to make room for a16..a19
+    assert messages == [f"a{i}" for i in range(4, 20)]
+    # a4..a15 were already pending before the FIRST drop -- never annotated
+    assert all("dropped_alerts" not in m for m in delivered[:12])
+    # a16..a19 (offered AFTER drops started) carry the running total as of
+    # when EACH was offered
+    assert [m["dropped_alerts"] for m in delivered[12:]] == [1, 2, 3, 4]
 
 
 def test_pump_loop_does_not_call_threadsafe_on_a_closed_loop():
