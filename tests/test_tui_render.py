@@ -990,6 +990,27 @@ def test_help_body_lines_lists_pages_then_actions_sections():
     assert "-- Actions --" in lines
     assert "page.goto: Jump to a named page  (name:str)" in lines
     assert "page.next: Advance to the next page in the roster" in lines
+    assert "-- Keymap --" not in lines   # HELP_VM has no keymap_rows key at all
+
+
+# -- keymap section (Phase 5 Task 3, docs/phase5-notes.md cheap-wins bundle) --
+
+HELP_VM_WITH_KEYMAP = {**HELP_VM, "keymap_rows": [
+    {"label": "n", "value": "page.next"},
+    {"label": "q", "value": "client.quit"},
+]}
+
+
+def test_help_body_lines_lists_keymap_section_last_when_present():
+    lines = _help_body_lines(HELP_VM_WITH_KEYMAP)
+    assert lines.index("-- Actions --") < lines.index("-- Keymap --")
+    assert "n: page.next" in lines
+    assert "q: client.quit" in lines
+
+
+def test_help_body_lines_omits_keymap_section_when_keymap_rows_is_empty():
+    vm = {**HELP_VM, "keymap_rows": []}
+    assert "-- Keymap --" not in _help_body_lines(vm)
 
 
 def test_render_help_lines_pads_to_exact_dimensions():

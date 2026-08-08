@@ -12,6 +12,7 @@ def test_view_model_shape_and_title():
     assert vm["title"] == "HELP"
     assert "page_rows" in vm
     assert "action_rows" in vm
+    assert "keymap_rows" in vm
 
 
 def test_falls_back_to_idle_info_without_a_bound_engine():
@@ -19,7 +20,8 @@ def test_falls_back_to_idle_info_without_a_bound_engine():
     vm = page.view_model()
     assert vm["page_rows"] == [{"label": "pages (page.goto <name>)", "value": "(none)"}]
     assert vm["action_rows"] == []
-    assert _IDLE_HELP_INFO == {"pages": [], "actions": {}}
+    assert vm["keymap_rows"] == []
+    assert _IDLE_HELP_INFO == {"pages": [], "actions": {}, "keymap": {}}
 
 
 def test_bound_info_reflects_the_live_roster_and_actions():
@@ -30,6 +32,7 @@ def test_bound_info_reflects_the_live_roster_and_actions():
             "page.next": {"description": "Advance to the next page", "args": {}},
             "page.goto": {"description": "Jump to a named page", "args": {"name": "str"}},
         },
+        "keymap": {"n": "page.next", "q": "client.quit"},
     })
     vm = page.view_model()
     assert vm["page_rows"] == [
@@ -38,6 +41,30 @@ def test_bound_info_reflects_the_live_roster_and_actions():
         {"label": "page.goto", "value": "Jump to a named page  (name:str)"},
         {"label": "page.next", "value": "Advance to the next page"},
     ]
+    assert vm["keymap_rows"] == [
+        {"label": "n", "value": "page.next"},
+        {"label": "q", "value": "client.quit"},
+    ]
+
+
+def test_keymap_rows_are_sorted_by_key_regardless_of_input_order():
+    page = HelpPage()
+    page.bind_info(lambda: {
+        "pages": [], "actions": {},
+        "keymap": {"z": "z.action", "a": "a.action"},
+    })
+    keys = [row["label"] for row in page.view_model()["keymap_rows"]]
+    assert keys == ["a", "z"]
+
+
+def test_keymap_rows_defaults_to_empty_when_provider_omits_the_key():
+    """A `bind_info` provider written before Phase 5 Task 3 (no "keymap"
+    key in its returned dict at all) must not crash `view_model()` --
+    `.get("keymap", {})`, not direct indexing (see view_model's own
+    comment)."""
+    page = HelpPage()
+    page.bind_info(lambda: {"pages": [], "actions": {}})
+    assert page.view_model()["keymap_rows"] == []
 
 
 def test_action_rows_are_sorted_by_name_regardless_of_input_order():

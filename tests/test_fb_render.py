@@ -1355,6 +1355,39 @@ def test_render_help_frame_draws_text_for_each_row():
                for x in range(app.LEFT_MARGIN, surf.width))
 
 
+def test_render_help_frame_draws_the_keymap_section_when_populated():
+    """Phase 5 Task 3 (docs/phase5-notes.md cheap-wins bundle): the new
+    THIRD section, appended after Actions -- HELP_VM itself has no
+    `keymap_rows` key at all (see this file's own comment on why that
+    fixture is deliberately left untouched, to avoid re-freezing the
+    golden PNG for an unrelated feature), so this test builds its own
+    vm with the section populated and checks it actually draws, at the
+    row position right after HELP_VM's 3 action rows end."""
+    surf = Surface(*HELP_SURFACE_SIZE)
+    vm = {**HELP_VM, "keymap_rows": [{"label": "n", "value": "page.next"}]}
+    app.render_help_frame(vm, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    # Row order: "-- Pages --"(0), 1 page row(1), ""(2), "-- Actions --"(3),
+    # 3 action rows(4,5,6), ""(7), "-- Keymap --"(8).
+    y_keymap_header = header_h + 8 * line_h
+    assert any(px[x, y_keymap_header] == app.NORMAL_FG
+               for x in range(app.LEFT_MARGIN, surf.width))
+
+
+def test_render_help_frame_omits_the_keymap_section_when_keymap_rows_is_absent():
+    """The exact fixture the frozen golden was built from -- proves the
+    new section draws NOTHING extra (byte-identical to pre-Task-3
+    behavior) when `keymap_rows` is simply not in the vm at all."""
+    surf_without = Surface(*HELP_SURFACE_SIZE)
+    app.render_help_frame(HELP_VM, surf_without)
+    surf_with_empty = Surface(*HELP_SURFACE_SIZE)
+    app.render_help_frame({**HELP_VM, "keymap_rows": []}, surf_with_empty)
+    assert surf_without.image.tobytes() == surf_with_empty.image.tobytes()
+
+
 def test_render_help_frame_reserves_the_bottom_chrome_as_background():
     surf = Surface(*HELP_SURFACE_SIZE)
     app.render_help_frame(HELP_VM, surf)

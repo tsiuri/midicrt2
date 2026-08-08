@@ -63,7 +63,7 @@ def _format_learn_bound(data: dict) -> str:
 
 
 def _bind_learn_cli(socket_path: str, action_name: str, mode: str, arg_pairs: list[str],
-                    timeout: float) -> None:
+                    timeout: float, range_spec: str | None = None) -> None:
     """`midicrt bind learn <action>`: arms the engine's single learn slot
     (`bind.learn`, engine/core.py) then blocks on the SAME connection's
     reader thread for the resulting `learn_bound`/`learn_cancelled` event.
@@ -77,7 +77,16 @@ def _bind_learn_cli(socket_path: str, action_name: str, mode: str, arg_pairs: li
     client waiting under normal conditions is never the one to time out
     first -- the engine's own `learn_cancelled {reason: "timeout"}` should
     always win that race and produce a readable message here instead of a
-    bare "timed out waiting" with no explanation."""
+    bare "timed out waiting" with no explanation.
+
+    `range_spec` (Phase 5 Task 3, docs/phase5-notes.md cheap-wins bundle):
+    `--range lo,hi`'s raw string, or `None` when the flag was never given
+    -- `None` is deliberately NOT sent as `{"range": None}` (the engine's
+    `range: str` schema arg would reject a non-string via `_COERCERS`);
+    omitting the wire key entirely lets `ActionRegistry.dispatch`'s own
+    `defaults={"range": ""}` (`Engine.__init__`'s `bind.learn`
+    registration) supply the exact same "not supplied" sentinel
+    `Engine._bind_learn` already checks for."""
     client = EngineClient(socket_path)
     try:
         client.connect()
@@ -88,8 +97,10 @@ def _bind_learn_cli(socket_path: str, action_name: str, mode: str, arg_pairs: li
         # `.action()` itself raises `ClientError` for a rejected arm (see
         # `EngineClient.request`) -- its response has no further data this
         # caller needs beyond "the arm succeeded", so it's discarded here.
-        client.action("bind.learn", {
-            "action": action_name, "mode": mode, "args": _parse_args(arg_pairs)})
+        learn_args = {"action": action_name, "mode": mode, "args": _parse_args(arg_pairs)}
+        if range_spec is not None:
+            learn_args["range"] = range_spec
+        client.action("bind.learn", learn_args)
     except ClientError as exc:
         client.close()
         raise SystemExit(f"midicrt: {exc}") from exc
@@ -161,7 +172,7 @@ def _handle_replay(args) -> None:
 
 def _handle_bind(socket_path: str, args) -> None:
     if args.bind_cmd == "learn":
-        _bind_learn_cli(socket_path, args.action, args.mode, args.arg, args.timeout)
+        _bind_learn_cli(socket_path, args.action, args.mode, args.arg, args.timeout, args.range)
         return
     if args.bind_cmd == "list":
         data = request(socket_path, "action", name="bind.list", args={})
@@ -202,6 +213,9 @@ def main() -> None:
     p_bind_learn.add_argument("--mode", default="trigger", choices=["trigger", "continuous"])
     p_bind_learn.add_argument("--arg", action="append", default=[])
     p_bind_learn.add_argument("--timeout", type=float, default=LEARN_TIMEOUT_S + 5.0)
+    p_bind_learn.add_argument(
+        "--range", default=None, metavar="LO,HI",
+        help="continuous mode only: lerp target range (default: 0.0,1.0)")
 
     args = ap.parse_args()
 

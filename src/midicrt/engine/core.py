@@ -120,6 +120,7 @@ fix) -- `Engine.__init__`'s own comment next to `self._behaviors` restates
 this at the wiring site.
 """
 import asyncio
+import fnmatch
 import logging
 import time
 from collections.abc import Callable
@@ -416,6 +417,31 @@ class _LearnArm:
     armed_at: float
 
 
+def _parse_learn_range(spec: str) -> tuple[float, float]:
+    """Parse `bind.learn`'s optional `range` wire arg (Phase 5 Task 3,
+    docs/phase5-notes.md cheap-wins bundle: `clients/cli.py`'s `--range
+    lo,hi` flag) -- a plain `"lo,hi"` string, matching this codebase's
+    established `--arg k=v`-style "everything over the wire is a string"
+    convention (`clients/cli.py::_parse_args`) rather than adding a new
+    non-scalar `ActionRegistry` coercer type just for two floats. Raises
+    `ActionError` (not `ValueError`) on anything else -- this runs INSIDE
+    `Engine._bind_learn`, which is itself the arm-time validation step the
+    task brief requires (see that method's own docstring's "Validation
+    happens ENTIRELY here, at ARM time" section): a malformed `--range`
+    must fail the SAME way a bad `mode`/`action` does, not raise a raw
+    `ValueError` that would escape `ActionRegistry.dispatch`'s own
+    `except ActionError`-only narrowing and tear down the requesting
+    client connection."""
+    parts = spec.split(",")
+    if len(parts) != 2:
+        raise ActionError(f"bind.learn: range must be 'lo,hi', got {spec!r}")
+    try:
+        lo, hi = (float(p) for p in parts)
+    except ValueError as exc:
+        raise ActionError(f"bind.learn: range must be 'lo,hi' floats, got {spec!r}") from exc
+    return (lo, hi)
+
+
 class Engine:
     def __init__(self, config: Config, *, keymap_path: str | None = None,
                  config_path: str | None = None, bindings_path: str | None = None,
@@ -564,6 +590,16 @@ class Engine:
         # Important perf fix (2026-08-07 fix wave, finding 1): see
         # set_topic_refcount_provider's own docstring and _flush_dirty's.
         self._topic_refcount_provider: Callable[[str], int] | None = None
+        # Phase 5 Task 3 (bind.list port_present, docs/phase5-notes.md's
+        # bundled cheap-wins list, Minor #2 from the phase-4 final review):
+        # same PULL-seam shape as `_topic_refcount_provider` right above --
+        # `Engine` has no `MidiInput` reference of its own at all
+        # (`daemon.py::build()` constructs one separately and feeds only
+        # `engine.queue`, see that module's own docstring), so `_bind_list`
+        # needs a way to ask "what ports are actually open right now"
+        # without the engine owning MIDI I/O itself. See
+        # `set_open_ports_provider`'s own docstring for the full contract.
+        self._open_ports_provider: Callable[[], list[str]] | None = None
         # Phase-3 task 9: seeded to "now", NOT epoch 0 -- see the module
         # docstring's "Behaviors + activity tracking" section for why a
         # freshly booted engine must not look infinitely idle on its very
@@ -711,11 +747,21 @@ class Engine:
         # `self.keymap`'s own construction computes THIS build's complete
         # action vocabulary.
         self._learn_armed: _LearnArm | None = None
+        # Phase 5 Task 3 (CLI `--range lo,hi` for continuous learn, docs/
+        # phase5-notes.md cheap-wins bundle): `range` joins the schema as
+        # a genuinely OPTIONAL wire arg (`defaults={"range": ""}` --
+        # `ActionRegistry.register`'s own new opt-in mechanism, see its
+        # docstring) -- an empty string means "not supplied", matching
+        # `_bind_learn`'s pre-existing hardcoded `(0.0, 1.0)` fallback
+        # exactly, so every one of this codebase's dozens of pre-existing
+        # `bind.learn` call sites (none of which pass `range` at all)
+        # keeps working completely unchanged.
         self.actions.register(
             "bind.learn", self._bind_learn,
             description="Arm the engine to learn a new MIDI binding from the next "
                         "qualifying MIDI event",
-            args={"action": "str", "mode": "str", "args": "dict"})
+            args={"action": "str", "mode": "str", "args": "dict", "range": "str"},
+            defaults={"range": ""})
         self.actions.register("bind.cancel", self._bind_cancel,
                               description="Cancel the currently armed learn slot, if any")
         # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
@@ -948,7 +994,39 @@ class Engine:
             "range": list(b.range),
             "valid": error is None,
             "error": error,
+            "port_present": self._port_present(b.match.port_pattern),
         }
+
+    def _port_present(self, port_pattern: str | None) -> bool:
+        """Phase 5 Task 3 (`bind.list` diagnostics, docs/phase5-notes.md
+        cheap-wins bundle, Minor #2 from the phase-4 final review): is
+        `port_pattern` currently matched by ANY open MIDI input port? Pure
+        diagnostic sugar for `bind list` (§6 of docs/phase4-bindings.md's
+        own troubleshooting section already tells a human to eyeball
+        `port_pattern` against "the real incoming event" by hand -- this
+        computes that check FOR them) -- never gates whether the binding
+        actually fires; `BindingDispatcher._matches` is untouched and is
+        the only place matching semantics that matter for real dispatch
+        live.
+
+        `port_pattern is None` ("any port") is trivially, always present
+        -- there is no specific port to be missing. No provider wired
+        (`set_open_ports_provider`'s own docstring: `--no-midi`, or the
+        overwhelming majority of this test suite's bare `Engine()`
+        instances) means "unknown", not "absent" -- reported `True` so a
+        binding is never spuriously flagged as port-missing just because
+        nothing ever told this engine what's open. A provider call that
+        itself raises (defensive only -- `MidiInput.open_ports` is a
+        plain `sorted(dict)` today and should never raise) is treated the
+        same way: this is a diagnostic nicety, not something worth letting
+        crash `bind.list` over."""
+        if port_pattern is None or self._open_ports_provider is None:
+            return True
+        try:
+            open_ports = self._open_ports_provider()
+        except Exception:  # noqa: BLE001 -- diagnostic-only; never let this crash bind.list
+            return True
+        return any(fnmatch.fnmatch(p, port_pattern) for p in open_ports)
 
     def _bind_remove(self, id: str) -> dict:
         """`bind.remove` action handler: drops the binding by id, persists
@@ -982,7 +1060,7 @@ class Engine:
     # auto-cancels an arm that's sat unanswered past `bindings_mod.
     # LEARN_TIMEOUT_S`. `bind.cancel` is the manual equivalent.
 
-    def _bind_learn(self, action: str, mode: str, args: dict) -> dict:
+    def _bind_learn(self, action: str, mode: str, args: dict, range: str = "") -> dict:
         """`bind.learn` action handler: arms the engine's single learn
         slot. A second `bind.learn` call while already armed REPLACES the
         arm outright (no stacking, no error) -- `learn_armed` is emitted
@@ -1013,7 +1091,20 @@ class Engine:
           all -- only `action`/`args`/`mode` are) -- one validator, shared
           with `bind.list`'s own post-hoc check, rather than re-deriving
           the same rules twice.
-        """
+
+        `range` (Phase 5 Task 3, docs/phase5-notes.md cheap-wins bundle:
+        "CLI --range lo,hi for continuous learn -- stuck at [0,1] today, a
+        learned zoom knob only reaches the bottom quarter"): an OPTIONAL
+        `"lo,hi"` string (`clients/cli.py`'s own `--range` flag), parsed by
+        `_parse_learn_range` below. Empty string (the wire-level default,
+        `ActionRegistry.register`'s own `defaults={"range": ""}` -- see
+        that registration's own comment) means "not supplied", falling
+        back to the pre-existing hardcoded `(0.0, 1.0)`. Meaningful ONLY
+        for `mode == "continuous"` -- silently ignored for `mode ==
+        "trigger"` (mirrors `Binding.threshold`'s own "always present,
+        ignored when the mode doesn't use it" precedent, engine/
+        bindings.py) rather than an error, since a trigger binding has no
+        `range` concept at all to reject a value FOR."""
         if mode not in ("trigger", "continuous"):
             raise ActionError(
                 f"bind.learn: unknown mode {mode!r} (must be 'trigger' or 'continuous')")
@@ -1025,6 +1116,8 @@ class Engine:
         args_template = dict(args)
         range_ = (0.0, 1.0)
         if mode == "continuous":
+            if range:
+                range_ = _parse_learn_range(range)
             float_args = sorted(k for k, t in schema.items() if t == "float")
             if len(float_args) != 1:
                 raise ActionError(
@@ -1280,21 +1373,32 @@ class Engine:
         """Turn the currently-armed learn slot + `ev` into a real,
         persisted `Binding` -- called from `_handle` (see that method's
         own comment for why this must run BEFORE `self._binding_
-        dispatcher.handle(ev)`). `match.port_pattern` is set to `ev.
-        source` VERBATIM (the task brief's own "exact ev.source as the
-        pattern" -- not a wildcard/fnmatch pattern a human would
-        hand-author) -- `BindingDispatcher._matches`'s `fnmatch.fnmatch`
-        still matches an exact string against itself correctly, so this
-        needs no special-casing on the matching side. Any binding(s) with
-        this EXACT match are replaced first (`_replace_bindings_with_
-        exact_match`, see its own docstring) -- both the removal and this
-        new binding's addition are persisted in ONE `BindingsFile.save()`
-        call, and `learn_bound`'s payload discloses whatever was
-        replaced."""
+        dispatcher.handle(ev)`).
+
+        Review fix (Phase 5 Task 3, docs/phase5-notes.md carry-over from
+        the phase-4 final review's own Important #1): `match.port_pattern`
+        used to be `ev.source` written VERBATIM -- an exact-string match
+        against a suffix (the ALSA `<client>:<port>` numbering) that
+        reliably renumbers across a reboot/replug/rtpmidid session churn,
+        silently turning every learned binding into a landmine that stops
+        firing the moment its physical port re-enumerates. Now goes
+        through `bindings_mod.glob_port_pattern` (see that function's own
+        docstring for the exact suffix-stripping + fnmatch-escaping it
+        does) -- the durable, glob-style equivalent that still matches the
+        SAME physical/logical port under whatever client:port number ALSA
+        assigns it next. `BindingDispatcher._matches`'s `fnmatch.fnmatch`
+        needs no special-casing to consume either shape (exact or
+        globbed) -- both are just patterns to it. Any binding(s) with this
+        EXACT match (the globbed pattern, dataclass `==`) are replaced
+        first (`_replace_bindings_with_exact_match`, see its own
+        docstring) -- both the removal and this new binding's addition are
+        persisted in ONE `BindingsFile.save()` call, and `learn_bound`'s
+        payload discloses whatever was replaced."""
         arm = self._learn_armed
         self._learn_armed = None
         match = bindings_mod.BindingMatch(
-            type=ev.type, number=ev.data1, channel=ev.channel, port_pattern=ev.source)
+            type=ev.type, number=ev.data1, channel=ev.channel,
+            port_pattern=bindings_mod.glob_port_pattern(ev.source))
         replaced = self._replace_bindings_with_exact_match(match)
         binding = bindings_mod.Binding(
             id=self._new_binding_id(), match=match, action=arm.action,
@@ -1451,10 +1555,19 @@ class Engine:
 
     def _help_info(self) -> dict:
         """Bound into `pages/help.py`'s `HelpPage` at construction (see
-        `__init__` above) -- the live page roster (cycle order) plus the
-        full action registry, exactly what `describe` already reports over
-        the wire (see `engine/server.py`), just rendered on-screen."""
-        return {"pages": list(self.pages), "actions": self.actions.describe()}
+        `__init__` above) -- the live page roster (cycle order), the full
+        action registry, and (Phase 5 Task 3, docs/phase5-notes.md
+        cheap-wins bundle: "help page renders live keymap") the live
+        key->action `keymap` -- exactly what `describe` already reports
+        over the wire (see `engine/server.py`), just rendered on-screen.
+        `self.keymap` is read live (a fresh attribute lookup on every
+        call, not a value frozen at `bind_info()` wiring time) so a
+        `config.reload` that changes the keymap is reflected the very
+        next time this page's `view_model()` runs, with no extra wiring
+        needed -- same "read the engine's current attribute" contract
+        `pages`/`actions.describe()` right beside it already have."""
+        return {"pages": list(self.pages), "actions": self.actions.describe(),
+                "keymap": self.keymap}
 
     def _discover_page_hooks(self, name: str, page: Page) -> None:
         """The ONE hasattr-based `PageHooks` discovery pass (Phase 4 Task
@@ -1586,6 +1699,30 @@ class Engine:
         see test_engine_core.py::
         test_snapshot_now_is_never_gated_by_the_refcount_provider."""
         self._topic_refcount_provider = provider
+
+    def set_open_ports_provider(self, provider: Callable[[], list[str]]) -> None:
+        """Engine<->`MidiInput` seam (Phase 5 Task 3, docs/phase5-notes.md
+        cheap-wins bundle) -- mirrors `set_topic_refcount_provider` right
+        above exactly (same PULL shape, same "engine asks on its own
+        schedule" rationale): `daemon.py::build()` calls this once, right
+        after constructing its `MidiInput`, with a callable returning that
+        `MidiInput.open_ports`'s CURRENT list (a live property read at
+        provider-call time, not a snapshot frozen at wiring time -- a port
+        vanishing/appearing between `bind.list` calls must be reflected on
+        the very next call). `_bind_list`/`_serialize_binding` are the only
+        consumers, computing each binding's `port_present` field (see
+        `_serialize_binding`'s own docstring).
+
+        No provider wired (the default -- `--no-midi`, or any test
+        constructing a bare `Engine()` with no daemon/MidiInput at all,
+        which is the overwhelming majority of this test suite) means
+        "there is no live port roster to check against at all", NOT "no
+        ports are open" -- `_port_present` treats that case as
+        `True` (never spuriously reports a binding as port-absent just
+        because nothing ever told this engine what's open), matching
+        `_topic_refcount_provider`'s own "unwired means preserve prior
+        behavior, don't guess a stricter answer" precedent."""
+        self._open_ports_provider = provider
 
     def snapshot_now(self, topic: str) -> dict | None:
         if topic.startswith("page."):

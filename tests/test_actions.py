@@ -102,3 +102,53 @@ async def test_dict_coercion_rejects_a_json_value_that_is_not_an_object():
         await reg.dispatch("bind.learn", {"args": "[1, 2, 3]"})
     with pytest.raises(ActionError):
         await reg.dispatch("bind.learn", {"args": 5})
+
+
+# -- register(..., defaults=...): an OPTIONAL schema arg (Phase 5 Task 3,
+# docs/phase5-notes.md cheap-wins bundle: CLI `--range` for continuous
+# learn) -----------------------------------------------------------------
+#
+# Every schema arg was, before this, unconditionally required -- adding a
+# genuinely new wire arg to an existing action (`bind.learn`'s `range`)
+# without breaking dozens of pre-existing callers that never pass it needs
+# a per-arg fallback used ONLY when the caller omits that key outright.
+
+async def test_dispatch_uses_the_default_when_the_caller_omits_the_arg():
+    reg = ActionRegistry()
+    seen = []
+    reg.register("zoom.set", lambda level, unit: seen.append((level, unit)),
+                 args={"level": "int", "unit": "str"}, defaults={"unit": "px"})
+    await reg.dispatch("zoom.set", {"level": "3"})
+    assert seen[-1] == (3, "px")
+
+
+async def test_dispatch_prefers_the_callers_value_over_the_default():
+    reg = ActionRegistry()
+    seen = []
+    reg.register("zoom.set", lambda level, unit: seen.append((level, unit)),
+                 args={"level": "int", "unit": "str"}, defaults={"unit": "px"})
+    await reg.dispatch("zoom.set", {"level": "3", "unit": "pt"})
+    assert seen[-1] == (3, "pt")
+
+
+async def test_dispatch_still_requires_a_schema_arg_with_no_default():
+    reg = ActionRegistry()
+    reg.register("zoom.set", lambda level, unit: None,
+                 args={"level": "int", "unit": "str"}, defaults={"unit": "px"})
+    with pytest.raises(ActionError, match="level"):
+        await reg.dispatch("zoom.set", {"unit": "pt"})
+
+
+async def test_describe_does_not_expose_defaults_wire_shape_is_unchanged():
+    reg = ActionRegistry()
+    reg.register("zoom.set", lambda level, unit: None,
+                 args={"level": "int", "unit": "str"}, defaults={"unit": "px"})
+    assert reg.describe()["zoom.set"] == {
+        "description": "", "args": {"level": "int", "unit": "str"}}
+
+
+async def test_register_with_no_defaults_behaves_exactly_as_before():
+    reg = ActionRegistry()
+    reg.register("zoom.set", lambda level: None, args={"level": "int"})
+    with pytest.raises(ActionError, match="missing arg"):
+        await reg.dispatch("zoom.set", {})

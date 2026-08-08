@@ -34,11 +34,20 @@ field is no longer a placeholder -- `engine/keymap.py` now serves a real,
 live key->action table there, and both clients (`clients/tui.py`,
 `clients/fb/app.py`) build their key dispatch from it. This page's OWN
 rendering was deliberately left untouched by that task (its scope was the
-keymap plumbing + client adoption, not this page) -- `view_model()` still
-returns only `{page_rows, action_rows}`, no keymap rows. Adding a "--
-Keymap --" section here (mirroring `_config_rows`/`_engine_rows`'s own
-label/value-row shape) is a small, natural, still-unclaimed follow-up
-whenever someone next touches this page.
+keymap plumbing + client adoption, not this page) -- `view_model()`
+returned only `{page_rows, action_rows}`, no keymap rows, until Phase 5
+Task 3 (below) finally claimed the follow-up that task's own comment
+flagged.
+
+UPDATE (Phase 5 Task 3, docs/phase5-notes.md cheap-wins bundle: "help page
+renders live keymap"): `view_model()` now also returns `keymap_rows`, one
+`{label, value}` row per `keymap` entry (key -> action, sorted by key) --
+exactly the "-- Keymap --" section the Phase 4 comment above described,
+mirroring `_pages_row`/`_action_rows`'s own shape. Both renderers
+(`clients/tui.py::_help_body_lines`, `clients/fb/app.py::
+render_help_frame`) append it as a THIRD section, after Actions -- see
+each renderer's own comment for why that ordering (not before, not
+interleaved) was chosen.
 
 Engine-info wiring
 ------------------
@@ -54,7 +63,7 @@ engine involved) falls back to `_IDLE_HELP_INFO` below, matching
 `ConfigPage`'s own `_IDLE_ENGINE_INFO` fallback contract.
 """
 
-_IDLE_HELP_INFO = {"pages": [], "actions": {}}
+_IDLE_HELP_INFO = {"pages": [], "actions": {}, "keymap": {}}
 
 
 def _pages_row(pages: list[str]) -> dict:
@@ -70,6 +79,20 @@ def _action_rows(actions: dict) -> list[dict]:
             value = f"{value}  ({args})" if value else f"({args})"
         rows.append({"label": name, "value": value})
     return rows
+
+
+def _keymap_rows(keymap: dict) -> list[dict]:
+    """Phase 5 Task 3 (docs/phase5-notes.md cheap-wins bundle): one row per
+    `keymap` entry, sorted by KEY (not by action -- a human scanning this
+    section is looking up "what does pressing this key do", the same
+    direction `engine/keymap.py`'s own `[keys]` TOML table is keyed),
+    mirroring `_action_rows`'s own sorted label/value shape exactly. An
+    empty `keymap` (the idle-info fallback, or a build with every key
+    filtered out) produces an empty list -- same "no special-case for
+    zero rows" precedent `_action_rows` already sets (an empty `actions`
+    dict produces `[]` there too, see `test_falls_back_to_idle_info_
+    without_a_bound_engine` in test_pages_help.py)."""
+    return [{"label": key, "value": action} for key, action in sorted(keymap.items())]
 
 
 class HelpPage:
@@ -92,4 +115,10 @@ class HelpPage:
             "title": "HELP",
             "page_rows": [_pages_row(info["pages"])],
             "action_rows": _action_rows(info["actions"]),
+            # `.get(..., {})`, not `info["keymap"]` -- defensive against a
+            # caller-supplied `bind_info` provider written before this
+            # field existed (e.g. an older test double) still working
+            # unchanged, same tolerance `_IDLE_HELP_INFO`'s own fallback
+            # already models for "pages"/"actions" being absent-shaped.
+            "keymap_rows": _keymap_rows(info.get("keymap", {})),
         }

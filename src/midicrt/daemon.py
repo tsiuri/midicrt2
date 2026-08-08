@@ -30,6 +30,14 @@ def build(cfg, socket_path: str, use_midi: bool, config_path: str | None = None)
         # module docstring for the full incident writeup.
         midi = MidiInput(cfg.midi_sources, engine.queue,
                          exclude_names=(engine.midi_output_port_name,))
+        # Phase 5 Task 3 (bind.list port_present, docs/phase5-notes.md
+        # cheap-wins bundle): the ONE production wiring site for
+        # `Engine.set_open_ports_provider` -- see that method's own
+        # docstring for the full engine<->MidiInput seam contract. Reads
+        # `midi.open_ports` LIVE on every call (a bound property access,
+        # not a value captured here) so a port vanishing/appearing between
+        # `bind.list` calls is always reflected on the next one.
+        engine.set_open_ports_provider(lambda: midi.open_ports)
     return engine, server, midi
 
 

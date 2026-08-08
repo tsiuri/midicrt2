@@ -588,13 +588,14 @@ def screensaver_row_texts(header_line: str, body_lines: list[str], width: int) -
     return [header_line, *body_lines, blank_row, blank_row, blank_row]
 
 
-# -- help page (phase-3 task 12, gap ports) -----------------------------------
+# -- help page (phase-3 task 12, gap ports; keymap section: Phase 5 Task 3) ---
 #
 # Same "-- Section --" + "label: value" dump convention as
 # `render_config_lines` (pages/help.py's view_model is deliberately the same
-# `{page_rows, action_rows}`-shaped list-of-dicts). See pages/help.py's own
-# module docstring for why this describe-data reference IS the v1 Help
-# page's parity port, not a literal keybinding-list transcription.
+# `{page_rows, action_rows, keymap_rows}`-shaped list-of-dicts). See
+# pages/help.py's own module docstring for why this describe-data reference
+# IS the v1 Help page's parity port, not a literal keybinding-list
+# transcription.
 def _help_header_text(vm: dict) -> str:
     return f"{vm['title']}  [n]ext page [q]uit"
 
@@ -605,6 +606,17 @@ def _help_body_lines(vm: dict) -> list[str]:
     lines.append("")
     lines.append("-- Actions --")
     lines += [f"{r['label']}: {r['value']}" for r in vm["action_rows"]]
+    # Phase 5 Task 3 (docs/phase5-notes.md cheap-wins bundle: "help page
+    # renders live keymap"): a THIRD section, appended AFTER Actions --
+    # `.get(...)`, not `vm["keymap_rows"]`, so an older/test-double vm
+    # dict missing this key entirely (this module's own pre-Task-3 test
+    # fixtures, still valid input shapes) renders exactly as before,
+    # rather than raising a `KeyError`.
+    keymap_rows = vm.get("keymap_rows", [])
+    if keymap_rows:
+        lines.append("")
+        lines.append("-- Keymap --")
+        lines += [f"{r['label']}: {r['value']}" for r in keymap_rows]
     return lines
 
 

@@ -73,9 +73,11 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import glob
 import json
 import logging
 import os
+import re
 import tempfile
 import tomllib
 from dataclasses import dataclass, field
@@ -116,6 +118,69 @@ def is_learnable_event(ev) -> bool:
     if ev.type == "control_change":
         return True
     return ev.type == "note_on" and bool(ev.data2)
+
+
+# Phase 5 Task 3 (port_pattern durability, docs/phase5-notes.md carry-over
+# from the phase-4 final review's own Important #1): a real ALSA/RtMidi
+# `MidiEvent.source` string always ends in a volatile " <client>:<port>"
+# ALSA sequencer-numbering suffix (confirmed live on this Pi's real
+# hardware, e.g. `"Midi Through:Midi Through Port-0 14:0"`,
+# `"pivisualizer:Network Export 130:0"`) -- those two integers are NOT a
+# stable identity for the physical/logical port at all: they are assigned
+# by ALSA at CONNECT time, in enumeration order, and reliably renumber
+# across a reboot, a USB replug, or (now that the LAN's net-MIDI has moved
+# to rtpmidid, see docs/phase5-notes.md's own environment note) an
+# rtpmidid session restart. `_capture_learn` (engine/core.py) used to write
+# `ev.source` into `BindingMatch.port_pattern` completely VERBATIM -- an
+# exact-string `fnmatch` match against a suffix that is near-guaranteed to
+# be a DIFFERENT number the next time the daemon boots, silently turning
+# every learned binding into a landmine that stops firing the first time
+# its physical port re-enumerates (the exact failure the phase-7
+# checklist's own "learn-on-real-hardware durability: learn ... reboot +
+# replug, verify the binding still fires" item exists to catch).
+_ALSA_PORT_SUFFIX_RE = re.compile(r"\s\d+:\d+$")
+
+
+def glob_port_pattern(source: str) -> str:
+    """Turn a raw `MidiEvent.source` string into a DURABLE `bind.learn`
+    `port_pattern`: strip the trailing volatile " <client>:<port>" ALSA
+    numbering suffix (see the module comment right above) and append a
+    trailing `"*"` so the resulting `fnmatch` pattern still matches the
+    SAME physical/logical port under whatever client:port number it lands
+    on next -- e.g. `"Midi Through:Midi Through Port-0 14:0"` becomes
+    `"Midi Through:Midi Through Port-0*"`, which still matches the exact
+    string it was learned from (`'*'` matches the stripped suffix, space
+    included) AND matches the same port re-enumerated as `"...Port-0
+    23:1"` after a reboot.
+
+    Any `fnmatch` special character (`*`, `?`, `[`) surviving in the
+    non-suffix portion of the name is escaped first, via `glob.escape` --
+    `glob` and `fnmatch` share the EXACT same special-character set (both
+    are built on the same bracket-expression syntax), so this is a
+    correct, dependency-free escaper for an `fnmatch` pattern too, not
+    just a `glob` one. No real port name observed on this Pi's hardware
+    contains any of these (`aconnect -l` / `mido.get_input_names()`,
+    checked live), but nothing in the ALSA client/port-naming contract
+    forbids a future device from shipping one (a hub or synth naming a
+    port something like `"Foo [Ch1]"`) -- without this, that literal `[`
+    would be silently reinterpreted as an `fnmatch` bracket-expression
+    open, breaking the pattern's self-match in a way a human staring at
+    `bindings.toml` would find genuinely surprising (see
+    `test_glob_port_pattern_escapes_fnmatch_specials_in_the_port_name`
+    in test_bindings.py for the live-shaped reproduction).
+
+    A source with NO trailing "NN:M" suffix at all (never observed against
+    real hardware on this Pi, but not something this pure string function
+    can assume true of every future MIDI backend/test double) falls back
+    to an exact, non-globbed pattern -- escaped and returned as-is, no
+    trailing `"*"` appended, since there is no known-volatile suffix to
+    strip in the first place; behaviorally identical to the OLD verbatim
+    behavior for that input shape."""
+    match = _ALSA_PORT_SUFFIX_RE.search(source)
+    if match is None:
+        return glob.escape(source)
+    return glob.escape(source[: match.start()]) + "*"
+
 
 # TOML has no null literal, so a continuous binding's "this arg gets filled
 # from the lerped CC value" marker can't be a real Python `None` on disk --

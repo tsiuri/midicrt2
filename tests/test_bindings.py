@@ -6,6 +6,7 @@ firing, `bind.list`/`bind.remove` actions, `config.reload` extension) lives
 in test_engine_core.py, same precedent as test_keymap.py vs
 test_engine_core.py's own keymap section.
 """
+import fnmatch
 import logging
 import time
 
@@ -18,6 +19,7 @@ from midicrt.engine.bindings import (
     BindingDispatcher,
     BindingMatch,
     BindingsFile,
+    glob_port_pattern,
     is_learnable_event,
     validate_binding,
 )
@@ -766,6 +768,62 @@ def test_is_learnable_event_true_for_control_change_any_value():
 
 def test_is_learnable_event_false_for_note_off():
     assert is_learnable_event(ev(type="note_off", data2=100)) is False
+
+
+# -- glob_port_pattern (Phase 5 Task 3, docs/phase5-notes.md carry-over from
+# the phase-4 final review's own Important #1: "learned port_pattern
+# durability") ----------------------------------------------------------------
+#
+# Pure string transform, same "no registry, no engine" charter as
+# `is_learnable_event` right above -- `Engine._capture_learn` (engine/core.py)
+# is the only production call site.
+
+def test_glob_port_pattern_strips_the_trailing_alsa_client_port_suffix():
+    pattern = glob_port_pattern("Midi Through:Midi Through Port-0 14:0")
+    assert pattern == "Midi Through:Midi Through Port-0*"
+
+
+def test_glob_port_pattern_still_matches_the_exact_source_it_was_learned_from():
+    source = "Midi Through:Midi Through Port-0 14:0"
+    assert fnmatch.fnmatch(source, glob_port_pattern(source))
+
+
+def test_glob_port_pattern_matches_the_same_port_after_alsa_renumbers_it():
+    """The actual durability proof: a pattern learned against one
+    client:port suffix must still match the SAME logical port reported
+    under a DIFFERENT suffix later (a reboot/replug/rtpmidid session
+    restart) -- see this module's own module-level comment right above
+    `glob_port_pattern` for why the OLD verbatim behavior broke this."""
+    pattern = glob_port_pattern("Midi Through:Midi Through Port-0 14:0")
+    assert fnmatch.fnmatch("Midi Through:Midi Through Port-0 23:1", pattern)
+    # A genuinely DIFFERENT port (different base name) must NOT match.
+    assert not fnmatch.fnmatch("USB MIDI Interface 20:0", pattern)
+
+
+def test_glob_port_pattern_with_no_alsa_suffix_falls_back_to_an_exact_pattern():
+    # No trailing "NN:M" -- nothing volatile to strip, so no "*" appended
+    # either (never observed against real hardware, but a pure string
+    # function can't assume every future source string has the suffix).
+    assert glob_port_pattern("Midi Through:0") == "Midi Through:0"
+    assert glob_port_pattern("A") == "A"
+
+
+def test_glob_port_pattern_escapes_fnmatch_specials_in_the_port_name():
+    """A port name containing a literal fnmatch special character
+    (`*`/`?`/`[`) must still self-match after going through
+    `glob_port_pattern` -- unescaped, `[Ch1]` would be reinterpreted as an
+    `fnmatch` bracket expression instead of matched literally. No real
+    port name observed on this Pi's hardware contains one of these (see
+    `glob_port_pattern`'s own docstring), but this proves the escaping is
+    actually correct if one ever does."""
+    source = "Synth [Ch1]:Port*A 12:0"
+    pattern = glob_port_pattern(source)
+    assert fnmatch.fnmatch(source, pattern)
+    # Proves the literal "*" in the port name is actually ESCAPED, not
+    # left as a live wildcard -- if escaping had failed, this string (the
+    # literal "*" swapped for an arbitrary character) would wrongly match
+    # too, since an unescaped "*" matches anything.
+    assert not fnmatch.fnmatch("Synth [Ch1]:PortXA 12:0", pattern)
 
 
 def test_is_learnable_event_false_for_clock_tick():

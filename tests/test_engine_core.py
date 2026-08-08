@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import fnmatch
 import json
 import time
 
@@ -977,6 +978,18 @@ def test_help_page_info_is_wired_to_the_real_engine_roster_and_actions():
     assert "voices" in vm["page_rows"][0]["value"]
 
 
+def test_help_page_renders_the_live_keymap(tmp_path):
+    """Phase 5 Task 3 (docs/phase5-notes.md cheap-wins bundle): `_help_info`
+    now also feeds the engine's real, live `self.keymap` through --
+    `DEFAULT_KEYMAP`'s own `n -> page.next` entry (engine/keymap.py) should
+    be visible in the help page's rendered keymap section with no
+    keymap.toml on disk at all."""
+    eng = Engine(Config(), keymap_path=str(tmp_path / "nope.toml"))
+    vm = eng.pages["help"].view_model()
+    keymap_rows = {r["label"]: r["value"] for r in vm["keymap_rows"]}
+    assert keymap_rows["n"] == "page.next"
+
+
 def test_help_page_is_absent_when_not_in_the_roster_has_no_crash_on_engine_init():
     eng = Engine(Config(pages=["eventlog"]))
     assert "help" not in eng.pages
@@ -1864,6 +1877,90 @@ async def test_bind_list_reports_an_invalid_roster_absent_binding(tmp_path):
     assert "sendnotes.key" in entry["error"]
 
 
+# -- bind.list port_present (Phase 5 Task 3, docs/phase5-notes.md cheap-wins
+# bundle: "annotate bind.list with port-present status") -----------------------
+
+async def test_bind_list_port_present_true_with_no_provider_wired():
+    """Unwired (the default for every bare `Engine()` in this whole test
+    suite, and for a real `--no-midi` daemon) means "unknown", not
+    "absent" -- see `set_open_ports_provider`'s own docstring."""
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern="Midi Through*"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["port_present"] is True
+
+
+async def test_bind_list_port_present_true_for_any_port_binding_even_with_no_matching_open_port():
+    eng = Engine(Config())
+    eng.set_open_ports_provider(lambda: ["USB MIDI Interface 20:0"])
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern=None),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["port_present"] is True
+
+
+async def test_bind_list_port_present_true_when_an_open_port_matches_the_pattern():
+    eng = Engine(Config())
+    eng.set_open_ports_provider(
+        lambda: ["Midi Through:Midi Through Port-0 14:0", "USB MIDI Interface 20:0"])
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern="Midi Through*"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["port_present"] is True
+
+
+async def test_bind_list_port_present_false_when_no_open_port_matches_the_pattern():
+    eng = Engine(Config())
+    eng.set_open_ports_provider(lambda: ["USB MIDI Interface 20:0"])
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern="Midi Through*"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["port_present"] is False
+
+
+async def test_bind_list_port_present_false_when_provider_reports_no_ports_open_at_all():
+    eng = Engine(Config())
+    eng.set_open_ports_provider(list)
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern="Midi Through*"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["port_present"] is False
+
+
+async def test_bind_list_port_present_true_when_provider_itself_raises():
+    """Defensive-only: `MidiInput.open_ports` should never raise, but a
+    diagnostic-only field must not be able to crash `bind.list` if a
+    future provider implementation ever does."""
+    def _boom():
+        raise RuntimeError("boom")
+
+    eng = Engine(Config())
+    eng.set_open_ports_provider(_boom)
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern="Midi Through*"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["port_present"] is True
+
+
 async def test_bind_remove_drops_the_binding_and_persists_atomically(tmp_path):
     p = tmp_path / "bindings.toml"
     _write_trigger_binding(p, action="page.next")
@@ -1951,7 +2048,8 @@ async def test_describe_style_action_registry_contains_bind_learn_and_cancel():
     eng = Engine(Config())
     actions = eng.actions.describe()
     assert "bind.learn" in actions
-    assert actions["bind.learn"]["args"] == {"action": "str", "mode": "str", "args": "dict"}
+    assert actions["bind.learn"]["args"] == {
+        "action": "str", "mode": "str", "args": "dict", "range": "str"}
     assert "bind.cancel" in actions
     assert actions["bind.cancel"]["args"] == {}
 
@@ -2057,6 +2155,58 @@ async def test_bind_learn_continuous_rejects_the_fill_key_if_passed_explicitly()
     assert eng._learn_armed is None
 
 
+# -- bind.learn: `range` (Phase 5 Task 3, docs/phase5-notes.md cheap-wins
+# bundle: "CLI --range lo,hi for continuous learn -- stuck at [0,1] today") --
+
+async def test_bind_learn_continuous_defaults_to_zero_one_range_when_omitted():
+    eng = Engine(Config())
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "pianoroll.zoom_level", "mode": "continuous", "args": {}})
+    assert eng._learn_armed.range == (0.0, 1.0)
+
+
+async def test_bind_learn_continuous_parses_a_custom_range():
+    eng = Engine(Config())
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "pianoroll.zoom_level", "mode": "continuous", "args": {},
+                       "range": "0.25,4.0"})
+    assert eng._learn_armed.range == (0.25, 4.0)
+
+
+async def test_bind_learn_continuous_range_can_be_inverted():
+    eng = Engine(Config())
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "pianoroll.zoom_level", "mode": "continuous", "args": {},
+                       "range": "1.0,0.0"})
+    assert eng._learn_armed.range == (1.0, 0.0)
+
+
+async def test_bind_learn_range_is_ignored_for_trigger_mode():
+    eng = Engine(Config())
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {},
+                       "range": "0.25,4.0"})
+    assert eng._learn_armed.range == (0.0, 1.0)   # unused by trigger mode; unaffected
+
+
+async def test_bind_learn_rejects_a_malformed_range_with_clean_action_error():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="range"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "pianoroll.zoom_level", "mode": "continuous", "args": {},
+                           "range": "not-a-range"})
+    assert eng._learn_armed is None
+
+
+async def test_bind_learn_rejects_a_range_with_the_wrong_number_of_parts():
+    eng = Engine(Config())
+    with pytest.raises(ActionError, match="range"):
+        await eng.actions.dispatch(
+            "bind.learn", {"action": "pianoroll.zoom_level", "mode": "continuous", "args": {},
+                           "range": "0.25,4.0,8.0"})
+    assert eng._learn_armed is None
+
+
 async def test_bind_learn_rearm_replaces_previous_arm_and_emits_learn_armed_again():
     eng = Engine(Config())
     got = []
@@ -2156,8 +2306,14 @@ async def test_learn_capture_note_on_builds_binding_persists_and_emits_learn_bou
     assert b.match.type == "note_on"
     assert b.match.number == 60
     assert b.match.channel == 3
-    # Exact source string, not a wildcard/fnmatch pattern (task brief).
-    assert b.match.port_pattern == "Midi Through:Midi Through Port-0 14:0"
+    # Durable, suffix-globbed pattern (Phase 5 Task 3 review fix, docs/
+    # phase5-notes.md) -- NOT the raw verbatim source string anymore: the
+    # trailing ALSA "14:0" client:port suffix is stripped and replaced with
+    # a trailing "*" so the binding survives that suffix renumbering (see
+    # bindings.py::glob_port_pattern's own docstring). It still matches the
+    # exact capturing source string, proven right below.
+    assert b.match.port_pattern == "Midi Through:Midi Through Port-0*"
+    assert fnmatch.fnmatch("Midi Through:Midi Through Port-0 14:0", b.match.port_pattern)
 
     from midicrt.engine.bindings import BindingsFile
     assert BindingsFile.load(str(p)).bindings == [b]   # persisted atomically
@@ -2167,6 +2323,36 @@ async def test_learn_capture_note_on_builds_binding_persists_and_emits_learn_bou
     assert bound_events[-1]["data"]["binding"]["id"] == b.id
     assert bound_events[-1]["data"]["binding"]["action"] == "page.next"
     assert bound_events[-1]["data"]["binding"]["valid"] is True
+
+
+async def test_learn_capture_still_fires_after_the_port_re_enumerates(tmp_path):
+    """The actual durability proof (Phase 5 Task 3, docs/phase5-notes.md):
+    ALSA renumbers a port's `<client>:<port>` suffix across a reboot/
+    replug/rtpmidid session restart -- simulated here by feeding a SECOND,
+    real dispatch event whose `source` carries a DIFFERENT trailing suffix
+    than the one the binding was learned against. A pre-fix exact-string
+    `port_pattern` would never match this second event at all (the
+    physical/logical port is the same, but the string isn't); the durable
+    glob pattern (`bindings_mod.glob_port_pattern`) must still fire."""
+    p = tmp_path / "bindings.toml"
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100,
+                           source="Midi Through:Midi Through Port-0 14:0"))
+    await asyncio.sleep(0.05)
+    assert eng.current_page == "eventlog"   # capturing event itself is consumed, not dispatched
+
+    # Same physical note, but ALSA re-enumerated the port to a DIFFERENT
+    # client:port pair (e.g. after a reboot) -- the suffix changed, the
+    # rest of the port name did not.
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100,
+                           source="Midi Through:Midi Through Port-0 23:1"))
+    await asyncio.sleep(0.05)
+    eng.stop()
+    await task
+    assert eng.current_page == "voices"   # fired despite the renumbered suffix
 
 
 async def test_learn_capture_control_change_builds_a_cc_binding(tmp_path):

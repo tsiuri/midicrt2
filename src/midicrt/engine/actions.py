@@ -68,7 +68,7 @@ class ActionRegistry:
         # no hook is wired.
         self._on_dispatch: Callable[[str, dict, str, dict], None] | None = None
 
-    def register(self, name, handler, description="", args=None):
+    def register(self, name, handler, description="", args=None, defaults=None):
         # Fix-wave addition (docs/phase5-notes.md, capture mark-
         # completeness review): register-time introspection for an
         # OPT-IN "this handler wants its own dispatch origin" signal --
@@ -84,7 +84,27 @@ class ActionRegistry:
         # injection site for why it's kept out of `args`/`schema`
         # entirely.
         wants_origin = "origin" in inspect.signature(handler).parameters
-        self._actions[name] = (handler, description, dict(args or {}), wants_origin)
+        # Phase 5 Task 3 (CLI `--range` for continuous learn, docs/
+        # phase5-notes.md cheap-wins bundle): `defaults` is an OPT-IN,
+        # per-arg fallback used ONLY when the caller's wire-level `args`
+        # dict omits that key outright -- see `dispatch`'s own comment at
+        # the consumption site for why this is the minimal way to add a
+        # genuinely OPTIONAL wire arg without breaking every existing
+        # caller of an action that predates the new arg (every schema arg
+        # was, until now, unconditionally REQUIRED -- see the "missing
+        # arg" check below). Stored ALREADY-COERCED (the caller passes the
+        # real Python value an action handler expects, e.g. `range=""` for
+        # `bind.learn`'s optional `range: str` arg) -- `dispatch` never
+        # re-runs a default through `_COERCERS`, only a genuinely
+        # CALLER-supplied value ever is. `describe()` deliberately does
+        # NOT expose this (unchanged wire shape: `{"description":...,
+        # "args": {arg: type_name}}`) -- a default's mere EXISTENCE isn't
+        # something any current consumer (a client, `validate_binding`,
+        # `keymap.filter_known_actions`) needs to know; "is this arg
+        # required" isn't a distinction this codebase's action vocabulary
+        # has ever needed to expose over the wire.
+        self._actions[name] = (handler, description, dict(args or {}), wants_origin,
+                               dict(defaults or {}))
 
     def set_dispatch_hook(self, callback: Callable[[str, dict, str, dict], None] | None) -> None:
         self._on_dispatch = callback
@@ -92,18 +112,27 @@ class ActionRegistry:
     def describe(self) -> dict:
         return {
             name: {"description": desc, "args": args}
-            for name, (_, desc, args, _wants_origin) in sorted(self._actions.items())
+            for name, (_, desc, args, _wants_origin, _defaults) in sorted(self._actions.items())
         }
 
     async def dispatch(self, name: str, args: dict, *, origin: str = "unknown") -> dict:
         if name not in self._actions:
             raise ActionError(f"unknown action: {name}")
-        handler, _, schema, wants_origin = self._actions[name]
+        handler, _, schema, wants_origin, defaults = self._actions[name]
         if set(args) - set(schema):
             raise ActionError(f"unknown args: {sorted(set(args) - set(schema))}")
         coerced = {}
         for arg, type_name in schema.items():
             if arg not in args:
+                # `defaults` (register()'s own opt-in, see its docstring):
+                # a schema arg the CALLER omitted falls back to its
+                # already-coerced default instead of a hard "missing arg"
+                # error, but ONLY for an arg actually named in `defaults`
+                # -- every other schema arg is still unconditionally
+                # required, unchanged from before this feature existed.
+                if arg in defaults:
+                    coerced[arg] = defaults[arg]
+                    continue
                 raise ActionError(f"missing arg: {arg}")
             try:
                 coerced[arg] = _COERCERS[type_name](args[arg])

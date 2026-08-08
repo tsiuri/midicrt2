@@ -664,13 +664,14 @@ def render_config_frame(vm: dict, surface: Surface) -> None:
         _row(f"{r['label']}: {r['value']}")
 
 
-# -- help page (phase-3 task 12, gap ports) -----------------------------------
+# -- help page (phase-3 task 12, gap ports; keymap section: Phase 5 Task 3) ---
 #
 # Same "-- Section --" + "label: value" row-dump convention as
 # `render_config_frame` (pages/help.py's view_model is deliberately the same
-# `{page_rows, action_rows}`-shaped list-of-dicts). See pages/help.py's own
-# module docstring for why this describe-data reference IS the v1 Help page's
-# parity port, not a literal keybinding-list transcription.
+# `{page_rows, action_rows, keymap_rows}`-shaped list-of-dicts). See
+# pages/help.py's own module docstring for why this describe-data reference
+# IS the v1 Help page's parity port, not a literal keybinding-list
+# transcription.
 def _help_header_text(vm: dict) -> str:
     return f"{vm['title']}"
 
@@ -701,6 +702,23 @@ def render_help_frame(vm: dict, surface: Surface) -> None:
     _row("-- Actions --")
     for r in vm["action_rows"]:
         _row(f"{r['label']}: {r['value']}")
+    # Phase 5 Task 3 (docs/phase5-notes.md cheap-wins bundle: "help page
+    # renders live keymap"): a THIRD section, appended AFTER Actions --
+    # `.get(...)`, not `vm["keymap_rows"]`, matching `clients/tui.py::
+    # _help_body_lines`'s own defensive-default reasoning (an older/
+    # test-double vm dict missing this key entirely renders byte-identical
+    # to before -- this is exactly why the pre-existing golden fixture
+    # (`fb_help_frame_golden.png`, built from a `keymap_rows`-less HELP_VM)
+    # needed no re-freeze for this task). Skipped ENTIRELY (no "--
+    # Keymap --" header drawn either) when the list is empty, not just
+    # when the key is absent -- an empty section header with nothing
+    # under it would be confusing chrome, not useful information.
+    keymap_rows = vm.get("keymap_rows", [])
+    if keymap_rows:
+        _row("")
+        _row("-- Keymap --")
+        for r in keymap_rows:
+            _row(f"{r['label']}: {r['value']}")
 
 
 # -- program changes page (phase-3 task 12, gap ports) ------------------------

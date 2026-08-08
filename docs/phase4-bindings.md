@@ -104,7 +104,7 @@ threshold = 64
 type = "note_on"
 number = 60
 channel = 0
-port_pattern = "Midi Through:Midi Through Port-0 14:0"
+port_pattern = "Midi Through:Midi Through Port-0*"   # suffix-globbed, see §2's port_pattern row
 
 [bindings.cc_swell]
 action = "pianoroll.zoom_level"
@@ -144,7 +144,7 @@ de-duplicate.
 | `type` | string | *(required)* | `"note_on"` or `"control_change"` — the only two MIDI message shapes a binding can watch (mirrors what `bind.learn` can ever capture, §3). |
 | `number` | int, 0–127 | *(required)* | Note number (`type = "note_on"`) or controller number (`type = "control_change"`) — `MidiEvent.data1` either way. |
 | `channel` | int, 0–15, or absent | `None` (any channel) | **0-indexed**, matching `MidiEvent.channel` directly — NOT the human 1-indexed display the event-log's `summary` strings use. Absent means "any channel." |
-| `port_pattern` | string, or absent | `None` (any port) | `fnmatch`-style glob matched against the MIDI event's source port name (e.g. `"Midi Through*"` matches any port whose name starts with that string). A `bind.learn` capture always writes the **exact, verbatim** source port string — never a wildcard — so a learned binding only fires from the literal physical port it was learned on. Hand-editing to a glob (as in the `cc_swell` example above) is how you make a binding port-agnostic. |
+| `port_pattern` | string, or absent | `None` (any port) | `fnmatch`-style glob matched against the MIDI event's source port name (e.g. `"Midi Through*"` matches any port whose name starts with that string). **Updated, Phase 5 Task 3 (docs/phase5-capture.md):** a `bind.learn` capture no longer writes the exact, verbatim source string — it strips the trailing volatile ALSA `<client>:<port>` numbering suffix and appends `*` (`engine/bindings.py::glob_port_pattern`), so a learned binding survives that suffix renumbering across a reboot/replug/rtpmidid session restart instead of silently going dead. See docs/phase5-capture.md's "Learned-binding port durability" section for the full rationale and the exact transform. |
 
 ### The fill sentinel (`args` ↔ TOML translation)
 
@@ -243,7 +243,7 @@ history, is what determines the parameter.
 ### CLI
 
 ```
-midicrt bind learn <action> [--mode trigger|continuous] [--arg k=v ...] [--timeout N]
+midicrt bind learn <action> [--mode trigger|continuous] [--arg k=v ...] [--timeout N] [--range lo,hi]
 midicrt bind list
 midicrt bind remove <id>
 midicrt bind cancel
@@ -263,17 +263,34 @@ midicrt bind cancel
   statically supply for a key learn is about to fill from live MIDI). If
   the action declares zero or more than one float arg, the arm is
   rejected immediately with a clear error naming the count, before any
-  MIDI port is even touched. Continuous learns always use `range = [0.0,
-  1.0]` — there is no `--range` flag; a custom range needs a `bind remove`
-  + hand-edit, or a fresh learn followed by editing `bindings.toml`
-  directly.
+  MIDI port is even touched. Continuous learns default to `range = [0.0,
+  1.0]`.
+- **`--range lo,hi`** (Phase 5 Task 3): continuous mode only — overrides
+  the default `[0.0, 1.0]` lerp target, e.g. `--range 0.25,4.0` for a
+  zoom-style parameter whose useful range doesn't start at 0. Silently
+  ignored for `--mode trigger` (a trigger binding has no `range` concept
+  to apply it to). A malformed value (not exactly two comma-separated
+  floats) is rejected immediately, same arm-time-validation discipline as
+  every other `bind learn` check. Wire-level equivalent: `bind.learn`'s
+  optional `range: str` arg (omit it entirely for the default — an
+  explicit empty string also means "not supplied").
 - **`--arg k=v`**: fills every *other* (non-float, non-fill) argument the
   target action's schema wants. Values are always sent as strings (the
   generic `--arg` convention); the wire-level `bind.learn` action itself
   accepts a real nested JSON object too if you're driving it via `midicrt
   action bind.learn --arg args='{"name":"pianoroll"}'` directly.
 - **`bind list`**: every persisted binding, each with a live `valid`/`error`
-  pair (see §6).
+  pair (see §6) plus (Phase 5 Task 3) a `port_present: bool` -- whether
+  `match.port_pattern` currently matches any OPEN MIDI input port
+  (`fnmatch` against `MidiInput.open_ports`, live at call time). `True`
+  when `port_pattern` is `None` (no port constraint) or when no live port
+  roster is known at all (`--no-midi`, or a daemon started before
+  `Engine.set_open_ports_provider` was wired) -- reported `False` ONLY
+  when there genuinely IS a known port roster and it does not contain a
+  match. Pure diagnostic sugar (never gates whether the binding actually
+  fires; `BindingDispatcher._matches` is untouched) for exactly the
+  "double check ... `port_pattern` ... against the real incoming event"
+  troubleshooting step §6 already tells a human to do by eyeball.
 - **`bind remove <id>`**: drops a binding by id (from `bind list`'s own
   output), persists, and disarms the live dispatcher immediately — a
   removed binding cannot fire again even for a MIDI event already in
@@ -401,8 +418,9 @@ schema), and for continuous bindings, `fill arg '...' is not declared
 'float' by action '...'` or a wrong fill-marker count. A binding that
 *is* reported `valid` but still never seems to fire is almost always a
 `match` mismatch — double check `channel` (0-indexed!) and `port_pattern`
-(exact string unless you hand-edited it to a glob) against the real
-incoming event.
+(a suffix-globbed pattern since Phase 5 Task 3, or an exact string if you
+hand-edited it — see docs/phase5-capture.md) against the real incoming
+event.
 
 **`config.reload` (or a daemon restart) logs a warning and keeps the old
 keymap/bindings.** Check `journalctl -u midicrtd` for the exact message —
