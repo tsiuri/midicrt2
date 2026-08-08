@@ -53,6 +53,43 @@ engine`'s stubbed `_midi_out`, which silently drops them (see
 exactly this: the call sites are untouched, only the I/O at the bottom is
 cut.
 
+Tick-driven state is FROZEN during replay (disclosed limitation)
+---------------------------------------------------------------------------
+`stream_session` never calls `Engine.run()` -- it feeds "event" lines
+straight into `Engine._handle` and applies marks directly, nothing more.
+That means `_tick_analyzers(now)`/`_tick_pages(now)`/`_tick_behaviors(now)`
+(engine/core.py's own `run()` loop, called once per real tick at
+`config.tick_hz`) are NEVER called during a replay, for ANY wall-clock
+value, real or log-derived. Concretely: `analyzers/stucknotes.py`'s
+long-held-note escalation (which fires from `tick(now)` alone, with NO new
+MIDI event required -- see that module's own docstring) simply never
+escalates during replay, no matter how long a note in the log stays held
+or how much recorded `ts` elapses between events; the same is true for
+`pages/pianoroll.py`'s wall-clock scroll advance and any FUTURE module
+that adds its own optional `tick(now)`/`drain_outputs(now)` hook. This is
+currently harmless: NOTHING in `_build_summary`'s reported fields (voices/
+harmony/transport/timesig) is tick-derived -- all four are pure
+`handle(ev)` state machines, computed identically whether or not any
+`tick()` ever ran. It is nonetheless a real FIDELITY gap disclosed here
+rather than silently assumed away: a session that visibly showed a
+stuck-note alert or a scrolling pianoroll live will replay with neither,
+and a hypothetical future summary field reading `alerts`/pianoroll scroll
+position would report stale/frozen values.
+
+Fixing this (NOT attempted by this task -- out of scope, since no current
+summary field needs it) would mean driving ticks from the LOG's own
+recorded `ts` progression, not real wall-clock time -- e.g. calling
+`engine._tick_analyzers(ts)`/`_tick_pages(ts)` at each "event" line's `ts`
+(and, for a gap-heavy log, at synthetic intermediate points spaced by
+`1/config.tick_hz` between events, mirroring how a live `run()` loop ticks
+continuously even between MIDI arrivals) rather than only reacting to
+events. `_tick_behaviors` would need the SAME suppression treatment
+`_handle`'s own gate already gives bindings/behaviors/learn (docs/
+phase5-notes.md's decided design: behaviors must never fire live during
+replay) -- so a future fix ticking analyzers/pages must NOT also start
+calling `_tick_behaviors`. Flagged here as the seam a future task would
+extend, not built now.
+
 Mark application semantics (what "apply AS MARKS, bypass the dispatcher"
 means here, concretely)
 ---------------------------------------------------------------------------
@@ -265,7 +302,20 @@ def stream_session(engine: Engine, path: str, *, speed: float = 1.0,
     thread) still alive from an earlier test polling on its own short
     interval, silently corrupting THIS call's sleep-count assertions with
     calls that have nothing to do with it (reproduced live while writing
-    this module's own tests -- see test_replay.py's timing-model section)."""
+    this module's own tests -- see test_replay.py's timing-model section).
+
+    `speed` must be strictly positive -- `speed <= 0` is rejected outright
+    (review round fix wave: previously silently clamped to `1e-9` via the
+    pacing division's own `max(speed, 1e-9)` guard, which turned a `0` or
+    negative speed into an effectively-infinite sleep between EVERY event
+    instead of a clean error; reproduced live as a genuinely hung
+    subprocess while writing this fix's own test). `clients/cli.py`'s
+    `--speed` argument ALSO validates at the argparse layer (a clean usage
+    error before this function is ever called at all) -- this check is the
+    defense-in-depth backstop for any other/future caller of this function
+    directly."""
+    if speed <= 0:
+        raise ValueError(f"speed must be > 0, got {speed!r}")
     sleep_fn = sleep_fn if sleep_fn is not None else time.sleep
     events_by_type: dict[str, int] = {}
     actions_by_origin: dict[str, int] = {}
@@ -286,13 +336,33 @@ def stream_session(engine: Engine, path: str, *, speed: float = 1.0,
             continue
 
         if kind == "event":
-            ts = line["ts"]
+            # Review round fix wave (Minor): a line can be VALID JSON but
+            # still missing/mistyped a field this branch assumes exists
+            # ("ts"/"type" via direct indexing, "ts" used in arithmetic
+            # below) -- a hand-edited or truncated log, or a future
+            # producer bug. Caught HERE (parsing only, before any pacing/
+            # engine-mutation happens) and skipped with a warning, matching
+            # `_iter_lines`'s own malformed-JSON discipline -- never an
+            # uncaught KeyError/TypeError crashing the whole replay over
+            # ONE bad line.
+            try:
+                ts = line["ts"]
+                if not isinstance(ts, int | float):
+                    # Caught HERE (not left to blow up later in the pacing
+                    # subtraction below, which only even runs when
+                    # `instant=False`) so a bad "ts" type is skipped
+                    # uniformly regardless of --instant.
+                    raise TypeError(f"'ts' must be a number, got {type(ts).__name__}")
+                ev = _midi_event_from_line(line)
+            except (KeyError, TypeError) as exc:
+                _LOG.warning("replay: skipping event line with missing/invalid fields "
+                            "in %s: %s", path, exc)
+                continue
             if not instant and prev_event_ts is not None:
-                dt = (ts - prev_event_ts) / max(speed, 1e-9)
+                dt = (ts - prev_event_ts) / speed
                 if dt > 0:
                     sleep_fn(dt)
             prev_event_ts = ts
-            ev = _midi_event_from_line(line)
             engine._handle(ev)
             events_by_type[ev.type] = events_by_type.get(ev.type, 0) + 1
             continue
@@ -303,7 +373,16 @@ def stream_session(engine: Engine, path: str, *, speed: float = 1.0,
             continue
 
         if kind == "page_changed":
-            engine._set_current_page(line["page"])
+            # Same discipline as the "event" branch above -- a
+            # page_changed line missing its own "page" field is logged and
+            # skipped (current_page left exactly as it was), not a crash.
+            try:
+                page = line["page"]
+            except (KeyError, TypeError) as exc:
+                _LOG.warning("replay: skipping page_changed line with missing/invalid "
+                            "'page' in %s: %s", path, exc)
+                continue
+            engine._set_current_page(page)
             continue
 
         # "tempo" and any unknown/future kind: counted in marks_by_kind

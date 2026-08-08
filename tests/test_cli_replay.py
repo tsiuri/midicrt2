@@ -59,3 +59,17 @@ def test_replay_speed_and_instant_are_mutually_exclusive():
     r = cli("replay", FIXTURE, "--speed", "2.0", "--instant")
     assert r.returncode != 0
     assert "not allowed" in r.stderr.lower()
+
+
+# -- review round (fix wave): --speed must be > 0 ----------------------------
+
+def test_replay_rejects_zero_speed_with_a_clean_argparse_error():
+    r = cli("replay", FIXTURE, "--speed", "0")
+    assert r.returncode != 0
+    assert "speed" in r.stderr.lower()
+
+
+def test_replay_rejects_negative_speed_with_a_clean_argparse_error():
+    r = cli("replay", FIXTURE, "--speed", "-1")
+    assert r.returncode != 0
+    assert "speed" in r.stderr.lower()

@@ -133,6 +133,23 @@ def _bind_learn_cli(socket_path: str, action_name: str, mode: str, arg_pairs: li
 # unlike those two, replay needs no socket at all, so there is nothing for
 # it to reuse from that line anyway.
 
+def _positive_speed(value: str) -> float:
+    """`--speed` argparse `type=` -- review round fix wave (Minor): a
+    non-positive speed used to reach `engine.replay.stream_session`'s own
+    pacing division unchecked, where `max(speed, 1e-9)` turned it into an
+    effectively-infinite sleep between every replayed event (a genuinely
+    hung process, reproduced live) instead of a clean error. Raising
+    `argparse.ArgumentTypeError` here gives the normal argparse usage-error
+    treatment (readable message, exit code 2) before a bad value ever
+    reaches the engine at all -- `stream_session` ALSO validates this
+    itself (`ValueError`) as a defense-in-depth backstop for any other
+    caller that isn't going through this CLI."""
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError(f"--speed must be > 0, got {value!r}")
+    return parsed
+
+
 def _handle_replay(args) -> None:
     from midicrt.engine.replay import replay_session  # lazy: pulls in engine.core's roster
     try:
@@ -169,7 +186,7 @@ def main() -> None:
     p_replay = sub.add_parser("replay")
     p_replay.add_argument("file")
     p_replay_speed = p_replay.add_mutually_exclusive_group()
-    p_replay_speed.add_argument("--speed", type=float, default=1.0,
+    p_replay_speed.add_argument("--speed", type=_positive_speed, default=1.0,
                                 help="Playback speed multiplier (default: 1.0x real-time)")
     p_replay_speed.add_argument("--instant", action="store_true",
                                 help="Replay as fast as possible, ignoring original timing")

@@ -345,6 +345,81 @@ def test_stream_session_ignores_an_unknown_mark_kind(tmp_path):
     assert summary["events_total"] == 1
 
 
+# -- review round (fix wave): defensive per-line schema handling ------------
+#
+# A line can be VALID JSON but still missing the fields this module's own
+# per-`kind` handling assumes are present (a hand-edited/truncated log, or
+# a future producer bug) -- these must be logged + skipped, exactly like
+# `_iter_lines`'s own malformed-JSON handling, never an uncaught
+# KeyError/TypeError crashing the whole replay.
+
+def test_stream_session_skips_an_event_line_missing_required_fields(tmp_path, caplog):
+    path = _write_session(tmp_path, [
+        _header(),
+        {"kind": "event", "source": "USB"},   # missing "ts" AND "type"
+        _event(ts=1000.1, type="note_on"),
+    ])
+    eng = build_offline_engine()
+    with caplog.at_level("WARNING"):
+        summary = stream_session(eng, path, instant=True)
+    assert summary["events_total"] == 1
+    assert summary["events_by_type"] == {"note_on": 1}
+    assert any("event" in r.message.lower() for r in caplog.records)
+
+
+def test_stream_session_skips_an_event_line_with_wrong_field_types(tmp_path, caplog):
+    # Valid JSON, present fields, WRONG type ("ts" as a string) -- this
+    # only blows up once arithmetic is attempted on it (the pacing
+    # subtraction), a TypeError rather than a KeyError, but the same
+    # log-and-skip discipline applies.
+    path = _write_session(tmp_path, [
+        _header(),
+        _event(ts=1000.0, type="note_on"),
+        _event(ts="not-a-number", type="note_off", data2=0),
+        _event(ts=1000.2, type="note_on", data1=64),
+    ])
+    eng = build_offline_engine()
+    with caplog.at_level("WARNING"):
+        summary = stream_session(eng, path, instant=False, sleep_fn=lambda s: None)
+    assert summary["events_total"] == 2
+    assert summary["events_by_type"] == {"note_on": 2}
+
+
+def test_stream_session_skips_a_page_changed_line_missing_page_field(tmp_path, caplog):
+    path = _write_session(tmp_path, [
+        _header(),
+        {"kind": "page_changed", "ts": 1000.0},   # missing "page"
+        _event(ts=1000.1, type="note_on"),
+    ])
+    eng = build_offline_engine()
+    with caplog.at_level("WARNING"):
+        summary = stream_session(eng, path, instant=True)
+    assert eng.current_page == next(iter(eng.pages))   # unchanged, not crashed
+    assert summary["events_total"] == 1
+
+
+# -- review round (fix wave): --speed must be > 0 ----------------------------
+
+def test_stream_session_rejects_zero_speed(tmp_path):
+    path = _write_session(tmp_path, [_header(), _event(ts=1000.0)])
+    eng = build_offline_engine()
+    with pytest.raises(ValueError, match="speed"):
+        stream_session(eng, path, speed=0, instant=False)
+
+
+def test_stream_session_rejects_negative_speed(tmp_path):
+    path = _write_session(tmp_path, [_header(), _event(ts=1000.0)])
+    eng = build_offline_engine()
+    with pytest.raises(ValueError, match="speed"):
+        stream_session(eng, path, speed=-2.0, instant=False)
+
+
+def test_replay_session_rejects_non_positive_speed(tmp_path):
+    path = _write_session(tmp_path, [_header(), _event(ts=1000.0)])
+    with pytest.raises(ValueError, match="speed"):
+        replay_session(path, speed=0)
+
+
 # -- v1 parity port: same-tick ordering is deterministic (ADAPTED) -----------
 #
 # v1's ~/codex/midicrt/tests/test_memory_replay.py asserts that several raw
