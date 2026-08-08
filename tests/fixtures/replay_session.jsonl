@@ -1,0 +1,40 @@
+{"kind": "header", "format": 1, "session_id": "session-20260807-171612-bf720e59", "started_ts": 1786148172.9036293, "engine_version": "2.0.0.dev0-fixture", "instruments": ["Fixture Instrument"]}
+{"kind": "event", "ts": 1700000000.0, "source": "Fixture Generator", "type": "start", "channel": null, "data1": null, "data2": null, "summary": "start"}
+{"kind": "event", "ts": 1700000000.5, "source": "Fixture Generator", "type": "clock_tick", "channel": null, "data1": null, "data2": null, "summary": "clock_tick", "clock_batch_start": null}
+{"kind": "event", "ts": 1700000001.0, "source": "Fixture Generator", "type": "clock_tick", "channel": null, "data1": null, "data2": null, "summary": "clock_tick", "clock_batch_start": 1700000000.5}
+{"kind": "tempo", "ts": 1700000001.0, "bpm": 120.0}
+{"kind": "event", "ts": 1700000001.5, "source": "Fixture Generator", "type": "clock_tick", "channel": null, "data1": null, "data2": null, "summary": "clock_tick", "clock_batch_start": 1700000001.0}
+{"kind": "event", "ts": 1700000002.0, "source": "Fixture Generator", "type": "clock_tick", "channel": null, "data1": null, "data2": null, "summary": "clock_tick", "clock_batch_start": 1700000001.5}
+{"kind": "event", "ts": 1700000002.5, "source": "Fixture Generator", "type": "clock_tick", "channel": null, "data1": null, "data2": null, "summary": "clock_tick", "clock_batch_start": 1700000002.0}
+{"kind": "event", "ts": 1700000003.0, "source": "Fixture Generator", "type": "clock_tick", "channel": null, "data1": null, "data2": null, "summary": "clock_tick", "clock_batch_start": 1700000002.5}
+{"kind": "event", "ts": 1700000003.5, "source": "Fixture Generator", "type": "clock_tick", "channel": null, "data1": null, "data2": null, "summary": "clock_tick", "clock_batch_start": 1700000003.0}
+{"kind": "event", "ts": 1700000004.0, "source": "Fixture Generator", "type": "clock_tick", "channel": null, "data1": null, "data2": null, "summary": "clock_tick", "clock_batch_start": 1700000003.5}
+{"kind": "event", "ts": 1700000004.02, "source": "Fixture Generator", "type": "note_on", "channel": 0, "data1": 60, "data2": 100, "summary": "note_on ch1 n60 v100"}
+{"kind": "event", "ts": 1700000004.04, "source": "Fixture Generator", "type": "note_on", "channel": 0, "data1": 64, "data2": 100, "summary": "note_on ch1 n64 v100"}
+{"kind": "event", "ts": 1700000004.06, "source": "Fixture Generator", "type": "note_on", "channel": 0, "data1": 67, "data2": 100, "summary": "note_on ch1 n67 v100"}
+{"kind": "event", "ts": 1700000004.52, "source": "Fixture Generator", "type": "note_off", "channel": 0, "data1": 60, "data2": 0, "summary": "note_off ch1 n60"}
+{"kind": "event", "ts": 1700000004.54, "source": "Fixture Generator", "type": "note_off", "channel": 0, "data1": 64, "data2": 0, "summary": "note_off ch1 n64"}
+{"kind": "event", "ts": 1700000004.56, "source": "Fixture Generator", "type": "note_off", "channel": 0, "data1": 67, "data2": 0, "summary": "note_off ch1 n67"}
+{"kind": "event", "ts": 1700000005.02, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 60, "data2": 90, "summary": "note_on ch2 n60 v90"}
+{"kind": "event", "ts": 1700000005.12, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 62, "data2": 90, "summary": "note_on ch2 n62 v90"}
+{"kind": "event", "ts": 1700000005.22, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 64, "data2": 90, "summary": "note_on ch2 n64 v90"}
+{"kind": "event", "ts": 1700000005.32, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 65, "data2": 90, "summary": "note_on ch2 n65 v90"}
+{"kind": "event", "ts": 1700000005.42, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 67, "data2": 90, "summary": "note_on ch2 n67 v90"}
+{"kind": "event", "ts": 1700000005.52, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 69, "data2": 90, "summary": "note_on ch2 n69 v90"}
+{"kind": "event", "ts": 1700000005.62, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 71, "data2": 90, "summary": "note_on ch2 n71 v90"}
+{"kind": "event", "ts": 1700000005.72, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 72, "data2": 90, "summary": "note_on ch2 n72 v90"}
+{"kind": "event", "ts": 1700000006.02, "source": "Fixture Generator", "type": "note_off", "channel": 1, "data1": 60, "data2": 0, "summary": "note_off ch2 n60"}
+{"kind": "event", "ts": 1700000006.07, "source": "Fixture Generator", "type": "note_off", "channel": 1, "data1": 62, "data2": 0, "summary": "note_off ch2 n62"}
+{"kind": "event", "ts": 1700000006.12, "source": "Fixture Generator", "type": "note_off", "channel": 1, "data1": 64, "data2": 0, "summary": "note_off ch2 n64"}
+{"kind": "event", "ts": 1700000006.17, "source": "Fixture Generator", "type": "note_off", "channel": 1, "data1": 65, "data2": 0, "summary": "note_off ch2 n65"}
+{"kind": "event", "ts": 1700000006.22, "source": "Fixture Generator", "type": "note_off", "channel": 1, "data1": 67, "data2": 0, "summary": "note_off ch2 n67"}
+{"kind": "event", "ts": 1700000006.27, "source": "Fixture Generator", "type": "note_off", "channel": 1, "data1": 69, "data2": 0, "summary": "note_off ch2 n69"}
+{"kind": "event", "ts": 1700000006.32, "source": "Fixture Generator", "type": "note_off", "channel": 1, "data1": 71, "data2": 0, "summary": "note_off ch2 n71"}
+{"kind": "event", "ts": 1700000006.6200001, "source": "Fixture Generator", "type": "control_change", "channel": 0, "data1": 7, "data2": 100, "summary": "cc7=100 ch1"}
+{"kind": "event", "ts": 1700000006.92, "source": "Fixture Generator", "type": "sysex", "channel": null, "data1": null, "data2": null, "summary": "sysex CMD_SWITCH_PAGE ccmonitor", "sysex_data": [125, 109, 99, 1, 4]}
+{"kind": "action", "ts": 1786148172.9072983, "name": "page.goto", "args": {"name": "ccmonitor"}, "origin": "sysex"}
+{"kind": "page_changed", "ts": 1786148172.9073148, "page": "ccmonitor"}
+{"kind": "event", "ts": 1700000007.22, "source": "Fixture Generator", "type": "note_on", "channel": 1, "data1": 60, "data2": 110, "summary": "note_on ch2 n60 v110"}
+{"kind": "action", "ts": 1786148172.9073944, "name": "page.next", "args": {}, "origin": "client"}
+{"kind": "page_changed", "ts": 1786148172.907402, "page": "harmony"}
+{"kind": "action", "ts": 1786148172.9074063, "name": "sendnotes.key", "args": {"key": "z"}, "origin": "binding:fixture_b1"}

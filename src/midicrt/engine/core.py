@@ -418,8 +418,24 @@ class _LearnArm:
 
 class Engine:
     def __init__(self, config: Config, *, keymap_path: str | None = None,
-                 config_path: str | None = None, bindings_path: str | None = None):
+                 config_path: str | None = None, bindings_path: str | None = None,
+                 replay: bool = False):
         self.config = config
+        # Phase 5 Task 2 (session replay, docs/phase5-notes.md): `False` for
+        # every real, live-running engine (`daemon.py::build()` never passes
+        # this) -- `True` only for the offline `Engine` `engine/replay.py::
+        # build_offline_engine()` constructs. See `_handle`'s own comment at
+        # the gate site for exactly what this suppresses and why (the
+        # decided design's three named reasons: double-firing against
+        # replayed action marks, non-determinism against whatever
+        # bindings.toml happens to be on disk, and learn arming that isn't
+        # actually "learning" anything real). Stored as a plain attribute
+        # (not threaded through as a per-call argument) because `_handle`
+        # is called once per event, at MIDI rates, by both live and replay
+        # code paths -- a per-instance flag set once at construction is
+        # cheaper and simpler than a parallel `_handle(ev, replay=...)`
+        # signature every call site would need to thread through.
+        self._replay = replay
         # Phase 4 Task 1 (config-served keymap, docs/phase4-notes.md):
         # `self._keymap_path` is eagerly resolved to a concrete path (never
         # `None`) so it always reads back as the truth ("what file does
@@ -1637,7 +1653,41 @@ class Engine:
         # concerns below (activity stamp, sysex, analyzers/pages) so a
         # capture always happens on the very same tick the qualifying
         # event arrives, never delayed a tick behind them.
-        if self._learn_armed is not None and bindings_mod.is_learnable_event(ev):
+        if self._replay:
+            # Phase 5 Task 2 (session replay, docs/phase5-notes.md): THE
+            # SEAM -- gates the exact same learn-arming/binding-dispatch-
+            # collection branch this `if/else` already was, per the
+            # decided design's point 2 ("the seam: the learn/dispatch
+            # branch atop `_handle` -- gate on a replay flag"). A replaying
+            # engine must never (a) let an armed learn slot consume a
+            # REPLAYED event (nothing is actually "learning" from a MIDI
+            # message that already happened, possibly hours/days ago), and
+            # must never (b) collect a binding-dispatch intent at all --
+            # `engine/replay.py`'s driver feeds events straight into
+            # `_handle` and NEVER calls `_dispatch_bindings`/`run()`, so an
+            # uncollected intent here would otherwise just silently
+            # accumulate in `self._pending_binding_dispatches` forever
+            # (a real, if slow, memory leak over a long replay) rather than
+            # ever firing -- gating the collection itself, not merely
+            # leaving it undispatched, is both the documented seam AND the
+            # cheaper choice. The three reasons this must be suppressed
+            # (not just "happens to never fire" as a side effect of no
+            # `run()` loop existing): double-firing (the session's own
+            # action marks already record what fired live -- re-deriving
+            # and re-dispatching the SAME intent from raw MIDI would double
+            # it), non-determinism (dispatching for real would consult
+            # WHATEVER `bindings.toml` happens to be loaded on the machine
+            # replaying this file, which can differ from -- or have
+            # drifted since -- the session's own original recording), and
+            # in-memory state that was never captured (a continuous
+            # binding's CC-edge baseline lives only in `BindingDispatcher`'s
+            # own live memory, never written to the session log, so
+            # "replaying" it for real would be replaying against a cold,
+            # not the original, baseline). Behaviors need no analogous gate
+            # here at all -- they only ever run from `_tick_behaviors`,
+            # which only `run()` ever calls, and replay never calls `run()`.
+            pass
+        elif self._learn_armed is not None and bindings_mod.is_learnable_event(ev):
             self._capture_learn(ev)
         else:
             # Phase 4 Task 2 (MIDI bindings, docs/phase4-notes.md): bindings

@@ -8,7 +8,7 @@ import pytest
 from midicrt.config import Config, ConfigError
 from midicrt.engine.actions import ActionError
 from midicrt.engine.bindings import LEARN_TIMEOUT_S
-from midicrt.engine.core import Engine, MidiEvent
+from midicrt.engine.core import Engine, MidiEvent, _LearnArm
 
 
 def ev(**kw):
@@ -2789,3 +2789,91 @@ async def test_flush_write_failure_does_not_kill_the_run_loop_and_disables_captu
 
     eng.stop()
     await task
+
+
+# -- Phase 5 Task 2 (session replay, docs/phase5-notes.md): the `_handle`
+# suppression seam -- `Engine(..., replay=True)`. Full replay-driver
+# behavior (the offline engine builder, the JSONL streaming loop, mark
+# application, the end-of-replay summary) is covered in test_replay.py;
+# this section is ONLY the engine-owned gate itself (`_handle`'s
+# learn/dispatch `if self._replay:` branch), tested the same
+# feed-`_handle`-directly way every other `_handle` behavior in this file
+# already is -- no session file, no `engine/replay.py` import needed.
+
+def test_engine_replay_flag_defaults_false():
+    eng = Engine(Config())
+    assert eng._replay is False
+
+
+def test_engine_replay_flag_is_settable_at_construction():
+    eng = Engine(Config(), replay=True)
+    assert eng._replay is True
+
+
+def test_replay_engine_never_collects_a_binding_dispatch_intent(tmp_path):
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="page.next")
+    live = Engine(Config(), bindings_path=str(p))
+    replaying = Engine(Config(), bindings_path=str(p), replay=True)
+    matching_event = ev(type="note_on", data1=60, data2=100)
+
+    live._handle(matching_event)
+    replaying._handle(matching_event)
+
+    # Sanity: the binding really does match this event for a live engine
+    # (otherwise this test would trivially pass for the wrong reason).
+    assert live._pending_binding_dispatches != []
+    # The replaying engine collects NOTHING at all -- the whole
+    # learn/dispatch branch is a no-op under `self._replay`.
+    assert replaying._pending_binding_dispatches == []
+
+
+def test_replay_engine_leaves_current_page_unmoved_by_a_matching_binding(tmp_path):
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, action="page.next")
+    eng = Engine(Config(), bindings_path=str(p), replay=True)
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    # Even collecting nothing (proven above) is one thing -- this confirms
+    # there is also no OTHER path (e.g. a stray direct dispatch) that moved
+    # the page as a side effect of this same event.
+    assert eng.current_page == next(iter(eng.pages))
+
+
+def test_replay_engine_armed_learn_slot_never_consumes_a_replayed_event(tmp_path):
+    # A learn slot has no legitimate way to be armed on a real replay
+    # engine (nothing ever calls `bind.learn` offline) -- this proves the
+    # SUPPRESSION itself, by force-arming one directly and confirming
+    # `_handle` never reaches `_capture_learn` for it, matching the
+    # `_replay` branch's own "an armed slot must never consume a REPLAYED
+    # event" reasoning (docs/phase5-notes.md decided design, point 2).
+    eng = Engine(Config(), replay=True)
+    arm = _LearnArm(action="page.next", mode="trigger", args_template={},
+                    range=(0.0, 1.0), armed_at=0.0)
+    eng._learn_armed = arm
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    assert eng._learn_armed is arm   # untouched -- _capture_learn never ran
+    assert eng._bindings_file.bindings == []   # nothing got persisted either
+
+
+def test_non_replay_engine_still_arms_learn_normally_control():
+    # Control for the test above: the SAME force-armed slot, on a
+    # non-replaying engine, DOES get consumed by a qualifying event --
+    # proves the fixture is meaningful (the arm is real, capturable state),
+    # not just inert regardless of the replay flag.
+    eng = Engine(Config())
+    eng._learn_armed = _LearnArm(action="page.next", mode="trigger", args_template={},
+                                 range=(0.0, 1.0), armed_at=0.0)
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    assert eng._learn_armed is None
+    assert len(eng._bindings_file.bindings) == 1
+
+
+def test_replay_engine_still_processes_analyzers_and_pages_normally():
+    # The suppression is scoped EXACTLY to the learn/dispatch branch --
+    # analyzers/pages must see a replayed event exactly like a live one
+    # (docs/phase5-notes.md: "MIDI events -> _handle (analyzers/pages
+    # consume normally)").
+    eng = Engine(Config(), replay=True)
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    assert eng.pages["voices"].view_model()["total"] == 1
+    assert eng.events_total == 1

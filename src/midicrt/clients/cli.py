@@ -121,6 +121,27 @@ def _bind_learn_cli(socket_path: str, action_name: str, mode: str, arg_pairs: li
         client.close()
 
 
+# -- `midicrt replay <file>` (Phase 5 Task 2, docs/phase5-notes.md) ---------
+#
+# The one subcommand here that talks to NO daemon at all -- everything else
+# in this file is a thin client over a real `midicrtd` socket (`request()`/
+# `EngineClient` above); `replay` instead builds its own throwaway, offline
+# `Engine` in-process (`engine/replay.py::replay_session`) and streams a
+# captured session file through it. `main()` special-cases `args.cmd ==
+# "replay"` BEFORE the `socket_path = ...` line the rest of this file
+# shares, mirroring how `"tui"`/`"bind"` are already special-cased below --
+# unlike those two, replay needs no socket at all, so there is nothing for
+# it to reuse from that line anyway.
+
+def _handle_replay(args) -> None:
+    from midicrt.engine.replay import replay_session  # lazy: pulls in engine.core's roster
+    try:
+        summary = replay_session(args.file, speed=args.speed, instant=args.instant)
+    except OSError as exc:
+        raise SystemExit(f"midicrt: {exc}") from exc
+    print(json.dumps(summary, indent=2))
+
+
 def _handle_bind(socket_path: str, args) -> None:
     if args.bind_cmd == "learn":
         _bind_learn_cli(socket_path, args.action, args.mode, args.arg, args.timeout)
@@ -145,6 +166,14 @@ def main() -> None:
     p_action.add_argument("--arg", action="append", default=[])
     sub.add_parser("tui")
 
+    p_replay = sub.add_parser("replay")
+    p_replay.add_argument("file")
+    p_replay_speed = p_replay.add_mutually_exclusive_group()
+    p_replay_speed.add_argument("--speed", type=float, default=1.0,
+                                help="Playback speed multiplier (default: 1.0x real-time)")
+    p_replay_speed.add_argument("--instant", action="store_true",
+                                help="Replay as fast as possible, ignoring original timing")
+
     p_bind = sub.add_parser("bind")
     bind_sub = p_bind.add_subparsers(dest="bind_cmd", required=True)
     bind_sub.add_parser("list")
@@ -158,6 +187,10 @@ def main() -> None:
     p_bind_learn.add_argument("--timeout", type=float, default=LEARN_TIMEOUT_S + 5.0)
 
     args = ap.parse_args()
+
+    if args.cmd == "replay":
+        _handle_replay(args)
+        return
 
     socket_path = args.socket or config_mod.load(None).socket_path
 
