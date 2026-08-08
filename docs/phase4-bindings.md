@@ -146,6 +146,28 @@ de-duplicate.
 | `channel` | int, 0–15, or absent | `None` (any channel) | **0-indexed**, matching `MidiEvent.channel` directly — NOT the human 1-indexed display the event-log's `summary` strings use. Absent means "any channel." |
 | `port_pattern` | string, or absent | `None` (any port) | `fnmatch`-style glob matched against the MIDI event's source port name (e.g. `"Midi Through*"` matches any port whose name starts with that string). **Updated, Phase 5 Task 3 (docs/phase5-capture.md):** a `bind.learn` capture no longer writes the exact, verbatim source string — it strips the trailing volatile ALSA `<client>:<port>` numbering suffix and appends `*` (`engine/bindings.py::glob_port_pattern`), so a learned binding survives that suffix renumbering across a reboot/replug/rtpmidid session restart instead of silently going dead. See docs/phase5-capture.md's "Learned-binding port durability" section for the full rationale and the exact transform. |
 
+**Disclosed limitation: identical-device collision.** Stripping the
+`<client>:<port>` suffix buys reboot/replug durability at a real cost —
+it also strips the ONE thing that could distinguish two DIFFERENT
+physical ports ALSA happens to enumerate under the SAME name, most
+commonly two simultaneously-connected units of the same USB MIDI
+interface model. A binding learned against "device A" globs to a pattern
+that ALSO matches "device B" — a control on the second, physically
+distinct unit will silently ALSO fire that binding, with no error. `bind
+list`'s `port_present: true` does not catch this either (it only checks
+whether *some* open port matches, not whether *exactly one* does — a
+collision reads as perfectly healthy). This is a deliberate, accepted
+tradeoff, not an oversight — the failure mode this task fixed (every
+learned binding going permanently dead on the very next reboot) is both
+more common and worse — but it's a real one if you run multiple
+identical-model MIDI interfaces at once: hand-edit the affected binding's
+`port_pattern` back to an exact string in that case. **Phase-7 follow-up
+idea** (not built): `bind list` could report how many currently-open
+ports match a binding's pattern (not just whether ≥1 does), so a count of
+2+ immediately flags this exact collision instead of `port_present: true`
+reading as unconditionally reassuring. Full writeup:
+docs/phase5-capture.md §7.
+
 ### The fill sentinel (`args` ↔ TOML translation)
 
 A continuous binding's `args` needs a marker for "this key gets filled from

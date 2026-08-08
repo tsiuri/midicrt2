@@ -94,6 +94,16 @@ state. `origin` is one of:
 | `auto` | ONLY ever the very first mark of a session whose `config.capture_auto_start = true` started it — a direct method call at `Engine.__init__` time, bypassing the dispatch hook the same way `sysex` does. |
 | `shutdown` | `capture.stop`'s own mark when `Engine.stop()` (a clean daemon shutdown) stops the session, rather than a real client/binding/behavior calling `capture.stop` itself. |
 
+`args` is the action's **fully-coerced** dispatch dict, not merely
+whatever the caller happened to supply — `ActionRegistry.dispatch` passes
+its `coerced` dict (post type-coercion, post `defaults=` fallback-filling,
+see §9) to the post-dispatch hook that feeds this mark, so an OPTIONAL arg
+the caller omitted still shows up here at its default value. Concretely:
+a `bind.learn` mark for a caller that never passed `--range` records
+`"args": {"action": ..., "mode": ..., "args": {...}, "range": ""}` — the
+empty-string default, not an absent key — because that's the value the
+handler actually ran with.
+
 `capture.stop` is special-cased to record **its own** mark explicitly,
 *before* actually stopping (`CaptureSink.stop()` flips `is_recording` false
 as its very first observable effect, and `record_action`'s own recording
@@ -376,6 +386,43 @@ means "unknown", reported `True` rather than spuriously flagging a
 binding as port-missing just because nothing ever told the engine what's
 open. Never gates whether a binding actually fires — `BindingDispatcher`
 is completely untouched by this field.
+
+### Disclosed limitation: identical-device collision (the tradeoff this fix accepts)
+
+Stripping the trailing `<client>:<port>` suffix buys durability across a
+reboot/replug/rtpmidid restart (§7 above) at a real cost: it also strips
+the ONE thing that could have distinguished two DIFFERENT physical ports
+that happen to share the same ALSA-enumerated NAME — most commonly two
+simultaneously-connected units of the same USB MIDI interface model (ALSA
+names both, e.g., `"USB MIDI Interface:USB MIDI Interface MIDI 1"`,
+distinguished ONLY by the client:port numbers this fix throws away). A
+binding learned against "device A" globs to a pattern that ALSO matches
+"device B" — so a control on the second, physically distinct unit will
+silently ALSO fire that binding, with no error and no warning. `bind.
+list`'s `port_present: true` does not catch this either: it only checks
+whether SOME open port matches, not whether EXACTLY one does, so a
+collision reads as perfectly healthy.
+
+This is a deliberate, accepted tradeoff, not an oversight: the failure
+mode this task fixed (every learned binding going permanently dead on the
+very next reboot) is both more common and worse than the failure mode
+this section discloses (a binding firing from an unintended second
+identical-model device, which requires two units of the exact same
+hardware connected at once to even be POSSIBLE). Net positive, but it
+must be written down, not silently traded away. If you rely on multiple
+identical-model MIDI interfaces plugged in simultaneously, hand-edit the
+affected binding's `port_pattern` in `bindings.toml` back to an exact
+string (or a pattern that also encodes something ALSA exposes besides the
+name + numbering, if your hardware provides one) — see
+`docs/phase4-bindings.md`'s own port_pattern row for the hand-edit
+convention.
+
+**Phase-7 follow-up idea** (not built, flagged for later): `bind.list`
+could additionally report how MANY currently-open ports match a
+binding's `port_pattern` (not just whether ≥1 does), so a human
+diagnosing "why is my binding firing from the wrong device" could see a
+count of 2+ and immediately suspect this exact collision, rather than
+`port_present: true` reading as unconditionally reassuring.
 
 ---
 

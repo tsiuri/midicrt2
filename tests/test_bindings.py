@@ -816,14 +816,18 @@ def test_glob_port_pattern_escapes_fnmatch_specials_in_the_port_name():
     port name observed on this Pi's hardware contains one of these (see
     `glob_port_pattern`'s own docstring), but this proves the escaping is
     actually correct if one ever does."""
-    source = "Synth [Ch1]:Port*A 12:0"
+    source = "Synth [Ch1]?:Port*A 12:0"
     pattern = glob_port_pattern(source)
     assert fnmatch.fnmatch(source, pattern)
     # Proves the literal "*" in the port name is actually ESCAPED, not
     # left as a live wildcard -- if escaping had failed, this string (the
     # literal "*" swapped for an arbitrary character) would wrongly match
     # too, since an unescaped "*" matches anything.
-    assert not fnmatch.fnmatch("Synth [Ch1]:PortXA 12:0", pattern)
+    assert not fnmatch.fnmatch("Synth [Ch1]?:PortXA 12:0", pattern)
+    # Same proof for "?" -- unescaped, fnmatch's "?" means "any single
+    # character", so swapping it for a DIFFERENT single character would
+    # still wrongly match if escaping had failed.
+    assert not fnmatch.fnmatch("Synth [Ch1]X:Port*A 12:0", pattern)
 
 
 def test_is_learnable_event_false_for_clock_tick():
