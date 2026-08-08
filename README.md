@@ -9,6 +9,13 @@ Run tests: `~/midicrt2-venv/bin/pytest`
 
 ## Docs
 
+- `docs/phase6-web.md` — `midicrt-web` usage/flags, the `0.0.0.0:8766`
+  read-only-by-default security posture + rationale (v1-observer parity,
+  revisit at Phase 7 cutover), 14-page renderer parity notes, known limits
+  (dict-args in the generic action form, replay stays CLI-only, 5/s
+  subscribe rate), and live smoke evidence. Read this before installing/
+  enabling `packaging/midicrt-web.service` or building anything against the
+  web protocol surface.
 - `docs/phase5-capture.md` — event-sourced session capture format spec
   (header/event/action-mark/page_changed/tempo lines, provenance origins),
   `index.json`/retention/pin, loss-window + write-failure containment,
