@@ -141,6 +141,21 @@ it automatically.
 
 ## 5. Parity notes (what "observer parity" means here)
 
+- **Subscription scope, disclosed plainly**: `Bridge.start()` subscribes
+  exactly two topics — the current `page.<name>` topic and
+  `overlay.status` (`bridge.py`'s own `self.client.subscribe([topic,
+  chrome.OVERLAY_STATUS_TOPIC], ...)`). The other overlay topics fb/tui
+  paint every tick as dedicated bottom-row chrome — `overlay.alerts`,
+  `overlay.timesig`, `overlay.beatflash`, `overlay.loopprogress` — are
+  never subscribed here and have no web-rendered row at all; this is a
+  deliberate scope cut for this task, not an oversight. The underlying
+  *information* mostly still reaches the browser through a different path
+  — see the Alert surface bullet below: `analyzers/stucknotes.py` also
+  emits a generic `alert` protocol EVENT (independent of the
+  `overlay.alerts` snapshot topic), which `WebSink` turns into a
+  dismissable banner — but the tui/fb *chrome-row presentation* itself
+  (the "alerts win, falls back to timesig" bottom row, the beatflash
+  glyph, the loopprogress bar) is not mirrored on the web surface at all.
 - **14 renderers**, one per `config.pages`'s default roster entry:
   `eventlog`, `progchanges` (reuses `renderEventlog` verbatim — the two
   pages share an identical `{title, count, lines}` shape by design, see
@@ -258,34 +273,50 @@ it automatically.
   that no longer matches a `PAGE_RENDERERS` key.
 - **A `midicrtd` restart leaves `midicrt-web` SILENTLY frozen — a
   "connected"-looking dashboard is NOT proof of fresh data (live-
-  reproduced during review)**: the bridge's single `EngineClient`
-  connection dies with the daemon, and `midicrt-web` never reconnects
-  mid-process. What that actually looks like, for the two cases:
-  - A websocket **already open** when `midicrtd` restarts: `bridge.py`'s
-    `_on_eof()` does offer that sink the `None` EOF sentinel, and
-    `app.py`'s `_handle_ws` does close the socket on the server side — but
-    `page.html` wires up **no `onclose`/`onerror` handler at all**, so
-    nothing in the UI ever reflects it. The connection indicator keeps
-    reading whatever it last said (normally "connected") and the last-
-    rendered page/status simply stops updating, forever, with no visible
-    error.
-  - A websocket that **connects AFTER** the restart: `Bridge.add_sink()`
-    still replays a completely normal-looking `hello` frame plus whatever
-    STALE data is sitting in `Bridge._latest` from before the daemon died
-    (that state is never cleared) — then never sends that sink anything
-    else, ever. No close frame, no error frame: `_on_eof()` only fires
-    once, against whichever sinks were registered AT THAT MOMENT; a sink
-    added later was never a member of that set and is never offered the
-    sentinel that would close it. The socket stays open indefinitely.
-  Both cases are indistinguishable to a user: a dashboard reading
-  "connected", showing a page that never changes again. **No layer —
-  server or client — detects or surfaces this on its own**; the only fix
-  today is a manual `midicrt-web` restart. `Restart=on-failure` cannot
-  help either way, since the aiohttp process itself never exits or
-  errors. Not exercised by this task's own live smoke (§8) — found and
-  confirmed live during this doc's review, not during the original smoke
-  run. See `docs/phase3-parity.md` §7 for the carried-forward cutover
-  hardening note.
+  reproduced during review)**: **correction to an earlier draft of this
+  doc**, which claimed `page.html` wires up no `onclose`/`onerror` handler
+  at all — false. `page.html` has genuinely had a
+  `ws.addEventListener("close", ...)` handler with exponential-backoff
+  reconnect since the original branch (`backoff` starts at 500ms, doubles,
+  caps at 10s — see the "websocket connection with auto-reconnect" block
+  near the end of the file). On a real `midicrtd` restart the browser DOES
+  notice and DOES reconnect: the server-side close reaches the client,
+  `connEl` flips to "disconnected", and `connect()` opens a fresh websocket
+  roughly 500ms later. The freeze is not a client-detection gap — it is
+  entirely **bridge-side**. `Bridge._pump_loop()` reads the dead
+  `EngineClient`'s `None` EOF sentinel exactly once, calls `_on_eof()`
+  (which offers that sentinel only to sinks registered AT THAT MOMENT),
+  and returns — nothing in `bridge.py` ever reconnects the underlying
+  `EngineClient` to `midicrtd`. The browser's new websocket lands on
+  `app.py`'s `_handle_ws`, which calls `Bridge.add_sink()`, which
+  immediately sends a completely normal-looking `hello_message()` (built
+  from `self.engine_hello`, captured once at the bridge's original
+  `start()` and never cleared) plus a replay of whatever STALE snapshots
+  are still sitting in `self._latest` from before the daemon died — then
+  never sends that sink anything else, ever, because the pump thread that
+  would feed it new messages already exited. So the honest reconnect the
+  client correctly performs lands on a bridge that lies to it: a
+  normal-looking `hello`, honest-looking-but-stale data, then permanent
+  silence, no close frame and no error frame the second time. Net symptom
+  is unchanged: a dashboard reading "connected", showing a page that never
+  changes again. **No layer detects or surfaces this on its own**; the
+  only fix today is a manual `midicrt-web` restart. `Restart=on-failure`
+  cannot help either way, since the aiohttp process itself never exits or
+  errors. **The real fix, when scheduled, is entirely bridge-side** —
+  either give `Bridge` its own reconnect-to-`midicrtd` loop (mirroring
+  what `page.html` already does for the browser leg), or at minimum clear
+  `self._latest`/`self.engine_hello` on EOF so a post-restart connection
+  gets an honest immediate error instead of a misleadingly normal `hello`.
+  **Cheapest ops-level mitigation, no code change**: add
+  `PartOf=midicrtd.service` to `midicrt-web.service` (§4) so systemd
+  bounces the web client on every daemon restart instead of leaving it
+  running stale — not applied here (a cutover decision on the unit file,
+  out of scope for this doc), just listed as the cheapest item on the
+  Phase 7 menu alongside the bridge-side reconnect fix. Not exercised by
+  this task's own live smoke (§8) — found and confirmed live during this
+  doc's review, not during the original smoke run. See
+  `docs/phase3-parity.md` §7 for the carried-forward cutover hardening
+  note.
 - **Port already in use**: v1's observer owns `:8765`; v2's is `:8766` by
   default (`DEFAULT_PORT`) specifically to avoid the collision — verified
   live, no conflict, both ports independently reachable (§8.1/§8.6).

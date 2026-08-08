@@ -176,15 +176,23 @@ Screensaver correctly suppresses **all three** chrome rows (fixed in Task
 
 ## 7. Phase 7 cutover checklist item (carried forward, not resolved here)
 
-- **REAL-REBOOT audio verification is deferred to the Phase 7 cutover
-  window** (Task 8's report, both the original landing and its fix round):
-  the boot-race fix for `midicrtd.service`'s audio capture
-  (`XDG_RUNTIME_DIR=/run/user/1000`, PipeWire-dependency ordering) was
-  verified via a simulated PipeWire stop/start cycle, not a real Pi reboot —
-  per this project's explicit "do NOT autonomously reboot the appliance"
-  rule. **Before cutover, a real reboot must be performed and audio capture
-  (`midicrt-fb --out` showing `available: true` with a real device) verified
-  post-boot**, not just simulated.
+- **REAL-REBOOT audio verification — PASSED 2026-08-07** (originally
+  deferred to the Phase 7 cutover window per Task 8's report, both the
+  original landing and its fix round: the boot-race fix for
+  `midicrtd.service`'s audio capture (`XDG_RUNTIME_DIR=/run/user/1000`,
+  PipeWire-dependency ordering) had only been verified via a simulated
+  PipeWire stop/start cycle, not a real Pi reboot, per this project's
+  explicit "do NOT autonomously reboot the appliance" rule). An
+  **unplanned full reboot on 2026-08-07** exercised the real path: wifi,
+  `midicrtd`, the audio supervisor, and v1 all auto-recovered post-boot
+  with no manual intervention (`docs/phase4-notes.md`'s Phase-7 checklist
+  item; fuller evidence in the phase-5 ledger). Treat the original ask as
+  satisfied. **Optional, cheap re-confirm at the Phase 7 cutover window**:
+  since this passed incidentally rather than via a deliberate pre-cutover
+  drill, a quick `midicrt-fb --out` check for `available: true` with a
+  real device right after cutover costs little and removes any doubt that
+  the unplanned reboot's conditions (config, hardware, connected devices)
+  still match production's.
 - **Post-fix SysEx positive-path live re-verification** (2026-08-07 fix
   wave): this fix wave touched `Engine.run()`'s dirty-flush loop (finding
   1, extracted into `_flush_dirty()` and gated on subscriber refcount) and
@@ -201,18 +209,26 @@ Screensaver correctly suppresses **all three** chrome rows (fixed in Task
   the destination page's own topic) to confirm the fix wave introduced no
   regression on that path, not just re-trust the pre-fix-wave result.
 - **`midicrt-web` silent-freeze on a `midicrtd` restart** (Phase 6 Task 3
-  doc review, live-reproduced; full writeup `docs/phase6-web.md` §7): after
-  any `midicrtd` restart, a `midicrt-web` process never reconnects — an
-  already-open websocket closes with zero client-side indication (no
-  `onclose` handler exists in `page.html`), and any NEW websocket gets a
-  normal-looking `hello` + stale cached snapshots and then goes silent
-  forever, socket open, no error either way. `Restart=on-failure` cannot
-  help since the process itself never exits. **Before cutover, decide
-  whether this stays a documented limitation or gets fixed** — a bridge-
-  side reconnect-to-`midicrtd` loop (or, at minimum, clearing `Bridge.
-  _latest`/`engine_hello` on disconnect so a post-restart connection gets
-  an honest immediate error instead of a misleadingly normal `hello`) is
-  the natural post-cutover hardening item.
+  doc review, live-reproduced; full writeup `docs/phase6-web.md` §7,
+  corrected there too): the browser side is not the problem — `page.html`
+  already has a real `close`/`error`-driven reconnect with exponential
+  backoff (~500ms first retry), and it fires correctly on a `midicrtd`
+  restart. The freeze is entirely **bridge-side**: `Bridge._pump_loop()`
+  exits after its one EOF, nothing ever reconnects the underlying
+  `EngineClient` to `midicrtd`, and the browser's honest reconnect lands
+  on a bridge that replays a normal-looking `hello` plus stale cached
+  snapshots (`engine_hello`/`_latest`, neither ever cleared) and then goes
+  silent forever — socket open, no error either way. `Restart=on-failure`
+  cannot help since the process itself never exits. **Before cutover,
+  decide whether this stays a documented limitation or gets fixed** — a
+  bridge-side reconnect-to-`midicrtd` loop (or, at minimum, clearing
+  `Bridge._latest`/`engine_hello` on disconnect so a post-restart
+  connection gets an honest immediate error instead of a misleadingly
+  normal `hello`) is the real fix. **Cheapest ops-level mitigation, no
+  code change**: add `PartOf=midicrtd.service` to `midicrt-web.service` so
+  systemd bounces the web client on every daemon restart instead of
+  leaving it running stale — not applied here, a cutover decision on the
+  unit file itself, just the cheapest item on this menu.
 
 ---
 
