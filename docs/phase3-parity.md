@@ -200,6 +200,19 @@ Screensaver correctly suppresses **all three** chrome rows (fixed in Task
   daemon with a subscribed client watching `describe`'s `current_page` and
   the destination page's own topic) to confirm the fix wave introduced no
   regression on that path, not just re-trust the pre-fix-wave result.
+- **`midicrt-web` silent-freeze on a `midicrtd` restart** (Phase 6 Task 3
+  doc review, live-reproduced; full writeup `docs/phase6-web.md` §7): after
+  any `midicrtd` restart, a `midicrt-web` process never reconnects — an
+  already-open websocket closes with zero client-side indication (no
+  `onclose` handler exists in `page.html`), and any NEW websocket gets a
+  normal-looking `hello` + stale cached snapshots and then goes silent
+  forever, socket open, no error either way. `Restart=on-failure` cannot
+  help since the process itself never exits. **Before cutover, decide
+  whether this stays a documented limitation or gets fixed** — a bridge-
+  side reconnect-to-`midicrtd` loop (or, at minimum, clearing `Bridge.
+  _latest`/`engine_hello` on disconnect so a post-restart connection gets
+  an honest immediate error instead of a misleadingly normal `hello`) is
+  the natural post-cutover hardening item.
 
 ---
 

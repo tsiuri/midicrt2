@@ -256,12 +256,36 @@ it automatically.
   a genuinely new page this build predates (fine — it's still usable, just
   unstyled), or a typo'd/renamed page name in `config.toml`'s `pages` list
   that no longer matches a `PAGE_RENDERERS` key.
-- **Browser shows stale/no data after a `midicrtd` restart**: the bridge's
-  single `EngineClient` connection dies with the daemon; `midicrt-web`
-  itself does not auto-reconnect mid-process today — restart `midicrt-web`
-  (the unit's `Restart=on-failure` only fires if the *process* exits, not
-  on an engine-side disconnect that the aiohttp app survives). This is a
-  known gap, not exercised by this task's smoke.
+- **A `midicrtd` restart leaves `midicrt-web` SILENTLY frozen — a
+  "connected"-looking dashboard is NOT proof of fresh data (live-
+  reproduced during review)**: the bridge's single `EngineClient`
+  connection dies with the daemon, and `midicrt-web` never reconnects
+  mid-process. What that actually looks like, for the two cases:
+  - A websocket **already open** when `midicrtd` restarts: `bridge.py`'s
+    `_on_eof()` does offer that sink the `None` EOF sentinel, and
+    `app.py`'s `_handle_ws` does close the socket on the server side — but
+    `page.html` wires up **no `onclose`/`onerror` handler at all**, so
+    nothing in the UI ever reflects it. The connection indicator keeps
+    reading whatever it last said (normally "connected") and the last-
+    rendered page/status simply stops updating, forever, with no visible
+    error.
+  - A websocket that **connects AFTER** the restart: `Bridge.add_sink()`
+    still replays a completely normal-looking `hello` frame plus whatever
+    STALE data is sitting in `Bridge._latest` from before the daemon died
+    (that state is never cleared) — then never sends that sink anything
+    else, ever. No close frame, no error frame: `_on_eof()` only fires
+    once, against whichever sinks were registered AT THAT MOMENT; a sink
+    added later was never a member of that set and is never offered the
+    sentinel that would close it. The socket stays open indefinitely.
+  Both cases are indistinguishable to a user: a dashboard reading
+  "connected", showing a page that never changes again. **No layer —
+  server or client — detects or surfaces this on its own**; the only fix
+  today is a manual `midicrt-web` restart. `Restart=on-failure` cannot
+  help either way, since the aiohttp process itself never exits or
+  errors. Not exercised by this task's own live smoke (§8) — found and
+  confirmed live during this doc's review, not during the original smoke
+  run. See `docs/phase3-parity.md` §7 for the carried-forward cutover
+  hardening note.
 - **Port already in use**: v1's observer owns `:8765`; v2's is `:8766` by
   default (`DEFAULT_PORT`) specifically to avoid the collision — verified
   live, no conflict, both ports independently reachable (§8.1/§8.6).
