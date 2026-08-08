@@ -120,6 +120,7 @@ fix) -- `Engine.__init__`'s own comment next to `self._behaviors` restates
 this at the wiring site.
 """
 import asyncio
+import contextlib
 import fnmatch
 import logging
 import time
@@ -798,7 +799,17 @@ class Engine:
                               description="Pin a stopped capture session so retention "
                                           "never deletes it",
                               args={"id": "str"})
-        if config.capture_auto_start:
+        # Fix-wave fix (2026-08-07, Important finding, replay isolation):
+        # `and not self._replay` -- an offline `engine/replay.py::
+        # build_offline_engine()` engine has no real I/O of its own, but
+        # honoring `capture_auto_start` here would still (a) sweep
+        # retention against the REAL sessions directory before this
+        # `Engine` even exists to know it's "just" a replay (a misconfigured
+        # config.toml could delete the very session file about to be
+        # replayed) and (b) open a brand-new REAL capture session that
+        # re-records the replayed stream right back into it. `self._replay`
+        # is already set (top of this method) by the time this line runs.
+        if config.capture_auto_start and not self._replay:
             # v1's OWN deployed default is manual-start-only (verified,
             # not invented -- see config.py's own comment on
             # `capture_auto_start`) -- this branch only ever fires when a
@@ -2083,7 +2094,25 @@ class Engine:
         # `_capture_stop_action`'s own docstring for the full origin-
         # injection mechanism this is the one exception to).
         if self._capture.is_recording:
-            self._capture_stop_action(origin="shutdown")
+            # Fix-wave fix (2026-08-07, Important finding): `_capture_stop_
+            # action` can raise `ActionError` when `CaptureSink.stop()`'s own
+            # final flush hits an `OSError` (ENOSPC/EIO) -- but the
+            # CONTAINMENT for that (rec flag off, alert emitted, session
+            # disabled -- see `_capture_write_failed`) already ran INSIDE
+            # that call, before it re-raised. That re-raise exists so a
+            # normal `capture.stop` DISPATCH reports the failure to the
+            # requesting client; `Engine.stop()` is not a dispatch caller
+            # (a direct method call, same as the auto-start case in
+            # `__init__`), and letting it propagate here would abort this
+            # method's OWN shutdown ordering right below -- skipping the
+            # sendnotes `flush_all()` note-off flush and `_midi_out.close()`
+            # -- on nothing more than a full disk, live-reproducing the
+            # exact phase-3 "stuck notes on real hardware" bug class this
+            # code was originally written to prevent. Suppressed, not
+            # logged again: `_capture_write_failed` already logged ONE
+            # error and emitted an `alert` for this exact incident.
+            with contextlib.suppress(ActionError):
+                self._capture_stop_action(origin="shutdown")
         # Phase-3 task 12 fix (Important, live-reproduced): flush any
         # still-gated Send Notes BEFORE closing midi_out -- a routine
         # restart mid-note used to just close the port out from under

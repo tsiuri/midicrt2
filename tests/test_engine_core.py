@@ -7,6 +7,7 @@ import time
 import pytest
 
 from midicrt.config import Config, ConfigError
+from midicrt.engine import capture as capture_mod
 from midicrt.engine.actions import ActionError
 from midicrt.engine.bindings import LEARN_TIMEOUT_S
 from midicrt.engine.core import Engine, MidiEvent, _LearnArm
@@ -2774,6 +2775,45 @@ async def test_capture_stop_action_raises_action_error_on_oserror_and_disables_c
     assert alerts and alerts[-1]["data"]["source"] == "capture"
 
 
+# -- shutdown-time capture-stop failure must not abort shutdown ordering
+# (fix wave: Important finding) ---------------------------------------------
+#
+# Bug: `Engine.stop()` calls `_capture_stop_action(origin="shutdown")`
+# completely unguarded. `_capture_stop_action` already contains an `OSError`
+# from `CaptureSink.stop()` (via `_capture_write_failed` -- rec flag off,
+# alert emitted) but then RE-RAISES it as `ActionError` for a normal
+# dispatch caller. `Engine.stop()` is not a dispatch caller -- it calls the
+# handler directly -- so that re-raise used to escape `stop()` entirely,
+# skipping the sendnotes `flush_all()` note-off flush AND `_midi_out.close()`
+# right below it: the exact phase-3 "stuck notes on real hardware" bug
+# class, now reachable again via a full disk at shutdown time instead of a
+# missing flush call.
+
+async def test_engine_stop_completes_and_flushes_notes_when_shutdown_capture_stop_fails(
+        monkeypatch):
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    await eng.actions.dispatch("capture.start", {})
+    await eng.actions.dispatch("sendnotes.key", {"key": "z"})   # gates a real note
+    assert eng._capture.is_recording is True
+
+    def broken_stop():
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(eng._capture, "stop", broken_stop)
+
+    eng.stop()   # must NOT raise -- containment already happened inside
+
+    # Shutdown ordering completed past the failed capture-stop: the gated
+    # note got its note_off, and midi_out was closed.
+    assert fake.note_off_calls == [(60, 1)]
+    assert fake.closed is True
+    # And capture itself ended up cleanly disabled, not stuck "recording".
+    assert eng._capture.is_recording is False
+    assert eng.analyzers["status"].view_model()["rec"] is False
+
+
 async def test_capture_status_action_reports_live_recording_state():
     eng = Engine(Config())
     assert (await eng.actions.dispatch("capture.status", {}))["recording"] is False
@@ -2994,6 +3034,32 @@ def test_engine_replay_flag_defaults_false():
 def test_engine_replay_flag_is_settable_at_construction():
     eng = Engine(Config(), replay=True)
     assert eng._replay is True
+
+
+# -- fix wave (2026-08-07, Important finding): a replaying engine must
+# never honor `config.capture_auto_start` -- an offline engine has no real
+# I/O of its own, but `_capture_start_action()` would still sweep retention
+# against the REAL sessions directory (a config error could delete the very
+# session file being replayed) and open a brand-new REAL capture session
+# that re-records the replayed stream. Gated the same way as this section's
+# own `_handle` seam: `Engine.__init__`'s auto-start branch now checks
+# `not self._replay` too.
+
+def test_capture_auto_start_is_suppressed_on_a_replaying_engine(monkeypatch):
+    swept = []
+    monkeypatch.setattr(capture_mod.CaptureSink, "_sweep_retention",
+                        lambda self: swept.append(1))
+    eng = Engine(Config(capture_auto_start=True), replay=True)
+    assert eng._capture.is_recording is False
+    assert eng.analyzers["status"].view_model()["rec"] is False
+    assert swept == []   # no retention sweep either -- start() never ran
+
+
+def test_capture_auto_start_still_works_on_a_normal_non_replay_engine_control():
+    # Control for the test above: proves the config flag is still real and
+    # the gate is scoped to replay specifically, not a blanket regression.
+    eng = Engine(Config(capture_auto_start=True))
+    assert eng._capture.is_recording is True
 
 
 def test_replay_engine_never_collects_a_binding_dispatch_intent(tmp_path):

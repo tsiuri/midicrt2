@@ -152,3 +152,37 @@ async def test_register_with_no_defaults_behaves_exactly_as_before():
     reg.register("zoom.set", lambda level: None, args={"level": "int"})
     with pytest.raises(ActionError, match="missing arg"):
         await reg.dispatch("zoom.set", {})
+
+
+# -- register(...): "origin" is a reserved schema arg name (fix wave,
+# 2026-08-07, Minor finding, closes a ledgered landmine from the Task-1
+# review) -------------------------------------------------------------------
+#
+# `dispatch()` injects a REAL `origin` kwarg into `handler_kwargs` for any
+# handler that opts in via `wants_origin` (a param literally named `origin`
+# in the handler's own signature) -- a schema that ALSO declares a
+# client-suppliable arg named `origin` would either be silently overwritten
+# (handler wants origin) or raise a raw `TypeError` past `dispatch`'s own
+# `except ActionError` narrowing (handler doesn't want origin). `register`
+# now rejects this outright, at registration time, before either failure
+# mode can ever reach a live dispatch.
+
+def test_register_rejects_a_schema_that_declares_an_arg_named_origin():
+    reg = ActionRegistry()
+    with pytest.raises(ValueError, match="origin"):
+        reg.register("some.action", lambda origin: None, args={"origin": "str"})
+
+
+def test_register_rejects_origin_in_schema_even_when_the_handler_does_not_want_origin():
+    reg = ActionRegistry()
+    with pytest.raises(ValueError, match="origin"):
+        reg.register("some.action", lambda value: None,
+                     args={"value": "int", "origin": "str"})
+
+
+def test_register_still_accepts_a_handler_that_wants_origin_with_no_such_schema_arg():
+    # Control: `wants_origin` itself (a handler PARAMETER named `origin`,
+    # with no matching `args` schema entry -- `Engine._capture_stop_action`'s
+    # own real shape) is the intended, unaffected use of the mechanism.
+    reg = ActionRegistry()
+    reg.register("capture.stop", lambda *, origin="unknown": {"origin": origin})

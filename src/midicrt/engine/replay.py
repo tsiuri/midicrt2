@@ -179,6 +179,7 @@ activity, not activity themselves).
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import time
@@ -236,8 +237,22 @@ def build_offline_engine(*, config: Config | None = None, keymap_path: str | Non
     `bindings.toml` containing a binding that WOULD match a replayed event,
     to prove it never fires (docs/phase5-notes.md's own "replay with a
     binding configured in a scratch bindings.toml -> binding does NOT
-    fire" acceptance test)."""
+    fire" acceptance test).
+
+    Fix-wave fix (2026-08-07, Important finding, replay isolation, layer 2):
+    `Engine.__init__` itself already gates `capture_auto_start` on `not
+    self._replay` (see that call site's own comment) -- this is
+    belt-and-suspenders defense-in-depth at the SECOND layer: if a caller
+    supplies a `config` with `capture_auto_start=True`, the config actually
+    used to construct the offline `Engine` is a neutered copy with that
+    flag forced off, so this builder never depends solely on the engine
+    remembering to check its own `_replay` flag correctly. `dataclasses.
+    replace` (not a mutation of the caller's own `config` object) so a
+    caller reusing the same `Config` instance elsewhere never sees it
+    silently changed underneath them."""
     cfg = config if config is not None else Config()
+    if cfg.capture_auto_start:
+        cfg = dataclasses.replace(cfg, capture_auto_start=False)
     engine = Engine(cfg, keymap_path=keymap_path, bindings_path=bindings_path, replay=True)
     engine._midi_out = _OfflineMidiOutput()
     return engine
@@ -259,12 +274,19 @@ def _midi_event_from_line(line: dict) -> MidiEvent:
 
 
 def _iter_lines(path: str):
-    """Yields parsed JSON objects, one per non-blank line -- a malformed
-    line is logged and SKIPPED (never raises), matching this codebase's
-    established "an optional/external file's per-entry corruption is
-    logged and skipped, never fatal" discipline (engine/bindings.py's
-    per-binding parsing, engine/capture.py's own index-rebuild-from-disk).
-    A missing/unreadable FILE itself is a different class of problem (the
+    """Yields parsed JSON OBJECTS (plain `dict`s), one per non-blank line --
+    a malformed line is logged and SKIPPED (never raises), matching this
+    codebase's established "an optional/external file's per-entry
+    corruption is logged and skipped, never fatal" discipline
+    (engine/bindings.py's per-binding parsing, engine/capture.py's own
+    index-rebuild-from-disk). Every kind of bad line is covered: invalid
+    JSON syntax (`json.JSONDecodeError`) AND syntactically valid JSON that
+    isn't an object at all -- a bare `42`, `"x"`, `[1]` (fix wave, Minor
+    finding: these used to parse through cleanly and reach `stream_session`'s
+    `line.get("kind")` call, an `AttributeError` on anything without a
+    `.get`) -- both are skipped the same way, so every caller downstream of
+    this generator can assume every yielded value really is a `dict`. A
+    missing/unreadable FILE itself is a different class of problem (the
     caller asked to replay a specific path that doesn't exist) and is
     deliberately NOT caught here -- `open()`'s own `OSError` propagates
     straight out of `stream_session`, mirroring `CaptureSink.start`/`.stop`
@@ -276,11 +298,23 @@ def _iter_lines(path: str):
             if not raw:
                 continue
             try:
-                yield json.loads(raw)
+                parsed = json.loads(raw)
             except json.JSONDecodeError as exc:
                 _LOG.warning("replay: skipping malformed JSON on line %d of %s: %s",
                             lineno, path, exc)
                 continue
+            # Fix wave (2026-08-07, Minor finding): VALID JSON that isn't a
+            # JSON OBJECT (a bare `42`, `"x"`, `[1]`) parses cleanly here but
+            # has no `.get` for `stream_session`'s `line.get("kind")` to call
+            # -- an uncaught `AttributeError` that used to escape this
+            # generator entirely, past `clients/cli.py::_handle_replay`'s
+            # `except OSError`-only catch. Same "log + skip this one entry,
+            # keep going" discipline as the malformed-JSON case right above.
+            if not isinstance(parsed, dict):
+                _LOG.warning("replay: skipping non-object JSON line %d of %s: %r",
+                            lineno, path, parsed)
+                continue
+            yield parsed
 
 
 def stream_session(engine: Engine, path: str, *, speed: float = 1.0,

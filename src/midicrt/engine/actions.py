@@ -2,6 +2,7 @@
 import inspect
 import json
 from collections.abc import Callable
+from typing import Any
 
 
 def _parse_bool(value):
@@ -49,7 +50,13 @@ class ActionError(Exception):
 
 class ActionRegistry:
     def __init__(self):
-        self._actions: dict[str, tuple[Callable, str, dict[str, str], bool]] = {}
+        # Fix wave (2026-08-07, Minor finding): this annotation was a stale
+        # 4-tuple left over from before `register()`'s own `defaults`
+        # parameter (Phase 5 Task 3, docs/phase5-notes.md cheap-wins bundle)
+        # started storing a genuine 5th element (`dict(defaults or {})`,
+        # see `register()` below) -- the runtime value has been a 5-tuple
+        # ever since; only the type annotation never caught up.
+        self._actions: dict[str, tuple[Callable, str, dict[str, str], bool, dict[str, Any]]] = {}
         # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md): an
         # OPTIONAL hook, set at most once (`Engine.__init__` wires it to
         # `Engine._on_action_dispatched`) and fired after every SUCCESSFUL
@@ -83,6 +90,39 @@ class ActionRegistry:
         # suppliable wire arg -- see `dispatch`'s own comment at the
         # injection site for why it's kept out of `args`/`schema`
         # entirely.
+        #
+        # Fix wave (2026-08-07, Minor finding, closes a ledgered landmine
+        # from the Task-1 review): that "never exposed" claim right above
+        # was only ever true by convention, not enforced -- nothing stopped
+        # a future action's `args` schema from declaring its OWN arg
+        # literally named `origin`. Two ways that goes wrong at dispatch
+        # time depending on `wants_origin`: (1) the handler DOES want
+        # origin -- `dispatch`'s `handler_kwargs["origin"] = origin`
+        # silently OVERWRITES whatever the client supplied under that same
+        # key, so a client-suppliable `origin` schema arg would be
+        # accepted, coerced, recorded in the action mark's own `args` dict
+        # by `_on_dispatch`/`record_action` (confusingly duplicating the
+        # mark's real top-level `origin` field with client-controlled
+        # noise) and then just... discarded, never reaching the handler at
+        # all; (2) the handler does NOT want origin, but the schema arg is
+        # still named `origin` -- `handler(**{"origin": coerced_value})`
+        # then raises a raw `TypeError` for any handler whose signature
+        # doesn't accept it, ESCAPING `dispatch`'s own `except ActionError`
+        # narrowing (`engine/server.py::ProtocolServer._dispatch`'s
+        # identical narrowing too) and tearing down the requesting client
+        # connection -- the same class of raw-exception-past-ActionError
+        # bug this fix wave's `_capture_start_action`/`_capture_stop_action`
+        # OSError conversions exist to prevent, just reachable from a
+        # schema typo instead of a full disk. Raising here, at REGISTER
+        # time (once, at daemon boot / test construction), turns a future
+        # landmine into an immediate, readable startup failure instead of
+        # a live dispatch-time surprise.
+        if "origin" in (args or {}):
+            raise ValueError(
+                f"action {name!r}: schema arg name 'origin' is reserved for the "
+                "origin-injection mechanism (see the comment right above) -- "
+                "rename this arg in its `args` schema"
+            )
         wants_origin = "origin" in inspect.signature(handler).parameters
         # Phase 5 Task 3 (CLI `--range` for continuous learn, docs/
         # phase5-notes.md cheap-wins bundle): `defaults` is an OPT-IN,

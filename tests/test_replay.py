@@ -93,6 +93,54 @@ def test_build_offline_engine_accepts_a_config():
     assert list(eng.pages) == ["eventlog"]
 
 
+# -- fix wave (2026-08-07, Important finding): `capture_auto_start` isolation
+# ------------------------------------------------------------------------
+#
+# A config with `capture_auto_start=True` used to give the offline (no I/O)
+# replay engine a REAL retention sweep against the REAL sessions directory
+# (could delete the very session file about to be replayed) plus a REAL
+# capture session that re-records the replayed stream right back into it.
+# Fixed at two layers: `Engine.__init__` gates auto-start on `not
+# self._replay`, and `build_offline_engine` additionally neuters any
+# `capture_auto_start=True` config it's handed before construction --
+# tested here independently of each other where possible.
+
+def test_build_offline_engine_with_auto_start_config_creates_no_session():
+    eng = build_offline_engine(config=Config(capture_auto_start=True))
+    assert eng._capture.is_recording is False
+
+
+def test_build_offline_engine_with_auto_start_config_never_sweeps_retention(monkeypatch):
+    swept = []
+    monkeypatch.setattr(capture_mod.CaptureSink, "_sweep_retention",
+                        lambda self: swept.append(1))
+    build_offline_engine(config=Config(capture_auto_start=True))
+    assert swept == []
+
+
+def test_build_offline_engine_does_not_mutate_the_callers_config_object():
+    cfg = Config(capture_auto_start=True)
+    build_offline_engine(config=cfg)
+    assert cfg.capture_auto_start is True   # caller's own object untouched
+
+
+def test_replay_streaming_unaffected_by_the_auto_start_isolation_fix(tmp_path):
+    # The isolation fix must not degrade ordinary replay behavior -- a
+    # session streams identically through an auto-start-configured offline
+    # engine as through a normal one.
+    path = _write_session(tmp_path, [
+        _header(),
+        _event(ts=1000.0, type="note_on"),
+        _event(ts=1000.1, type="note_off", data2=0),
+    ])
+    eng = build_offline_engine(config=Config(capture_auto_start=True))
+    summary = stream_session(eng, path, instant=True)
+    assert summary["events_total"] == 2
+    assert summary["events_by_type"] == {"note_on": 1, "note_off": 1}
+    # And still never actually recorded any of it for real.
+    assert eng._capture.is_recording is False
+
+
 # -- stream_session: events feed _handle, events_total/events_by_type -------
 
 def test_stream_session_counts_events_by_type(tmp_path):
@@ -330,6 +378,33 @@ def test_stream_session_skips_a_malformed_json_line_and_continues(tmp_path, capl
         summary = stream_session(eng, str(p), instant=True)
     assert summary["events_total"] == 2
     assert any("malformed" in r.message.lower() or "json" in r.message.lower()
+              for r in caplog.records)
+
+
+# -- fix wave (2026-08-07, Minor finding): a line can be VALID JSON but not
+# a JSON OBJECT at all (a bare number, string, or array) -- `_iter_lines`'s
+# malformed-JSON catch only ever guards `json.JSONDecodeError`, so `42`,
+# `"x"`, `[1]` all parse cleanly and are handed to `stream_session`'s
+# `line.get("kind")` call, which raises `AttributeError` (int/str/list have
+# no `.get`) straight out of the whole replay -- past `clients/cli.py::
+# _handle_replay`'s own `except OSError` (an unrelated exception class),
+# crashing the CLI with a raw traceback instead of a clean skip.
+
+@pytest.mark.parametrize("bad_line", ["42", '"x"', "[1]"])
+def test_stream_session_skips_a_non_dict_json_line_and_continues(tmp_path, caplog, bad_line):
+    p = tmp_path / "session.jsonl"
+    p.write_text(
+        json.dumps(_header()) + "\n"
+        + json.dumps(_event(ts=1000.0, type="note_on")) + "\n"
+        + bad_line + "\n"
+        + json.dumps(_event(ts=1000.1, type="note_off", data2=0)) + "\n"
+    )
+    eng = build_offline_engine()
+    with caplog.at_level("WARNING"):
+        summary = stream_session(eng, str(p), instant=True)   # must not raise
+    assert summary["events_total"] == 2
+    assert summary["events_by_type"] == {"note_on": 1, "note_off": 1}
+    assert any("json" in r.message.lower() or "object" in r.message.lower()
               for r in caplog.records)
 
 
