@@ -1,0 +1,34 @@
+[Unit]
+Description=midicrt2 web observer (read-only)
+After=midicrtd.service
+Wants=midicrtd.service
+
+[Service]
+User=billie
+# No Group= override (unlike midicrtd.service's Group=audio, needed for
+# PortAudio device access, or midicrt-fb.service's Group=video +
+# SupplementaryGroups=input, needed for /dev/fb0 + evdev): this unit is a
+# pure protocol CLIENT of midicrtd's existing Unix socket
+# (/run/midicrt/ctl.sock, created by midicrtd's own RuntimeDirectory=midicrt
+# as billie:audio) and never touches audio/video/input devices itself.
+# Connecting to that socket only requires owner-level access on the socket
+# file plus traversal on /run/midicrt, both already satisfied by matching
+# midicrtd's own User=billie -- no supplementary group needed.
+ExecStart=/home/billie/midicrt2-venv/bin/midicrt-web --host 0.0.0.0 --port 8766
+# Deployment decision (docs/phase6-notes.md item 7, docs/phase6-web.md):
+# bind 0.0.0.0:8766 (LAN-reachable, no auth) but READ-ONLY -- --allow-control
+# is deliberately NOT passed here. This mirrors v1's own web observer
+# (midicrt-web-observer.service, :8765, also 0.0.0.0, also read-only) so v2
+# ships the SAME trust posture the Pi already runs today, not a stricter or
+# looser one invented for this unit alone. The Pi has no firewall and this
+# is a single-purpose LAN appliance; control (page navigation, capture
+# start/stop, bindings) stays reachable only via `midicrt`/`midicrt-fb`/the
+# TUI on the box itself, or a future explicit `--allow-control` opt-in.
+# Revisit at Phase 7 cutover (see docs/phase3-parity.md) once this is the
+# ONLY web surface in play, not a parity add-on running alongside v1's.
+Restart=on-failure
+RestartSec=2
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
