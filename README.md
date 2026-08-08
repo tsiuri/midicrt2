@@ -9,6 +9,14 @@ Run tests: `~/midicrt2-venv/bin/pytest`
 
 ## Docs
 
+- `docs/phase5-capture.md` — event-sourced session capture format spec
+  (header/event/action-mark/page_changed/tempo lines, provenance origins),
+  `index.json`/retention/pin, loss-window + write-failure containment,
+  `midicrt replay` usage + suppression semantics + the tick-freeze and
+  transport-running limitations, learned-binding port durability
+  (`bind.list`'s `port_present`), `--range` for continuous learn, and the
+  help page's live keymap section. Read this before building anything
+  against captured session files or the replay pipeline.
 - `docs/phase4-bindings.md` — keymap.toml/bindings.toml schema reference,
   `midicrt bind learn/list/remove/cancel` usage, trigger-vs-continuous
   guidance, roster-dependence caveats, troubleshooting. Read this before
