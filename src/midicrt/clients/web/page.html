@@ -91,17 +91,28 @@ function escapeHtml(s) {
   })[c]);
 }
 
-function fmtBpm(bpm) { return (bpm === null || bpm === undefined) ? "—" : Number(bpm).toFixed(1); }
+// -- status bar: the bridge renders this string server-side via
+// clients/chrome.py's status_text() (docs/phase6-notes.md item 1,
+// merge-reconciliation fix) and ships it alongside the raw vm as
+// `status_text` -- displayed here VERBATIM (`textContent`, so it's
+// auto-escaped) instead of this page keeping its own JS copy of the
+// format. That old copy had already drifted from chrome.py's real output
+// (no `rec`/REC_MARKER handling at all) -- one rendering path now, so it
+// can never drift again.
+function renderStatus(text) {
+  statusEl.textContent = text || "connecting…";
+}
 
-// -- status bar: mirrors clients/chrome.py's status_text() word-for-word --
-function renderStatus(vm) {
-  if (!vm) { statusEl.textContent = "connecting…"; return; }
-  const bar = String(vm.bar ?? 0).padStart(4, "0");
-  const beat = String(vm.beat ?? 1).padStart(2, "0");
-  const state = vm.running ? "RUN" : "STOP";
-  const source = vm.source || "no clock";
-  statusEl.textContent =
-    `BAR ${bar}  BEAT ${beat}   ${fmtBpm(vm.bpm)} BPM   ${state}   clock: ${source}`;
+// -- nav roster: describe's `topics` (page.* entries, roster/cycle order)
+// -- NOT the alphabetized `pages` list, which is display-only (see
+// engine/server.py's own comment on the `describe` response). Using
+// `pages` here would show buttons in alphabetical order while page.next/
+// page.prev cycle in roster order -- clicking the nav wouldn't match
+// what the keyboard/CLI actions actually do.
+function pageRoster(describe) {
+  return (describe.topics || [])
+    .filter((t) => typeof t === "string" && t.startsWith("page."))
+    .map((t) => t.slice("page.".length));
 }
 
 function renderPageNav(current, pages) {
@@ -171,11 +182,11 @@ function handleMessage(msg) {
   if (msg.kind === "hello") {
     currentPage = msg.page;
     connEl.textContent = "connected"; connEl.className = "up";
-    if (describeCache) renderPageNav(currentPage, describeCache.pages);
+    if (describeCache) renderPageNav(currentPage, pageRoster(describeCache));
     return;
   }
   if (msg.kind === "snapshot") {
-    if (msg.topic === "overlay.status") { renderStatus(msg.data); return; }
+    if (msg.topic === "overlay.status") { renderStatus(msg.status_text); return; }
     if (typeof msg.topic === "string" && msg.topic.startsWith("page.")) {
       renderPage(msg.topic, msg.data);
     }
@@ -183,16 +194,21 @@ function handleMessage(msg) {
   }
   if (msg.kind === "event" && msg.name === "page_changed") {
     currentPage = msg.data.page;
-    if (describeCache) renderPageNav(currentPage, describeCache.pages);
+    if (describeCache) renderPageNav(currentPage, pageRoster(describeCache));
   }
 }
 
-// -- /api/describe: page list + action schema (control surface) -----------
+// -- /api/describe: page roster (topics, roster order) + action schema
+// (control surface) -----------------------------------------------------
 async function loadDescribe() {
   try {
     const res = await fetch("/api/describe");
     describeCache = await res.json();
-    renderPageNav(currentPage, describeCache.pages);
+    // Seed currentPage from describe's current_page (docs/phase6-notes.md
+    // item 2) when the `hello` ws frame hasn't landed yet -- fetch() and
+    // the websocket connect race, so describe can resolve first.
+    if (currentPage === null) currentPage = describeCache.current_page;
+    renderPageNav(currentPage, pageRoster(describeCache));
     if (ALLOW_CONTROL) populateActionSelect(describeCache.actions || {});
   } catch (e) {
     // describe is a nice-to-have for nav/control; snapshots still render without it.

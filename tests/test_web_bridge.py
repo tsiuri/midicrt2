@@ -7,6 +7,7 @@ import asyncio
 
 from test_server import make
 
+from midicrt.clients import chrome
 from midicrt.clients.base import EngineClient
 from midicrt.clients.web.bridge import Bridge, WebSink
 from midicrt.engine.core import MidiEvent
@@ -121,7 +122,14 @@ async def test_bridge_follows_page_changed_and_resubscribes(tmp_path):
 
 
 async def test_bridge_describe_and_action_proxy_to_engine(tmp_path):
-    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    # Pinned to the 2-page roster this assertion actually cares about
+    # (merge-reconciliation fix, docs/phase6-notes.md item 5): this test
+    # was written when Config's default roster WAS ["eventlog", "voices"]
+    # (pre-phase-4); master's default has since grown to 14 pages
+    # (phase-3 task 12's gap ports). Pinning `pages=` here makes that
+    # dependency explicit instead of accidentally relying on whatever the
+    # global default happens to be today.
+    eng, srv, task = await make(tmp_path, tick_hz=100.0, pages=["eventlog", "voices"])
     bridge = await _start_bridge(srv)
 
     data = await asyncio.to_thread(bridge.describe)
@@ -132,6 +140,47 @@ async def test_bridge_describe_and_action_proxy_to_engine(tmp_path):
 
     await asyncio.to_thread(bridge.stop)
     eng.stop(); await task; await srv.close()
+
+
+def test_bridge_attaches_rendered_status_text_to_overlay_status_snapshot():
+    """Merge-reconciliation fix (docs/phase6-notes.md item 1, status-bar
+    copy drift): the bridge must render the status STRING itself via
+    `chrome.status_text()` -- the exact function clients/tui.py's/
+    fb/app.py's own status rows call -- and attach it to the fanned-out
+    message as `status_text`, so page.html can display it verbatim instead
+    of keeping its own copy of the format (the pre-merge copy had already
+    drifted: no `rec`/REC_MARKER handling at all). Constructed without
+    calling `Bridge.start()` -- `_on_message`'s snapshot path never touches
+    `self.loop`, so this is a pure, fast, dependency-free unit test, same
+    style as the WebSink tests below.
+    """
+    bridge = Bridge(EngineClient("/nonexistent"))
+    sink = WebSink()
+    bridge.add_sink(sink)
+    vm = {"bar": 3, "beat": 2, "bpm": 120.0, "running": True, "source": "midi", "rec": True}
+    bridge._on_message({"kind": "snapshot", "topic": chrome.OVERLAY_STATUS_TOPIC, "data": vm})
+
+    msg = sink.queue.get_nowait()
+    assert msg["status_text"] == chrome.status_text(vm)
+    assert msg["status_text"].startswith(chrome.REC_MARKER)  # the rec dot must show
+
+
+def test_bridge_late_sink_replay_includes_rendered_status_text():
+    """The `status_text` enrichment must survive `add_sink()`'s cached-latest
+    replay too, not just the live fan-out path -- a browser connecting
+    mid-session must see the rec-aware string immediately, not a raw vm it
+    has to render itself."""
+    bridge = Bridge(EngineClient("/nonexistent"))
+    early = WebSink()
+    bridge.add_sink(early)
+    vm = {"bar": 0, "beat": 1, "bpm": None, "running": False, "source": None, "rec": False}
+    bridge._on_message({"kind": "snapshot", "topic": chrome.OVERLAY_STATUS_TOPIC, "data": vm})
+    early.queue.get_nowait()  # drain so the late sink's replay is unambiguous
+
+    late = WebSink()
+    bridge.add_sink(late)  # joins AFTER the snapshot already landed
+    replayed = late.queue.get_nowait()
+    assert replayed["status_text"] == chrome.status_text(vm)
 
 
 def test_websink_offer_drops_and_replaces_when_full():

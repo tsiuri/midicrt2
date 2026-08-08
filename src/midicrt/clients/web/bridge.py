@@ -53,7 +53,12 @@ from midicrt.clients.base import (
     switch_topic,
 )
 
-DEFAULT_SUBSCRIBE_RATE = 10.0
+# Web spec (docs/phase6-notes.md item 6): 5/s, not the 10/s this branch
+# shipped with pre-merge -- a browser tab is a slower consumer than a
+# terminal render loop, and WebSink's own drop-and-replace queue already
+# makes a higher rate here pure waste (the queue can hold exactly one
+# pending frame regardless).
+DEFAULT_SUBSCRIBE_RATE = 5.0
 
 
 class WebSink:
@@ -145,9 +150,20 @@ class Bridge:
         if kind == "snapshot":
             topic = msg.get("topic")
             if topic == self.state["topic"] or topic == chrome.OVERLAY_STATUS_TOPIC:
-                self._latest[topic] = msg
                 if topic == chrome.OVERLAY_STATUS_TOPIC:
                     self.state["status_vm"] = msg["data"]
+                    # Merge-reconciliation fix (docs/phase6-notes.md item 1):
+                    # render the status STRING here, server-side, with the
+                    # exact same `chrome.status_text()` function clients/
+                    # tui.py's/fb/app.py's own status rows call, and ship it
+                    # alongside the raw vm as `status_text`. page.html
+                    # displays this verbatim instead of keeping its own JS
+                    # copy of the format -- the pre-merge copy had silently
+                    # drifted (no `rec`/REC_MARKER handling at all, see
+                    # chrome.py's own REC_MARKER). One rendering path, never
+                    # two to keep in sync again.
+                    msg["status_text"] = chrome.status_text(msg["data"])
+                self._latest[topic] = msg
                 self._fan_out(msg)
             # else: a stale snapshot for a topic we just switched away from
             # (switch_topic's re-subscribe timing) -- drop it, same filter
