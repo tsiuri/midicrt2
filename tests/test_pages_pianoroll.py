@@ -8,6 +8,8 @@ timestamps (mirroring tests/test_analyzers_transport.py's own convention)
 rather than going through engine/midi_in.py -- these are the state
 machine's own math contract in isolation.
 """
+from itertools import pairwise
+
 import pytest
 
 from midicrt.engine.core import MidiEvent
@@ -514,3 +516,162 @@ def test_each_page_instance_gets_its_own_independent_state():
     page_a.handle(note_on(0, 60, ts=0.0))
     assert page_a.view_model()["notes"]
     assert page_b.view_model()["notes"] == []   # untouched
+
+
+# -- Phase 8 Task 3: the "paper" grid (docs/visual-audit.md §9c) -----------
+#
+# `grid.beat_xs`/`grid.bar_xs` are computed through the EXACT SAME `_x()`/
+# `_dist()`/`_current_bpm()` machinery the notes above already exercise --
+# see pages/pianoroll.py's module docstring "Paper grid" section for the
+# `_beat_zero_ts` anchor + current-bpm-derived period design and why it
+# deliberately reuses the "re-project ALL history via current bpm" choice
+# `_dist()` already made for notes, rather than v1's own per-historical-
+# tempo-segment tick integration.
+
+def test_grid_pitch_guide_ys_one_entry_per_semitone_with_correct_c_flag():
+    s = PianorollState(now=100.0, pitch_lo=60, pitch_hi=72)
+    guides = s.view_model()["grid"]["pitch_guide_ys"]
+    assert len(guides) == 13   # 60..72 inclusive
+    assert [g["pitch"] for g in guides] == list(range(72, 59, -1))   # hi->lo, top-down
+    c_pitches = {g["pitch"] for g in guides if g["is_c"]}
+    assert c_pitches == {60, 72}   # C4 and C5 only
+    assert {g["name"] for g in guides if g["is_c"]} == {"C4", "C5"}
+
+
+def test_grid_pitch_guide_y_matches_note_y_exactly():
+    # Float-identity, not approx -- both are computed by the literal same
+    # `_y(pitch)` expression on the same (pitch, hi, lo) ints, so a note's
+    # "y" and its row's guide "y" must compare bit-equal, letting a
+    # renderer match them by set membership with no epsilon fudge.
+    s = PianorollState(now=100.0, pitch_lo=60, pitch_hi=72)
+    s.handle(note_on(0, 66, ts=99.0))
+    note_y = s.view_model()["notes"][0]["y"]
+    guide_ys = {g["y"] for g in s.view_model()["grid"]["pitch_guide_ys"]}
+    assert note_y in guide_ys
+
+
+def test_grid_running_flag_reflects_transport_state():
+    s = PianorollState(now=100.0)
+    assert s.view_model()["grid"]["running"] is False
+    s.handle(transport("start", ts=100.0))
+    assert s.view_model()["grid"]["running"] is True
+    s.handle(transport("stop", ts=101.0))
+    assert s.view_model()["grid"]["running"] is False
+
+
+def test_grid_beat_lines_evenly_spaced_at_known_bpm_wallclock_mode():
+    # bpm=120 (period 0.5s), span_s=8.0, zoom=1.0, beat_zero_ts == construction
+    # "now" -- so the nearest-to-now boundary sits exactly at x=1.0 and every
+    # subsequent one steps back by period/span = 0.5/8 = 0.0625 in x, down to
+    # and including the window edge (dist == span is inclusive).
+    s = PianorollState(now=100.0, span_s=8.0, idle_bpm=120.0)
+    grid = s.view_model()["grid"]
+    xs = sorted(grid["beat_xs"] + grid["bar_xs"])
+    assert len(xs) == 17   # m = 0..-16 inclusive
+    assert xs[0] == pytest.approx(0.0)
+    assert xs[-1] == pytest.approx(1.0)
+    diffs = [b - a for a, b in pairwise(xs)]
+    assert all(d == pytest.approx(0.0625) for d in diffs)
+
+
+def test_grid_bar_lines_are_every_fourth_beat():
+    s = PianorollState(now=100.0, span_s=8.0, idle_bpm=120.0)
+    grid = s.view_model()["grid"]
+    assert len(grid["bar_xs"]) == 5     # m = 0, -4, -8, -12, -16
+    assert len(grid["beat_xs"]) == 12   # the remaining 12 of the 17 total
+    # bar_xs and beat_xs never share a position
+    assert not (set(grid["bar_xs"]) & set(grid["beat_xs"]))
+
+
+def test_grid_scales_with_zoom():
+    s = PianorollState(now=100.0, span_s=8.0, idle_bpm=120.0)
+    base_count = len(s.view_model()["grid"]["beat_xs"] + s.view_model()["grid"]["bar_xs"])
+    s.zoom_by(1.0)   # zoom 1.0 -> 2.0, halves the effective span
+    zoomed_count = len(s.view_model()["grid"]["beat_xs"] + s.view_model()["grid"]["bar_xs"])
+    assert base_count == 17
+    assert zoomed_count == 9   # span halves to 4.0s -> m = 0..-8 inclusive
+
+
+def test_grid_tempo_mode_spacing_differs_from_wallclock_at_same_bpm():
+    # Proves the grid genuinely re-projects through the ACTIVE mode's own
+    # `_dist()`, not just a fixed real-time spacing -- mirrors the note-level
+    # squish/stretch tests above. bpm=240 (period 0.25s): wallclock's fixed
+    # 8s window covers 32 periods either side of "now" (33 lines); tempo
+    # mode's fixed 16-beat window covers only 16 periods (17 lines) at the
+    # SAME bpm/period, because tempo's distance unit is beats, not seconds.
+    def _count(mode: str) -> int:
+        s = PianorollState(now=100.0, span_s=8.0, span_beats=16.0, idle_bpm=240.0)
+        s.set_projection(mode)
+        grid = s.view_model()["grid"]
+        return len(grid["beat_xs"] + grid["bar_xs"])
+
+    assert _count("wallclock") == 33
+    assert _count("tempo") == 17
+
+
+def test_grid_keeps_scrolling_while_stopped_at_idle_bpm():
+    # The core "paper" ruling (docs/visual-audit.md §9c/`pianoroll_state.py`
+    # `on_tick`): the grid must not freeze while the transport is stopped --
+    # it keeps advancing at idle_scroll_bpm from wall-clock time alone.
+    # Never started at all here (mirrors v1's own "idle before any run"
+    # case, where `last_run_bpm` already defaults to `idle_scroll_bpm`).
+    s = PianorollState(now=100.0, span_s=8.0, idle_bpm=120.0)   # period 0.5s
+    first = s.view_model()["grid"]
+    assert min(abs(x - 1.0) for x in first["beat_xs"] + first["bar_xs"]) == pytest.approx(0.0)
+    assert s.tick(105.25) is False   # nothing has ever played -- not dirty
+    later = s.view_model()["grid"]
+    # 5.25s later is 10.5 periods -- NOT a whole number of beats, so the
+    # boundary nearest "now" is no longer exactly at x=1.0: proof the grid's
+    # phase has genuinely advanced with wall-clock time, not just been
+    # recomputed identically.
+    nearest_gap = min(1.0 - x for x in later["beat_xs"] + later["bar_xs"])
+    assert nearest_gap == pytest.approx(0.25 / 8.0)
+    assert later["running"] is False
+
+
+def test_grid_uses_last_run_bpm_after_stop_not_idle_bpm():
+    # v1's `last_run_bpm` persists across a stop -- the grid must keep
+    # scrolling at the tempo the transport actually ran at, not fall back
+    # to idle_scroll_bpm just because the transport is currently stopped.
+    s = PianorollState(now=0.0, span_s=8.0, idle_bpm=120.0)
+    s.handle(transport("start", ts=0.0))
+    s.handle(clock_tick(ts=0.25, batch_start=0.0))   # bpm = 60/0.25 = 240
+    assert s._current_bpm() == pytest.approx(240.0)
+    s.handle(transport("stop", ts=0.5))
+    assert s._current_bpm() == pytest.approx(240.0)   # NOT idle_bpm=120
+    s.tick(1.0)
+    grid = s.view_model()["grid"]
+    xs = sorted(grid["beat_xs"] + grid["bar_xs"])
+    diffs = [b - a for a, b in pairwise(xs)]
+    # period/span = 0.25/8 = 0.03125 -- proves 240bpm spacing, not 120bpm's
+    # 0.0625, despite the transport being stopped at the time of this read.
+    assert all(d == pytest.approx(0.03125) for d in diffs)
+
+
+def test_grid_beat_zero_anchor_resets_on_transport_start():
+    # Advancing wall-clock time alone (no "start") leaves the OLD anchor in
+    # place, so the nearest-to-now boundary drifts off x=1.0 the moment
+    # elapsed time isn't a whole number of periods. A "start" event at that
+    # SAME moment instead re-anchors phase exactly there (v1's tick counter
+    # resets to 0 on "start"), snapping the nearest boundary back to exactly
+    # x=1.0 -- proof the anchor genuinely moved, not just stayed pinned to
+    # construction time while "now" moved past it.
+    def _nearest_x(state) -> float:
+        grid = state.view_model()["grid"]
+        return max(grid["beat_xs"] + grid["bar_xs"])
+
+    drifted = PianorollState(now=100.0, span_s=8.0, idle_bpm=120.0)
+    drifted.tick(100.25)
+    assert _nearest_x(drifted) == pytest.approx(0.96875)   # 1 - 0.25/8
+
+    restarted = PianorollState(now=100.0, span_s=8.0, idle_bpm=120.0)
+    restarted.handle(transport("start", ts=100.25))
+    assert _nearest_x(restarted) == pytest.approx(1.0)
+
+
+def test_grid_bpm_non_positive_produces_empty_grid_lines_not_a_crash():
+    s = PianorollState(now=100.0, idle_bpm=0.0)
+    grid = s.view_model()["grid"]
+    assert grid["beat_xs"] == []
+    assert grid["bar_xs"] == []
+    assert grid["pitch_guide_ys"]   # pitch guides are independent of bpm

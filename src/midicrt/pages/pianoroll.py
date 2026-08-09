@@ -217,13 +217,122 @@ Ported v1 controls
   `spans`/history). "continue" has no explicit v1 branch in
   `on_midi_event` at all (falls through to nothing) -- ported as a genuine
   no-op here too.
+
+Paper grid (Phase 8 Task 3, docs/visual-audit.md §9c's "build-priority #2")
+---------------------------------------------------------------------------
+The task's own flagship visual: "a faint low-opacity grid, synced to
+play/pause and BPM, fixed almost like paper scrolling across the screen."
+v1's exact mechanism (audit-confirmed, `compositor_renderer.py::
+_render_pianoroll`'s dotted-guide block, fed by `pianoroll_state.py::
+on_tick`'s dual-clock scroll): horizontal dotted separators between pitch
+rows (brighter on C rows), dotted vertical guides at bar/beat tick
+boundaries computed from the SAME `tick_left`/`tick_right_edge` anchor the
+note spans use -- so grid and notes are always in registration, and the
+grid keeps advancing via wall-clock-at-`idle_scroll_bpm` even while the
+transport is stopped (the literal "paper" feel).
+
+`view_model()["grid"]` ports this as pure data (task brief: "the renderer
+can draw without doing music math"):
+
+    {"beat_xs": [0..1, ...], "bar_xs": [0..1, ...],
+     "pitch_guide_ys": [{"y": 0..1, "is_c": bool, "pitch": int, "name": str}, ...],
+     "running": bool}
+
+- `beat_xs`/`bar_xs`: x-fractions of beat/bar boundaries currently inside
+  the visible window, using the EXACT SAME `_x()`/`_dist()`/`_current_bpm()`
+  projection the notes above already go through -- a beat boundary and a
+  note onset at the same real instant always land at the same x, in
+  EITHER mode, automatically (no grid-specific mode branch needed). Bar
+  boundaries (every `BEATS_PER_BAR`-th beat, imported from `analyzers/
+  transport.py` rather than re-declared) are reported separately and are
+  mutually exclusive with `beat_xs` -- mirrors v1's own timeline-strip loop
+  (`if t % bar_ticks != 0:` before adding a beat tick), so a renderer never
+  double-draws the same column.
+- `pitch_guide_ys`: one entry per semitone in `[pitch_lo, pitch_hi]`,
+  top-down (matches `notes[]`'s own "y: 0 at the highest visible pitch"
+  convention) -- `y` for pitch `p` is the IDENTICAL `_y(p)` expression a
+  note at that pitch gets, so a renderer can match "does this row have a
+  visible note" by plain set membership on `y`, no epsilon needed (see
+  `test_grid_pitch_guide_y_matches_note_y_exactly`). `pitch`/`name` are a
+  disclosed EXTENSION beyond the task brief's minimal
+  `{y, is_c}` sketch -- the brief's own "renderer can draw without doing
+  music math" goal applies to the WHOLE grid dict, and the label column
+  needs a note name per row; computing `NOTE_NAMES[pitch % 12]` +
+  octave in the renderer would be exactly the kind of music math the brief
+  says the grid should spare it, so it's precomputed here instead (`NOTE_
+  NAMES` imported from `analyzers/theory.py`, the same table `pages/
+  chordkey.py` already reuses, rather than re-declared).
+- `running`: `self._running`, plain passthrough -- lets a renderer show a
+  different chrome cue for "genuinely playing" vs "idle-scrolling" without
+  it needing to infer that from bpm/mode itself.
+
+Adapted, not a literal port: the anchor mechanism
+---------------------------------------------------------------------------
+v1 keeps one monotonic INTEGER tick counter (reset to 0 on transport
+"start", advanced by real ticks while running or extrapolated wall-clock
+"virtual ticks" while stopped -- see the "Fixed like paper" scroll row in
+the module's own class docstring reference, `pianoroll_state.py::on_tick`)
+and finds bar/beat boundaries by integer modulo on that counter. v2 has no
+such counter (this port's storage substrate is real timestamps, not
+ticks -- see this module's OWN docstring intro). Instead: `_beat_zero_ts`
+is a single real timestamp anchor -- the last transport-"start" event's
+`ts`, or this state's own construction time if the transport has never
+started (mirrors v1's `last_run_bpm` defaulting to `idle_scroll_bpm`
+before any run: the paper is already scrolling from boot, not frozen until
+the first "start"). `_grid_instants()` walks backward from `_now` in steps
+of `60/_current_bpm()` seconds relative to that anchor, yields each
+instant's SIGNED integer offset `m` (for `m % BEATS_PER_BAR == 0` bar
+detection) and its projected x -- stopping once `_dist()` exceeds the
+active projection's own `_span()`, so zoom/mode/bpm all apply automatically
+via the same functions notes use, with NO grid-specific window math
+duplicated.
+
+This makes the SAME simplification `_dist()` already discloses for note
+projection (module docstring above, "Tempo-relative projection math"):
+every boundary is re-projected using the CURRENT bpm uniformly, not v1's
+own per-historical-tempo-segment tick integration. A live tempo change
+therefore rescales grid spacing exactly like it rescales note spacing (by
+design -- see `test_grid_tempo_mode_spacing_differs_from_wallclock_at_
+same_bpm`), but a boundary from BEFORE a tempo change won't stay
+phase-locked to where v1's real MIDI clock would have put it at the time.
+Accepted for the reasons `_dist()`'s own docstring already gives: v2 has
+no per-historical-segment integration to draw on, and matching notes'
+existing behavior keeps grid and notes visually consistent with each
+other, which matters far more here than exact fidelity to a mechanism v1
+itself only needed because ticks were its only available unit.
+`_GRID_MAX_INSTANTS` bounds the walk defensively (a malformed/adversarial
+`clock_tick` pair could otherwise derive an extreme bpm and loop far
+longer than any real session's window could ever need -- generous enough
+that no plausible bpm/zoom/span combination in this module's own
+documented ranges gets clipped).
+
+Not ported (disclosed, out of THIS task's scope -- see task-3-brief.md and
+docs/visual-audit.md §9c's own row-by-row build-priority list)
+---------------------------------------------------------------------------
+- **Active-row background tint + 1s fade-out** and **overlap flash** (both
+  distinct §9c audit rows from the label-column invert this task DOES add)
+  are per-frame ANIMATIONS keyed off wall-clock, not projected VM state --
+  phase-8's task-4 brief ("Animation & burn-in catalog... the audit is the
+  checklist") is the one that owns porting animated/burn-in rows; adding
+  them here would pre-empt that task's own TDD pass over the exact same
+  audit rows.
+- **The separate solid "Bars" timeline strip** (§9c: one pixel-ROW of solid
+  GREEN_MID/GREEN_DIM ticks, distinct from the dotted guides this task
+  ports) -- not requested by this task's brief ("faint beat/bar gridlines
+  behind the roll" -- the dotted backdrop, not a second chrome row) and no
+  v2 renderer currently reserves space for a fourth chrome strip; flagged
+  here rather than silently folded in or silently dropped.
 """
 from __future__ import annotations
 
+import math
 import time
 from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from midicrt.analyzers.theory import NOTE_NAMES
+from midicrt.analyzers.transport import BEATS_PER_BAR
 
 if TYPE_CHECKING:
     # Type-only: mirrors analyzers/transport.py's own comment -- avoids a
@@ -255,6 +364,18 @@ HISTORY_RETENTION_S = 120.0
 N_CHANNELS = 16
 _ALL_NOTES_OFF_CONTROL = 123   # v1 quirk: only 123, not 120 -- see module docstring
 _PROJECTION_MODES = ("wallclock", "tempo")
+
+# -- paper-grid tunables (Phase 8 Task 3, see module docstring's "Paper
+# grid" section) -----------------------------------------------------------
+# Defensive cap on `_grid_instants()`'s backward walk -- see that section's
+# closing paragraph for why only wallclock mode's line COUNT can scale with
+# bpm at all (tempo mode's count is always bounded by `_effective_span_
+# beats()`, currently <=64 given this module's own ZOOM_MIN/DEFAULT_SPAN_
+# BEATS). Sized well above the worst plausible wallclock case (DEFAULT_
+# SPAN_S / ZOOM_MIN=32s of window at an implausibly fast 10,000bpm derived
+# bpm is ~5333 instants) so no realistic bpm/zoom/span combination is ever
+# clipped -- this only bites a malformed/adversarial clock_tick pair.
+_GRID_MAX_INSTANTS = 8192
 
 
 @dataclass
@@ -327,6 +448,12 @@ class PianorollState:
         # running is ignored" gate.
         self._running = False
         self._now = float(now) if now is not None else time.time()
+        # Paper-grid beat-zero anchor (module docstring's "Adapted, not a
+        # literal port" section) -- defaults to construction time so the
+        # grid is already "scrolling" at `idle_bpm` before any transport
+        # "start" ever arrives, matching v1's own `last_run_bpm` defaulting
+        # to `idle_scroll_bpm` pre-run rather than being undefined/frozen.
+        self._beat_zero_ts = self._now
 
     # -- event handling ------------------------------------------------------
 
@@ -334,6 +461,9 @@ class PianorollState:
         self._now = max(self._now, ev.ts)
         if ev.type == "start":
             self._running = True
+            # Re-anchor bar/beat phase to THIS downbeat -- v1's own tick
+            # counter resets to 0 on "start" (see module docstring).
+            self._beat_zero_ts = ev.ts
             return self._reset()
         if ev.type == "stop":
             self._running = False
@@ -525,6 +655,54 @@ class PianorollState:
         return {"mode": self._projection, "span_s": span_s, "span_beats": span_beats,
                 "zoom": self._zoom}
 
+    # -- paper grid (module docstring's "Paper grid" section) -----------------
+
+    def _grid_instants(self):
+        """Yield `(m, x)` for every beat boundary currently inside the
+        visible window, closest-to-`now` first. `m` is the SIGNED integer
+        beat offset from `_beat_zero_ts` (`m == 0` is the anchor itself,
+        always a bar boundary); `x` is `_x()`'s own projection of that
+        boundary's real timestamp, so it lands exactly where a note onset
+        at the same instant would. Stops once `_dist()` exceeds `_span()`
+        -- the same window every note is already filtered against."""
+        bpm = self._current_bpm()
+        if bpm <= 0:
+            return
+        period = 60.0 / bpm
+        span = self._span()
+        if span <= 0:
+            return
+        m = math.floor((self._now - self._beat_zero_ts) / period)
+        emitted = 0
+        while emitted < _GRID_MAX_INSTANTS:
+            ts = self._beat_zero_ts + m * period
+            if self._dist(ts) > span:
+                return
+            yield m, self._x(ts, span)
+            m -= 1
+            emitted += 1
+
+    def _grid(self) -> dict:
+        beat_xs: list[float] = []
+        bar_xs: list[float] = []
+        for m, x in self._grid_instants():
+            (bar_xs if m % BEATS_PER_BAR == 0 else beat_xs).append(x)
+        pitch_guide_ys = [
+            {
+                "y": self._y(pitch),
+                "is_c": pitch % 12 == 0,
+                "pitch": pitch,
+                "name": f"{NOTE_NAMES[pitch % 12]}{pitch // 12 - 1}",
+            }
+            for pitch in range(self._pitch_hi, self._pitch_lo - 1, -1)
+        ]
+        return {
+            "beat_xs": beat_xs,
+            "bar_xs": bar_xs,
+            "pitch_guide_ys": pitch_guide_ys,
+            "running": self._running,
+        }
+
     def _iter_spans(self):
         yield from self._closed
         yield from self._active.values()
@@ -554,6 +732,7 @@ class PianorollState:
             "notes": notes,
             "window": self._window(),
             "range": {"lo": self._pitch_lo, "hi": self._pitch_hi},
+            "grid": self._grid(),
         }
 
 

@@ -74,16 +74,25 @@ LUM_DIM: Color = (0, 140, 45)      # v1 GREEN_DIM
 LUM_MID: Color = (0, 180, 50)      # v1 GREEN_MID
 LUM_BRIGHT: Color = (0, 255, 80)   # v1 GREEN_BRIGHT / _CH_BASE_RGB
 
-# Symbolic lookup for the four tiers — lets a per-page ramp table (below)
+# -- Paper-grid tiers (Phase 8 Task 3): the two v1 roll-guide constants
+# task-2-report.md §2/§7 explicitly deferred adding ("not adopted... grid
+# guides are a separate, later task per the brief") -- byte-for-byte copies,
+# same "looked up directly, never computed" convention as the four above.
+LUM_FAINT_C: Color = (0, 68, 27)     # v1 _ROLL_H_DOT_C ("slightly brighter on C rows")
+LUM_BAR_GUIDE: Color = (0, 86, 33)   # v1 _ROLL_V_BAR_DOT ("dotted bar-tracking verticals")
+
+# Symbolic lookup for the tiers — lets a per-page ramp table (below)
 # name a fixed role by string instead of importing+repeating the tuple, and
 # gives the guard test / a future debug tool one place to enumerate "every
 # tier v1 actually uses" without re-deriving the list.
 TIERS: dict[str, Color] = {
     "off": LUM_OFF,
     "faint": LUM_FAINT,
+    "faint_c": LUM_FAINT_C,
     "dim": LUM_DIM,
     "mid": LUM_MID,
     "bright": LUM_BRIGHT,
+    "bar_guide": LUM_BAR_GUIDE,
 }
 
 

@@ -382,3 +382,111 @@ def test_open_fb_mmap_resizes_pre_existing_file(tmp_path):
     finally:
         mm.close()
         f.close()
+
+
+# -- dotted-line primitives (Phase 8 Task 3: pianoroll paper-grid) ----------
+#
+# v1's own dotted-guide layer (`fb/compositor_renderer.py::_render_pianoroll`)
+# pokes its numpy buffer directly with a strided slice assignment
+# (`buf[y, x0::stride] = color`) -- not reproducible here without breaking
+# this module's own "renderers must draw only through Surface's methods,
+# never reach into surface.image directly" convention (see module
+# docstring). These two primitives give a renderer the same visual (a
+# faint, screen-fixed dotted backdrop notes scroll across) through the
+# ordinary Surface API instead: every `stride`-th pixel along a horizontal
+# or vertical run is lit; the pixels in between are left UNTOUCHED (not
+# painted background) so the grid reads as a backdrop, not a solid line
+# with holes punched in it.
+
+
+def test_dotted_hline_lights_every_stride_th_pixel():
+    surf = Surface(12, 3)
+    surf.clear(BLACK)
+    surf.dotted_hline(0, 1, 10, RED, stride=3)   # x = 0, 3, 6, 9
+    px = surf.image.load()
+    for x in (0, 3, 6, 9):
+        assert px[x, 1] == RED
+    for x in (1, 2, 4, 5, 7, 8):
+        assert px[x, 1] == BLACK
+    assert px[0, 0] == BLACK   # rows above/below untouched
+    assert px[0, 2] == BLACK
+
+
+def test_dotted_hline_phase_shifts_the_starting_offset():
+    surf = Surface(12, 1)
+    surf.clear(BLACK)
+    surf.dotted_hline(0, 0, 10, RED, stride=3, phase=1)   # x = 1, 4, 7
+    px = surf.image.load()
+    for x in (1, 4, 7):
+        assert px[x, 0] == RED
+    for x in (0, 2, 3, 5, 6, 8, 9):
+        assert px[x, 0] == BLACK
+
+
+def test_dotted_hline_clips_to_surface_bounds():
+    surf = Surface(6, 1)
+    surf.clear(BLACK)
+    surf.dotted_hline(-3, 0, 10, RED, stride=3)   # dots at x=-3,0,3,6,9 -> only 0,3 on-surface
+    px = surf.image.load()
+    assert px[0, 0] == RED
+    assert px[3, 0] == RED
+    for x in (1, 2, 4, 5):
+        assert px[x, 0] == BLACK
+
+
+def test_dotted_hline_off_surface_row_draws_nothing():
+    surf = Surface(6, 4)
+    surf.clear(BLACK)
+    surf.dotted_hline(0, -1, 6, RED, stride=1)
+    surf.dotted_hline(0, 4, 6, RED, stride=1)
+    px = surf.image.load()
+    for x in range(6):
+        for y in range(4):
+            assert px[x, y] == BLACK
+
+
+def test_dotted_hline_non_positive_width_or_stride_draws_nothing():
+    surf = Surface(6, 1)
+    surf.clear(BLACK)
+    surf.dotted_hline(0, 0, 0, RED, stride=2)
+    surf.dotted_hline(0, 0, 6, RED, stride=0)
+    px = surf.image.load()
+    for x in range(6):
+        assert px[x, 0] == BLACK
+
+
+def test_dotted_vline_lights_every_stride_th_pixel():
+    surf = Surface(3, 12)
+    surf.clear(BLACK)
+    surf.dotted_vline(1, 0, 10, RED, stride=3)   # y = 0, 3, 6, 9
+    px = surf.image.load()
+    for y in (0, 3, 6, 9):
+        assert px[1, y] == RED
+    for y in (1, 2, 4, 5, 7, 8):
+        assert px[1, y] == BLACK
+    assert px[0, 0] == BLACK   # columns left/right untouched
+    assert px[2, 0] == BLACK
+
+
+def test_dotted_vline_clips_to_surface_bounds():
+    surf = Surface(1, 6)
+    surf.clear(BLACK)
+    surf.dotted_vline(0, -3, 10, RED, stride=3)   # dots at y=-3,0,3,6,9 -> only 0,3 on-surface
+    px = surf.image.load()
+    assert px[0, 0] == RED
+    assert px[0, 3] == RED
+    for y in (1, 2, 4, 5):
+        assert px[0, y] == BLACK
+
+
+def test_dotted_vline_off_surface_column_draws_nothing():
+    surf = Surface(4, 6)
+    surf.clear(BLACK)
+    surf.dotted_vline(-1, 0, 6, RED, stride=1)
+    surf.dotted_vline(4, 0, 6, RED, stride=1)
+    px = surf.image.load()
+    for x in range(4):
+        for y in range(6):
+            assert px[x, y] == BLACK
+
+

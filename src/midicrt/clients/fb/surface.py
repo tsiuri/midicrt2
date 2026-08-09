@@ -1,11 +1,12 @@
 """fb/surface.py — RGB pixel surface + RGB565 framebuffer packing.
 
 Wraps a PIL "RGB" Image as the drawing target for the CRT fb client.
-Drawing (`clear`/`rect`/`hline`/`vline`/`box`/`fill_column`) happens in
-ordinary 8-bit RGB; `to_rgb565()` packs the buffer into the wire/device
-format on demand. `write_fb()` and `write_to_mmap()` write that packed
-buffer to a framebuffer device node (or, in tests, a plain file standing
-in for one) — see their docstrings for when to use which.
+Drawing (`clear`/`rect`/`hline`/`vline`/`box`/`fill_column`/`dotted_hline`/
+`dotted_vline`) happens in ordinary 8-bit RGB; `to_rgb565()` packs the
+buffer into the wire/device format on demand. `write_fb()` and
+`write_to_mmap()` write that packed buffer to a framebuffer device node
+(or, in tests, a plain file standing in for one) — see their docstrings
+for when to use which.
 
 Convention: renderers (`clients/fb/app.py::render_frame` and friends) must
 draw only through `Surface`'s methods below — never reach into
@@ -111,6 +112,39 @@ class Surface:
         self.hline(x, y + h - 1, w, color)   # bottom
         self.vline(x, y, h, color)           # left
         self.vline(x + w - 1, y, h, color)   # right
+
+    def dotted_hline(self, x: int, y: int, w: int, color: Color, stride: int = 2, phase: int = 0) -> None:
+        """Draw a horizontal DOTTED run: only every `stride`-th pixel of the
+        `w`-px span starting at `x` is lit (at `x + phase`, `x + phase +
+        stride`, ...) — the pixels in between are left untouched, not
+        painted background, so this reads as a faint backdrop grid a
+        renderer draws UNDER other content, not a solid line with holes
+        punched in it (the pianoroll paper-grid's dotted pitch-row/bar/beat
+        guides — Phase 8 Task 3 — are this primitive's only caller so far).
+
+        `phase` (mod `stride`) lets a caller offset the pattern per row/line
+        — v1's own alternating-phase dotted rows (`row_idx & 1`) is exactly
+        this. Clips silently to the surface bounds; a row entirely off the
+        surface, or a non-positive `w`/`stride`, draws nothing.
+        """
+        if w <= 0 or stride <= 0 or not (0 <= y < self.height):
+            return
+        draw = ImageDraw.Draw(self.image)
+        pts = [(px, y) for px in range(x + (phase % stride), x + w, stride) if 0 <= px < self.width]
+        if pts:
+            draw.point(pts, fill=color)
+
+    def dotted_vline(self, x: int, y: int, h: int, color: Color, stride: int = 2, phase: int = 0) -> None:
+        """Draw a vertical DOTTED run — the column analogue of
+        `dotted_hline` above; same stride/phase/clipping semantics, own
+        pixel untouched-between-dots convention.
+        """
+        if h <= 0 or stride <= 0 or not (0 <= x < self.width):
+            return
+        draw = ImageDraw.Draw(self.image)
+        pts = [(x, py) for py in range(y + (phase % stride), y + h, stride) if 0 <= py < self.height]
+        if pts:
+            draw.point(pts, fill=color)
 
     def fill_column(self, x: int, y_bottom: int, h: int, color: Color, width: int = 1) -> None:
         """Draw a vertical bar `width` px wide and `h` px tall, bottom-

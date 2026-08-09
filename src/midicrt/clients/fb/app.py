@@ -95,7 +95,17 @@ from midicrt.clients.base import (
     switch_topic,
     wait_first_snapshot,
 )
-from midicrt.clients.fb.lum import LUM_BRIGHT, LUM_MID, LUM_OFF, RAMPS, lum
+from midicrt.clients.fb.lum import (
+    LUM_BAR_GUIDE,
+    LUM_BRIGHT,
+    LUM_DIM,
+    LUM_FAINT,
+    LUM_FAINT_C,
+    LUM_MID,
+    LUM_OFF,
+    RAMPS,
+    lum,
+)
 from midicrt.clients.fb.surface import Surface, open_fb_mmap
 from midicrt.clients.fb.text import draw_text, load_font
 from midicrt.clients.tui import _tail
@@ -419,27 +429,39 @@ def render_tuner_frame(vm: dict, surface: Surface) -> None:
     _row("Tuning: " + tuning_meter(vm["cents"], 40))
 
 
-# -- pianoroll page (phase-3 task 7) ------------------------------------------
+# -- pianoroll page (phase-3 task 7; paper-grid + label column: phase-8 task 3) -
 #
 # Layout: same reverse-video header convention as the other pages, then a
-# pixel roll body drawn via `Surface.rect` (task brief: "fb: pixel roll via
-# rect/hline primitives" -- `rect` alone suffices here since every note is
-# already a filled bar, the same choice `render_harmony_frame`'s tension
-# fill makes over a separate hline loop). One rect per note: x0/x1 mapped
-# onto the full surface width, y mapped onto the usable body height sliced
-# into `range.hi - range.lo + 1` equal rows (the same "usable_h // count"
-# convention `render_voices_frame` already uses for its 16 channel rows).
-# v1's real CRT compositor (`fb/compositor_renderer.py`, not read -- out of
-# this task's ported source map, see pages/pianoroll.py's own module
-# docstring) is a separate rendering pipeline this renderer does not need
-# to match pixel-for-pixel; it follows the same "primitives only, never
-# poke surface.image directly" convention every fb renderer here already
-# established.
+# LEFT LABEL COLUMN (`PIANOROLL_LABEL_CHARS` wide) holding one
+# `"{note_name:>7} │"` row per visible pitch, then the pixel roll body drawn
+# via `Surface.rect` (task brief: "fb: pixel roll via rect/hline
+# primitives" -- `rect` alone suffices here since every note is already a
+# filled bar, the same choice `render_harmony_frame`'s tension fill makes
+# over a separate hline loop). One rect per note: x0/x1 mapped onto the
+# roll body's width (surface width MINUS the label column, not the full
+# surface width as before this task), y mapped onto the usable body height
+# sliced into `range.hi - range.lo + 1` equal rows (the same "usable_h //
+# count" convention `render_voices_frame` already uses for its 16 channel
+# rows). v1's real CRT compositor (`fb/compositor_renderer.py`, READ for
+# this task -- see `docs/visual-audit.md` §9c and `pages/pianoroll.py`'s
+# own module docstring "Paper grid" section) is a separate rendering
+# pipeline this renderer does not need to match pixel-for-pixel; it follows
+# the same "primitives only, never poke surface.image directly" convention
+# every fb renderer here already established -- the dotted-guide look v1
+# gets from a raw numpy buffer stride (`compositor_renderer.py`'s
+# `buf[y, x0::stride] = color`) is reproduced here via `Surface.dotted_
+# hline`/`dotted_vline` (new primitives, `clients/fb/surface.py`) instead.
+#
+# Draw order (bottom to top): grid (dotted pitch-row + bar/beat guides) ->
+# label column -> notes. Grid strictly UNDER notes matches v1's own
+# layering (`_render_pianoroll` draws its dotted guides, THEN its note
+# rects, in that order) and is exercised directly by
+# `test_render_pianoroll_frame_grid_is_drawn_under_notes_not_over_them`.
 #
 # Monochrome velocity-brightness (Phase 8 Task 2 -- 2026-08-08
 # gui-phase-decisions doc ruling #1, "the only 'color' is shading/
 # brightness level of green"): this renderer used to cycle 8 rainbow hues
-# by channel (`_ROLL_CHANNEL_PALETTE`, replaced by this task) -- but
+# by channel (`_ROLL_CHANNEL_PALETTE`, replaced by that task) -- but
 # `docs/visual-audit.md` §9c's build-priority #1 finding is that v1's REAL
 # CRT compositor was never doing that: `_CH_BASE_RGB = [(0, 255, 80)] * 16`
 # is already one hue for every channel, and `_velocity_scale()` is a
@@ -447,11 +469,29 @@ def render_tuner_frame(vm: dict, surface: Surface) -> None:
 # onto that single base color. `_roll_note_color` below ports that
 # mechanism exactly via `clients/fb/lum.py`'s `lum()`/`RAMPS["pianoroll"]`
 # -- `ch` is kept in the signature (existing call sites still pass it) but
-# no longer affects the output color at all; channel identity moves to the
-# per-pitch label column a later task (T3, per this task's own brief) adds
-# instead of being encoded as hue -- a disclosed, deliberate no-op
-# parameter, not dead code left by oversight.
+# no longer affects the output color at all; channel identity now lives in
+# the per-pitch label column THIS task adds (v1's own C-row brightness
+# split + active-pitch invert, `compositor_renderer.py:857-876`), not as a
+# note-fill hue.
 _PIANOROLL_RAMP = RAMPS["pianoroll"]
+
+# `"{note_name:>7} │"` is always exactly 9 characters (7 right-justified +
+# 1 space + 1 pipe) -- v1's own `LEFT_CHARS` convention
+# (`compositor_renderer.py::_render_pianoroll`'s `getattr(widget,
+# "left_margin", 10)`, close to but not identical to this task's own
+# label-text-width-derived constant; kept exact to the STRING this task
+# actually renders rather than v1's separately-configurable margin).
+PIANOROLL_LABEL_CHARS = 9
+# v1's exact dotted-guide strides (`compositor_renderer.py`'s
+# `row_guide_step`/`bar_guide_step`) -- reused for BOTH beat and bar
+# vertical guides here (a disclosed simplification: v1 only dots bar
+# boundaries in the roll body itself, reserving beat ticks for a separate
+# solid timeline strip this task does not port -- see pages/pianoroll.py's
+# module docstring "Not ported" section. This task's own brief asks for
+# BOTH beat and bar dotted guides in the roll body, so v1's bar-guide
+# geometry is reused for both, distinguished only by brightness tier).
+PIANOROLL_GRID_ROW_STRIDE = 4
+PIANOROLL_GRID_LINE_STRIDE = 3
 
 
 def _roll_note_color(ch: int, vel: float) -> tuple[int, int, int]:
@@ -468,12 +508,71 @@ def _pianoroll_header_text(vm: dict) -> str:
     return f"{vm['title']}  ({w['mode']} zoom {w['zoom']:.2f}, range {rng['lo']}-{rng['hi']})"
 
 
+def _pianoroll_label_text(guide: dict) -> str:
+    return f"{guide['name']:>7} │"
+
+
+def _draw_pianoroll_grid(
+    surface: Surface, grid: dict, roll_x0: int, roll_w: int,
+    header_h: int, usable_h: int, row_span_h: int,
+) -> None:
+    """The "paper" backdrop -- dotted pitch-row separators (brighter on C
+    rows) plus dotted beat/bar vertical guides -- drawn UNDER the note rects
+    `render_pianoroll_frame` paints afterward. Pure primitive-drawing, no
+    music math: every position here is already a projected fraction from
+    `pages/pianoroll.py`'s `grid` VM (see that module's own docstring).
+    """
+    if roll_w <= 0 or usable_h <= 0:
+        return
+    guides = grid["pitch_guide_ys"]
+    # Separator sits at each row's TOP edge (same y a note at that pitch
+    # would use) -- v1 skips the very first row (no line above the highest
+    # visible pitch), see pages/pianoroll.py's grid docstring cross-ref.
+    for k in range(1, len(guides)):
+        guide = guides[k]
+        y = header_h + round(guide["y"] * row_span_h)
+        color = LUM_FAINT_C if guide["is_c"] else LUM_FAINT
+        surface.dotted_hline(roll_x0, y, roll_w, color, stride=PIANOROLL_GRID_ROW_STRIDE, phase=k & 1)
+
+    roll_top = header_h
+    for x_frac in grid["beat_xs"]:
+        x = roll_x0 + round(x_frac * roll_w)
+        surface.dotted_vline(x, roll_top, usable_h, LUM_FAINT, stride=PIANOROLL_GRID_LINE_STRIDE)
+    for x_frac in grid["bar_xs"]:
+        x = roll_x0 + round(x_frac * roll_w)
+        surface.dotted_vline(x, roll_top, usable_h, LUM_BAR_GUIDE, stride=PIANOROLL_GRID_LINE_STRIDE)
+
+
+def _draw_pianoroll_labels(
+    surface: Surface, guides: list[dict], font, header_h: int, row_span_h: int,
+    note_h: int, active_ys: set[float],
+) -> None:
+    """The per-pitch note-name label column, v1's exact 2-level brightness
+    split (C rows bright, others dim) plus the active-pitch invert (a
+    `LUM_MID`-filled cell behind `BG`-colored text) while ANY note data for
+    that pitch is currently visible in the roll -- `active_ys` is `vm["notes"]`'s
+    own already-projected `y` fractions, matched by set membership (exact,
+    not approximate -- both are the SAME `_y(pitch)` expression on the
+    engine side, see pages/pianoroll.py's grid docstring).
+    """
+    label_w = PIANOROLL_LABEL_CHARS * font.width
+    for guide in guides:
+        y = header_h + round(guide["y"] * row_span_h)
+        label = _pianoroll_label_text(guide)
+        if guide["y"] in active_ys:
+            surface.rect(0, y, label_w, note_h, LUM_MID)
+            draw_text(surface, 0, y, label, BG, font)
+        else:
+            color = LUM_BRIGHT if guide["is_c"] else LUM_DIM
+            draw_text(surface, 0, y, label, color, font)
+
+
 def render_pianoroll_frame(vm: dict, surface: Surface) -> None:
     """Render the pianoroll page view-model (pages/pianoroll.py) onto
     `surface`. Pure: reads only `vm` and the cached default font, writes
     only to `surface`'s pixels -- no I/O, no clock, no global state beyond
     the font's (side-effect-free) glyph cache. See module comment above for
-    the pixel-roll layout / channel-color + charred-velocity convention.
+    the label-column / paper-grid / note-rect layering.
     """
     font = load_font()
     surface.clear(BG)
@@ -488,11 +587,21 @@ def render_pianoroll_frame(vm: dict, surface: Surface) -> None:
     rng = vm["range"]
     pitch_span = max(1, rng["hi"] - rng["lo"] + 1)
     note_h = max(1, usable_h // pitch_span)
-    roll_w = surface.width
+    row_span_h = max(0, usable_h - note_h)
+    label_w = PIANOROLL_LABEL_CHARS * font.width
+    roll_x0 = label_w
+    roll_w = max(0, surface.width - label_w)
+
+    grid = vm["grid"]
+    _draw_pianoroll_grid(surface, grid, roll_x0, roll_w, header_h, usable_h, row_span_h)
+
+    active_ys = {n["y"] for n in vm["notes"]}
+    _draw_pianoroll_labels(surface, grid["pitch_guide_ys"], font, header_h, row_span_h, note_h, active_ys)
+
     for note in vm["notes"]:
-        y = header_h + round(note["y"] * max(0, usable_h - note_h))
-        x0 = round(note["x0"] * roll_w)
-        x1 = round(note["x1"] * roll_w)
+        y = header_h + round(note["y"] * row_span_h)
+        x0 = roll_x0 + round(note["x0"] * roll_w)
+        x1 = roll_x0 + round(note["x1"] * roll_w)
         w = max(1, x1 - x0)
         surface.rect(x0, y, w, note_h, _roll_note_color(note["ch"], note["vel"]))
 

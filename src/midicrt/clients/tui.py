@@ -327,7 +327,14 @@ def render_tuner_lines(vm: dict, width: int, height: int) -> list[str]:
     return [header] + body
 
 
-# -- pianoroll page (phase-3 task 7) -----------------------------------------
+# -- pianoroll page (phase-3 task 7; paper-grid: phase-8 task 3 SKIPPED here) -
+#
+# Phase 8 Task 3 ("paper" grid) intentionally does NOT touch this renderer:
+# `docs/visual-audit.md` §9b confirms v1's own TEXT renderer never had a
+# background grid either (dotted guides are exclusively a §9c fb-compositor
+# feature) -- v2's TUI was already at honest parity, and `vm["grid"]` (the
+# new VM key that task adds) is simply left unread here, same as any other
+# renderer-specific field this one doesn't need.
 #
 # Layout: header row (title + projection mode/zoom + fixed pitch range),
 # then a QUANTIZED note grid body -- the ENGINE already produced normalized
