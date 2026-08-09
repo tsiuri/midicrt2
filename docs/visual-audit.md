@@ -641,36 +641,46 @@ dropped).
 
 **Counts unchanged from Task 6** (PRESENT 33 / DIFFERENT 13 / MISSING 19 /
 N/A 3, above) — Task 7 was the planned live-real-CRT sign-off pass over
-this whole audit, but the supervised v1-pause window could not be safely
-opened (v1's keyboard-driven quit is currently unresponsive on this
-deployment, reproduced on two independent process instances via `strace`;
-full incident record in `docs/phase8-smoke.md`). No row in this document
-was re-verified against the *physical tube* as a result, so no row here
-is re-stamped "live-CRT confirmed" and no count changes were made on the
-strength of an incomplete pass.
+this whole audit, and it completed successfully on the second attempt.
+**Every animation/burn-in row this task targeted is now confirmed on the
+physical tube** (real `/dev/fb0` writes via `midicrt-fb`, not headless):
+the header marquee genuinely scrolling under a live clock-derived BPM and
+sharing its row with the on-screen keymap indicator (§20b + Task 6's
+PRESENT rows), the pianoroll "paper" grid + label column + Bars strip at
+live BPM (§9a/Task 3/Task 4 PRESENT rows), row-tint + overlap-flash on
+real injected overlapping notes (Task 4 PRESENT rows), pagecycle's
+v1-semantics rotation genuinely advancing `current_page` on a real fb0
+capture pair 17s apart with zero client action in between (§20e PRESENT
+row, Task 5), a number-key-equivalent jump correctly arming
+`pagecycle_user_pause` (verified: still on the jumped-to page ~63s later,
+well past the 15s scratch interval), and monochrome rendering holding
+across every real-device capture (single-hue brightness ramp only —
+`(0,255,82)`/`(0,182,49)`/`(0,141,41)`/etc., no rainbow, the §2
+DIFFERENT-row's replacement confirmed byte-consistent per Task 2's own
+method). No count changes: this was confirmation of already-PRESENT rows
+on the physical device, not new features. Full timeline and evidence
+index: `docs/phase8-smoke.md` §5.
 
-What Task 7 DID re-confirm, against the real running production
-`midicrtd` (headless `midicrt-fb --out`/`--overlay`, never the physical
-`/dev/fb0`): the header marquee genuinely scrolling under a live
-clock-derived BPM (§20b's PRESENT row), monochrome rendering holding
-(single color `(0,255,82)` across a real multi-page/live-MIDI capture,
-the §2 DIFFERENT-row's replacement byte-exact per Task 2), the on-screen
-keymap indicator visible in the header (§ Task 6's PRESENT row), the help
-overlay + roster-resolved `page.jump` labels rendering correctly (Task
-6's PRESENT row), and pagecycle's v1-semantics rotation genuinely
-advancing `current_page` on a 15s scratch interval with no client action
-in between (§20e's PRESENT row, Task 5). None of these were previously in
-doubt from Task 6's own review, so this is corroboration, not new
-information — hence no count movement.
+**The help overlay is the one item confirmed headlessly, not physically,
+by design**: `client.help_toggle` is a pure client-local pseudo-action
+that never reaches the engine's action registry, so it cannot be
+triggered via `midicrt action`, and no physical keyboard press could be
+delivered from the remote session driving this smoke. `midicrt-fb --out
+--overlay` (Task 6's own sanctioned no-keyboard mechanism, confirmed by
+its own `--help` text to never touch `/dev/fb0`) was used instead — real
+evidence against the live production daemon, just not a physical-tube
+frame. See `docs/phase8-smoke.md` §5 for the full rationale.
 
-**Open item for a follow-up pass**: diagnose why v1's `keyboard_listener()`
-(`~/codex/midicrt/midicrt.py`) is not consuming input on its controlling
-tty (zero `read`/`poll` syscalls on fd 0 across two independent process
-instances, one under 8 minutes old — not an aged-process fluke). Working
-hypothesis, unconfirmed: this Phase 8 window's own boot-de-branding job
-required a real reboot, and a console/plymouth/getty parameter change
-from that reboot may have altered `tty1`'s console behavior enough to
-break `blessed`'s raw-mode detection for a process whose controlling
-terminal traces back to it. This blocks not just Task 7 but any future
-supervised real-CRT pause of v1 until resolved — see `docs/phase8-smoke.md`
-§7 for the recommended diagnostic-first approach before another attempt.
+**Closed item**: an earlier draft of this section reported v1's
+keyboard-driven quit as broken (reproduced via `strace` on two process
+instances) and the live-tube pass as BLOCKED. That diagnosis was wrong —
+`pause-path-investigation.md` found the `strace` filter used
+(`read,poll`) never covered `pselect6`, the actual syscall `blessed`'s
+readiness check makes on this platform, and its output represents the
+watched fd as `[0]`, not `fd=0` — a filter+grep blind spot, not a dead
+listener. v1's quit path was never broken. The one real, disclosed
+casualty of the misdiagnosis was a `kill -TERM` escalation that cascaded
+into a tmux/getty teardown (self-healed) — preserved as an incident
+record in `docs/phase8-smoke.md` §1-4, with a binding escalation-rule
+amendment (never signal v1's process tree; verify with a complete
+syscall trace first) carried into this and future smokes.

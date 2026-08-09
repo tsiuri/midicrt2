@@ -35,12 +35,17 @@ Run tests: `~/midicrt2-venv/bin/pytest`
 - `docs/visual-audit.md` — the Phase 8 v1-vs-v2 visual/animation feature
   parity checklist (PRESENT/DIFFERENT/MISSING/N-A per row, build-priority
   ranking). The load-bearing document for the whole GUI-parity phase.
-- `docs/phase8-smoke.md` — Phase 8 Task 7's supervised real-CRT smoke
-  attempt. **Read this before pausing v1 again**: v1's keyboard-driven
-  quit is currently unresponsive on this deployment (reproduced on two
-  independent process instances), and one escalation attempt had a real,
-  disclosed side effect (a `kill -TERM` on the wedged process cascaded
-  into tearing down the whole tmux session via the `.zprofile`/
-  `getty@tty1` exec-attach chain, which then self-healed via getty's own
-  restart into a fresh v1 instance). The live-`/dev/fb0` pause window is
-  BLOCKED pending a diagnosis of that regression, not yet retried.
+- `docs/phase8-smoke.md` — Phase 8 Task 7's supervised real-CRT smoke:
+  **DONE** on the second attempt (v1 paused via `send-keys q` in ~2s,
+  full GUI-phase demo captured on the real `/dev/fb0`, v1 restored and
+  verified, total downtime ~2m46s). **Read this before pausing v1**: the
+  first attempt misdiagnosed v1's keyboard-quit as broken because its
+  `strace` filter didn't cover `pselect6` (the actual syscall `blessed`'s
+  readiness check uses on this platform) and its grep didn't match that
+  syscall's `[0]`-style fd notation — v1's quit was never actually
+  broken. That misdiagnosis led to a `kill -TERM` escalation that
+  cascaded into a real tmux/getty teardown (self-healed) — **never signal
+  v1's process tree**; if `send-keys` ever seems ineffective, verify with
+  `strace -e trace=pselect6` (watch for `pselect6(1, [0], ...)`) before
+  concluding anything, per the binding escalation-rule amendment in that
+  doc.

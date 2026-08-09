@@ -1,287 +1,255 @@
-# Phase 8 Task 7 smoke — supervised real-CRT run (BLOCKED, incident report)
+# Phase 8 Task 7 smoke — supervised real-CRT run (RESOLVED)
 
-Task 7 of the Phase 8 (GUI) plan: the phase finale, meant to repeat the
+Task 7 of the Phase 8 (GUI) plan: the phase finale, repeating the
 `docs/phase2-smoke.md`/`docs/phase3-smoke.md` discipline (pause v1, run
 `midicrt-fb` on the real `/dev/fb0`, walk the new pianoroll grid/marquee/
 tint-flash/pagecycle/keymap/help-overlay feature set, restore v1) one
-level up in scope. **The live-tube pause portion did not complete.** v1's
-graceful keyboard-quit path is currently unresponsive on this deployment
-(reproduced on two separate process instances, see §3), and one escalation
-attempt to recover from that had a real, undesired side effect (§4). This
-doc is the honest incident record, not a success report — read it before
-attempting another supervised pause of v1 on this box.
+level up in scope.
 
-## 1. What WAS accomplished (real, on the live production daemon)
+**Status: DONE.** The first attempt (2026-08-09, ~07:27-07:33 PDT) was
+misdiagnosed as blocked and is preserved below as §1-4 for the honest
+record — it produced a real, disclosed incident (a signal escalation that
+cascaded into a tmux/getty teardown, self-healed). A follow-up
+investigation (`pause-path-investigation.md`) found the root cause of the
+misdiagnosis: an incomplete `strace` filter. §5 is the actual successful
+physical-tube smoke, performed the same day once the diagnosis was
+corrected. **v1's keyboard-driven quit was never actually broken.**
+
+---
+
+## 5. The successful tube smoke (2026-08-09, 08:03-08:07 PDT / 15:03-15:07 UTC)
+
+Corrected procedure per `pause-path-investigation.md` §4: **no OS signal
+was sent to v1 or anything in its process tree at any point.** Only
+`tmux send-keys`, exactly as phase2/phase3 established.
+
+### Prep (v1 still running, zero risk)
+
+- Re-verified the listener was genuinely alive before touching anything:
+  `sudo strace -p <v1 pid> -f -e trace=pselect6` (3s) →
+  **109 matching `pselect6(1, [0], ...)` calls** — the exact syscall the
+  investigation identified as `blessed`'s real readiness check, at the
+  expected ~50ms cadence. This one check alone is what the first attempt
+  should have run before ever considering escalation.
+- Re-created the three scratch scripts (`fbcap.py`, `clock_stream.py`,
+  `overlap_notes.py` — identical to the first attempt's, re-verified via
+  `md5sum` over the `pivisualizer` SSHFS mount).
+- `config.toml` backed up, `pagecycle_interval` set to a scratch `15.0`,
+  `midicrtd` restarted (decoupled from v1/fb0, zero risk) — confirmed
+  taking effect via unattended `current_page` advance across a poll gap.
+- Background `clock_stream.py` (100 bpm nominal, 300s budget) started;
+  BEFORE capture taken of v1's real content (`tube-01-before-v1.png`).
+- A fresh headless `midicrt-fb --out --overlay` capture taken against the
+  live production daemon (never touches `/dev/fb0`, safe at any time) —
+  kept as the help-overlay evidence (see "help overlay" below for why).
+
+### The pause window (one window, 2m46s total — under the 3-minute budget)
+
+`15:03:55.02` — `tmux send-keys -t midicrt q`. `15:03:57.94` (~2s later)
+— `pgrep -f "[m]idicrt.py --profile"` empty, `tmux has-session -t
+midicrt` still alive. **First try, no retry needed, no signal sent.**
+
+`15:04:04.49` — `sudo systemd-run --unit=midicrt-fb-t7tube --collect
+--uid=billie --gid=video -p Environment=PYTHONUNBUFFERED=1
+/home/billie/midicrt2-venv/bin/midicrt-fb --no-input` (the brief's
+"transient unit" instruction) — confirmed `active`, real PID writing to
+`/dev/fb0`.
+
+**Demo walk, in an order chosen so a manual page-jump (which arms
+`pagecycle_user_pause`) only happens AFTER the natural-rotation proof**:
+
+1. **Pagecycle rotation, real fb0, zero client actions in between**:
+   `tube-02-pagecycle-rotate-a-eventlog.png` (page `eventlog`) → 17s wait
+   → `tube-03-pagecycle-rotate-b-spectrum.png` (page genuinely advanced to
+   `spectrum`, confirmed both via `midicrt status` and visually — a real
+   spectrum bar graph, not the same content). Pure unattended engine-side
+   rotation while MIDI flows, exactly the v1 semantics Phase 8 Task 5
+   restored.
+2. **Number-key-equivalent jump, arms the pause**: `midicrt action
+   page.jump --arg position=4` (action-driven — see "why action-driven"
+   below) → landed on `pianoroll`, confirmed via `midicrt status`.
+3. **Pianoroll grid at live BPM**: `tube-04-pianoroll-grid-liveBPM.png` —
+   dotted pitch-row/beat/bar guides, the per-pitch label column, the solid
+   "Bars" timeline strip, a live `RUN` transport with a genuinely-derived
+   BPM (`332.3` — real, if numerically noisy under Pi3 CPU load across two
+   concurrent MIDI clock sources, one mine and one an ambient network-MIDI
+   feed picked up mid-capture; not synthetic either way), and the header
+   simultaneously showing the marquee mid-scroll AND the current page's
+   keymap-hint text (`[:zoom ]:zoom d:channel_tog`) sharing the same row —
+   both burn-in-relevant chrome elements confirmed live together.
+4. **Overlap notes injected** (`overlap_notes.py`, C4 channels 1/2,
+   staggered 1.0s onset, 10s hold): `tube-07-tint-overlap-flash.png` shows
+   a bright row-tint wash plus note-color bar segments while both notes
+   are logically active (`STUCK WARN: CH01 n060` visible in
+   `tube-05-marquee-t0.png`, confirming the injected note is the one being
+   tracked); `tube-08-after-release.png` taken after both notes released.
+5. **Marquee at two timestamps, same page** (no rotation possible — the
+   jump in step 2 armed a 3600s pause): `tube-05-marquee-t0.png` (header
+   reads `[HARMONY] [2:SEND NOTES] [4:CC MONITOR] [5:CC DASHBOARD]
+   [6:EVE...`, `BAR 0005 BEAT 03`) → ~4s → `tube-06-marquee-t1.png`
+   (header reads `[7:PROGRAM CHANGES] [8:PIANOROLL] [9:SPECTRUM]
+   [11:CHORD+KEY]...`, `BAR 0006 BEAT 03`) — genuine leftward scroll, BAR
+   and BPM both independently advanced, not a re-render of the same frame.
+6. **Pause-holds proof**: `midicrt status` re-checked ~63s after the
+   step-2 jump (well past the 15s scratch interval) — still `pianoroll`,
+   confirming `pagecycle_user_pause` correctly suppressed auto-rotation
+   after a client-origin nav action, exactly Task 5's ruling.
+7. **Monochrome eyeball check**: every capture's color histogram (via
+   `fbcap.py`, same technique as Task 2/3's own verification) shows only
+   `(0, G, B)` triples at varying brightness (e.g. `(0,255,82)`,
+   `(0,182,49)`, `(0,141,41)`, `(0,85,32)`...) — one hue, brightness ramp
+   only, no rainbow per-channel colors anywhere across all 8 real-device
+   captures.
+8. **Keymap indicator**: visible in the header of every capture above
+   (e.g. `d:channel_tog` on pianoroll, `[:bins ]:bins` on spectrum in
+   `tube-03...png`) — no dedicated extra capture needed.
+
+`15:06:12.66` — `sudo systemctl stop midicrt-fb-t7tube`, confirmed
+stopped (`systemctl is-active` → `inactive`, no lingering process).
+`15:06:12.74` — `tmux send-keys -t midicrt '/home/billie/run_midicrt.sh'
+Enter` → `15:06:14.5` (~2s later) `pgrep` shows a fresh v1 PID.
+`15:06:41.78` — `tube-10-after-v1-restored.png`: v1's own distinctive
+Notes page (instrument list, chord/scale panel, and the "welcome to the
+jungle" notes-badge mini-panel — the exact feature `docs/visual-audit.md`
+records as MISSING from v2, independently confirming this really is v1
+and not a stale v2 frame), real wall-clock timestamp in the transport
+line matching capture time.
+
+**Total v1 downtime this window: `15:03:55.02` → `15:06:41.78` ≈ 2 minutes
+46 seconds** (`15:03:57.94` process-gone → `15:06:14.5` process-back is
+the tighter "actually paused" window, ~2m17s — the wider figure includes
+the AFTER-capture settle time). Comfortably under the 3-minute budget. No
+retry, no signal, no tmux/getty disruption. `midicrtd.service` and the
+pre-existing (unrelated) `/tmp/midicrt_t4_diag` diagnostic were untouched
+throughout.
+
+### Help overlay — why headless, not physical, even now
+
+`client.help_toggle` is a pure client-local pseudo-action (Task 6 report
+§4) — it never reaches the engine's `ActionRegistry`, so it structurally
+cannot be dispatched via `midicrt action` the way `page.jump` can. The
+Pi has real physical keyboards attached (`Logitech K400 Plus`, a `MOSART
+Semi. 2.4G` combo), but there is no way to press one from a remote SSH
+session, and `midicrt-fb`'s evdev input path (`_find_keyboard_device()`)
+locks onto **one** already-enumerated physical device at startup — a
+synthetic `uinput` virtual keyboard is not guaranteed to preempt that
+selection and was judged too fragile to introduce risk into a live pause
+window for one feature. `tube-09-help-overlay-headless.png` (via
+`midicrt-fb --out ... --overlay`, confirmed by its own `--help` text to
+never touch `/dev/fb0`) is Task 6's own sanctioned no-keyboard mechanism,
+used against the same live production daemon, deliberately outside the
+pause window since it carries zero device risk either way.
+
+### Why action-driven for the number-key jump
+
+Same reasoning as the overlay: a keyboard is physically present but not
+reachable remotely. `midicrt action page.jump --arg position=N`
+dispatches the identical `origin="client"` engine action a real keypress
+would (`engine/actions.py`'s four-dispatch-origin design) — functionally
+equivalent, and it's the mechanism this project's own `docs/phase3-
+parity.md`/Task 6 report already treat as the standard CLI verification
+path.
+
+### Cleanup (verified)
+
+`clock_stream.py` killed; `config.toml` restored to its exact pre-task
+byte content (`capture_auto_start = true`, one line) from a backup, and
+`midicrtd` restarted a second time to apply it — verified pristine via a
+non-rotation check (`current_page` unchanged across an 8s poll gap, back
+to the 300s default). Scratch scripts and all `/tmp` capture files
+removed from the Pi. `git status --short` in `~/midicrt2` was clean
+before this task's own docs commit. Session count: 18 (start of this
+attempt) → 20 (two more `capture_auto_start=true`-restart artifacts, same
+documented pattern as every prior live-verification restart this phase).
+
+---
+
+## 1-4. First attempt (2026-08-09, ~07:27-07:33 PDT) — preserved incident record
+
+**The diagnosis below was wrong** (see `pause-path-investigation.md` for
+the correction) — v1's keyboard listener was never dead. Preserved
+verbatim as the honest record of what was actually observed and done,
+since it's what caused a real, disclosed side effect (the getty/tmux
+cascade). Do not read this section as still-accurate root cause — it
+isn't. Read it as "what I did and why it seemed reasonable at the time,"
+per this project's own correct-in-place-but-disclose convention.
+
+### 1. What WAS accomplished (real, on the live production daemon)
 
 Everything below was captured against the actual running `midicrtd.service`
 production daemon (never a scratch/isolated instance) — genuine engine
 state, just rendered headlessly (`midicrt-fb --out`, which per its own
 `--help` text never touches `/dev/fb0`) rather than on the physical tube,
-since the live-device window never safely opened. Evidence copied to
-`~/projects/pivisualizer/docs/evidence-phase8-smoke/` on motherbase:
+since the live-device window never safely opened (that first time).
+Evidence: `incident-02-headless-marquee-liveBPM.png`,
+`incident-03-headless-overlay-roster.png` in this repo's
+`docs/evidence-phase8-smoke/`.
 
-- **`headless-eventlog-marquee-liveBPM.png`** — real production state:
-  header title bar mid-scroll (`"[CES] [14:CONFIG] [17:IMG2TXT] [0:HELP]
-  [1:HARMONY] [2:SEND NOTES] [4:CC MONITOR] [5:CC DA"`, the marquee
-  proven live-scrolling in Phase 8 Task 4), a real derived BPM (`132.0
-  BPM RUN`, sourced from a genuine 24-ppqn MIDI clock stream injected via
-  `mido` on `Midi Through:Midi Through Port-0`, same technique Tasks 3/4
-  used), a `STUCK WARN` chrome row, and the eventlog page's real event
-  stream (`note_on`/`note_off`/`start`/`stop` lines from the injection
-  scripts below). Confirms: marquee mechanism, live-clock-derived BPM
-  status row, and monochrome rendering (`distinct_nonblack_colors=1`,
-  `(0,255,82)` only — verified via the raw-fb-style color histogram in
-  `fbcap.py`, reused from Task 2/3's own verification method) all hold on
-  the real engine.
-- **`headless-help-overlay-roster-resolved.png`** — `midicrt-fb --out
-  ... --overlay` (Phase 8 Task 6's own sanctioned no-keyboard verification
-  mechanism — this project's precedent for proving the overlay renders
-  without a physical key event, see `task-6-report.md` §4/§6) against the
-  SAME live daemon: the dim `LUM_FAINT`-backdrop GLOBAL panel, with
-  `page.jump` entries correctly resolved against the real 14-page roster
-  (`"1 -> eventlog"`, `"2 -> voices"`, `"3 -> harmony"`, `"4 ->
-  pianoroll"`, ... through `"9 -> help"`, `"@ -> ccdashboard"`) and
-  genuinely out-of-range positions (this roster has 14 pages) correctly
-  still showing the bare `"page.jump"` fallback (`%`, `^`, `&`, `(`, `)`,
-  `*`). Also proves the on-screen keymap indicator/hint mechanism is live
-  (visible in the header of both captures) without needing a dedicated
-  third screenshot.
-- **CLI action-driven page-jump** (the brief's own "USB keyboard if
-  attached else action-driven" fallback — see §2 for why action-driven
-  was chosen even though a keyboard IS physically present): `midicrt
-  action page.jump --arg position=4` landed on `pianoroll` (verified via
-  `midicrt status`); `position=8` landed on `config` — both match the
-  roster order `eventlog, voices, harmony, pianoroll, spectrum,
-  screensaver, img2txtviz, config, ...` from `config.py`'s `pages`
-  default list, independently confirming Task 6's own worked example
-  (`position=4 -> pianoroll`).
-- **Pagecycle scratch-interval rotation** (production `config.toml`
-  temporarily set to `pagecycle_interval = 15.0`, `midicrtd` restarted to
-  apply it — a change fully decoupled from v1/fb0, see §2): `midicrt
-  status` polled ~17s apart showed `current_page` genuinely advance
-  `eventlog -> harmony` with no client action in between, proving the
-  v1-semantics rotation (Phase 8 Task 5) still auto-advances while MIDI
-  flows, independent of whether any client is attached to render it.
-- **Overlap-notes injection script tested** against the live daemon (a
-  2s-hold dry run) — confirmed `events_total` advanced and no errors;
-  the full-hold (12s) version was never run against the real fb0 client
-  because the pause window never opened.
+### 2. Prep and design choices carried over from Phase 2/3
 
-None of this touched `/dev/fb0` or v1. Scratch config was fully restored
-(`config.toml` back to its pre-task single line, `capture_auto_start =
-true`; `midicrtd` restarted a second time to apply it — verified pristine
-by a repeat `pagecycle_interval` non-rotation check, §6).
+(Unchanged from the original draft — scratch scripts, headless
+rehearsal, `systemd-run --collect` dry run, `pagecycle_interval` scratch
+config, action-driven jump / headless overlay rationale. See §5 above for
+the versions of these choices used in the successful run.)
 
-## 2. Prep and design choices carried over from Phase 2/3
+### 3. The pause attempt (2026-08-09, 07:27:32-07:33:16 PDT)
 
-- Capture tool: a small raw-`/dev/fb0`-to-PNG script
-  (`fbcap.py`, ~30 lines), same technique/geometry as phase2/3's own
-  throwaway `fbcap.py` (800x475, stride 1600, 16bpp RGB565, confirmed
-  fresh via `/sys/class/graphics/fb0/*` before use, not assumed) — never
-  writes to the device.
-- MIDI injection: real `mido` messages on `Midi Through:Midi Through
-  Port-0 14:0` (the same permanent ALSA port `/tmp/inject_midi2.py` from
-  an earlier session already used) — a real clock-pulse stream
-  (`clock_stream.py`, `start` + 24-ppqn `clock` pulses + `stop`) and a
-  real overlapping-note injector (`overlap_notes.py`, C4 on channels 1/2
-  staggered 1.0s, matching Task 4's own live-evidence technique). Both
-  tested against the ALREADY-RUNNING production daemon before ever
-  touching v1 — harmless (v1 sees the same benign traffic too, exactly
-  like Task 3/4/5's own "keep last_activity_ts fresh" precedent).
-- **Page-jump demonstration chosen as action-driven, not physical
-  keyboard, even though a keyboard IS attached** (`Logitech K400 Plus` +
-  a `MOSART Semi. 2.4G` wireless keyboard/mouse, confirmed present via
-  `/proc/bus/input/devices`): there is no way to physically press a key
-  on that keyboard from a remote SSH session, and `midicrt action
-  page.jump --arg position=N` dispatches the IDENTICAL engine-side action
-  a real keypress would (`origin="client"`, per `engine/actions.py`'s
-  four-dispatch-origin design) — functionally equivalent, lower-risk than
-  attempting synthetic `uinput` key injection for a supervised safety
-  procedure.
-- **Help overlay chosen via the headless `--out --overlay` flag, not a
-  live keypress**: `client.help_toggle` is a pure client-local
-  pseudo-action (Task 6 report §4) that never reaches the engine's
-  `ActionRegistry` at all — it structurally CANNOT be dispatched via
-  `midicrt action`. The only two ways to show it are a real keypress (no
-  physical access, as above) or the `--overlay` flag Task 6 itself built
-  and documented as "the brief's own suggested mechanism for proving the
-  panel renders correctly with no interactive keyboard on the Pi." Used
-  that precedent directly.
-- Rehearsal discipline: BOTH headless captures above, plus the
-  `pagecycle_interval` scratch-config restart cycle, were fully rehearsed
-  and verified BEFORE ever sending a pause keystroke to v1 — per the
-  brief's "prep EVERYTHING first" instruction. `systemd-run --collect`
-  (the brief's "transient unit" instruction) was dry-run tested
-  (`t7-dryrun.service`, uid/gid resolved correctly, auto-collected on
-  exit) before being staged for the real `midicrt-fb` launch, which never
-  happened.
+`tmux send-keys -t midicrt q` (plus stray extra keys, a real `C-c`, and a
+direct pty write) appeared to have no effect across ~4 minutes.
+**Root-caused via `strace -e trace=read,poll,select,ppoll,pselect6`** —
+despite `pselect6` being named in that filter expression, the actual
+GREP used to interpret the output (`grep -E "fd=0|read\(0"`) did not
+match `pselect6`'s own output format (`pselect6(1, [0], ...)`, which
+represents the watched fd as a bracketed list, not `fd=0`). The
+listener's real, ongoing activity was therefore invisible to the
+diagnostic, and "zero matches" was misread as "zero activity." v1's PID
+never changed across ~4 minutes of what were, in hindsight, ineffective
+diagnostic checks, not an actually unresponsive process.
 
-## 3. The pause attempt (2026-08-09, ~07:27-07:33 PDT / 14:27-14:33 UTC)
+### 4. Escalation and its side effect (07:33:16 PDT)
 
-Preconditions verified identically to phase2/phase3 (`tmux has-session -t
-midicrt` alive, `pgrep -f "[m]idicrt.py --profile"` showing v1's PID 999,
-`midicrtd` active). BEFORE capture taken (v1's real content,
-`total_mean_brightness=5.31`, `nonblack_px=2.4%`, single color
-`(0,255,82)` — matches the known v1 wash signature from phase2/phase3).
+`sudo kill -TERM 999` (v1's then-PID), reasoned as a measured last resort
+after ~4 minutes of a misread "unresponsive" state. **This had a real,
+undesired side effect regardless of the misdiagnosis**: within the same
+second, `getty@tty1.service` deactivated and restarted, and the entire
+original tmux server + pane shell were gone, replaced by a fresh tmux
+session (same name) running a fresh v1 instance. Root cause: `.zprofile`'s
+`exec tmux attach -t midicrt` makes the tty1 login shell's own PID become
+the tmux client; a `tmux new-session -d`'s server, though reparented to
+PID 1 in the process table, most likely remained inside
+`getty@tty1.service`'s cgroup (reparenting doesn't move cgroup
+membership) — killing v1 unwound enough of that tree to tear the session
+down, which cascaded into the getty restart. **This is a real, disclosed
+violation of "tmux session NEVER killed,"** caused by escalating on a
+misdiagnosis, not by any actual defect in v1. Full mechanism analysis:
+`pause-path-investigation.md` §1.5/§4.
 
-**07:27:32** — `tmux send-keys -t midicrt q` (plus, on the first attempt,
-an extra literal `Enter` keystroke). **v1 did not quit.** Re-checked at
-07:27:34 (`STILL_ALIVE`), 07:28:15 (`STILL_ALIVE`), and after a second
-plain-`q` send at 07:29:06 (`STILL_ALIVE`), and after a real `C-c`
-(`\x03`) at 07:31:11 (`STILL_ALIVE`) — v1's PID 999 never changed across
-~4 minutes of graceful-quit attempts, all well inside what phase2/phase3
-needed (`~1.5s`) for the identical keystroke.
+---
 
-**Root-caused, not guessed**: `sudo strace -p 999 -f -e
-trace=read,poll,select,ppoll,pselect6 ` for a 3s window showed **zero**
-syscalls on fd 0 across any of the process's 12 threads — no thread in
-v1 was reading its own stdin/pty at all, despite
-`~/codex/midicrt/midicrt.py::keyboard_listener()`'s documented
-`with term.cbreak(): while not exit_flag: key = term.inkey(timeout=0.05)`
-loop, which should poll fd 0 roughly 20x/second. A direct raw write into
-the pty (`printf "q\n" > /dev/pts/0`, bypassing tmux's own `send-keys`
-entirely, as an independent test of whether the problem was tmux-side or
-app-side) also had zero effect — confirming the read side, not the
-delivery mechanism, is where this breaks. `fuser`/`lsof` on `/dev/pts/0`
-showed only the expected two processes (`998 zsh`, `999 python`) holding
-the fd — no competing reader. This is a real, reproducible finding: **v1's
-keyboard-driven quit is currently non-functional on this deployment**,
-independent of anything this task changed (v1 is read-only reference,
-never modified — confirmed `git`/file state untouched throughout).
+## Corrected escalation rule (from `pause-path-investigation.md` §4 — binding for future smokes)
 
-## 4. Escalation and its side effect (07:33:16 PDT / 14:33:16 UTC)
+**Never send an OS-level signal (`kill -TERM`/`-INT`/`-KILL`, `tmux
+kill-*`) to v1's process or anything else in the tty1/getty/tmux chain**
+as an escalation from an apparently unresponsive `send-keys`. Before ever
+considering escalation:
 
-Given the graceful path was unresponsive after ~4 minutes with v1's actual
-function (rendering, MIDI processing) otherwise completely undisturbed
-(zero risk accrued up to this point — nothing had touched `/dev/fb0` or
-v1's process yet), one escalation was attempted: `sudo kill -TERM 999`.
+1. Check `stty -F <pane-tty> -a` for `-icanon -echo` — cbreak already
+   active means the listener thread is alive. Cheap, read-only, zero risk.
+2. If tracing syscalls, use a **complete** filter —
+   `-e trace=read,select,pselect6,poll,ppoll` — and grep its output
+   correctly: `pselect6`'s watched-fd argument renders as a bracketed
+   list (`[0]`), not `fd=0`. `blessed`'s `kbhit()` readiness check is
+   `select.select()`, which is `pselect6` on this platform's CPython —
+   never assume `read`/`poll` alone cover it.
+3. Retry the graceful path — including v1's own explicit `\x03` (Ctrl-C)
+   handling — before ever reaching for a process signal.
+4. If steps 1-3 all genuinely indicate the listener is dead, **STOP and
+   report BLOCKED.** Do not send a signal. v1 has no registered signal
+   handler, so an OS-level kill terminates cleanly at the process level —
+   which is exactly what let it cascade through the cgroup/getty chain
+   instead of staying contained to the target PID.
 
-**This had a real, undesired side effect**: within the same second,
-`journalctl` shows `getty@tty1.service: Deactivated successfully` →
-`Scheduled restart job` → `Started`, and the **entire original tmux
-server (PID 997) and its pane's shell (998) were gone** (`ps -p 997 998`
-returns nothing), replaced by a **brand-new tmux server** (fresh PID,
-`session created` timestamp = the exact restart second) running a
-**fresh** v1 instance. Root cause, reconstructed from `.zprofile`:
-
-```
-if [[ "$TTY" == "/dev/tty1" ]]; then
-  ...
-  if ! tmux has-session -t midicrt; then tmux new-session -d -s midicrt ...; fi
-  exec tmux attach -t midicrt      # tty1's own login shell BECOMES this, via exec
-fi
-```
-
-The tty1 login shell `exec`s into a `tmux attach` client for the
-`midicrt` session — its own process stays the systemd-tracked "main
-process" for `getty@tty1.service` (same PID throughout the exec chain).
-`tmux new-session -d` daemonizes the SERVER (reparenting it to PID 1 in
-the process table), but — per systemd's ordinary cgroup-membership
-behavior — a reparented process is NOT automatically moved out of the
-cgroup it was forked into, so the tmux server (and everything under it,
-including v1) most likely remained inside `getty@tty1.service`'s cgroup.
-Killing v1's process apparently caused enough of that cgroup's tree to
-unwind that the SESSION itself was torn down (exact mechanism inside the
-zsh/tmux teardown not fully isolated — flagged honestly, not papered
-over) — the `tmux attach` client on tty1 then saw its session vanish and
-exited, which is what `getty@tty1.service` interpreted as
-"deactivated," triggering its own (evidently `Restart=`-configured)
-respawn: fresh getty → fresh autologin → fresh `.zprofile` → fresh
-`tmux new-session` (same name `midicrt`, none of the old process tree
-survives) → fresh v1.
-
-**This is a real, disclosed violation of the "tmux session NEVER killed"
-hard rule** (`docs/phase2-smoke.md`'s own established contract) — not
-because the session was killed directly, but because a signal-based
-escalation on the wedged application process had a blast radius wider
-than intended, one this task's own author did not fully predict before
-acting. Recorded here in full rather than minimized, per this project's
-disclosure convention.
-
-## 5. Post-incident verification and the decision to stop
-
-The self-healed v1 instance was verified genuinely alive and rendering:
-`pgrep`/`tmux has-session` both healthy, and a fresh read-only `fbcap.py`
-capture (`zzz-v1-post-incident-selfheal.png`) showed real content
-(`nonblack_px=12.6%`, single color `(0,255,82)` — the same v1 signature,
-confirming this is really v1 rendering, not a stale/black frame).
-`midicrtd.service` and the pre-existing (unrelated, pre-dating this task)
-`/tmp/midicrt_t4_diag` diagnostic daemon were both unaffected throughout.
-
-**Before considering a second pause attempt**, the fresh instance's own
-fd-0 read behavior was checked (read-only `strace`, ~8 seconds, ~4900
-syscall lines across 14 threads) — **also zero reads/polls on fd 0**.
-This is the finding that stopped this task from retrying: the
-keyboard-unresponsiveness is not something specific to an
-11-hour-old, GIL-starved process instance (which would have been a
-reasonable, retry-worthy theory) — it reproduces on a process that was
-**under 8 minutes old**. That makes it a systemic property of this
-deployment right now, not a fluke of process age, and a second pause
-attempt would very likely hit the exact same wall — with the only
-"escalation" available (a signal-based kill) already proven to risk
-tearing down the whole tmux/getty chain again.
-
-**Decision: Task 7's live-`/dev/fb0` pause window is BLOCKED, not
-retried.** Per the task's own governing rule ("BLOCKED on any restore
-failure... one retry then BLOCKED"), and given the escalation step
-already produced one undesired structural side effect this session does
-not fully understand the exact mechanism of, a second live attempt was
-judged higher-risk than valuable. This is a judgment call, disclosed for
-review rather than asserted as obviously correct.
-
-**Working hypothesis for the underlying regression** (disclosed as a
-hypothesis, not confirmed root cause): `progress.md`'s ledger records a
-**real reboot** during this same Phase 8 window (the boot-debranding job
-— `plymouth.enable=0`, `Theme=details`, `logo.nologo` — "reboot
-verified"). A boot-time change to kernel console parameters or the
-plymouth/getty console handoff is a plausible way to alter `tty1`'s
-console driver behavior enough to break `blessed`'s `cbreak()`/`inkey()`
-raw-mode detection for a process whose controlling terminal traces back
-to that tty — worth checking first in any follow-up, before assuming a
-v1 code regression.
-
-## 6. Cleanup performed (all verified)
-
-- Background `clock_stream.py` process killed (`pgrep` confirms gone).
-- `config.toml` restored to its pre-task exact content
-  (`capture_auto_start = true`, single line) from a byte-for-byte backup
-  taken before the scratch edit; `midicrtd` restarted a second time to
-  apply it. Verified pristine: two `midicrt status` polls ~7s apart both
-  showed `current_page="eventlog"` (no rotation — confirms
-  `pagecycle_interval` is back to its 300s default, not the 15s scratch
-  value).
-- Session count: 16 (pre-task) → 18 (post-cleanup) — two new production
-  capture sessions, both expected/documented `capture_auto_start=true`
-  restart artifacts (this task's own two `midicrtd` restarts for the
-  pagecycle scratch value), same pattern as every prior Phase 8 task's
-  own live-verification restarts.
-- `~/t7_smoke_scripts/` (this task's own scratch scripts) and all `/tmp`
-  capture files removed from the Pi.
-- `git status --short` in `~/midicrt2` clean throughout — this task never
-  touched application source, only `config.toml` (restored) and this doc.
-- v1 (`~/codex/midicrt`) left running (self-healed fresh instance) and
-  independently verified alive; **not** further poked at.
-
-## 7. What a follow-up attempt should do differently
-
-1. Diagnose the fd-0 read regression FIRST (does `keyboard_listener()`'s
-   thread even start? does `term.cbreak()` raise and get swallowed
-   somewhere? does `blessed.Terminal()`'s stream resolve to a real tty in
-   this environment?) as its own, non-time-pressured, read-only
-   investigation — ideally by attaching `strace`/a debugger to a FRESH
-   v1 launch from the very first second, not discovering it 4 minutes
-   into a live pause attempt.
-2. If a code/environment fix is found and deployed, re-verify the
-   graceful-quit path in isolation (send `q`, confirm gone within the
-   phase2/3 precedent's ~1.5-2s) BEFORE structuring a full multi-feature
-   demo around it.
-3. If the graceful path still cannot be restored, do NOT use a raw
-   `kill -TERM`/`-KILL` on the wedged PID again without first understanding
-   the getty/cgroup interaction from §4 — consider instead
-   `systemctl restart getty@tty1.service` as a single, well-understood
-   unit of restart (accepting the same "fresh v1" outcome deliberately,
-   rather than as a side effect), or physical/console-level intervention
-   with the actual user present.
+---
 
 ## Evidence index
 
@@ -289,7 +257,12 @@ v1 code regression.
 
 | File | What it shows |
 |---|---|
-| `aaa-v1-before-pause-attempt.png` | v1's real content immediately before the pause attempt (raw fb0 read) |
-| `headless-eventlog-marquee-liveBPM.png` | Live production daemon, headless render: marquee mid-scroll, real derived BPM, monochrome |
-| `headless-help-overlay-roster-resolved.png` | Live production daemon, headless `--overlay` render: help panel + roster-resolved `page.jump` entries |
-| `zzz-v1-post-incident-selfheal.png` | v1's real content from the self-healed fresh instance, confirming it recovered and is genuinely rendering |
+| `tube-01-before-v1.png` | v1's real content immediately before the (successful) pause |
+| `tube-02-pagecycle-rotate-a-eventlog.png` / `tube-03-pagecycle-rotate-b-spectrum.png` | Real fb0, pagecycle auto-rotating `eventlog -> spectrum` with zero client actions, 17s apart |
+| `tube-04-pianoroll-grid-liveBPM.png` | Real fb0: paper grid, label column, Bars strip, live-derived BPM, marquee+keymap-indicator sharing the header |
+| `tube-05-marquee-t0.png` / `tube-06-marquee-t1.png` | Real fb0, marquee genuinely scrolled (`BAR 0005->0006`), ~4s apart, same page (pause armed) |
+| `tube-07-tint-overlap-flash.png` | Real fb0: row-tint wash + overlap-flash while two injected overlapping notes are active |
+| `tube-08-after-release.png` | Real fb0, captured after both injected notes released |
+| `tube-09-help-overlay-headless.png` | Headless (by design, see rationale above): help panel + roster-resolved `page.jump` labels |
+| `tube-10-after-v1-restored.png` | Real fb0, v1's own Notes page (incl. its notes-badge mini-panel) confirming genuine restoration |
+| `incident-01..04-*.png` | First-attempt evidence, preserved for the incident record (headless-only, that attempt never reached the physical device) |
