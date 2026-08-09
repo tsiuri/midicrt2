@@ -931,8 +931,9 @@ def test_render_pianoroll_frame_draws_a_rect_per_note_in_its_velocity_color():
     header_h = font.height + 2 * app.HEADER_PAD
     usable_h = surf.height - app._reserved_chrome_height(font) - header_h
     # Phase 8 Task 3: the roll body no longer starts at x=0 -- the label
-    # column (app.PIANOROLL_LABEL_CHARS wide) now sits to its left.
-    roll_x0 = app.PIANOROLL_LABEL_CHARS * font.width
+    # column (app.PIANOROLL_LABEL_MARGIN_CHARS wide -- v1's margin, one
+    # char wider than the label text itself) now sits to its left.
+    roll_x0 = app.PIANOROLL_LABEL_MARGIN_CHARS * font.width
     roll_w = surf.width - roll_x0
     note = PIANOROLL_NOTES[0]   # ch1, y=0.0, loud -- top-left-most rect
     x = roll_x0 + round(note["x0"] * roll_w) + 2
@@ -978,8 +979,9 @@ def test_render_pianoroll_frame_reserves_the_bottom_chrome_as_background():
 # -- paper grid + label column (Phase 8 Task 3, docs/visual-audit.md §9c) --
 #
 # Geometry shared by the tests below: PIANOROLL_SURFACE_SIZE=(420, 144),
-# PIANOROLL_LABEL_CHARS=9 * font.width(8) = 72px label column, so
-# roll_x0=72, roll_w=348. usable_h=96, pitch_span=13 -> note_h=7,
+# PIANOROLL_LABEL_MARGIN_CHARS=10 * font.width(8) = 80px label column (v1's
+# own margin -- one char wider than the 9-char label text itself, review
+# fix), so roll_x0=80, roll_w=340. usable_h=96, pitch_span=13 -> note_h=7,
 # row_span_h=89. Only guide rows 0 (C5), 6 (F#4), 12 (C4) have a note in
 # PIANOROLL_NOTES (y=0.0/0.5/1.0) -- every other row is a clean probe point
 # for "is the grid visible with nothing drawn over it."
@@ -990,7 +992,7 @@ def _pianoroll_layout():
     usable_h = PIANOROLL_SURFACE_SIZE[1] - app._reserved_chrome_height(font) - header_h
     note_h = usable_h // 13
     row_span_h = usable_h - note_h
-    roll_x0 = app.PIANOROLL_LABEL_CHARS * font.width
+    roll_x0 = app.PIANOROLL_LABEL_MARGIN_CHARS * font.width
     roll_w = PIANOROLL_SURFACE_SIZE[0] - roll_x0
     return font, header_h, usable_h, note_h, row_span_h, roll_x0, roll_w
 

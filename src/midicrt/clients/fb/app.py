@@ -432,7 +432,8 @@ def render_tuner_frame(vm: dict, surface: Surface) -> None:
 # -- pianoroll page (phase-3 task 7; paper-grid + label column: phase-8 task 3) -
 #
 # Layout: same reverse-video header convention as the other pages, then a
-# LEFT LABEL COLUMN (`PIANOROLL_LABEL_CHARS` wide) holding one
+# LEFT LABEL COLUMN (`PIANOROLL_LABEL_MARGIN_CHARS` wide, one char wider
+# than the label text itself -- v1's own margin convention) holding one
 # `"{note_name:>7} │"` row per visible pitch, then the pixel roll body drawn
 # via `Surface.rect` (task brief: "fb: pixel roll via rect/hline
 # primitives" -- `rect` alone suffices here since every note is already a
@@ -476,12 +477,20 @@ def render_tuner_frame(vm: dict, surface: Surface) -> None:
 _PIANOROLL_RAMP = RAMPS["pianoroll"]
 
 # `"{note_name:>7} │"` is always exactly 9 characters (7 right-justified +
-# 1 space + 1 pipe) -- v1's own `LEFT_CHARS` convention
-# (`compositor_renderer.py::_render_pianoroll`'s `getattr(widget,
-# "left_margin", 10)`, close to but not identical to this task's own
-# label-text-width-derived constant; kept exact to the STRING this task
-# actually renders rather than v1's separately-configurable margin).
+# 1 space + 1 pipe) -- the label TEXT's own printed width.
 PIANOROLL_LABEL_CHARS = 9
+# v1's own `LEFT_CHARS` margin (`compositor_renderer.py::_render_pianoroll`'s
+# `getattr(widget, "left_margin", 10)`) is ONE CHARACTER WIDER than the
+# label text itself -- a blank buffer column between the pipe and the roll
+# body (review fix: an earlier draft of this port used
+# `PIANOROLL_LABEL_CHARS` for BOTH the printed text width AND the roll's
+# x-origin/invert-rect width, a disclosed deviation from v1's exact margin
+# that this fixes). v1's own invert rect also spans this WIDER margin, not
+# just the text's own width (`comp.rect(0, px_y, LEFT_CHARS * cw, cell_h,
+# GREEN_MID)` -- confirmed by direct read, `compositor_renderer.py:868`),
+# so both `roll_x0` (below) and `_draw_pianoroll_labels`'s invert-fill width
+# use THIS constant, not `PIANOROLL_LABEL_CHARS`.
+PIANOROLL_LABEL_MARGIN_CHARS = 10
 # v1's exact dotted-guide strides (`compositor_renderer.py`'s
 # `row_guide_step`/`bar_guide_step`) -- reused for BOTH beat and bar
 # vertical guides here (a disclosed simplification: v1 only dots bar
@@ -553,9 +562,11 @@ def _draw_pianoroll_labels(
     that pitch is currently visible in the roll -- `active_ys` is `vm["notes"]`'s
     own already-projected `y` fractions, matched by set membership (exact,
     not approximate -- both are the SAME `_y(pitch)` expression on the
-    engine side, see pages/pianoroll.py's grid docstring).
+    engine side, see pages/pianoroll.py's grid docstring). The invert fill
+    spans the full v1 margin (`PIANOROLL_LABEL_MARGIN_CHARS`), not just the
+    9-char label text -- matches v1's own `LEFT_CHARS * cw` rect width.
     """
-    label_w = PIANOROLL_LABEL_CHARS * font.width
+    label_w = PIANOROLL_LABEL_MARGIN_CHARS * font.width
     for guide in guides:
         y = header_h + round(guide["y"] * row_span_h)
         label = _pianoroll_label_text(guide)
@@ -588,7 +599,7 @@ def render_pianoroll_frame(vm: dict, surface: Surface) -> None:
     pitch_span = max(1, rng["hi"] - rng["lo"] + 1)
     note_h = max(1, usable_h // pitch_span)
     row_span_h = max(0, usable_h - note_h)
-    label_w = PIANOROLL_LABEL_CHARS * font.width
+    label_w = PIANOROLL_LABEL_MARGIN_CHARS * font.width
     roll_x0 = label_w
     roll_w = max(0, surface.width - label_w)
 

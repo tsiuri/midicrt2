@@ -262,9 +262,23 @@ can draw without doing music math"):
   says the grid should spare it, so it's precomputed here instead (`NOTE_
   NAMES` imported from `analyzers/theory.py`, the same table `pages/
   chordkey.py` already reuses, rather than re-declared).
-- `running`: `self._running`, plain passthrough -- lets a renderer show a
-  different chrome cue for "genuinely playing" vs "idle-scrolling" without
-  it needing to infer that from bpm/mode itself.
+- `running`: `self._running`, plain passthrough. **Review fix, disclosed
+  choice**: an earlier draft of this docstring claimed this field "lets a
+  renderer show a different chrome cue for genuinely-playing vs. idle-
+  scrolling" -- no renderer actually does that, and none is added here.
+  Two reasons this stays a plain unconsumed passthrough rather than wiring
+  a new visual cue: (1) v1's own dotted-guide draw code has NO running/
+  stopped branch either (confirmed by the full `_render_pianoroll` read
+  this task's docstring already cites elsewhere) -- a v2-only cue here
+  would be an unrequested embellishment beyond the "port faithfully"
+  scope, not a gap; (2) `clients/fb/app.py`'s existing bottom status strip
+  (`_draw_status`, fed by the SEPARATE `overlay.status` topic, not this
+  page's own VM) already shows `RUN`/`STOP` for every page including this
+  one -- a second, redundant indicator sourced from `grid["running"]`
+  specifically would duplicate chrome that already exists. Kept in the VM
+  regardless (matches the task brief's literal schema, and costs nothing
+  to report) in case a future task finds a genuine non-redundant use for
+  it, but the claim of an existing consumer is removed.
 
 Adapted, not a literal port: the anchor mechanism
 ---------------------------------------------------------------------------
@@ -321,7 +335,12 @@ docs/visual-audit.md §9c's own row-by-row build-priority list)
   ports) -- not requested by this task's brief ("faint beat/bar gridlines
   behind the roll" -- the dotted backdrop, not a second chrome row) and no
   v2 renderer currently reserves space for a fourth chrome strip; flagged
-  here rather than silently folded in or silently dropped.
+  here rather than silently folded in or silently dropped. **Ownership
+  (review fix)**: this is a §9c row same as the two items above it, so it
+  belongs to Task 4's "implement every MISSING/DIFFERENT row from the
+  audit's animation/burn-in tables... the audit is the checklist" catalog,
+  not a permanently-unscheduled gap -- explicitly assigned there rather
+  than left ambiguous about which future task (if any) owns it.
 """
 from __future__ import annotations
 
@@ -454,6 +473,16 @@ class PianorollState:
         # "start" ever arrives, matching v1's own `last_run_bpm` defaulting
         # to `idle_scroll_bpm` pre-run rather than being undefined/frozen.
         self._beat_zero_ts = self._now
+        # `pitch_guide_ys` memoization (review fix): invariant per (pitch_lo,
+        # pitch_hi) -- nothing in this class mutates that pair today
+        # (pitch-window panning is disclosed future work, module docstring's
+        # "Not ported" section), so every `view_model()` call was
+        # reformatting the same N note-name strings from scratch. Keyed on
+        # the CURRENT pair rather than built once-and-frozen so a future
+        # range-change feature invalidates it automatically instead of
+        # needing its own cache-busting code -- see `_pitch_guide_ys()`.
+        self._pitch_guide_cache_key: tuple[int, int] | None = None
+        self._pitch_guide_cache: list[dict] | None = None
 
     # -- event handling ------------------------------------------------------
 
@@ -687,21 +716,37 @@ class PianorollState:
         bar_xs: list[float] = []
         for m, x in self._grid_instants():
             (bar_xs if m % BEATS_PER_BAR == 0 else beat_xs).append(x)
-        pitch_guide_ys = [
-            {
-                "y": self._y(pitch),
-                "is_c": pitch % 12 == 0,
-                "pitch": pitch,
-                "name": f"{NOTE_NAMES[pitch % 12]}{pitch // 12 - 1}",
-            }
-            for pitch in range(self._pitch_hi, self._pitch_lo - 1, -1)
-        ]
         return {
             "beat_xs": beat_xs,
             "bar_xs": bar_xs,
-            "pitch_guide_ys": pitch_guide_ys,
+            "pitch_guide_ys": self._pitch_guide_ys(),
             "running": self._running,
         }
+
+    def _pitch_guide_ys(self) -> list[dict]:
+        """Memoized `pitch_guide_ys` (review fix, see `__init__`'s own
+        comment) -- rebuilds only when `(pitch_lo, pitch_hi)` differs from
+        the cached key, so the common case (every `view_model()` call
+        during an ordinary session, where the range never changes) reuses
+        the SAME list object rather than reformatting N note-name strings
+        every time. Returned BY REFERENCE, not copied -- consistent with
+        this VM's existing convention of never defensively copying returned
+        data (e.g. `clients/fb/lum.py`'s `RAMPS`/`TIERS`); callers only ever
+        read this list, never mutate it.
+        """
+        key = (self._pitch_lo, self._pitch_hi)
+        if self._pitch_guide_cache_key != key:
+            self._pitch_guide_cache = [
+                {
+                    "y": self._y(pitch),
+                    "is_c": pitch % 12 == 0,
+                    "pitch": pitch,
+                    "name": f"{NOTE_NAMES[pitch % 12]}{pitch // 12 - 1}",
+                }
+                for pitch in range(self._pitch_hi, self._pitch_lo - 1, -1)
+            ]
+            self._pitch_guide_cache_key = key
+        return self._pitch_guide_cache
 
     def _iter_spans(self):
         yield from self._closed

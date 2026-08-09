@@ -675,3 +675,42 @@ def test_grid_bpm_non_positive_produces_empty_grid_lines_not_a_crash():
     assert grid["beat_xs"] == []
     assert grid["bar_xs"] == []
     assert grid["pitch_guide_ys"]   # pitch guides are independent of bpm
+
+
+# -- review fix: pitch_guide_ys memoization -----------------------------
+#
+# `pitch_guide_ys` is invariant data (one {y, is_c, pitch, name} dict per
+# semitone in [pitch_lo, pitch_hi]) that view_model() was rebuilding --
+# reformatting every note name string via f-string + NOTE_NAMES lookup --
+# on EVERY call, even though nothing in this class mutates pitch_lo/pitch_hi
+# after construction today (pitch-range panning is disclosed future work,
+# module docstring's "Not ported" section). Cached keyed on the
+# (pitch_lo, pitch_hi) pair so a future range-change feature invalidates
+# it automatically rather than needing its own cache-busting code.
+
+def test_grid_pitch_guide_ys_is_memoized_across_calls():
+    s = PianorollState(now=100.0, pitch_lo=60, pitch_hi=72)
+    first = s.view_model()["grid"]["pitch_guide_ys"]
+    second = s.view_model()["grid"]["pitch_guide_ys"]
+    assert first is second   # same object -- proves the second call did not rebuild
+    assert first == second   # (content sanity, in case identity check above is ever relaxed)
+
+
+def test_grid_pitch_guide_ys_cache_invalidates_on_range_change():
+    s = PianorollState(now=100.0, pitch_lo=60, pitch_hi=72)
+    first = s.view_model()["grid"]["pitch_guide_ys"]
+    # No public setter exists yet for pitch_lo/pitch_hi (pitch-window
+    # panning is disclosed future work) -- mutate the private fields
+    # directly to simulate that future feature and prove the cache keys
+    # off the CURRENT range rather than latching onto the first one seen.
+    s._pitch_lo = 61
+    s._pitch_hi = 73
+    second = s.view_model()["grid"]["pitch_guide_ys"]
+    assert second is not first
+    assert [g["pitch"] for g in second] == list(range(73, 60, -1))
+    # Reverting to the original range must not still be considered
+    # "already cached" against the wrong (now stale) object.
+    s._pitch_lo, s._pitch_hi = 60, 72
+    third = s.view_model()["grid"]["pitch_guide_ys"]
+    assert third is not second
+    assert third == first
