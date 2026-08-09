@@ -51,9 +51,29 @@ def test_build_leaves_the_open_ports_provider_unwired_with_no_midi(tmp_path):
     assert engine._open_ports_provider is None
 
 
-def start_daemon(sock):
+def _write_isolated_daemon_config(tmp_path) -> str:
+    """Fix round, item 1 (subprocess config isolation) -- twin of
+    `tests/test_fb_render.py::_write_isolated_daemon_config`, same
+    reasoning: a `midicrt.daemon` subprocess with no `--config` inherits
+    the REAL `~/.config/midicrt/config.toml` (`capture_auto_start = true`
+    in production on this box), which `tests/conftest.py`'s autouse
+    isolation fixture cannot reach across a subprocess boundary. Confirmed
+    live: before this fix, all 9 of this file's `start_daemon()` call
+    sites silently wrote real session files into
+    `/var/lib/midicrt/sessions` on every test run."""
+    config_path = tmp_path / "isolated-config.toml"
+    config_path.write_text(
+        "capture_auto_start = false\n"
+        f'capture_dir = "{tmp_path / "sessions"}"\n'
+    )
+    return str(config_path)
+
+
+def start_daemon(sock, tmp_path):
+    config_path = _write_isolated_daemon_config(tmp_path)
     p = subprocess.Popen(
-        [VENVPY, "-m", "midicrt.daemon", "--socket", sock, "--no-midi", "--no-audio"],
+        [VENVPY, "-m", "midicrt.daemon", "--socket", sock, "--no-midi", "--no-audio",
+         "--config", config_path],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     for _ in range(100):
         if subprocess.run(
@@ -73,7 +93,7 @@ def cli(sock, *args):
 
 def test_daemon_cli_roundtrip(tmp_path):
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         st = json.loads(cli(sock, "status").stdout)
         assert st["page"] == "eventlog" and st["clients"] >= 1
@@ -106,7 +126,7 @@ def test_daemon_cli_roundtrip(tmp_path):
 
 def test_cli_bind_list_empty(tmp_path):
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         r = cli(sock, "bind", "list")
         assert r.returncode == 0
@@ -118,7 +138,7 @@ def test_cli_bind_list_empty(tmp_path):
 
 def test_cli_bind_remove_unknown_id_fails(tmp_path):
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         r = cli(sock, "bind", "remove", "nope")
         assert r.returncode != 0
@@ -130,7 +150,7 @@ def test_cli_bind_remove_unknown_id_fails(tmp_path):
 
 def test_cli_bind_cancel_with_nothing_armed_reports_not_cancelled(tmp_path):
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         r = cli(sock, "bind", "cancel")
         assert r.returncode == 0
@@ -142,7 +162,7 @@ def test_cli_bind_cancel_with_nothing_armed_reports_not_cancelled(tmp_path):
 
 def test_cli_bind_learn_unknown_action_fails_immediately(tmp_path):
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         r = cli(sock, "bind", "learn", "bogus.action")
         assert r.returncode != 0
@@ -168,7 +188,7 @@ def test_cli_bind_learn_arm_then_cancel_round_trip(tmp_path):
     the learn_cancelled event delivery, and the exit-code contract all
     work through the real socket/argparse path."""
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         learn_proc = _bind_learn_bg(sock, "page.next", "--timeout", "10")
         time.sleep(0.5)   # let the arm request land before cancelling
@@ -192,7 +212,7 @@ def test_cli_bind_learn_continuous_mode_arms_with_auto_detected_fill_arg(tmp_pat
     through the real CLI flag parsing rather than a direct engine-level
     dispatch call."""
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         learn_proc = _bind_learn_bg(
             sock, "pianoroll.zoom_level", "--mode", "continuous", "--timeout", "10")
@@ -217,7 +237,7 @@ def test_cli_bind_learn_continuous_mode_with_range_flag_arms_successfully(tmp_pa
     `_bind_learn` range-validation tests for that half); this proves a
     WELL-FORMED one arms successfully end to end over the real socket."""
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         learn_proc = _bind_learn_bg(
             sock, "pianoroll.zoom_level", "--mode", "continuous",
@@ -237,7 +257,7 @@ def test_cli_bind_learn_continuous_mode_with_range_flag_arms_successfully(tmp_pa
 
 def test_cli_bind_learn_trigger_with_arg_flag_arms_successfully(tmp_path):
     sock = str(tmp_path / "ctl.sock")
-    p = start_daemon(sock)
+    p = start_daemon(sock, tmp_path)
     try:
         learn_proc = _bind_learn_bg(
             sock, "page.goto", "--arg", "name=harmony", "--timeout", "10")

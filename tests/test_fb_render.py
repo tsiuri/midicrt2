@@ -364,9 +364,36 @@ def test_render_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
-def _start_daemon(sock):
+def _write_isolated_daemon_config(tmp_path) -> str:
+    """Fix round, item 1 (subprocess config isolation): a `midicrt.daemon`
+    subprocess started with no `--config` inherits the REAL
+    `~/.config/midicrt/config.toml` -- on this box that file has
+    `capture_auto_start = true`, a real, user-intended PRODUCTION setting,
+    not a test default. `tests/conftest.py`'s repo-wide autouse isolation
+    fixture (`_isolate_default_midicrt_config_paths`) cannot help here: it
+    monkeypatches module attributes in THIS process, but `_start_daemon`
+    spawns a genuinely separate OS process that re-imports `config.py`
+    fresh -- see that fixture's own (now-corrected) docstring for the full
+    explanation. Confirmed live: before this fix, every subprocess daemon
+    this file spawns silently wrote a real (if tiny) session file into
+    `/var/lib/midicrt/sessions` on every test run. Both keys are declared
+    explicitly (not left to `Config()`'s own default, which happens to
+    also be `capture_auto_start=False` today) so this test file's
+    isolation is an explicit, auditable fact, not a coincidence that would
+    silently break if that default ever changed."""
+    config_path = tmp_path / "isolated-config.toml"
+    config_path.write_text(
+        "capture_auto_start = false\n"
+        f'capture_dir = "{tmp_path / "sessions"}"\n'
+    )
+    return str(config_path)
+
+
+def _start_daemon(sock, tmp_path):
+    config_path = _write_isolated_daemon_config(tmp_path)
     p = subprocess.Popen(
-        [VENVPY, "-m", "midicrt.daemon", "--socket", sock, "--no-midi", "--no-audio"],
+        [VENVPY, "-m", "midicrt.daemon", "--socket", sock, "--no-midi", "--no-audio",
+         "--config", config_path],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     for _ in range(100):
         if subprocess.run(
@@ -388,7 +415,7 @@ def test_out_mode_renders_one_frame_and_exits_against_real_daemon(tmp_path):
     )
     sock = str(tmp_path / "ctl.sock")
     out_png = tmp_path / "frame.png"
-    daemon = _start_daemon(sock)
+    daemon = _start_daemon(sock, tmp_path)
     try:
         result = subprocess.run(
             [VENVPY, "-m", "midicrt.clients.fb.app",
@@ -1780,7 +1807,7 @@ def test_fps_zero_rejected_before_connect_no_hang(tmp_path):
     # error out with TimeoutExpired instead of failing a clean assertion.
     sock = str(tmp_path / "ctl.sock")
     out_png = tmp_path / "frame.png"
-    daemon = _start_daemon(sock)
+    daemon = _start_daemon(sock, tmp_path)
     try:
         result = subprocess.run(
             [VENVPY, "-m", "midicrt.clients.fb.app",

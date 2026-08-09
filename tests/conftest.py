@@ -35,8 +35,26 @@ LIFO stack, with no double-teardown or ordering hazard.
 `config.py`'s own `DEFAULT_PATH` is deliberately NOT touched here --
 `Engine.__init__` never reads `config.toml` at all (a `Config()` dataclass
 is passed in directly); only `config_mod.load(path)` reads it, and every
-call site either takes an explicit path or is a daemon-startup path outside
-the test suite's reach.
+IN-PROCESS call site takes an explicit path already.
+
+**Correction (fix round after Phase 8 Task 2, "monochrome" review): the
+daemon-startup path is NOT outside the test suite's reach** -- that claim
+was wrong, and it was live, not hypothetical. `tests/test_fb_render.py::
+_start_daemon` and `tests/test_daemon_cli.py::start_daemon` both spawn a
+REAL `python -m midicrt.daemon` SUBPROCESS -- a genuinely separate OS
+process this fixture's `monkeypatch.setattr()` calls can never reach (a
+fresh interpreter re-imports `config.py` fresh, with its real, unpatched
+`DEFAULT_PATH`). Confirmed live: before the fix, all 11 of those two
+helpers' call sites spawned an unconfigured daemon that silently read the
+REAL `~/.config/midicrt/config.toml` on this box (`capture_auto_start =
+true`, a real production setting) and wrote real test-noise session files
+into `/var/lib/midicrt/sessions` on every subprocess-daemon test run.
+Fixed at the point of the actual gap, not here -- a process-boundary
+monkeypatch is structurally impossible, so both helpers now pass their own
+explicit `--config <tmp_path>/isolated-config.toml`
+(`capture_auto_start = false` + `capture_dir` under that same `tmp_path`)
+directly on the subprocess command line instead. See each helper's own
+`_write_isolated_daemon_config` docstring.
 
 Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md) extends the
 SAME fixture to `engine/capture.py`'s own `DEFAULT_STATE_DIR`/
