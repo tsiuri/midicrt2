@@ -32,3 +32,15 @@ Run tests: `~/midicrt2-venv/bin/pytest`
   cutover sign-off document).
 - `docs/phase1-smoke.md`, `docs/phase2-smoke.md`, `docs/phase3-smoke.md` —
   supervised real-CRT/real-hardware smoke evidence for each phase.
+- `docs/visual-audit.md` — the Phase 8 v1-vs-v2 visual/animation feature
+  parity checklist (PRESENT/DIFFERENT/MISSING/N-A per row, build-priority
+  ranking). The load-bearing document for the whole GUI-parity phase.
+- `docs/phase8-smoke.md` — Phase 8 Task 7's supervised real-CRT smoke
+  attempt. **Read this before pausing v1 again**: v1's keyboard-driven
+  quit is currently unresponsive on this deployment (reproduced on two
+  independent process instances), and one escalation attempt had a real,
+  disclosed side effect (a `kill -TERM` on the wedged process cascaded
+  into tearing down the whole tmux session via the `.zprofile`/
+  `getty@tty1` exec-attach chain, which then self-healed via getty's own
+  restart into a fresh v1 instance). The live-`/dev/fb0` pause window is
+  BLOCKED pending a diagnosis of that regression, not yet retried.

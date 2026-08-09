@@ -634,3 +634,43 @@ dropped).
    "at rest"), so this is about restoring visual richness within an
    already-working animation loop, lower risk than building a missing
    mechanism from zero.
+
+---
+
+## Phase 8 Task 7 — final status (2026-08-09)
+
+**Counts unchanged from Task 6** (PRESENT 33 / DIFFERENT 13 / MISSING 19 /
+N/A 3, above) — Task 7 was the planned live-real-CRT sign-off pass over
+this whole audit, but the supervised v1-pause window could not be safely
+opened (v1's keyboard-driven quit is currently unresponsive on this
+deployment, reproduced on two independent process instances via `strace`;
+full incident record in `docs/phase8-smoke.md`). No row in this document
+was re-verified against the *physical tube* as a result, so no row here
+is re-stamped "live-CRT confirmed" and no count changes were made on the
+strength of an incomplete pass.
+
+What Task 7 DID re-confirm, against the real running production
+`midicrtd` (headless `midicrt-fb --out`/`--overlay`, never the physical
+`/dev/fb0`): the header marquee genuinely scrolling under a live
+clock-derived BPM (§20b's PRESENT row), monochrome rendering holding
+(single color `(0,255,82)` across a real multi-page/live-MIDI capture,
+the §2 DIFFERENT-row's replacement byte-exact per Task 2), the on-screen
+keymap indicator visible in the header (§ Task 6's PRESENT row), the help
+overlay + roster-resolved `page.jump` labels rendering correctly (Task
+6's PRESENT row), and pagecycle's v1-semantics rotation genuinely
+advancing `current_page` on a 15s scratch interval with no client action
+in between (§20e's PRESENT row, Task 5). None of these were previously in
+doubt from Task 6's own review, so this is corroboration, not new
+information — hence no count movement.
+
+**Open item for a follow-up pass**: diagnose why v1's `keyboard_listener()`
+(`~/codex/midicrt/midicrt.py`) is not consuming input on its controlling
+tty (zero `read`/`poll` syscalls on fd 0 across two independent process
+instances, one under 8 minutes old — not an aged-process fluke). Working
+hypothesis, unconfirmed: this Phase 8 window's own boot-de-branding job
+required a real reboot, and a console/plymouth/getty parameter change
+from that reboot may have altered `tty1`'s console behavior enough to
+break `blessed`'s raw-mode detection for a process whose controlling
+terminal traces back to it. This blocks not just Task 7 but any future
+supervised real-CRT pause of v1 until resolved — see `docs/phase8-smoke.md`
+§7 for the recommended diagnostic-first approach before another attempt.
