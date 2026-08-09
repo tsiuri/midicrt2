@@ -368,10 +368,43 @@ class SpectrumAnalyzer:
             x = np.asarray(block, dtype=np.float32)
         raw = compute_bins(x, sr, self._bins_n)
         with self._lock:
-            for i, v in enumerate(raw):
+            # Defensive length clip (Phase 8 Task 6, `adjust_bins` below):
+            # `self._bins_n` was read UNLOCKED just above (deliberately --
+            # keeping the FFT math itself off the lock), so a concurrent
+            # `adjust_bins()` call from the action-dispatch thread can
+            # resize `self._levels`/`self._peak` between that read and this
+            # write. `raw`'s length reflects the OLD `_bins_n`; clipping to
+            # `min(len(raw), len(self._levels))` avoids an IndexError on
+            # the rare race, at the cost of a harmlessly-incomplete update
+            # for the one straddling block (a real bin count only changes
+            # on an infrequent keypress, never per-block).
+            n = min(len(raw), len(self._levels))
+            for i in range(n):
+                v = raw[i]
                 self._levels[i] = SMOOTHING * self._levels[i] + (1.0 - SMOOTHING) * v
                 self._peak[i] = max(self._peak[i], self._levels[i])
         return True
+
+    def adjust_bins(self, delta: int) -> int:
+        """Phase 8 Task 6 (docs/visual-audit.md's spectrum retuning-keys
+        row -- representative minimal subset, see `engine/keymap.py`'s own
+        `DEFAULT_PAGE_KEYMAPS` docstring for why only bins+/- made this
+        pass, not the other 21 v1 keys): v1's `[`/`]` keys adjusted
+        `TARGET_BINS` live; `MIN_BINS`/`MAX_BINS` (this module's own
+        existing construction-time clamp) bound the result the same way
+        construction already does. Resizes `_levels`/`_peak` to the new
+        length under the SAME lock `on_audio_block`/`tick` already use --
+        existing entries are preserved where the new length still covers
+        them (shrink: truncate; grow: pad with 0.0) rather than resetting
+        to all-zero on every adjustment. Returns the new (clamped) bin
+        count."""
+        with self._lock:
+            new_n = max(MIN_BINS, min(MAX_BINS, self._bins_n + int(delta)))
+            if new_n != self._bins_n:
+                self._levels = (self._levels + [0.0] * new_n)[:new_n]
+                self._peak = (self._peak + [0.0] * new_n)[:new_n]
+                self._bins_n = new_n
+            return self._bins_n
 
     def tick(self, now: float) -> bool:
         """Decay peak-hold toward the live level over injected wall-clock

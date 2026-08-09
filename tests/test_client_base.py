@@ -9,12 +9,17 @@ from test_server import Client, make
 
 from midicrt import proto
 from midicrt.clients.base import (
+    KEY_HANDLED,
+    KEY_HELP_TOGGLE,
+    KEY_NOOP,
+    KEY_QUIT,
     ClientError,
     EngineClient,
     current_page_topic,
     dispatch_key,
     drain_latest,
     fetch_keymap,
+    fetch_keymap_sections,
     switch_topic,
     wait_first_snapshot,
 )
@@ -545,27 +550,27 @@ def test_drain_latest_still_accepts_a_plain_set_of_topics():
 
 class _ActionRecorder:
     def __init__(self):
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, dict]] = []
 
-    def action(self, name):
-        self.calls.append(name)
+    def action(self, name, args=None):
+        self.calls.append((name, args or {}))
 
 
-def test_dispatch_key_client_quit_returns_true_without_calling_action():
+def test_dispatch_key_client_quit_returns_quit_without_calling_action():
     client = _ActionRecorder()
-    assert dispatch_key(client, "q", {"q": "client.quit"}) is True
+    assert dispatch_key(client, "q", {"q": "client.quit"}) == KEY_QUIT
     assert client.calls == []
 
 
 def test_dispatch_key_sends_named_action_for_a_real_key():
     client = _ActionRecorder()
-    assert dispatch_key(client, "c", {"c": "eventlog.clear"}) is False
-    assert client.calls == ["eventlog.clear"]
+    assert dispatch_key(client, "c", {"c": "eventlog.clear"}) == KEY_HANDLED
+    assert client.calls == [("eventlog.clear", {})]
 
 
 def test_dispatch_key_unmapped_key_is_a_silent_noop():
     client = _ActionRecorder()
-    assert dispatch_key(client, "z", {"q": "client.quit"}) is False
+    assert dispatch_key(client, "z", {"q": "client.quit"}) == KEY_NOOP
     assert client.calls == []
 
 
@@ -573,7 +578,7 @@ def test_dispatch_key_unrecognized_client_pseudo_action_is_a_silent_noop():
     # A keymap.toml typo or a future pseudo-action this client build
     # doesn't know about yet -- never reaches the engine either way.
     client = _ActionRecorder()
-    assert dispatch_key(client, "x", {"x": "client.bogus"}) is False
+    assert dispatch_key(client, "x", {"x": "client.bogus"}) == KEY_NOOP
     assert client.calls == []
 
 
@@ -583,16 +588,36 @@ def test_dispatch_key_drives_a_remapped_page_action():
     # page.next once the fake describe-shaped keymap below says otherwise.
     client = _ActionRecorder()
     fake_keymap = {"n": "page.prev"}
-    assert dispatch_key(client, "n", fake_keymap) is False
-    assert client.calls == ["page.prev"]
+    assert dispatch_key(client, "n", fake_keymap) == KEY_HANDLED
+    assert client.calls == [("page.prev", {})]
+
+
+# -- Phase 8 Task 6: args-table entries + help_toggle -----------------------
+
+def test_dispatch_key_sends_baked_args_for_a_table_entry():
+    client = _ActionRecorder()
+    keymap = {"1": {"action": "page.jump", "args": {"position": 1}}}
+    assert dispatch_key(client, "1", keymap) == KEY_HANDLED
+    assert client.calls == [("page.jump", {"position": 1})]
+
+
+def test_dispatch_key_help_toggle_returns_help_toggle_without_calling_action():
+    client = _ActionRecorder()
+    assert dispatch_key(client, "?", {"?": "client.help_toggle"}) == KEY_HELP_TOGGLE
+    assert client.calls == []
 
 
 async def test_fetch_keymap_reads_the_real_engine_keymap_over_the_wire(tmp_path):
+    from midicrt.engine.keymap import DEFAULT_KEYMAP
+
     eng, srv, task = await make(tmp_path)
     client = EngineClient(srv.socket_path)
     await asyncio.to_thread(client.connect)
     keymap = await asyncio.to_thread(fetch_keymap, client)
-    assert keymap == eng.keymap == {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"}
+    # A build with no keymap.toml ships the pure built-in default -- see
+    # engine/keymap.py's own module docstring for the full schema-v2
+    # shape (page.jump args-tables, client.help_toggle, ...).
+    assert keymap == eng.keymap == DEFAULT_KEYMAP
     await asyncio.to_thread(client.close)
     eng.stop(); await task; await srv.close()
 
@@ -607,3 +632,45 @@ def test_fetch_keymap_falls_back_to_default_when_server_predates_the_field():
             return {"data": {"current_page": "eventlog"}}   # no "keymap" key
 
     assert fetch_keymap(_OldServerClient()) == DEFAULT_KEYMAP
+
+
+async def test_fetch_keymap_sections_reads_global_and_page_sections(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    bundle = await asyncio.to_thread(fetch_keymap_sections, client)
+    assert bundle["effective"] == eng.keymap
+    assert bundle["global"] == eng.keymap_global
+    assert bundle["page"] == eng.keymap_page
+    assert bundle["hints_enabled"] is True
+    assert bundle["roster"] == list(eng.pages)
+    await asyncio.to_thread(client.close)
+    eng.stop(); await task; await srv.close()
+
+
+def test_fetch_keymap_sections_falls_back_to_empty_dicts_when_server_predates_the_fields():
+    from midicrt.engine.keymap import DEFAULT_KEYMAP
+
+    class _OldServerClient:
+        def request(self, cmd):
+            return {"data": {"current_page": "eventlog"}}   # no keymap_global/keymap_page/topics
+
+    bundle = fetch_keymap_sections(_OldServerClient())
+    assert bundle == {"effective": DEFAULT_KEYMAP, "global": {}, "page": {}, "hints_enabled": True,
+                      "roster": []}
+
+
+def test_fetch_keymap_sections_derives_roster_from_topics_not_the_sorted_pages_field():
+    # "pages" (describe's own field) is alphabetically sorted, display-only
+    # (engine/server.py's own comment) -- the roster must come from
+    # "topics" (roster/cycle order) instead, or a page.jump entry would
+    # resolve to the WRONG target page name in the overlay.
+    class _FakeClient:
+        def request(self, cmd):
+            return {"data": {
+                "pages": ["eventlog", "voices"],   # sorted -- happens to match order here
+                "topics": ["page.voices", "page.eventlog", "overlay.status"],
+            }}
+
+    bundle = fetch_keymap_sections(_FakeClient())
+    assert bundle["roster"] == ["voices", "eventlog"]

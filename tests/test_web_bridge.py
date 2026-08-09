@@ -248,6 +248,16 @@ async def test_bridge_follows_page_changed_and_resubscribes(tmp_path):
     assert bridge.state["page"] == "voices"
     assert bridge.state["topic"] == "page.voices"
 
+    # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+    # revamp): `Engine._set_current_page` now ALSO emits `keymap_changed`
+    # right after `page_changed` (its own docstring has the rationale) --
+    # `WebSink.offer`'s per-event-name keying (this task's own fix to a
+    # latent collision the OLD shared-`_UNKEYED` scheme had, see bridge.py's
+    # module docstring) means BOTH now reach every sink, in order, instead
+    # of the second silently clobbering the first.
+    keymap_ev = await asyncio.wait_for(sink.queue.get(), timeout=2.0)
+    assert keymap_ev["kind"] == "event" and keymap_ev["name"] == "keymap_changed"
+
     # A real snapshot (voices or overlay.status) follows once the deferred
     # resubscribe completes and its seeded latest snapshot reaches the next
     # push tick -- waiting for THIS proves the round trip actually landed

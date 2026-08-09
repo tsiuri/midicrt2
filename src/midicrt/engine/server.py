@@ -194,6 +194,17 @@ class ProtocolServer:
                 # `Engine.__init__`'s own comment for why that validation
                 # happens engine-side, not here).
                 "keymap": self.engine.keymap,
+                # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md
+                # keymap revamp): the two SECTIONS `self.engine.keymap`
+                # above is already the flat union of -- see `Engine.
+                # _recompute_keymap`'s own docstring for why filtering them
+                # separately (not just splitting the merged dict after the
+                # fact) is what makes this split meaningful. Additive wire
+                # fields -- an older client that only reads "keymap" is
+                # completely unaffected.
+                "keymap_global": self.engine.keymap_global,
+                "keymap_page": self.engine.keymap_page,
+                "keymap_hints_enabled": self.engine.config.keymap_hints_enabled,
                 "engine_version": self.engine.status()["engine_version"],
                 "proto_version": proto.PROTO_VERSION,
             }))

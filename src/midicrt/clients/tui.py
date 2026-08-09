@@ -78,12 +78,14 @@ import time
 from midicrt.behaviors.screensaver import SCREENSAVER_PAGE
 from midicrt.clients import chrome
 from midicrt.clients.base import (
+    KEY_HELP_TOGGLE,
+    KEY_QUIT,
     ClientError,
     EngineClient,
     current_page_topic,
     dispatch_key,
     drain_latest,
-    fetch_keymap,
+    fetch_keymap_sections,
     switch_topic,
     wait_first_snapshot,
 )
@@ -834,14 +836,30 @@ def _handle_key_press(client, key: str, state: dict) -> bool:
     surfacing through `drain_latest`'s/`wait_first_snapshot`'s OWN
     `ClientError` in `run_tui`'s main loop below -- unaffected by this
     function ever swallowing one. Returns `True` only for the
-    `client.quit` pseudo-action (`dispatch_key`'s own return value, never
-    raises for that case)."""
+    `client.quit` pseudo-action.
+
+    Phase 8 Task 6 (help overlay, docs/gui-phase-decisions-2026-08-08.md
+    keymap revamp): `state["help_overlay"]` is the sticky bool this
+    function owns (mirrors `state["learn_armed"]`'s own sticky-flag
+    precedent right below in this module). Two rules, checked in this
+    order (module docstring: "ANY key dismisses"):
+      1. If the overlay IS currently showing, THIS key dismisses it and
+         is SWALLOWED -- never reaches `dispatch_key`/the engine.
+      2. Otherwise, `KEY_HELP_TOGGLE` (`client.help_toggle`) sets the flag
+         and returns `False` (never quits)."""
+    if state.get("help_overlay"):
+        state["help_overlay"] = False
+        return False
     try:
-        return dispatch_key(client, key, state["keymap"])
+        outcome = dispatch_key(client, key, state["keymap"])
     except ClientError as exc:
         state["last_error"] = str(exc)
         state["last_error_until"] = time.time() + _ERROR_DISPLAY_S
         return False
+    if outcome == KEY_HELP_TOGGLE:
+        state["help_overlay"] = True
+        return False
+    return outcome == KEY_QUIT
 
 
 def _active_error_text(state: dict) -> str | None:
@@ -906,6 +924,50 @@ def _apply_learn_event(state: dict, msg: dict) -> None:
         _set_learn_message(state, f"LEARN: cancelled ({reason})")
 
 
+# -- help overlay (Phase 8 Task 6) -------------------------------------------
+#
+# TUI equivalent of `clients/fb/app.py::_draw_help_overlay` -- an
+# alternate-screen-style boxed panel (module docstring's own "TUI:
+# alternate-screen box" framing) rather than a dim-backdrop pixel rect
+# (the TUI has no dimming primitive, and burn-in isn't a real concern on
+# a terminal emulator anyway -- see chrome.py's own indicator docstring
+# for why the TUI skips the fb-specific burn-in machinery entirely). Reuses
+# `chrome.overlay_lines()` for CONTENT (global + current-page sections),
+# same as the fb renderer -- only the ASCII border framing here is TUI-
+# specific.
+
+
+def render_help_overlay_box(keymap_global: dict, keymap_page: dict, page_name: str,
+                            width: int, height: int,
+                            roster: list[str] | None = None) -> tuple[int, int, list[str]]:
+    """Returns `(box_x, box_y, rows)`: the box's top-left terminal
+    position and its own full row strings (border included) -- sized to
+    the actual content, centered, clamped to `width`x`height`. `run_tui`
+    blits each row via `term.move_xy(box_x, box_y + i) + row`, writing
+    ONLY the box's own columns so the rest of whatever frame was already
+    printed underneath is left completely undisturbed outside the box's
+    own rectangle (module docstring: "not a page switch" -- the page
+    keeps rendering beneath; here that means literally: this function
+    never touches the terminal itself, and the caller only overwrites the
+    exact cells the box occupies). `roster` (optional, the live page
+    cycle order) resolves `page.jump` entries to their target page name --
+    see `clients/chrome.py::overlay_lines`'s own docstring."""
+    lines = chrome.overlay_lines(keymap_global, keymap_page, page_name, roster)
+    if not lines:
+        lines = ["(no bindings)"]
+    inner_w = max(1, min(max(0, width - 4), max(len(line) for line in lines)))
+    box_w = inner_w + 4
+    box_h = min(height, len(lines) + 2)
+    box_x = max(0, (width - box_w) // 2)
+    box_y = max(0, (height - box_h) // 2)
+    rows = ["+" + "-" * (box_w - 2) + "+"]
+    for i in range(box_h - 2):
+        content = lines[i][:inner_w] if i < len(lines) else ""
+        rows.append("| " + content.ljust(inner_w) + " |")
+    rows.append("+" + "-" * (box_w - 2) + "+")
+    return box_x, box_y, rows
+
+
 def run_tui(socket_path: str) -> int:
     import blessed
 
@@ -916,7 +978,7 @@ def run_tui(socket_path: str) -> int:
     try:
         client.connect()
         page, topic = current_page_topic(client)
-        keymap = fetch_keymap(client)
+        keymap_bundle = fetch_keymap_sections(client)
         client.subscribe([topic, *overlay_topics], max_rate=_SUBSCRIBE_RATE)
     except ClientError as exc:
         print(f"midicrt tui: {exc}")
@@ -924,7 +986,14 @@ def run_tui(socket_path: str) -> int:
         return 1
 
     inbox = client.start_reader()
-    state = {"page": page, "topic": topic, "keymap": keymap,
+    state = {"page": page, "topic": topic, "keymap": keymap_bundle["effective"],
+             "keymap_global": keymap_bundle["global"], "keymap_page": keymap_bundle["page"],
+             "keymap_hints_enabled": keymap_bundle.get("hints_enabled", True),
+             # Page CYCLE order, fetched once -- fixed for the daemon's
+             # whole life (see clients/fb/app.py::_run_device's identical
+             # comment); resolves page.jump entries in the help overlay.
+             "roster": list(keymap_bundle.get("roster", [])),
+             "help_overlay": False,
              "status_vm": dict(chrome.DEFAULT_STATUS_VM),
              "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
@@ -938,13 +1007,19 @@ def run_tui(socket_path: str) -> int:
             switch_topic(client, state["topic"], new_topic, _SUBSCRIBE_RATE)
             state["page"], state["topic"] = new_page, new_topic
         elif msg.get("kind") == "event" and msg.get("name") == "keymap_changed":
-            # Phase 4 Task 1: the engine's `config.reload` action re-read
-            # keymap.toml -- re-fetch the full table via `describe` (rather
-            # than trusting this event's own payload) so this client's
-            # dispatch always matches what a fresh `describe` would report
-            # right now, same "ask, don't assume" precedent `page_changed`'s
-            # own handler above already sets for page/topic state.
-            state["keymap"] = fetch_keymap(client)
+            # Phase 4 Task 1: the engine's `config.reload` action (Phase 8
+            # Task 6: also every page transition, see `Engine.
+            # _set_current_page`'s own docstring) -- re-fetch the full
+            # bundle via `describe` (rather than trusting this event's own
+            # payload) so this client's dispatch/indicator/overlay always
+            # match what a fresh `describe` would report right now, same
+            # "ask, don't assume" precedent `page_changed`'s own handler
+            # above already sets for page/topic state.
+            bundle = fetch_keymap_sections(client)
+            state["keymap"] = bundle["effective"]
+            state["keymap_global"] = bundle["global"]
+            state["keymap_page"] = bundle["page"]
+            state["keymap_hints_enabled"] = bundle.get("hints_enabled", True)
         elif msg.get("kind") == "event" and msg.get("name") in _LEARN_EVENT_NAMES:
             # Phase 4 Task 3 (DAW-style MIDI learn, docs/phase4-notes.md):
             # see `_apply_learn_event`'s own docstring for the sticky-flag/
@@ -1037,6 +1112,21 @@ def run_tui(socket_path: str) -> int:
                             out.append(term.move_xy(0, i + 1) + line)
                         print("".join(out), end="", flush=True)
                     else:
+                        # Phase 8 Task 6 (on-screen keymap indicator): the
+                        # CURRENT page's own compact key hints, appended
+                        # right-aligned into the header row's spare width --
+                        # see clients/chrome.py::header_with_hint's own
+                        # docstring for why this is the SAME function fb's
+                        # header-row integration uses, just fed a static
+                        # (non-scrolling) left string instead of a marquee
+                        # slice: the TUI has no burn-in concern of its own
+                        # (chrome.py's indicator-section docstring), so a
+                        # static hint here is not a gap versus fb, just a
+                        # simpler equivalent for a renderer that was never
+                        # going to scroll its header to begin with.
+                        hint_text = (chrome.page_keymap_hint_text(state["keymap_page"])
+                                    if state["keymap_hints_enabled"] else "")
+                        header_line = chrome.header_with_hint(header_line, hint_text, term.width)
                         status_line = render_status_row(state["status_vm"], term.width)
                         error_text = _active_error_text(state)
                         learn_text = _active_learn_message(state)
@@ -1085,10 +1175,31 @@ def run_tui(socket_path: str) -> int:
                         out.append(term.move_xy(0, term.height - 1)
                                    + term.reverse(beatprogress_line) + term.normal)
                         print("".join(out), end="", flush=True)
+                    if state.get("help_overlay"):
+                        # Phase 8 Task 6: drawn LAST, blitting only its own
+                        # cells over whatever frame this same repaint just
+                        # printed (screensaver included -- toggling help
+                        # while screensaving is allowed, same as fb) --
+                        # see render_help_overlay_box's own docstring.
+                        box_x, box_y, box_rows = render_help_overlay_box(
+                            state["keymap_global"], state["keymap_page"], state["page"],
+                            term.width, term.height, state["roster"])
+                        overlay_out = [term.move_xy(box_x, box_y + i) + row
+                                      for i, row in enumerate(box_rows)]
+                        print("".join(overlay_out), end="", flush=True)
                     dirty = False
                 key = term.inkey(timeout=0.05)
+                overlay_before = state.get("help_overlay", False)
                 if _handle_key_press(client, str(key), state):
                     return 0
+                if state.get("help_overlay", False) != overlay_before:
+                    # Phase 8 Task 6: the overlay's on/off state is flipped
+                    # entirely inside `_handle_key_press` (no vm/topic
+                    # change involved at all -- module docstring: "not a
+                    # page switch") -- without this, toggling help would
+                    # never trigger a repaint until some UNRELATED update
+                    # happened to coincide with it.
+                    dirty = True
                 if _active_error_text(state) or _active_learn_message(state) or state.get(
                         "learn_armed"):
                     # Keep repainting while the transient error/learn

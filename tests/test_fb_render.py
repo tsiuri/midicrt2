@@ -468,6 +468,174 @@ def test_burn_in_tripwire_marquee_header_pixels_differ_at_t_and_t_plus_n():
     assert body_t == body_t_plus_n
 
 
+def test_burn_in_tripwire_keymap_hint_pixels_differ_at_t_and_t_plus_n():
+    """Phase 8 Task 6's own mover: `page_keymap_hint_window_text` reuses the
+    marquee's offset (see its own docstring) -- twin of the marquee tripwire
+    right above, proving a too-long-to-fit hint list actually scrolls in
+    the real render path, not just at the pure chrome.py function level
+    (test_chrome.py's own coverage)."""
+    from midicrt.analyzers.marquee import MarqueeAnalyzer
+
+    analyzer = MarqueeAnalyzer(["eventlog"], speed_cps=4.0)   # fits -> header itself is static
+    font = load_font()
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    capacity = app._header_char_capacity(surf, font)
+    hint_budget = capacity // app._KEYMAP_HINT_MAX_FRACTION - 1
+    # A page_keymap with enough entries that its hint text overflows the
+    # reserved budget -- deliberately synthetic/oversized, proportional to
+    # this surface's own real character budget rather than a hardcoded
+    # count that might happen to fit a different font/surface.
+    page_keymap = {str(i): f"page.action_{i}" for i in range(max(8, hint_budget))}
+    from midicrt.clients import chrome as chrome_mod
+    assert len(chrome_mod.page_keymap_hint_text(page_keymap)) > hint_budget   # sanity: scroll engaged
+
+    analyzer.tick(2000.0)
+    frame_t = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(frame_t, "eventlog", EMPTY_VM, font,
+                      chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                      chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
+                      analyzer.view_model(), page_keymap=page_keymap)
+
+    analyzer.tick(2003.0)
+    frame_t_plus_n = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(frame_t_plus_n, "eventlog", EMPTY_VM, font,
+                      chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                      chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
+                      analyzer.view_model(), page_keymap=page_keymap)
+
+    header_h = font.height + 2 * app.HEADER_PAD
+    header_t = frame_t.image.crop((0, 0, frame_t.width, header_h)).tobytes()
+    header_t_plus_n = frame_t_plus_n.image.crop((0, 0, frame_t_plus_n.width, header_h)).tobytes()
+    assert header_t != header_t_plus_n
+    body_t = frame_t.image.crop((0, header_h, frame_t.width, frame_t.height)).tobytes()
+    body_t_plus_n = frame_t_plus_n.image.crop((0, header_h, frame_t_plus_n.width,
+                                                frame_t_plus_n.height)).tobytes()
+    assert body_t == body_t_plus_n
+
+
+# -- on-screen keymap indicator + help overlay (Phase 8 Task 6) -------------
+
+def _paint_eventlog(page_keymap=None, keymap_hints_enabled=True, overlay_active=False,
+                    keymap_global=None, roster=None):
+    font = load_font()
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf, "eventlog", EMPTY_VM, font,
+                      chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                      chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
+                      DEFAULT_MARQUEE_VM, page_keymap=page_keymap,
+                      keymap_hints_enabled=keymap_hints_enabled, overlay_active=overlay_active,
+                      keymap_global=keymap_global, roster=roster)
+    return surf
+
+
+def test_paint_frame_with_no_page_keymap_matches_pre_task_6_header_byte_for_byte():
+    # Backward compat: every OLD call site (none of which ever passed the
+    # new kwargs) must render an IDENTICAL header to before this task --
+    # see `_paint_frame`'s own docstring.
+    with_defaults = _paint_eventlog()
+    explicit_none = _paint_eventlog(page_keymap=None)
+    assert with_defaults.image.tobytes() == explicit_none.image.tobytes()
+
+
+def test_paint_frame_header_differs_when_a_page_keymap_hint_is_shown():
+    plain = _paint_eventlog(page_keymap={})
+    with_hint = _paint_eventlog(page_keymap={"i": "img2txtviz.invert"})
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    assert (plain.image.crop((0, 0, plain.width, header_h)).tobytes()
+            != with_hint.image.crop((0, 0, with_hint.width, header_h)).tobytes())
+
+
+def test_paint_frame_hides_the_hint_when_keymap_hints_enabled_is_false():
+    page_keymap = {"i": "img2txtviz.invert"}
+    shown = _paint_eventlog(page_keymap=page_keymap, keymap_hints_enabled=True)
+    hidden = _paint_eventlog(page_keymap=page_keymap, keymap_hints_enabled=False)
+    no_keymap_at_all = _paint_eventlog(page_keymap=None, keymap_hints_enabled=True)
+    assert shown.image.tobytes() != hidden.image.tobytes()
+    # Disabled must look EXACTLY like "no page-specific keys at all", not
+    # just "different from shown" -- proves the gate actually suppresses
+    # the hint rather than merely altering it.
+    assert hidden.image.tobytes() == no_keymap_at_all.image.tobytes()
+
+
+def test_paint_frame_draws_the_help_overlay_when_active():
+    inactive = _paint_eventlog(overlay_active=False)
+    active = _paint_eventlog(overlay_active=True, keymap_global={"q": "client.quit"})
+    assert inactive.image.tobytes() != active.image.tobytes()
+
+
+def test_paint_frame_forwards_roster_to_the_overlay_on_the_ordinary_page_path():
+    # Regression (live-verification finding, task-6-report.md): the
+    # NON-screensaver `_draw_help_overlay` call site once omitted
+    # `roster` entirely (a copy-paste split from the screensaver-page
+    # call site above it) -- `page.jump` entries rendered as the bare,
+    # uninformative "page.jump" instead of "-> <target page>" on every
+    # ordinary page, the overwhelmingly common case. Proven at the
+    # `_paint_frame` level (not just `_draw_help_overlay` directly) so a
+    # future regression at either call site is caught the same way this
+    # one was found -- by actually exercising the wiring, not just the
+    # function it's supposed to call.
+    entry = {"1": {"action": "page.jump", "args": {"position": 1}}}
+    without_roster = _paint_eventlog(overlay_active=True, keymap_global=entry, roster=None)
+    with_roster = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(with_roster, "eventlog", EMPTY_VM, load_font(),
+                      chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                      chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
+                      DEFAULT_MARQUEE_VM, page_keymap=None, overlay_active=True,
+                      keymap_global=entry, roster=["eventlog"])
+    assert without_roster.image.tobytes() != with_roster.image.tobytes()
+
+
+def test_paint_frame_overlay_active_but_empty_sections_still_shows_a_panel():
+    # Defensive case (chrome.overlay_lines returning []) -- the panel still
+    # draws (the "(no bindings)" placeholder), never silently no-ops.
+    inactive = _paint_eventlog(overlay_active=False)
+    active_empty = _paint_eventlog(overlay_active=True, keymap_global={}, page_keymap={})
+    assert inactive.image.tobytes() != active_empty.image.tobytes()
+
+
+def test_draw_help_overlay_paints_a_dim_backdrop_rect():
+    font = load_font()
+    surf = Surface(200, 150)
+    before = surf.image.tobytes()
+    app._draw_help_overlay(surf, font, {"q": "client.quit", "n": "page.next"},
+                           {"p": "pianoroll.projection_toggle"}, "pianoroll")
+    after = surf.image.tobytes()
+    assert before != after
+    # At least one pixel must actually be the dim LUM_FAINT backdrop tone
+    # (not, say, accidentally painted at full HEADER_BG brightness) --
+    # confirms the "dim panel" wording is a real rendering choice, not
+    # just documentation.
+    px = surf.image.load()
+    assert any(px[x, y] == app.LUM_FAINT for x in range(surf.width) for y in range(surf.height))
+
+
+def test_draw_help_overlay_resolves_page_jump_entries_with_a_roster():
+    font = load_font()
+    surf_bare = Surface(300, 200)
+    app._draw_help_overlay(surf_bare, font,
+                           {"2": {"action": "page.jump", "args": {"position": 2}}}, {}, "eventlog")
+    surf_with_roster = Surface(300, 200)
+    app._draw_help_overlay(surf_with_roster, font,
+                           {"2": {"action": "page.jump", "args": {"position": 2}}}, {}, "eventlog",
+                           roster=["eventlog", "voices"])
+    # Resolving to "-> voices" instead of "page.jump" changes the rendered
+    # text, so the two panels must NOT be pixel-identical.
+    assert surf_bare.image.tobytes() != surf_with_roster.image.tobytes()
+
+
+def test_draw_help_overlay_is_centered_and_sized_to_content():
+    font = load_font()
+    surf = Surface(200, 150)
+    app._draw_help_overlay(surf, font, {"q": "client.quit"}, {}, "eventlog")
+    px = surf.image.load()
+    # A short 3-line panel (border/content/border) must NOT fill the whole
+    # surface -- sanity that sizing-to-content, not a fixed full-screen
+    # box, is what actually happened.
+    top_left_untouched = px[0, 0] != app.LUM_FAINT
+    assert top_left_untouched
+
+
 def test_render_frame_accent_color_is_brighter_than_normal():
     assert app.ACCENT_FG != app.NORMAL_FG
     assert sum(app.ACCENT_FG) > sum(app.NORMAL_FG)
@@ -2360,9 +2528,9 @@ def test_run_device_survives_page_switch_before_new_topics_snapshot_arrives(tmp_
     calls = []
     real_paint_frame = app._paint_frame
 
-    def spy_paint_frame(surface, page, vm, *rest):
+    def spy_paint_frame(surface, page, vm, *rest, **kwargs):
         calls.append((page, dict(vm)))
-        return real_paint_frame(surface, page, vm, *rest)
+        return real_paint_frame(surface, page, vm, *rest, **kwargs)
 
     monkeypatch.setattr(app, "_paint_frame", spy_paint_frame)
 
@@ -2396,7 +2564,8 @@ def test_run_device_survives_page_switch_before_new_topics_snapshot_arrives(tmp_
     fb_path = str(tmp_path / "fb0")
     try:
         app._run_device(FakeClient(), inbox, fb_path, True, 1000.0, "screensaver", "page.screensaver",
-                        {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"})
+                        {"effective": {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"},
+                         "global": {}, "page": {}, "hints_enabled": True})
     except ClientError:
         pass  # expected clean shutdown via the `None` sentinel
     finally:
@@ -2451,7 +2620,7 @@ class _RejectingClient:
         self.message = message
         self.calls: list[str] = []
 
-    def action(self, name):
+    def action(self, name, args=None):
         self.calls.append(name)
         raise ClientError(self.message)
 
@@ -2460,17 +2629,18 @@ class _RecordingClient:
     def __init__(self):
         self.calls: list[str] = []
 
-    def action(self, name):
+    def action(self, name, args=None):
         self.calls.append(name)
 
 
 def test_dispatch_evdev_key_client_quit_returns_true():
-    assert app._dispatch_evdev_key(_RecordingClient(), "q", {"q": "client.quit"}, {}) is True
+    assert app._dispatch_evdev_key(
+        _RecordingClient(), "q", {"q": "client.quit"}, {}, {}) is True
 
 
 def test_dispatch_evdev_key_sends_a_real_action_and_returns_false():
     client = _RecordingClient()
-    assert app._dispatch_evdev_key(client, "c", {"c": "eventlog.clear"}, {}) is False
+    assert app._dispatch_evdev_key(client, "c", {"c": "eventlog.clear"}, {}, {}) is False
     assert client.calls == ["eventlog.clear"]
 
 
@@ -2478,7 +2648,7 @@ def test_dispatch_evdev_key_logs_a_rejected_action_and_returns_false(caplog):
     client = _RejectingClient("missing arg: name")
     rate_state: dict = {}
     with caplog.at_level(logging.WARNING):
-        result = app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state)
+        result = app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state, {})
     assert result is False   # never treated as "quit"
     assert "missing arg" in caplog.text
     assert "g" in caplog.text
@@ -2493,16 +2663,40 @@ def test_dispatch_evdev_key_rate_caps_repeated_failures(caplog):
     client = _RejectingClient("boom")
     rate_state: dict = {}
     with caplog.at_level(logging.WARNING):
-        app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state)
-        app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state)
+        app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state, {})
+        app._dispatch_evdev_key(client, "g", {"g": "page.goto"}, rate_state, {})
     assert len(client.calls) == 2                     # the action IS retried every press...
     assert caplog.text.count("action dispatch failed") == 1   # ...but only logged once
 
 
 def test_dispatch_evdev_key_unmapped_key_is_a_noop():
     client = _RecordingClient()
-    assert app._dispatch_evdev_key(client, "z", {}, {}) is False
+    assert app._dispatch_evdev_key(client, "z", {}, {}, {}) is False
     assert client.calls == []
+
+
+# -- Phase 8 Task 6: help overlay swallow/toggle -----------------------------
+
+def test_dispatch_evdev_key_help_toggle_arms_overlay_without_calling_action():
+    client = _RecordingClient()
+    overlay_state = {"active": False}
+    result = app._dispatch_evdev_key(
+        client, "?", {"?": "client.help_toggle"}, {}, overlay_state)
+    assert result is False
+    assert overlay_state["active"] is True
+    assert client.calls == []
+
+
+def test_dispatch_evdev_key_swallows_any_key_while_overlay_active():
+    client = _RecordingClient()
+    overlay_state = {"active": True}
+    # Even a REAL, otherwise-dispatchable key must be swallowed -- the
+    # overlay-dismiss rule takes priority over normal dispatch.
+    result = app._dispatch_evdev_key(
+        client, "c", {"c": "eventlog.clear"}, {}, overlay_state)
+    assert result is False
+    assert overlay_state["active"] is False   # dismissed
+    assert client.calls == []                 # never reached the engine
 
 
 def test_run_device_refetches_keymap_on_keymap_changed_event(tmp_path, monkeypatch):
@@ -2539,7 +2733,8 @@ def test_run_device_refetches_keymap_on_keymap_changed_event(tmp_path, monkeypat
     fb_path = str(tmp_path / "fb0")
     try:
         app._run_device(FakeClient(), inbox, fb_path, True, 1000.0, "eventlog", "page.eventlog",
-                        {"n": "page.next"})
+                        {"effective": {"n": "page.next"}, "global": {}, "page": {},
+                         "hints_enabled": True})
     except ClientError:
         pass  # expected clean shutdown via the `None` sentinel
     finally:

@@ -251,6 +251,188 @@ def marquee_window_text(vm: dict, width: int) -> str:
     return scroll_window(vm.get("text", ""), vm.get("doubled", ""), vm.get("offset", 0), width)
 
 
+# -- on-screen keymap indicator (Phase 8 Task 6, docs/gui-phase-decisions-
+# 2026-08-08.md keymap revamp: "on-screen indicators of current keymap...
+# [should be] developed") ---------------------------------------------------
+#
+# A compact CHROME element, not a whole new reserved strip: it shares the
+# HEADER row's own remaining width, to the right of the marquee text --
+# see `clients/fb/app.py::_header_text`'s own docstring for the layout
+# integration and why this keeps every EXISTING page's body-height math
+# (and every existing golden fixture) untouched. The TUI client (which has
+# no marquee/burn-in concern at all, `run_tui`'s own docstring) shows the
+# SAME compact text statically appended to its header row instead.
+#
+# Burn-in rule (docs/gui-phase-decisions-2026-08-08.md ruling #3: "ALL of
+# v1's animations are valuable... many exist for CRT BURN-IN PREVENTION"):
+# `page_keymap_hint_text` builds PLAIN text with no motion of its own --
+# motion comes from `header_with_hint` reusing the SAME `overlay.marquee`
+# scroll offset the page-title marquee already ticks on (via `scroll_
+# window`, byte-identical engage/slice mechanic), rather than inventing a
+# second independent clock. A hint line short enough to fit its reserved
+# width never needs to scroll at all (matches the marquee's OWN "static
+# when it fits" rule) -- on the fb client specifically, that's fine
+# burn-in-wise ONLY because it sits inside the header's reverse-video bar,
+# which is already a solid-fill chrome element with its OWN separate
+# anti-burn-in mitigation (v1's header row precedent, `analyzers/
+# marquee.py`'s whole reason for existing) -- this hint text riding along
+# in the same bar doesn't add a new static-bright hazard.
+
+
+def _short_action_label(action: str) -> str:
+    """`"pianoroll.channel_toggle"` -> `"channel_toggle"`, `"page.jump"` ->
+    `"jump"` -- the hint is a compact discovery aid (what does this key
+    roughly do), not a full action-name dump; stripping the namespace
+    prefix (the part before the LAST dot) keeps entries short enough that
+    a handful actually fit a header's spare width. A bare name with no dot
+    (shouldn't occur for any REAL action, but keymap.toml can be hand-
+    edited) passes through unchanged rather than raising."""
+    return action.rsplit(".", 1)[-1]
+
+
+def _entry_action_name(entry) -> str:
+    """A keymap entry is either a plain string action name or an args-table
+    `{"action": ..., "args": {...}}` (engine/keymap.py's schema v2) -- this
+    extracts just the action name either way, for display purposes only
+    (the hint never shows baked args -- see `page_keymap_hint_text`'s own
+    docstring for why)."""
+    return entry if isinstance(entry, str) else str(entry.get("action", "?"))
+
+
+def page_keymap_hint_text(page_keymap: dict) -> str:
+    """Compact `"key:label  key:label  ..."` hint string for ONE page's own
+    `[keys.<page>]` section (`Engine.keymap_page`, current-page-scoped --
+    NOT the global table, which the help OVERLAY covers separately, see
+    `overlay_lines` below) -- sorted by key for a stable, scannable order.
+    `""` for a page with no page-specific bindings at all (most pages,
+    today -- only pianoroll/img2txtviz/sendnotes/spectrum have any, see
+    `engine/keymap.py::DEFAULT_PAGE_KEYMAPS`), which both clients treat as
+    "nothing to show" -- no placeholder text, no reserved width wasted."""
+    if not page_keymap:
+        return ""
+    parts = [f"{key}:{_short_action_label(_entry_action_name(entry))}"
+             for key, entry in sorted(page_keymap.items())]
+    return "  ".join(parts)
+
+
+_HINT_GAP = "    "   # same 4-space seam convention as analyzers/marquee.py's own GAP
+
+
+def page_keymap_hint_window_text(page_keymap: dict, offset: int, width: int) -> str:
+    """Width-aware slice of `page_keymap_hint_text()`, scrolling via the
+    SAME `scroll_window()` mechanic (and, at the fb call site, the SAME
+    `overlay.marquee` offset) the header marquee itself uses -- burn-in
+    rule (docs/gui-phase-decisions-2026-08-08.md ruling #3): a hint list
+    too long to fit its reserved width must not sit static-bright at a
+    fixed screen position indefinitely any more than the marquee's own
+    roster text would. Static (no scroll) when it already fits `width`,
+    exactly mirroring `marquee_window_text`'s own "static when it fits"
+    engage condition -- the common case (most pages' hint lists are a
+    handful of short entries)."""
+    text = page_keymap_hint_text(page_keymap)
+    if not text or width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    doubled = (text + _HINT_GAP) * 2
+    return scroll_window(text, doubled, offset, width)
+
+
+def header_with_hint(marquee_slice: str, hint_text: str, width: int) -> str:
+    """Compose the final header-row string: `marquee_slice` (already
+    sized/scrolled for whatever width the CALLER reserved for it) on the
+    left, `hint_text` right-aligned within the remaining `width` columns,
+    separated by at least one blank column. `hint_text` empty (no page-
+    specific keys, or the indicator disabled -- see `clients/fb/app.py`'s
+    own `keymap_hints_enabled` gating at the call site) returns
+    `marquee_slice` completely unchanged -- BYTE-IDENTICAL to every
+    existing header call site/golden fixture that never reserved any hint
+    space in the first place, since `_header_char_capacity`'s caller only
+    shrinks the marquee's own budget when there's real hint text to show
+    (see that call site's own docstring)."""
+    if not hint_text or width <= 0:
+        return marquee_slice
+    if len(hint_text) >= width:
+        hint_text = hint_text[:width]
+    row = list(marquee_slice[:width].ljust(width))
+    start = width - len(hint_text)
+    for i, ch in enumerate(hint_text):
+        row[start + i] = ch
+    return "".join(row)
+
+
+# -- help OVERLAY (Phase 8 Task 6): togglable, dim panel over the current
+# page ------------------------------------------------------------------
+#
+# `client.help_toggle` (engine/keymap.py) is a pure CLIENT-LOCAL pseudo-
+# action -- the overlay never reaches the engine at all (no page switch,
+# no dirty topic, the underlying page's own subscription/render keeps
+# ticking normally underneath, matching the brief's "not a page switch"
+# requirement literally: there is nothing server-side to switch). Both
+# clients render it the SAME way structurally: a GLOBAL section (`Engine.
+# keymap_global`) followed by a CURRENT-PAGE section (`Engine.keymap_
+# page`) -- see `overlay_lines` below for the shared line-building this
+# module gives both renderers so the two can never drift on WHAT the
+# overlay lists, only on how each draws a dim backdrop/box around it.
+
+
+def _entry_display_label(entry, roster: list[str] | None) -> str:
+    """The overlay row's label for one entry -- `_entry_action_name`'s bare
+    action name, EXCEPT for a `page.jump` entry when `roster` (the live
+    page cycle order) is available: those resolve to the actual TARGET
+    PAGE NAME (`"-> voices"`) instead of the literal string "page.jump"
+    repeated identically for all 20 roster-positional jump bindings
+    (live-verification finding, task-6-report.md's own self-review: the
+    overlay's whole purpose is "what does this key actually do" --
+    "page.jump" answers that for a human far worse than "jump to voices"
+    does). `roster=None` (the default -- no caller currently omits it
+    except pre-existing test literals) falls back to the bare action name
+    unchanged, so this is purely additive. An out-of-range/malformed
+    `position` (shouldn't occur for a build's own DEFAULT_KEYMAP, but a
+    hand-edited keymap.toml could bind `page.jump` to a position past a
+    SMALLER roster) falls back to the bare name too, rather than raising
+    or showing a bogus name."""
+    if isinstance(entry, dict) and entry.get("action") == "page.jump" and roster:
+        position = entry.get("args", {}).get("position")
+        if isinstance(position, int) and 1 <= position <= len(roster):
+            return f"-> {roster[position - 1]}"
+    return _entry_action_name(entry)
+
+
+def _section_lines(title: str, section: dict, roster: list[str] | None) -> list[str]:
+    if not section:
+        return []
+    lines = [title]
+    for key, entry in sorted(section.items()):
+        lines.append(f"  {key}  {_entry_display_label(entry, roster)}")
+    return lines
+
+
+def overlay_lines(keymap_global: dict, keymap_page: dict, page_name: str,
+                  roster: list[str] | None = None) -> list[str]:
+    """The help overlay's full text content, as plain lines -- a GLOBAL
+    section (every key from `Engine.keymap_global`, full action names,
+    unlike the compact indicator's abbreviated labels: the overlay is the
+    place a user goes to actually LOOK UP a binding, so it should be
+    unambiguous) followed by a blank separator and a `page_name`-titled
+    section for `keymap_page` (skipped entirely when empty -- most pages
+    have no page-specific keys today). `clients/tui.py`'s boxed panel and
+    `clients/fb/app.py`'s pixel key-table both draw this SAME list, never
+    their own independently-assembled copy.
+
+    `roster` (optional, the live page cycle order -- see `_entry_display_
+    label`'s own docstring) resolves `page.jump` entries to their actual
+    target page name instead of the bare action name; omitted, this
+    function's output is unchanged from before that enhancement."""
+    lines = _section_lines("GLOBAL", keymap_global, roster)
+    page_section = _section_lines(page_name.upper(), keymap_page, roster)
+    if page_section:
+        if lines:
+            lines.append("")
+        lines.extend(page_section)
+    return lines
+
+
 def status_text(vm: dict) -> str:
     """Build the one-line transport status text from an `overlay.status`
     view-model. BAR is 0-indexed, BEAT is 1-indexed within a hardcoded 4/4

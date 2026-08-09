@@ -2,6 +2,7 @@ import asyncio
 import errno
 import fnmatch
 import json
+import logging
 import time
 
 import pytest
@@ -396,9 +397,18 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.prev", {})
     assert eng.current_page == "sendnotes"
 
+    # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+    # revamp): `_set_current_page` now ALSO emits `keymap_changed` on every
+    # transition (recomputed for the new page's own `[keys.<page>]`
+    # section) -- reusing the SAME event both clients already refetch the
+    # full keymap on (Phase 4's `config.reload` path) means neither
+    # client needed a single line of new event-handling code to pick up
+    # per-page keymap sections on page nav. See engine/core.py::
+    # Engine._set_current_page's own docstring.
     names = [e["name"] for e in events]
-    assert names == ["page_changed"] * 15
-    assert [e["data"]["page"] for e in events] == [
+    assert names == ["page_changed", "keymap_changed"] * 15
+    page_events = [e for e in events if e["name"] == "page_changed"]
+    assert [e["data"]["page"] for e in page_events] == [
         "voices", "harmony", "pianoroll", "spectrum", "screensaver", "img2txtviz",
         "config", "help", "progchanges", "ccmonitor", "ccdashboard", "chordkey",
         "sendnotes", "second", "sendnotes",
@@ -573,6 +583,102 @@ async def test_page_goto_valid_and_unknown():
     assert eng.current_page == "second"  # unchanged on error
 
 
+# -- page.jump (Phase 8 Task 6, docs/gui-phase-decisions-2026-08-08.md      --
+# -- keymap revamp: roster-POSITIONAL number-key page jumps) ----------------
+
+async def test_page_jump_dispatches_to_the_nth_page_in_roster():
+    eng = Engine(Config())
+    order = eng._page_order()
+    r = await eng.actions.dispatch("page.jump", {"position": 3})
+    assert eng.current_page == order[2]   # 1-indexed
+    assert r["page"] == order[2]
+
+
+async def test_page_jump_position_one_is_the_first_page():
+    eng = Engine(Config())
+    order = eng._page_order()
+    await eng.actions.dispatch("page.goto", {"name": order[-1]})   # move away from position 1
+    await eng.actions.dispatch("page.jump", {"position": 1})
+    assert eng.current_page == order[0]
+
+
+async def test_page_jump_out_of_range_position_is_a_silent_no_op_not_an_error(caplog):
+    eng = Engine(Config())
+    order = eng._page_order()
+    starting_page = eng.current_page
+    with caplog.at_level(logging.INFO):
+        r = await eng.actions.dispatch("page.jump", {"position": len(order) + 5})
+    assert eng.current_page == starting_page   # unchanged -- no exception, no page switch
+    assert r == {}
+    assert "out of range" in caplog.text.lower()
+
+
+async def test_page_jump_position_zero_is_out_of_range():
+    eng = Engine(Config())
+    starting_page = eng.current_page
+    await eng.actions.dispatch("page.jump", {"position": 0})
+    assert eng.current_page == starting_page
+
+
+async def test_page_jump_negative_position_is_out_of_range():
+    eng = Engine(Config())
+    starting_page = eng.current_page
+    await eng.actions.dispatch("page.jump", {"position": -1})
+    assert eng.current_page == starting_page
+
+
+async def test_page_jump_emits_page_changed_and_keymap_changed_like_page_goto():
+    eng = Engine(Config())
+    events = []
+    eng.add_listener(lambda m: events.append(m) if m.get("kind") == "event" else None)
+    await eng.actions.dispatch("page.jump", {"position": 2})
+    assert [e["name"] for e in events] == ["page_changed", "keymap_changed"]
+
+
+# -- per-page keymap sections (Phase 8 Task 6) -------------------------------
+
+def test_keymap_page_reflects_the_current_pages_own_default_section():
+    from midicrt.engine import keymap as keymap_mod
+
+    eng = Engine(Config())   # boots on "eventlog" -- no page-specific keys
+    assert eng.keymap_page == {}
+    assert eng.keymap_global == keymap_mod.DEFAULT_KEYMAP
+    assert eng.keymap == eng.keymap_global
+
+
+async def test_keymap_page_recomputes_on_page_change_to_a_page_with_its_own_section():
+    from midicrt.engine import keymap as keymap_mod
+
+    eng = Engine(Config())
+    await eng.actions.dispatch("page.goto", {"name": "pianoroll"})
+    assert eng.keymap_page == keymap_mod.DEFAULT_PAGE_KEYMAPS["pianoroll"]
+    assert eng.keymap_global == keymap_mod.DEFAULT_KEYMAP
+    # The effective table is the union, page winning on any overlap
+    # (structurally none exist between global/pianoroll defaults today).
+    assert eng.keymap == {**eng.keymap_global, **eng.keymap_page}
+
+
+async def test_keymap_page_goes_back_to_empty_when_leaving_a_page_with_its_own_section():
+    eng = Engine(Config())
+    await eng.actions.dispatch("page.goto", {"name": "pianoroll"})
+    assert eng.keymap_page
+    await eng.actions.dispatch("page.goto", {"name": "eventlog"})
+    assert eng.keymap_page == {}
+
+
+async def test_config_reload_recomputes_per_page_keymap_sections(tmp_path):
+    keymap_path = tmp_path / "keymap.toml"
+    eng = Engine(Config(), keymap_path=str(keymap_path))
+    await eng.actions.dispatch("page.goto", {"name": "pianoroll"})
+    keymap_path.write_text('[keys.pianoroll]\n"9" = "pianoroll.projection_toggle"\n')
+    r = await eng.actions.dispatch("config.reload", {})
+    assert eng.keymap_page["9"] == "pianoroll.projection_toggle"
+    # Every other pianoroll default survives the merge (module docstring's
+    # own "override what you name, keep everything else" contract).
+    assert eng.keymap_page["p"] == "pianoroll.projection_toggle"
+    assert r["keymap"] == eng.keymap
+
+
 # -- pianoroll page (phase-3 task 7) -----------------------------------------
 
 def test_pianoroll_is_in_the_default_roster():
@@ -647,6 +753,32 @@ async def test_pianoroll_channels_action_rejects_malformed_spec():
         await eng.actions.dispatch("pianoroll.channels", {"spec": "not-a-channel"})
 
 
+# -- pianoroll.channel_toggle / .projection_toggle (Phase 8 Task 6) ---------
+
+async def test_pianoroll_channel_toggle_removes_a_visible_channel():
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("pianoroll.channel_toggle", {"channel": 10})
+    assert 10 not in r["channels"]
+    assert "page.pianoroll" in eng._dirty
+
+
+async def test_pianoroll_channel_toggle_is_a_true_toggle_leaving_others_untouched():
+    eng = Engine(Config())
+    await eng.actions.dispatch("pianoroll.channel_toggle", {"channel": 10})
+    r = await eng.actions.dispatch("pianoroll.channel_toggle", {"channel": 10})
+    assert 10 in r["channels"]
+    assert set(r["channels"]) == set(range(1, 17))   # every other channel still visible
+
+
+async def test_pianoroll_projection_toggle_flips_wallclock_to_tempo_and_back():
+    eng = Engine(Config())
+    assert eng.pages["pianoroll"].view_model()["window"]["mode"] == "wallclock"
+    r = await eng.actions.dispatch("pianoroll.projection_toggle", {})
+    assert r["mode"] == "tempo"
+    r = await eng.actions.dispatch("pianoroll.projection_toggle", {})
+    assert r["mode"] == "wallclock"
+
+
 # -- spectrum page (phase-3 task 8) ------------------------------------------
 
 def test_spectrum_is_in_the_default_roster():
@@ -667,6 +799,25 @@ def test_spectrum_handle_never_marks_itself_dirty_for_midi_events():
     eng = Engine(Config())
     eng._handle(ev())
     assert "page.spectrum" not in eng._dirty
+
+
+async def test_spectrum_bins_action_adjusts_and_marks_dirty():
+    # Phase 8 Task 6 -- the one representative v1 retuning key this task
+    # adds real mutable state for (see engine/keymap.py's own
+    # DEFAULT_PAGE_KEYMAPS docstring for the disclosed-partial-coverage
+    # rationale).
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("spectrum.bins", {"delta": -16})
+    assert r["bins"] == 80   # DEFAULT_BINS(96) - 16
+    assert "page.spectrum" in eng._dirty
+
+
+async def test_spectrum_bins_action_clamps_to_the_documented_range():
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("spectrum.bins", {"delta": -1000})
+    assert r["bins"] == 8    # MIN_BINS
+    r = await eng.actions.dispatch("spectrum.bins", {"delta": 1000})
+    assert r["bins"] == 256  # MAX_BINS
 
 
 def test_spectrum_tick_is_wired_through_tick_pages():

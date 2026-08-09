@@ -86,12 +86,14 @@ from midicrt import config as config_mod
 from midicrt.behaviors.screensaver import SCREENSAVER_PAGE
 from midicrt.clients import chrome
 from midicrt.clients.base import (
+    KEY_HELP_TOGGLE,
+    KEY_QUIT,
     ClientError,
     EngineClient,
     current_page_topic,
     dispatch_key,
     drain_latest,
-    fetch_keymap,
+    fetch_keymap_sections,
     switch_topic,
     wait_first_snapshot,
 )
@@ -1334,9 +1336,21 @@ def _header_char_capacity(surface: Surface, font) -> int:
     return max(0, (surface.width - LEFT_MARGIN) // font.width)
 
 
+# Phase 8 Task 6 (on-screen keymap indicator): the hint's reserved slice of
+# the header's OWN character budget is capped at a THIRD of it -- a page
+# with an unusually long hint list must never crowd the marquee title out
+# entirely; it just shows as many hint entries as fit that cap, same
+# "degrade gracefully, never crash/vanish the OTHER thing sharing this
+# row" spirit as every other width-capped chrome row in this module.
+_KEYMAP_HINT_MAX_FRACTION = 3
+
+
 def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
                   alerts_vm: dict, timesig_vm: dict, beatflash_vm: dict,
-                  loopprogress_vm: dict, marquee_vm: dict) -> None:
+                  loopprogress_vm: dict, marquee_vm: dict, *,
+                  page_keymap: dict | None = None, keymap_hints_enabled: bool = True,
+                  overlay_active: bool = False, keymap_global: dict | None = None,
+                  roster: list[str] | None = None) -> None:
     """Render `page`'s body, then all THREE chrome strips -- UNLESS `page`
     is the screensaver page (Important fix, task-9 review), in which case
     NO chrome is painted at all, matching v1's true full-screen blank --
@@ -1356,15 +1370,96 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
     (true full-screen blank, chrome included -- see its own module
     comment), so it is still passed through uniformly rather than
     special-cased here.
-    """
+
+    Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap revamp):
+    `page_keymap`/`keymap_hints_enabled`/`overlay_active`/`keymap_global`
+    are all NEW, keyword-only, DEFAULTED params -- every existing call
+    site (and every existing golden fixture) that never passes them keeps
+    rendering the exact byte-identical header it always did (`page_keymap
+    =None` -> `chrome.page_keymap_hint_text` sees `{}` -> `""` -> `chrome.
+    header_with_hint` returns `marquee_slice` completely unchanged, see
+    that function's own docstring). When there IS a non-empty hint to
+    show, it reserves a slice of the header's character budget (capped at
+    `_KEYMAP_HINT_MAX_FRACTION`) for `header_with_hint` to lay in on the
+    right, narrowing the marquee's own slice by exactly that much -- both
+    computed against the SAME `capacity` so the two pieces never overlap.
+    `overlay_active=True` draws the help-overlay panel LAST, on top of
+    everything else this function just painted (including the screensaver
+    page's blank -- toggling help while screensaving is a legitimate,
+    if unusual, thing to want to do, and costs nothing to allow)."""
     renderer = RENDERERS.get(page, _render_unknown)
-    marquee_text = chrome.marquee_window_text(marquee_vm, _header_char_capacity(surface, font))
+    capacity = _header_char_capacity(surface, font)
+    # `hint_budget` is reserved BEFORE computing the hint text (not the
+    # other way around) so `page_keymap_hint_window_text` can decide for
+    # itself whether the hint fits statically or needs to scroll -- fed
+    # the SAME `overlay.marquee` offset the title marquee scrolls on, so a
+    # too-long hint list is a mover too (burn-in rule), not a second
+    # static-bright text this task would otherwise be reintroducing right
+    # next to the one v1 mechanism it's reusing to avoid exactly that.
+    hint_budget = (max(0, capacity // _KEYMAP_HINT_MAX_FRACTION - 1)
+                  if keymap_hints_enabled else 0)
+    hint_text = (chrome.page_keymap_hint_window_text(
+                    page_keymap or {}, marquee_vm.get("offset", 0), hint_budget)
+                if hint_budget else "")
+    hint_width = len(hint_text) + 1 if hint_text else 0
+    marquee_width = max(0, capacity - hint_width)
+    marquee_slice = chrome.marquee_window_text(marquee_vm, marquee_width)
+    marquee_text = chrome.header_with_hint(marquee_slice, hint_text, capacity)
     renderer(vm, surface, marquee_text)
     if page == SCREENSAVER_PAGE:
+        if overlay_active:
+            _draw_help_overlay(surface, font, keymap_global or {}, page_keymap or {}, page, roster)
         return
     _draw_secondary(surface, alerts_vm, timesig_vm, font)
     _draw_status(surface, status_vm, font)
     _draw_beatprogress(surface, beatflash_vm, loopprogress_vm, font)
+    if overlay_active:
+        _draw_help_overlay(surface, font, keymap_global or {}, page_keymap or {}, page, roster)
+
+
+# -- help overlay (Phase 8 Task 6) -------------------------------------------
+
+_OVERLAY_PAD = 8   # px inset between the dim panel's edge and its text, both axes
+
+
+def _draw_help_overlay(surface: Surface, font, keymap_global: dict, page_keymap: dict,
+                        page_name: str, roster: list[str] | None = None) -> None:
+    """Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+    revamp): a dim panel drawn OVER whatever `_paint_frame` already
+    painted onto `surface` this frame -- NOT a `surface.clear()`/page
+    switch, the underlying page's pixels remain exactly as drawn outside
+    the panel's own rect (module docstring: "not a page switch"). Content
+    is `chrome.overlay_lines()` -- the SAME line-building both this
+    renderer and the TUI's boxed panel share, so the two can never
+    disagree on WHAT the overlay lists.
+
+    "Dim panel" (brief's own wording): the backdrop fills with `LUM_FAINT`
+    (the dimmest tier this codebase's monochrome framework defines, see
+    `clients/fb/lum.py`) rather than `HEADER_BG`'s bright reverse-video
+    treatment every OTHER chrome element uses -- a deliberate LOW-CONTRAST
+    look, distinguishing "a reference panel you summoned on purpose and
+    will dismiss in a second" from the always-on, must-stay-legible-at-a-
+    glance chrome strips. Text draws in `LUM_DIM` for the same reason.
+    Sized to the actual content (centered, clamped to the surface) rather
+    than a fixed box -- a page with no page-specific keys shows a shorter
+    panel than one with several, and `chrome.overlay_lines`'s own "(no
+    bindings)" case never arises in practice (the global section always
+    has at least `q`/`?`) but is handled defensively regardless."""
+    lines = chrome.overlay_lines(keymap_global, page_keymap, page_name, roster)
+    if not lines:
+        lines = ["(no bindings)"]
+    line_h = font.height + LINE_GAP
+    text_w = max((len(line) for line in lines), default=0) * font.width
+    box_w = min(surface.width - 2 * _OVERLAY_PAD, text_w + 2 * _OVERLAY_PAD)
+    box_h = min(surface.height - 2 * _OVERLAY_PAD, len(lines) * line_h + 2 * _OVERLAY_PAD)
+    box_x = max(0, (surface.width - box_w) // 2)
+    box_y = max(0, (surface.height - box_h) // 2)
+    surface.rect(box_x, box_y, box_w, box_h, LUM_FAINT)
+    for i, line in enumerate(lines):
+        y = box_y + _OVERLAY_PAD + i * line_h
+        if y + font.height > box_y + box_h:
+            break   # more lines than the box can hold (shouldn't happen -- sized above) -- clip
+        draw_text(surface, box_x + _OVERLAY_PAD, y, line, LUM_DIM, font)
 
 
 # -- real-device geometry (coded here, exercised only in Task 4) -----------
@@ -1429,6 +1524,57 @@ def _build_evdev_char_table(evdev) -> dict[int, str]:
     return table
 
 
+# Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap revamp):
+# engine/keymap.py's module docstring "Modifier handling" section has the
+# full rationale for why fb (unlike the TUI, which gets shift-resolved
+# characters straight from its terminal driver) needs to track
+# KEY_LEFTSHIFT/KEY_RIGHTSHIFT down/up state itself. Evdev keycode ->
+# US-keyboard shift-row SYMBOL, covering exactly the punctuation
+# `DEFAULT_KEYMAP` actually uses (the shifted digit row + "?", shift+/) --
+# not a general US-layout shift table, which this codebase has no other
+# use for.
+_DIGIT_KEYCODE_NAMES = {
+    "1": "KEY_1", "2": "KEY_2", "3": "KEY_3", "4": "KEY_4", "5": "KEY_5",
+    "6": "KEY_6", "7": "KEY_7", "8": "KEY_8", "9": "KEY_9", "0": "KEY_0",
+}
+
+
+def _build_evdev_shifted_char_table(evdev) -> dict[int, str]:
+    """The shifted-symbol counterpart to `_build_evdev_char_table` above --
+    `KEY_1`..`KEY_0` (unshifted "1".."0") map here to `engine/keymap.py`'s
+    `SHIFTED_DIGIT_ROW` ("!@#$%^&*()", same left-to-right order, ONE
+    shared source of truth) plus `KEY_SLASH` -> "?" (`DEFAULT_KEYMAP`'s
+    help-overlay toggle key). `_input_loop` looks this table up INSTEAD OF
+    `_build_evdev_char_table`'s plain table whenever a shift key is
+    currently held (`shift_state["down"]`), never both."""
+    from midicrt.engine.keymap import SHIFTED_DIGIT_ROW
+
+    table = {}
+    for ch, name in _DIGIT_KEYCODE_NAMES.items():
+        code = getattr(evdev.ecodes, name, None)
+        if code is not None:
+            table[code] = SHIFTED_DIGIT_ROW["1234567890".index(ch)]
+    slash_code = getattr(evdev.ecodes, "KEY_SLASH", None)
+    if slash_code is not None:
+        table[slash_code] = "?"
+    return table
+
+
+def _resolve_shift_keycodes(evdev) -> frozenset[int]:
+    """`KEY_LEFTSHIFT`/`KEY_RIGHTSHIFT` evdev codes -- a function (not a
+    module-level constant computed at import time) because `evdev.ecodes`
+    itself is only ever imported lazily (module docstring: "don't require
+    evdev to succeed at import time"), same reason `_build_evdev_char_
+    table`/`_build_evdev_shifted_char_table` both take the already-imported
+    module as a parameter rather than importing it a second time."""
+    codes = []
+    for name in ("KEY_LEFTSHIFT", "KEY_RIGHTSHIFT"):
+        code = getattr(evdev.ecodes, name, None)
+        if code is not None:
+            codes.append(code)
+    return frozenset(codes)
+
+
 # How often `_dispatch_evdev_key` is allowed to log a rejected-action
 # warning, PER `rate_state` dict (one per `_input_loop` call, i.e. one per
 # process lifetime -- see that function's own docstring) -- a stuck/
@@ -1437,8 +1583,8 @@ def _build_evdev_char_table(evdev) -> dict[int, str]:
 _KEY_ERROR_LOG_INTERVAL_S = 1.0
 
 
-def _dispatch_evdev_key(client: EngineClient, key: str, keymap: dict[str, str],
-                        rate_state: dict) -> bool:
+def _dispatch_evdev_key(client: EngineClient, key: str, keymap: dict,
+                        rate_state: dict, overlay_state: dict) -> bool:
     """The per-keypress body of `_input_loop`'s read loop, extracted so the
     fix below is directly unit-testable without a real evdev device
     (bindings review, live-reproduced Important finding: the OLD `except
@@ -1446,40 +1592,57 @@ def _dispatch_evdev_key(client: EngineClient, key: str, keymap: dict[str, str],
     diagnostic -- unlike the TUI's own exit bug, nothing ever surfaced
     this failure at all, forever).
 
-    Resolves `key` via the SAME `dispatch_key` (`clients/base.py`) the TUI
-    client uses. A `ClientError` (a rejected action -- bad/missing args,
-    unknown action -- indistinguishable BY TYPE from a lost connection,
-    same ambiguity `clients/tui.py::_handle_key_press` documents at
-    length) is ALWAYS treated as "an action failed, not fatal": logged as
-    a warning (rate-capped via `rate_state["last_warn_ts"]`, a plain
-    mutable dict `_input_loop` keeps ONE of across its whole
-    `read_loop()`, not a fresh one per call) and this function returns
-    `False` -- never signals quit for an action failure. A genuine
-    disconnect is still caught, just not here: it surfaces via the render
-    loop's own EOF check on the main thread, unaffected by this always
-    absorbing the exception. Returns `True` only for the `client.quit`
-    pseudo-action (`dispatch_key`'s own return value, never raises for
-    that case)."""
+    Phase 8 Task 6 (help overlay, docs/gui-phase-decisions-2026-08-08.md
+    keymap revamp): `overlay_state` is the shared `{"active": bool}`
+    mutable dict `_run_device` also reads from its render loop to decide
+    whether to paint the overlay panel -- the SAME "shared dict, GIL-atomic
+    single-key read/write, no lock needed" pattern `state["keymap"]`/
+    `get_keymap()` already use elsewhere in this module. Two rules, checked
+    in this order (module docstring: "ANY key dismisses" while active):
+      1. If the overlay IS currently active, THIS key (whatever it is)
+         dismisses it and is SWALLOWED -- never reaches `dispatch_key`/the
+         engine at all, matching v1 having no overlay precedent to
+         contradict and the brief's own explicit "next key -> dismiss +
+         swallow" design.
+      2. Otherwise, resolve normally via `dispatch_key` (`clients/base.py`)
+         -- the TUI client's SAME resolution function. `KEY_HELP_TOGGLE`
+         (the `client.help_toggle` pseudo-action) flips `overlay_state
+         ["active"]` to `True` and returns `False` (never quits).
+
+    A `ClientError` (a rejected action -- bad/missing args, unknown
+    action) is ALWAYS treated as "an action failed, not fatal": logged as
+    a warning (rate-capped via `rate_state["last_warn_ts"]`) and this
+    function returns `False`. Returns `True` only for the `client.quit`
+    pseudo-action."""
+    if overlay_state.get("active"):
+        overlay_state["active"] = False
+        return False
     try:
-        return dispatch_key(client, key, keymap)
+        outcome = dispatch_key(client, key, keymap)
     except ClientError as exc:
         now = time.time()
         if now - rate_state.get("last_warn_ts", 0.0) >= _KEY_ERROR_LOG_INTERVAL_S:
             _LOG.warning("action dispatch failed for key %r: %s", key, exc)
             rate_state["last_warn_ts"] = now
         return False
+    if outcome == KEY_HELP_TOGGLE:
+        overlay_state["active"] = True
+        return False
+    return outcome == KEY_QUIT
 
 
 def _input_loop(client: EngineClient, quit_event: threading.Event,
-                 get_keymap: Callable[[], dict[str, str]]) -> None:
+                 get_keymap: Callable[[], dict], overlay_state: dict) -> None:
     """Background-thread evdev reader (brief: "Input runs in a thread").
-    Every keydown is translated through `_build_evdev_char_table` into a
-    single char, then resolved via `_dispatch_evdev_key` -- `get_keymap()`
-    is a zero-arg callable (not a frozen dict) so a `keymap_changed`
-    refetch landing on the MAIN thread mid-read-loop (via
-    `_make_page_switcher`'s `on_event`, which reassigns `state["keymap"]`
-    rather than mutating it in place) is picked up on this thread's very
-    next keypress -- same "callable, not a frozen snapshot" pattern
+    Every keydown is translated through `_build_evdev_char_table`/`_build_
+    evdev_shifted_char_table` (tracking `KEY_LEFTSHIFT`/`KEY_RIGHTSHIFT`
+    down/up state -- see those functions' own docstrings and engine/
+    keymap.py's module docstring "Modifier handling" section for why fb
+    needs this and the TUI client doesn't) into a single char, then
+    resolved via `_dispatch_evdev_key` -- `get_keymap()` is a zero-arg
+    callable (not a frozen dict) so a `keymap_changed` refetch landing on
+    the MAIN thread mid-read-loop is picked up on this thread's very next
+    keypress -- same "callable, not a frozen snapshot" pattern
     `drain_latest`/`wait_first_snapshot` already use for `topics`/`topic`
     elsewhere in this module. `_dispatch_evdev_key` returning `True` (the
     `client.quit` pseudo-action) sets `quit_event` for a clean exit,
@@ -1498,15 +1661,28 @@ def _input_loop(client: EngineClient, quit_event: threading.Event,
         _LOG.info("no input device with KEY_Q capability found; continuing without input")
         return
     char_table = _build_evdev_char_table(evdev)
+    shifted_table = _build_evdev_shifted_char_table(evdev)
+    shift_keycodes = _resolve_shift_keycodes(evdev)
+    shift_state = {"down": False}
     rate_state: dict = {}   # one shared "last warned" timestamp for this whole read_loop
     try:
         for event in dev.read_loop():
-            if event.type != evdev.ecodes.EV_KEY or event.value != 1:  # key-down only
+            if event.type != evdev.ecodes.EV_KEY:
                 continue
-            key = char_table.get(event.code)
+            if event.code in shift_keycodes:
+                # value: 1=down, 0=up, 2=autorepeat (ignored -- shift held
+                # is already reflected by the down event that preceded it).
+                if event.value == 1:
+                    shift_state["down"] = True
+                elif event.value == 0:
+                    shift_state["down"] = False
+                continue
+            if event.value != 1:   # key-down only, for every non-shift key
+                continue
+            key = (shifted_table if shift_state["down"] else char_table).get(event.code)
             if key is None:
                 continue
-            if _dispatch_evdev_key(client, key, get_keymap(), rate_state):
+            if _dispatch_evdev_key(client, key, get_keymap(), rate_state, overlay_state):
                 quit_event.set()
                 return
     except OSError as exc:
@@ -1527,16 +1703,25 @@ def _input_loop(client: EngineClient, quit_event: threading.Event,
 def _make_page_switcher(client: EngineClient, state: dict, max_rate: float):
     """Return a `drain_latest(on_event=...)` callback that reacts to
     `page_changed` by resubscribing and updating `state["page"]`/`
-    state["topic"]` in place, and (Phase 4 Task 1, docs/phase4-notes.md)
-    to `keymap_changed` by REASSIGNING `state["keymap"]` to a freshly
-    fetched table -- reassignment, not in-place mutation, is deliberate:
-    `_input_loop`'s background thread reads `state["keymap"]` through a
-    `get_keymap` callable (`lambda: state["keymap"]`) on every keypress
-    with no lock, and CPython's GIL makes a single dict-KEY read/write
-    atomic -- swapping in a whole new dict object is therefore safe to
-    observe from that other thread without any synchronization of its
-    own, whereas mutating the SAME dict's contents key-by-key would risk
-    the input thread observing a half-updated table mid-swap."""
+    state["topic"]` in place, and (Phase 4 Task 1, docs/phase4-notes.md;
+    Phase 8 Task 6 widened this to the full section bundle) to `keymap_
+    changed` by REASSIGNING `state["keymap"]`/`state["keymap_global"]`/
+    `state["keymap_page"]` to a freshly fetched bundle -- reassignment,
+    not in-place mutation, is deliberate: `_input_loop`'s background
+    thread reads `state["keymap"]` through a `get_keymap` callable
+    (`lambda: state["keymap"]`) on every keypress with no lock, and
+    CPython's GIL makes a single dict-KEY read/write atomic -- swapping in
+    a whole new dict object is therefore safe to observe from that other
+    thread without any synchronization of its own, whereas mutating the
+    SAME dict's contents key-by-key would risk the input thread observing
+    a half-updated table mid-swap.
+
+    `Engine._set_current_page` (Phase 8 Task 6) now emits `keymap_changed`
+    on EVERY page transition, not just `config.reload` -- this callback
+    needed no new branch to pick that up, since it already refetches the
+    full bundle on that exact event name; the per-page `[keys.<page>]`
+    section just falls out of the SAME describe() call the page-goes-
+    stale case always triggered."""
 
     def on_event(msg: dict) -> None:
         if msg.get("kind") == "event" and msg.get("name") == "page_changed":
@@ -1545,14 +1730,18 @@ def _make_page_switcher(client: EngineClient, state: dict, max_rate: float):
             switch_topic(client, state["topic"], new_topic, max_rate)
             state["page"], state["topic"] = new_page, new_topic
         elif msg.get("kind") == "event" and msg.get("name") == "keymap_changed":
-            state["keymap"] = fetch_keymap(client)
+            bundle = fetch_keymap_sections(client)
+            state["keymap"] = bundle["effective"]
+            state["keymap_global"] = bundle["global"]
+            state["keymap_page"] = bundle["page"]
+            state["keymap_hints_enabled"] = bundle.get("hints_enabled", True)
 
     return on_event
 
 
 def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
                  no_input: bool, fps: float, page: str, topic: str,
-                 keymap: dict[str, str]) -> int:
+                 keymap_bundle: dict) -> int:
     """Real-/dev/fb0 render loop. Coded per the task brief's geometry spec
     but NOT exercised by this task's tests -- v1 owns the CRT until Task
     4's supervised smoke window runs this path for real.
@@ -1564,17 +1753,37 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
     needless syscall overhead once the pixel pack itself is fast (see
     surface.py's module docstring for the to_rgb565 benchmark that made
     this worth doing).
+
+    `keymap_bundle` (Phase 8 Task 6, replaces the old bare `keymap: dict`
+    parameter): the `{"effective", "global", "page"}` shape `fetch_keymap_
+    sections` returns -- `run()`'s only caller fetches it once at connect;
+    `_make_page_switcher`'s `on_event` refetches the same shape on every
+    `keymap_changed`.
     """
     width, height, stride = _read_fb_geometry()
     surface = Surface(width, height)
     font = load_font()
-    state = {"page": page, "topic": topic, "keymap": dict(keymap),
+    state = {"page": page, "topic": topic, "keymap": dict(keymap_bundle["effective"]),
+             "keymap_global": dict(keymap_bundle["global"]),
+             "keymap_page": dict(keymap_bundle["page"]),
+             "keymap_hints_enabled": keymap_bundle.get("hints_enabled", True),
+             # The page CYCLE order (Phase 8 Task 6 live-verification
+             # finding): fetched ONCE here, never refetched on keymap_
+             # changed -- the roster is fixed for the daemon's whole life
+             # (engine/core.py's own "the roster is built once, at
+             # __init__" fact), so re-deriving it from every keymap bundle
+             # would be redundant, not incorrect.
+             "roster": list(keymap_bundle.get("roster", [])),
              "status_vm": dict(chrome.DEFAULT_STATUS_VM),
              "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
              "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM),
              "marquee_vm": dict(chrome.DEFAULT_MARQUEE_VM)}
     on_event = _make_page_switcher(client, state, fps)
+    # Phase 8 Task 6 (help overlay): shared with `_input_loop`'s background
+    # thread the SAME way `state["keymap"]` is -- see `_dispatch_evdev_key`'s
+    # own docstring for the swallow-while-active contract this backs.
+    overlay_state = {"active": False}
 
     fb_file, fb_mm = open_fb_mmap(fb_path, stride * height)
     try:
@@ -1595,15 +1804,27 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             # docstring for why reassignment (not in-place mutation) is
             # what makes that safe with no lock.
             threading.Thread(target=_input_loop,
-                            args=(client, quit_event, lambda: state["keymap"]),
+                            args=(client, quit_event, lambda: state["keymap"], overlay_state),
                             daemon=True).start()
 
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
         vm_topic = state["topic"]
         _paint_frame(surface, state["page"], vm, font, state["status_vm"],
                      state["alerts_vm"], state["timesig_vm"],
-                     state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"])
+                     state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"],
+                     page_keymap=state["keymap_page"],
+                     keymap_hints_enabled=state["keymap_hints_enabled"],
+                     overlay_active=overlay_state["active"], keymap_global=state["keymap_global"],
+                     roster=state["roster"])
         surface.write_to_mmap(fb_mm, stride=stride)
+        # Phase 8 Task 6: the overlay's on/off state changes on the INPUT
+        # thread (a keypress), not through any of the drained topics below
+        # -- without tracking it here too, toggling help would never
+        # trigger a repaint until some UNRELATED overlay/page update
+        # happened to coincide with it. Compared every tick against the
+        # value as of the LAST paint (this local, not `overlay_state`
+        # itself, which the input thread can flip again between checks).
+        overlay_active_prev = overlay_state["active"]
 
         period = 1.0 / fps
         while not quit_event.is_set():
@@ -1670,16 +1891,24 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             # catches up; the overlay update itself isn't lost, it just
             # gets folded into the next tick that also carries (or already
             # has) a topic-matching vm.
+            overlay_now = overlay_state["active"]
+            overlay_changed = overlay_now != overlay_active_prev
+            overlay_active_prev = overlay_now
             vm_is_current = vm_topic == state["topic"]
             if vm_is_current and (page_updated or status_updated or secondary_updated
-                                   or beatprogress_updated or marquee_updated):
+                                   or beatprogress_updated or marquee_updated
+                                   or overlay_changed):
                 # `render_frame` clears the WHOLE surface, so all THREE
                 # chrome strips must be repainted on every redraw, not just
                 # when their own vm changed (`_paint_frame` skips them
                 # entirely on the screensaver page -- see its own docstring).
                 _paint_frame(surface, state["page"], vm, font, state["status_vm"],
                              state["alerts_vm"], state["timesig_vm"],
-                             state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"])
+                             state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"],
+                             page_keymap=state["keymap_page"],
+                             keymap_hints_enabled=state["keymap_hints_enabled"],
+                             overlay_active=overlay_now, keymap_global=state["keymap_global"],
+                             roster=state["roster"])
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
     finally:
@@ -1688,7 +1917,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
 
 
 def run(socket_path: str, fb_path: str, out_path: str | None,
-        no_input: bool, fps: float) -> int:
+        no_input: bool, fps: float, show_overlay: bool = False) -> int:
     client = EngineClient(socket_path)
     overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
                        chrome.OVERLAY_TIMESIG_TOPIC, chrome.OVERLAY_BEATFLASH_TOPIC,
@@ -1740,18 +1969,28 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
                     marquee["vm"] = msg["data"]
 
             vm = wait_first_snapshot(inbox, topic, _capture_status)
+            # Phase 8 Task 6: `--out` now ALSO fetches the keymap bundle
+            # (a single extra `describe` round trip, on a path that only
+            # ever renders one frame and exits -- negligible) so the
+            # on-screen indicator shows in an acceptance PNG same as it
+            # would live, and so `--overlay`/`show_overlay` (this task's
+            # own live-verification knob, no interactive terminal needed
+            # on the Pi to prove the panel renders correctly) has real
+            # global/page sections to draw.
+            keymap_bundle = fetch_keymap_sections(client)
             surface = Surface(*OUT_SIZE)
             _paint_frame(surface, page, vm, load_font(), status["vm"],
                          secondary["alerts_vm"], secondary["timesig_vm"],
                          beatprogress["beatflash_vm"], beatprogress["loopprogress_vm"],
-                         marquee["vm"])
+                         marquee["vm"],
+                         page_keymap=keymap_bundle["page"],
+                         keymap_hints_enabled=keymap_bundle.get("hints_enabled", True),
+                         overlay_active=show_overlay, keymap_global=keymap_bundle["global"],
+                         roster=keymap_bundle.get("roster", []))
             surface.save_png(out_path)
             return 0
-        # Fetched only on this (interactive-device) path -- the headless
-        # `--out` branch above never dispatches a key at all, so a
-        # `describe` round trip for it there would be pure overhead.
-        keymap = fetch_keymap(client)
-        return _run_device(client, inbox, fb_path, no_input, fps, page, topic, keymap)
+        keymap_bundle = fetch_keymap_sections(client)
+        return _run_device(client, inbox, fb_path, no_input, fps, page, topic, keymap_bundle)
     except ClientError as exc:
         print(f"midicrt-fb: {exc}")
         return 1
@@ -1788,10 +2027,13 @@ def main() -> None:
                      help="render one frame to this PNG and exit (headless test mode)")
     ap.add_argument("--no-input", action="store_true")
     ap.add_argument("--fps", type=_fps_type, default=30.0)
+    ap.add_argument("--overlay", action="store_true",
+                     help="(--out only) render one frame WITH the help overlay panel "
+                          "shown, for live verification without a real keyboard")
     args = ap.parse_args()
 
     socket_path = args.socket or config_mod.load(None).socket_path
-    raise SystemExit(run(socket_path, args.fb, args.out, args.no_input, args.fps))
+    raise SystemExit(run(socket_path, args.fb, args.out, args.no_input, args.fps, args.overlay))
 
 
 if __name__ == "__main__":

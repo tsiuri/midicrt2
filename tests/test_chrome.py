@@ -16,8 +16,12 @@ from midicrt.clients.chrome import (
     beatflash_glyph,
     beatprogress_row_text,
     format_bpm,
+    header_with_hint,
     loopprogress_bar,
     marquee_window_text,
+    overlay_lines,
+    page_keymap_hint_text,
+    page_keymap_hint_window_text,
     scroll_window,
     secondary_status_text,
     status_text,
@@ -306,3 +310,111 @@ def test_marquee_window_text_scrolls_when_narrower_than_content():
 def test_marquee_window_text_default_vm_is_blank_at_any_width():
     assert marquee_window_text(DEFAULT_MARQUEE_VM, width=40) == ""
     assert marquee_window_text(DEFAULT_MARQUEE_VM, width=0) == ""
+
+
+# -- on-screen keymap indicator (Phase 8 Task 6) -----------------------------
+
+def test_page_keymap_hint_text_empty_section_is_blank():
+    assert page_keymap_hint_text({}) == ""
+
+
+def test_page_keymap_hint_text_sorts_by_key_and_strips_action_namespace():
+    section = {"p": "pianoroll.projection_toggle", "d": {"action": "pianoroll.channel_toggle",
+                                                          "args": {"channel": 10}}}
+    assert page_keymap_hint_text(section) == "d:channel_toggle  p:projection_toggle"
+
+
+def test_page_keymap_hint_text_omits_args_from_the_label():
+    section = {"1": {"action": "page.jump", "args": {"position": 1}}}
+    assert page_keymap_hint_text(section) == "1:jump"
+
+
+def test_header_with_hint_empty_hint_returns_marquee_slice_unchanged():
+    assert header_with_hint("SOME TITLE", "", width=40) == "SOME TITLE"
+
+
+def test_header_with_hint_zero_width_returns_marquee_slice_unchanged():
+    assert header_with_hint("SOME TITLE", "d:ch10", width=0) == "SOME TITLE"
+
+
+def test_header_with_hint_right_aligns_within_the_full_width():
+    result = header_with_hint("TITLE", "d:ch10", width=20)
+    assert len(result) == 20
+    assert result.endswith("d:ch10")
+    assert result.startswith("TITLE")
+
+
+def test_header_with_hint_truncates_an_oversized_hint_to_fit_width():
+    result = header_with_hint("T", "way-too-long-to-fit-here", width=10)
+    assert len(result) == 10
+
+
+def test_page_keymap_hint_window_text_empty_section_is_blank():
+    assert page_keymap_hint_window_text({}, offset=0, width=40) == ""
+
+
+def test_page_keymap_hint_window_text_static_when_it_fits():
+    section = {"i": "img2txtviz.invert"}
+    assert page_keymap_hint_window_text(section, offset=99, width=40) == "i:invert"
+
+
+def test_page_keymap_hint_window_text_scrolls_when_narrower_than_content():
+    # Same shared `scroll_window` mechanic the marquee uses -- a too-long
+    # hint list is a MOVER (burn-in rule), not a second static string.
+    section = {"1": "a.one", "2": "b.two", "3": "c.three", "4": "d.four"}
+    text = page_keymap_hint_text(section)
+    window_0 = page_keymap_hint_window_text(section, offset=0, width=10)
+    window_5 = page_keymap_hint_window_text(section, offset=5, width=10)
+    assert len(text) > 10   # sanity: scroll IS engaged at this width
+    assert len(window_0) == 10 and len(window_5) == 10
+    assert window_0 != window_5
+
+
+# -- help overlay content (Phase 8 Task 6) -----------------------------------
+
+def test_overlay_lines_global_only_when_page_section_is_empty():
+    lines = overlay_lines({"q": "client.quit", "n": "page.next"}, {}, "eventlog")
+    assert lines == ["GLOBAL", "  n  page.next", "  q  client.quit"]
+
+
+def test_overlay_lines_includes_page_section_when_present():
+    lines = overlay_lines(
+        {"q": "client.quit"}, {"p": "pianoroll.projection_toggle"}, "pianoroll")
+    assert lines == [
+        "GLOBAL", "  q  client.quit", "", "PIANOROLL", "  p  pianoroll.projection_toggle",
+    ]
+
+
+def test_overlay_lines_both_empty_is_an_empty_list():
+    assert overlay_lines({}, {}, "eventlog") == []
+
+
+def test_overlay_lines_shows_full_action_names_not_abbreviated():
+    # Unlike the compact indicator (page_keymap_hint_text strips the
+    # namespace) -- the overlay is the lookup surface, full names only.
+    lines = overlay_lines({}, {"1": {"action": "page.jump", "args": {"position": 1}}}, "eventlog")
+    assert lines == ["EVENTLOG", "  1  page.jump"]
+
+
+def test_overlay_lines_resolves_page_jump_to_the_target_page_name_when_roster_given():
+    # Live-verification finding (task-6-report.md's self-review): without
+    # a roster, all 20 jump keys show the uninformative literal
+    # "page.jump" -- with one, each resolves to the actual page it jumps
+    # TO, which is what a human actually wants to know.
+    roster = ["eventlog", "voices", "harmony"]
+    lines = overlay_lines({"2": {"action": "page.jump", "args": {"position": 2}}}, {},
+                          "eventlog", roster)
+    assert lines == ["GLOBAL", "  2  -> voices"]
+
+
+def test_overlay_lines_page_jump_out_of_range_position_falls_back_to_bare_name():
+    roster = ["eventlog"]
+    lines = overlay_lines({"5": {"action": "page.jump", "args": {"position": 5}}}, {},
+                          "eventlog", roster)
+    assert lines == ["GLOBAL", "  5  page.jump"]
+
+
+def test_overlay_lines_non_jump_entries_unaffected_by_roster():
+    roster = ["eventlog", "voices"]
+    lines = overlay_lines({"q": "client.quit"}, {}, "eventlog", roster)
+    assert lines == ["GLOBAL", "  q  client.quit"]

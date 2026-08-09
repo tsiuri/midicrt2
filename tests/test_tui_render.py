@@ -29,6 +29,7 @@ from midicrt.clients.tui import (
     render_config_lines,
     render_harmony_lines,
     render_help_lines,
+    render_help_overlay_box,
     render_img2txtviz_lines,
     render_lines,
     render_pianoroll_lines,
@@ -106,7 +107,7 @@ class _RejectingClient:
         self.message = message
         self.calls: list[str] = []
 
-    def action(self, name):
+    def action(self, name, args=None):
         self.calls.append(name)
         raise ClientError(self.message)
 
@@ -115,7 +116,7 @@ class _RecordingClient:
     def __init__(self):
         self.calls: list[str] = []
 
-    def action(self, name):
+    def action(self, name, args=None):
         self.calls.append(name)
 
 
@@ -141,6 +142,73 @@ def test_handle_key_press_unmapped_key_does_not_touch_last_error():
     assert tui._handle_key_press(client, "z", state) is False
     assert client.calls == []
     assert state.get("last_error") is None
+
+
+# -- Phase 8 Task 6: help overlay toggle/swallow (docs/gui-phase-decisions- --
+# -- 2026-08-08.md keymap revamp) --------------------------------------------
+
+def test_handle_key_press_help_toggle_arms_overlay_without_calling_action():
+    state = {"keymap": {"?": "client.help_toggle"}}
+    client = _RecordingClient()
+    result = tui._handle_key_press(client, "?", state)
+    assert result is False
+    assert state["help_overlay"] is True
+    assert client.calls == []
+
+
+def test_handle_key_press_swallows_any_key_while_overlay_active():
+    state = {"keymap": {"c": "eventlog.clear"}, "help_overlay": True}
+    client = _RecordingClient()
+    result = tui._handle_key_press(client, "c", state)
+    assert result is False
+    assert state["help_overlay"] is False   # dismissed
+    assert client.calls == []               # never reached the engine
+
+
+def test_handle_key_press_quit_still_works_when_overlay_is_not_active():
+    state = {"keymap": {"q": "client.quit"}, "help_overlay": False}
+    assert tui._handle_key_press(_RecordingClient(), "q", state) is True
+
+
+# -- Phase 8 Task 6: TUI's boxed help-overlay panel --------------------------
+
+def test_render_help_overlay_box_global_and_page_sections():
+    box_x, box_y, rows = render_help_overlay_box(
+        {"q": "client.quit"}, {"p": "pianoroll.projection_toggle"}, "pianoroll",
+        width=60, height=20)
+    assert rows[0].startswith("+") and rows[0].endswith("+")
+    assert rows[-1] == rows[0]   # top/bottom borders match
+    assert any("GLOBAL" in row for row in rows)
+    assert any("PIANOROLL" in row for row in rows)
+    assert any("client.quit" in row for row in rows)
+    assert 0 <= box_x < 60 and 0 <= box_y < 20
+
+
+def test_render_help_overlay_box_centers_within_the_given_dimensions():
+    box_x, box_y, rows = render_help_overlay_box({"q": "client.quit"}, {}, "eventlog",
+                                                  width=80, height=24)
+    box_w = len(rows[0])
+    assert box_x == (80 - box_w) // 2
+    assert box_y == (24 - len(rows)) // 2
+
+
+def test_render_help_overlay_box_falls_back_to_placeholder_when_empty():
+    _box_x, _box_y, rows = render_help_overlay_box({}, {}, "eventlog", width=40, height=10)
+    assert any("no bindings" in row for row in rows)
+
+
+def test_render_help_overlay_box_every_row_is_the_same_width():
+    _box_x, _box_y, rows = render_help_overlay_box(
+        {"q": "client.quit", "n": "page.next"}, {}, "eventlog", width=60, height=20)
+    widths = {len(row) for row in rows}
+    assert len(widths) == 1
+
+
+def test_render_help_overlay_box_resolves_page_jump_with_a_roster():
+    _box_x, _box_y, rows = render_help_overlay_box(
+        {"2": {"action": "page.jump", "args": {"position": 2}}}, {}, "eventlog",
+        width=60, height=20, roster=["eventlog", "voices"])
+    assert any("-> voices" in row for row in rows)
 
 
 def test_active_error_text_none_when_no_error_recorded():
@@ -245,7 +313,7 @@ def test_run_tui_handles_learn_events_without_crashing(monkeypatch):
         def start_reader(self):
             return inbox
 
-        def action(self, name):
+        def action(self, name, args=None):
             pass
 
         def close(self):
@@ -1272,7 +1340,7 @@ def test_run_tui_survives_page_switch_before_new_topics_snapshot_arrives(monkeyp
         def start_reader(self):
             return inbox
 
-        def action(self, name):
+        def action(self, name, args=None):
             pass
 
         def close(self):
@@ -1346,7 +1414,7 @@ def test_run_tui_refetches_keymap_on_keymap_changed_event(monkeypatch):
         def start_reader(self):
             return inbox
 
-        def action(self, name):
+        def action(self, name, args=None):
             pass
 
         def close(self):

@@ -11,7 +11,7 @@ import socket
 import threading
 
 from midicrt import proto
-from midicrt.engine.keymap import CLIENT_QUIT_ACTION, DEFAULT_KEYMAP
+from midicrt.engine.keymap import CLIENT_HELP_TOGGLE_ACTION, CLIENT_QUIT_ACTION, DEFAULT_KEYMAP
 
 
 class ClientError(Exception):
@@ -347,13 +347,14 @@ def current_page_topic(client: EngineClient) -> tuple[str, str]:
 
 
 def fetch_keymap(client: EngineClient) -> dict[str, str]:
-    """Ask the engine (via `describe`) for its CURRENT key->action keymap
-    (Phase 4 Task 1, docs/phase4-notes.md) -- called once at connect
-    (alongside `current_page_topic`'s own separate `describe()` call) and
-    again whenever a `keymap_changed` event arrives (the engine's
-    `config.reload` action re-read `keymap.toml`), so both clients always
-    dispatch through whatever the engine reports RIGHT NOW rather than a
-    table cached once at connect time.
+    """Ask the engine (via `describe`) for its CURRENT effective key->action
+    keymap (Phase 4 Task 1, docs/phase4-notes.md) -- called once at connect
+    and again whenever a `keymap_changed` event arrives. Kept as its own
+    small function (rather than folded into `fetch_keymap_sections` below)
+    purely for backward compatibility with its existing direct callers/
+    tests; production client code uses `fetch_keymap_sections` instead
+    (Phase 8 Task 6) so a page-nav/config-reload refetch costs ONE
+    `describe` round trip, not two.
 
     Defensive against an older server predating this task (wire compat is
     additive-only, same "an older/newer client and server never crash each
@@ -367,33 +368,113 @@ def fetch_keymap(client: EngineClient) -> dict[str, str]:
     return dict(keymap) if isinstance(keymap, dict) else dict(DEFAULT_KEYMAP)
 
 
-def dispatch_key(client: EngineClient, key: str, keymap: dict[str, str]) -> bool:
-    """Shared key-dispatch resolution for both clients (Phase 4 Task 1):
-    look `key` up in `keymap` and either handle a `client.*` pseudo-action
-    locally or send the named action to the engine via `client.action`.
+def fetch_keymap_sections(client: EngineClient) -> dict:
+    """Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+    revamp): ONE `describe` round trip returning every keymap-shaped field
+    a client needs -- `"effective"` (the flat table `dispatch_key`
+    dispatches through, unchanged Phase-4 shape/contract), `"global"` and
+    `"page"` (the two SECTIONS the on-screen keymap indicator and the help
+    overlay render separately -- see `engine/core.py::Engine.
+    _recompute_keymap`'s own docstring for why the engine reports them
+    pre-split rather than a client re-deriving the split itself), and
+    `"hints_enabled"` (`config.keymap_hints_enabled` -- whether the
+    on-screen indicator should render at all), and `"roster"` (the live
+    page CYCLE order, derived from `describe`'s existing `"topics"` field
+    -- NOT `"pages"`, which is alphabetically sorted display-only, see
+    `engine/server.py`'s own comment. Used by the help overlay to resolve
+    a `page.jump` entry to its actual target page name, `clients/chrome.
+    py::overlay_lines`'s own `roster` parameter).
 
-    Returns `True` when the caller should quit (the `CLIENT_QUIT_ACTION`
-    pseudo-action, "client.quit") -- the only `client.*` name with any
-    real meaning today -- `False` otherwise. A key absent from `keymap` is
-    silently ignored (matches the prior hardcoded behavior of both
-    clients' old private key tables). Any OTHER `client.*` value (a
-    keymap.toml typo, or a future pseudo-action this client build doesn't
-    know about yet) is likewise treated as a harmless local no-op --
-    NEVER sent to the engine, which would just reject it as an "unknown
-    action" (`client.*` names are never registered in the engine's
-    `ActionRegistry` at all, see `engine/keymap.py`'s own "Pseudo-actions"
-    section) and needlessly cost the caller a round trip/exception for a
-    name that was never meant to leave this process. A rejected REAL
-    action (e.g. a stale keymap entry naming an action this build's
-    roster doesn't have) surfaces via the normal `ClientError` path --
-    non-fatal to the caller's render loop, same as before this task."""
-    action = keymap.get(key)
+    Same defensive-against-an-older-server contract as `fetch_keymap`
+    above for each field independently: a missing/non-dict `"keymap_
+    global"`/`"keymap_page"` falls back to `{}`, a missing `"keymap_
+    hints_enabled"` falls back to `True`, and a missing/non-list `"topics"`
+    falls back to an empty roster (an older server simply has nothing to
+    report -- the indicator/overlay degrade gracefully, never a crash)."""
+    data = client.request("describe")["data"]
+    effective = data.get("keymap")
+    global_km = data.get("keymap_global")
+    page_km = data.get("keymap_page")
+    hints_enabled = data.get("keymap_hints_enabled")
+    topics = data.get("topics")
+    roster = [t[len("page."):] for t in topics if t.startswith("page.")] \
+        if isinstance(topics, list) else []
+    return {
+        "effective": dict(effective) if isinstance(effective, dict) else dict(DEFAULT_KEYMAP),
+        "global": dict(global_km) if isinstance(global_km, dict) else {},
+        "page": dict(page_km) if isinstance(page_km, dict) else {},
+        "hints_enabled": hints_enabled if isinstance(hints_enabled, bool) else True,
+        "roster": roster,
+    }
+
+
+# -- key resolution: outcomes (Phase 8 Task 6) -------------------------------
+#
+# `dispatch_key` used to return a plain bool ("should the caller quit").
+# The help-OVERLAY toggle needs a THIRD outcome a plain bool can't carry
+# (not quit, not an ordinary dispatched action -- "flip the caller's local
+# overlay flag") without the caller re-deriving it from the keymap itself
+# (duplicating the exact resolution `dispatch_key` already just did). A
+# small string enum is the minimal honest fix -- see each constant's own
+# use at the two call sites (`clients/tui.py::_handle_key_press`,
+# `clients/fb/app.py::_dispatch_evdev_key`) for how the overlay-active
+# swallow (module docstring: "ANY key dismisses") layers on TOP of this,
+# entirely client-side, before `dispatch_key` is even called.
+KEY_QUIT = "quit"
+KEY_HELP_TOGGLE = "help_toggle"
+KEY_HANDLED = "handled"
+KEY_NOOP = "noop"
+
+
+def resolve_key_entry(keymap: dict, key: str) -> tuple[str | None, dict]:
+    """Normalize a `keymap[key]` value (a plain string action name, or a
+    Phase-8 args-table `{"action": ..., "args": {...}}`) into `(action_
+    name_or_None, args_dict)`. `(None, {})` when `key` has no entry at
+    all -- shared by `dispatch_key` below."""
+    entry = keymap.get(key)
+    if entry is None:
+        return None, {}
+    if isinstance(entry, str):
+        return entry, {}
+    return entry.get("action"), dict(entry.get("args", {}))
+
+
+def dispatch_key(client: EngineClient, key: str, keymap: dict) -> str:
+    """Shared key-dispatch resolution for both clients (Phase 4 Task 1;
+    Phase 8 Task 6 widened the return type -- see module comment above
+    `KEY_QUIT` for why): look `key` up in `keymap` (string OR args-table
+    shaped, `resolve_key_entry` above) and either handle a `client.*`
+    pseudo-action locally or send the named action (with its baked args,
+    if any) to the engine via `client.action`.
+
+    Returns one of the `KEY_*` constants above:
+      - `KEY_QUIT` for the `client.quit` pseudo-action.
+      - `KEY_HELP_TOGGLE` for the `client.help_toggle` pseudo-action --
+        the caller (NOT this function) owns flipping its own local
+        overlay-visible flag; `dispatch_key` itself has and needs no
+        notion of "is the overlay currently showing".
+      - `KEY_NOOP` for an unmapped key, or any OTHER `client.*` value (a
+        keymap.toml typo, or a future pseudo-action this client build
+        doesn't know about yet) -- never sent to the engine, which would
+        just reject it as an "unknown action" (`client.*` names are never
+        registered in the engine's `ActionRegistry` at all).
+      - `KEY_HANDLED` once a real action has actually been sent to the
+        engine via `client.action(name, args)` -- a REJECTED real action
+        (e.g. a stale keymap entry naming an action this build's roster
+        doesn't have) still surfaces via the normal `ClientError` path,
+        non-fatal to the caller's render loop, unchanged from before this
+        task; `dispatch_key` itself doesn't catch it."""
+    action, args = resolve_key_entry(keymap, key)
     if action is None:
-        return False
+        return KEY_NOOP
+    if action == CLIENT_QUIT_ACTION:
+        return KEY_QUIT
+    if action == CLIENT_HELP_TOGGLE_ACTION:
+        return KEY_HELP_TOGGLE
     if action.startswith("client."):
-        return action == CLIENT_QUIT_ACTION
-    client.action(action)
-    return False
+        return KEY_NOOP
+    client.action(action, args)
+    return KEY_HANDLED
 
 
 def switch_topic(client: EngineClient, old_topic: str, new_topic: str, max_rate: float) -> None:

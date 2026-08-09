@@ -166,6 +166,16 @@ class Config:
     # this dataclass's own existing convention for every other v1-ported
     # knob (`screensaver_after_s`, `pagecycle_interval`, ...).
     header_scroll_speed_cps: float = 4.0
+    # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md's keymap
+    # revamp ruling: "on-screen indicators of current keymap... [should be]
+    # developed"): the on-screen keymap-hint chrome element defaults ON --
+    # see `clients/chrome.py`'s indicator functions and `clients/fb/
+    # app.py`'s header integration. Boot-time only (like `pagecycle_
+    # enabled`/`screensaver_enabled` above -- `config.reload` re-reads
+    # `config.toml` but has never live-applied anything beyond
+    # `instruments`, see `engine/core.py::Engine._config_reload`'s own
+    # docstring).
+    keymap_hints_enabled: bool = True
 
 
 def load(path: str | None = None) -> Config:

@@ -86,6 +86,85 @@ logged warning; the rest of the table still loads.
 
 ---
 
+## 1b. Schema v2 (Phase 8 Task 6) — per-page sections, args-table entries,
+## roster-positional jumps, the help overlay
+
+Added at the 2026-08-08 keymap revamp (docs/gui-phase-decisions-2026-08-08.md
+on motherbase; full design rationale in `engine/keymap.py`'s own module
+docstring and `.superpowers/sdd/2026-08-08-midicrt2-phase8-gui/task-6-
+report.md`). Purely additive over §1 above — every schema-v1 `keymap.toml`
+still loads and behaves identically; nothing here changes v1's own
+contract.
+
+```toml
+[keys]
+"v" = "eventlog.clear"
+"1" = {action = "page.jump", args = {position = 1}}   # example override
+
+[keys.pianoroll]
+"[" = {action = "pianoroll.zoom", args = {delta = -0.1}}
+"p" = "pianoroll.projection_toggle"
+```
+
+**Two entry shapes.** A `[keys]` (or `[keys.<page>]`) value is either the
+familiar plain **string** action name (§1, unchanged — only valid for an
+ARGLESS action), or an **args-table**: `{action = "name", args = {...}}`.
+The args-table's `args` must supply **exactly** the target action's full
+schema — every arg the action needs, no extras — checked by
+`filter_known_actions` at the same registry-boundary timing as §1's own
+validation (dropped + logged, never raised, on a mismatch). This is what
+makes an args-requiring action bindable to a single keypress at all: §1's
+"six shipping actions" that could never be keymap-bound (`sendnotes.key`,
+`page.goto`, `pianoroll.zoom`/`.projection`/`.channels`, `pagecycle.
+enable`) all CAN be now, via an args-table entry that pins one specific
+argument value to that key — a bare STRING binding to one of them is still
+rejected exactly as §1 describes; only the args-table shape closes that
+gap.
+
+**Per-page sections, `[keys.<page>]`.** A nested table under `[keys]`,
+keyed by page name, holding entries scoped to when that page is CURRENT —
+merged OVER the global `[keys]` table (a page-scoped key wins over a
+global one bound to the same character) whenever that page is displayed,
+and simply absent from dispatch on every other page. Same merge-not-
+replace semantics as §1's global table: a `[keys.pianoroll]` overriding
+one key leaves every OTHER pianoroll default (and every global default)
+intact — see `engine/keymap.py::DEFAULT_PAGE_KEYMAPS` for the shipped
+per-page defaults (pianoroll/img2txtviz/sendnotes/spectrum today).
+Discriminated from an args-table entry purely by shape: a `[keys]` dict
+value WITHOUT an `"action"` key is a page section; WITH one, it's an
+args-table entry for that literal key.
+
+**Roster-positional page jumps.** `DEFAULT_KEYMAP` ships 20 bindings out of
+the box: `"1".."9","0"` → `page.jump` positions 1–10 (the roster's first
+ten pages, 1-indexed), and the shifted digit row `"!@#$%^&*()"` → positions
+11–20 (`!`=11 … `)`=20, standard US shift-row layout). `page.jump {position:
+int}` (unlike `page.goto {name: str}`) resolves against the roster's
+CURRENT order at dispatch time — always reachable, roster-shape-
+independent — and an out-of-range position (more jump keys ship by default
+than most rosters have pages) is a **silent no-op**, logged at INFO, never
+an `ActionError` — deliberately different from `page.goto`'s loud failure
+on an unknown NAME, since a typo'd name is a real mistake but an unmapped
+position number on a smaller-than-20-page roster is entirely expected.
+Modifier handling is client-specific, not part of this schema: the TUI
+gets a real keyboard's shift+1 resolved to the literal `"!"` for free from
+its terminal driver; the fb client's raw `evdev` input has no such
+resolution layer and tracks `KEY_LEFTSHIFT`/`KEY_RIGHTSHIFT` state itself
+(`clients/fb/app.py::_input_loop`/`_build_evdev_shifted_char_table`).
+
+**On-screen keymap indicator + help overlay** (the other half of this
+revamp, no `keymap.toml` schema of their own — mentioned here since both
+read straight off the tables above): a chrome element shows the CURRENT
+page's own `[keys.<page>]` hints compactly (toggle: `config.toml`'s
+`keymap_hints_enabled`, default `true`); `?` (a new `DEFAULT_KEYMAP`
+pseudo-action, `client.help_toggle`, resolved entirely client-side like
+`client.quit`) opens/closes a dim panel listing the GLOBAL section then
+the current page's own section — any key dismisses it (swallowed, never
+reaching the engine) — without switching pages or touching the underlying
+subscription. `midicrt-fb --out PATH --overlay` renders one frame with the
+panel forced on, for headless verification with no interactive keyboard.
+
+---
+
 ## 2. `bindings.toml` schema reference
 
 ```toml

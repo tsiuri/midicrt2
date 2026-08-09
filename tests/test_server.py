@@ -5,6 +5,7 @@ import time
 
 from midicrt import proto
 from midicrt.config import Config
+from midicrt.engine import keymap as keymap_mod
 from midicrt.engine.core import Engine, MidiEvent
 from midicrt.engine.server import ProtocolServer
 
@@ -111,7 +112,13 @@ async def test_hello_and_describe(tmp_path):
     # `{}` placeholder -- now the engine's real (default, no keymap.toml on
     # this tmp_path) key->action table, byte-identical to `eng.keymap`.
     assert d["data"]["keymap"] == eng.keymap
-    assert d["data"]["keymap"] == {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"}
+    assert d["data"]["keymap"] == keymap_mod.DEFAULT_KEYMAP
+    # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+    # revamp): the two additive section fields, byte-identical to the
+    # engine's own attributes (see Engine._recompute_keymap's docstring).
+    assert d["data"]["keymap_global"] == eng.keymap_global
+    assert d["data"]["keymap_page"] == eng.keymap_page
+    assert d["data"]["keymap_hints_enabled"] is True
     eng.stop(); await task; await srv.close()
 
 
@@ -476,7 +483,7 @@ async def test_config_reload_round_trip_over_the_wire(tmp_path):
     await c.hello()
 
     d = await c.request("describe")
-    assert d["data"]["keymap"] == {"q": "client.quit", "c": "eventlog.clear", "n": "page.next"}
+    assert d["data"]["keymap"] == keymap_mod.DEFAULT_KEYMAP
 
     keymap_path.write_text('[keys]\nn = "page.prev"\n')
     r = await c.request("action", name="config.reload", args={})

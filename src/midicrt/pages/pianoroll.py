@@ -784,6 +784,38 @@ class PianorollState:
         self._visible_channels = _parse_channel_spec(spec)
         return sorted(self._visible_channels)
 
+    def toggle_channel(self, channel: int) -> list[int]:
+        """Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md's keymap
+        revamp, docs/visual-audit.md's pianoroll channel-visibility row):
+        v1's `d` key toggled channel 10 (drums) specifically, IN/OUT of
+        whatever else was visible, unlike `set_channels()`'s own
+        replace-the-whole-set semantics (which `*` -- "show all" -- still
+        uses, ported as `set_channels("")`). A single-keypress binding has
+        no way to supply a full comma/range spec, so this is a genuinely
+        new, minimal action: flip ONE channel's membership in `_visible_
+        channels`, leaving every other channel's current visibility
+        untouched -- exactly v1's own toggle semantics, just reachable via
+        the args-table keymap mechanism (`{action: "pianoroll.
+        channel_toggle", args: {channel: 10}}`) instead of a hardcoded key
+        branch."""
+        channel = int(channel)
+        if channel in self._visible_channels:
+            self._visible_channels.discard(channel)
+        else:
+            self._visible_channels.add(channel)
+        return sorted(self._visible_channels)
+
+    def toggle_projection(self) -> str:
+        """Phase 8 Task 6: v1's `p` key TOGGLED between beat/tempo-relative
+        projection (`set_projection()` above is the ABSOLUTE setter this
+        already exposed -- a fixed keymap.toml args table can only ever
+        bind ONE static target mode, which can't reproduce a toggle). This
+        is the argless flip: read the CURRENT mode, set the other one --
+        `_PROJECTION_MODES` is always exactly the 2-tuple `("wallclock",
+        "tempo")`, so "the other one" is unambiguous."""
+        other = next(m for m in _PROJECTION_MODES if m != self._projection)
+        return self.set_projection(other)
+
     # -- projection / view model ----------------------------------------------
 
     def _current_bpm(self) -> float:
@@ -1016,6 +1048,12 @@ class PianorollPage:
     def set_channels(self, spec: str) -> list[int]:
         return self._state.set_channels(spec)
 
+    def toggle_channel(self, channel: int) -> list[int]:
+        return self._state.toggle_channel(channel)
+
+    def toggle_projection(self) -> str:
+        return self._state.toggle_projection()
+
     # -- page-declared actions (Phase 4 Task 0, docs/phase4-notes.md) -------
     #
     # These three used to be registered directly in `Engine.__init__`
@@ -1046,6 +1084,12 @@ class PianorollPage:
     def _action_channels(self, spec: str) -> dict:
         return {"channels": self.set_channels(spec)}
 
+    def _action_channel_toggle(self, channel: int) -> dict:
+        return {"channels": self.toggle_channel(channel)}
+
+    def _action_projection_toggle(self) -> dict:
+        return {"mode": self.toggle_projection()}
+
     def actions(self) -> list[tuple[str, object, str, dict[str, str]]]:
         return [
             ("pianoroll.zoom", self._action_zoom,
@@ -1066,4 +1110,16 @@ class PianorollPage:
             ("pianoroll.channels", self._action_channels,
              ("Set the pianoroll's visible-channel filter (comma/range spec, "
               "empty = all)"), {"spec": "str"}),
+            # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+            # revamp): argless counterparts specifically so a single
+            # keypress (via the keymap's args-table mechanism) can
+            # reproduce v1's TOGGLE keys ('d' -> channel 10, 'p' -> mode) --
+            # see PianorollState.toggle_channel/.toggle_projection's own
+            # docstrings for why the existing absolute setters above can't
+            # serve a toggle themselves.
+            ("pianoroll.channel_toggle", self._action_channel_toggle,
+             "Toggle one channel's visibility (v1's 'd'=ch10 precedent)",
+             {"channel": "int"}),
+            ("pianoroll.projection_toggle", self._action_projection_toggle,
+             "Toggle the pianoroll's projection mode between wallclock and tempo", {}),
         ]

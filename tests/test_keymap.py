@@ -13,26 +13,57 @@ import logging
 import pytest
 
 from midicrt.engine.keymap import (
+    CLIENT_HELP_TOGGLE_ACTION,
     CLIENT_QUIT_ACTION,
     DEFAULT_KEYMAP,
+    DEFAULT_PAGE_KEYMAPS,
+    PAGE_JUMP_ACTION,
     filter_known_actions,
     load_keymap,
+    load_page_keymaps,
 )
 
 
 def test_default_keymap_matches_documented_reality():
-    # Verified against both clients' ACTUAL current key handling (not the
-    # task brief's own illustrative [keys] schema example, which lists a
-    # "p" = "page.prev" entry as a SAMPLE, not a claim about pre-existing
-    # behavior) -- see module docstring's own "Default-keymap reality
-    # check". Neither client has ever bound "p" to anything.
-    assert DEFAULT_KEYMAP == {
-        "q": "client.quit",
-        "c": "eventlog.clear",
-        "n": "page.next",
-    }
+    # Verified against both clients' ACTUAL current key handling -- see
+    # module docstring's own "Default-keymap reality check". Phase 8
+    # Task 6 (keymap revamp) added the help-overlay toggle and the 20
+    # roster-positional jump bindings on top of the original three real
+    # keys; neither client has ever bound "p" to anything at the GLOBAL
+    # level (pianoroll's own [keys.pianoroll] section does bind "p", see
+    # DEFAULT_PAGE_KEYMAPS below -- that's a page-scoped override, not a
+    # global default).
+    assert DEFAULT_KEYMAP["q"] == "client.quit"
+    assert DEFAULT_KEYMAP["c"] == "eventlog.clear"
+    assert DEFAULT_KEYMAP["n"] == "page.next"
+    assert DEFAULT_KEYMAP["?"] == "client.help_toggle"
     assert CLIENT_QUIT_ACTION == "client.quit"
-    assert "p" not in DEFAULT_KEYMAP
+    assert CLIENT_HELP_TOGGLE_ACTION == "client.help_toggle"
+    assert PAGE_JUMP_ACTION == "page.jump"
+
+
+def test_default_keymap_has_the_four_named_keys_plus_twenty_jump_bindings():
+    named = {"q", "c", "n", "?"}
+    assert set(DEFAULT_KEYMAP) - named == set("1234567890!@#$%^&*()")
+    assert len(DEFAULT_KEYMAP) == 24
+
+
+def test_default_keymap_number_row_jumps_to_positions_one_through_ten():
+    for i, ch in enumerate("1234567890"):
+        assert DEFAULT_KEYMAP[ch] == {"action": PAGE_JUMP_ACTION, "args": {"position": i + 1}}
+
+
+def test_default_keymap_shifted_row_jumps_to_positions_eleven_through_twenty():
+    for i, ch in enumerate("!@#$%^&*()"):
+        assert DEFAULT_KEYMAP[ch] == {"action": PAGE_JUMP_ACTION, "args": {"position": i + 11}}
+
+
+def test_default_page_keymaps_cover_the_pages_this_task_restored_keys_for():
+    assert set(DEFAULT_PAGE_KEYMAPS) == {"pianoroll", "img2txtviz", "sendnotes", "spectrum"}
+    assert DEFAULT_PAGE_KEYMAPS["pianoroll"]["p"] == "pianoroll.projection_toggle"
+    assert DEFAULT_PAGE_KEYMAPS["img2txtviz"]["i"] == "img2txtviz.invert"
+    assert DEFAULT_PAGE_KEYMAPS["sendnotes"]["z"] == {
+        "action": "sendnotes.key", "args": {"key": "z"}}
 
 
 def test_load_keymap_missing_file_returns_defaults(tmp_path):
@@ -45,9 +76,7 @@ def test_load_keymap_adds_a_new_key_on_top_of_defaults(tmp_path):
     p = tmp_path / "keymap.toml"
     p.write_text('[keys]\nv = "eventlog.clear"\n')
     result = load_keymap(str(p))
-    assert result == {
-        "q": "client.quit", "c": "eventlog.clear", "n": "page.next", "v": "eventlog.clear",
-    }
+    assert result == {**DEFAULT_KEYMAP, "v": "eventlog.clear"}
 
 
 def test_load_keymap_file_overrides_a_default_key(tmp_path):
@@ -261,3 +290,116 @@ def test_load_keymap_or_warn_never_raises_on_wrong_shaped_keys(tmp_path):
         p = tmp_path / "keymap.toml"
         p.write_text(bad)
         load_keymap_or_warn(str(p))   # must not raise, for any of these shapes
+
+
+# -- Phase 8 Task 6: schema v2 -- args-table entries + per-page sections ----
+
+def test_load_keymap_accepts_an_args_table_entry_at_the_global_level(tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys]\nv = {action = "page.jump", args = {position = 3}}\n')
+    result = load_keymap(str(p))
+    assert result["v"] == {"action": "page.jump", "args": {"position": 3}}
+
+
+def test_load_keymap_does_not_treat_a_page_section_as_a_global_entry(tmp_path):
+    # `[keys.pianoroll]` must land in load_page_keymaps, NOT show up as a
+    # literal "pianoroll" key in the GLOBAL table.
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys]\nv = "eventlog.clear"\n\n[keys.pianoroll]\n"[" = "pianoroll.zoom"\n')
+    result = load_keymap(str(p))
+    assert "pianoroll" not in result
+    assert result["v"] == "eventlog.clear"
+
+
+def test_load_page_keymaps_missing_file_returns_pure_defaults(tmp_path):
+    result = load_page_keymaps(str(tmp_path / "nope.toml"))
+    assert result == DEFAULT_PAGE_KEYMAPS
+    assert result is not DEFAULT_PAGE_KEYMAPS
+
+
+def test_load_page_keymaps_merges_a_page_override_over_its_own_defaults(tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys.pianoroll]\n"[" = {action = "pianoroll.zoom", args = {delta = -0.5}}\n')
+    result = load_page_keymaps(str(p))
+    # The overridden key changed; every OTHER pianoroll default survives.
+    assert result["pianoroll"]["["] == {"action": "pianoroll.zoom", "args": {"delta": -0.5}}
+    assert result["pianoroll"]["p"] == "pianoroll.projection_toggle"
+    assert result["pianoroll"]["d"] == DEFAULT_PAGE_KEYMAPS["pianoroll"]["d"]
+
+
+def test_load_page_keymaps_adds_a_brand_new_page_section_not_in_the_defaults(tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys.voices]\nx = "eventlog.clear"\n')
+    result = load_page_keymaps(str(p))
+    assert result["voices"] == {"x": "eventlog.clear"}
+    assert result["pianoroll"] == DEFAULT_PAGE_KEYMAPS["pianoroll"]   # untouched
+
+
+def test_load_page_keymaps_skips_a_malformed_entry_within_a_page_section_and_logs(caplog, tmp_path):
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys.pianoroll]\nx = 5\ny = "pianoroll.projection_toggle"\n')
+    with caplog.at_level(logging.WARNING):
+        result = load_page_keymaps(str(p))
+    assert "x" not in result["pianoroll"]
+    assert result["pianoroll"]["y"] == "pianoroll.projection_toggle"
+    assert "pianoroll" in caplog.text and "x" in caplog.text
+
+
+def test_load_page_keymaps_or_warn_malformed_toml_returns_none_and_a_warning(tmp_path):
+    from midicrt.engine.keymap import load_page_keymaps_or_warn
+
+    p = tmp_path / "keymap.toml"
+    p.write_text("this is not valid toml {{{ [[[ ===\n")
+    pages, warning = load_page_keymaps_or_warn(str(p))
+    assert pages is None
+    assert warning is not None
+
+
+def test_load_page_keymaps_or_warn_success_returns_pages_and_no_warning(tmp_path):
+    from midicrt.engine.keymap import load_page_keymaps_or_warn
+
+    p = tmp_path / "keymap.toml"
+    p.write_text('[keys.voices]\nx = "eventlog.clear"\n')
+    pages, warning = load_page_keymaps_or_warn(str(p))
+    assert warning is None
+    assert pages["voices"] == {"x": "eventlog.clear"}
+
+
+# -- Phase 8 Task 6: filter_known_actions validates args-table entries ------
+
+def test_filter_known_actions_keeps_an_args_table_entry_matching_the_full_schema():
+    keymap = {"1": {"action": "page.jump", "args": {"position": 1}}}
+    actions = {"page.jump": {"description": "", "args": {"position": "int"}}}
+    assert filter_known_actions(keymap, actions) == {
+        "1": {"action": "page.jump", "args": {"position": 1}}}
+
+
+def test_filter_known_actions_drops_an_args_table_entry_missing_a_required_arg():
+    keymap = {"1": {"action": "page.jump", "args": {}}}
+    actions = {"page.jump": {"description": "", "args": {"position": "int"}}}
+    assert filter_known_actions(keymap, actions) == {}
+
+
+def test_filter_known_actions_drops_an_args_table_entry_with_an_extra_unknown_arg():
+    keymap = {"1": {"action": "page.jump", "args": {"position": 1, "bogus": True}}}
+    actions = {"page.jump": {"description": "", "args": {"position": "int"}}}
+    assert filter_known_actions(keymap, actions) == {}
+
+
+def test_filter_known_actions_drops_an_args_table_entry_naming_an_unknown_action():
+    keymap = {"1": {"action": "no.such.action", "args": {}}}
+    assert filter_known_actions(keymap, {}) == {}
+
+
+def test_filter_known_actions_drops_an_args_table_entry_naming_a_client_pseudo_action():
+    # Pseudo-actions never take args -- an args-table entry naming one is
+    # malformed, not a valid "pseudo-action bypasses the args check" case
+    # (that bypass is only for STRING-shaped client.* entries).
+    keymap = {"x": {"action": "client.help_toggle", "args": {}}}
+    assert filter_known_actions(keymap, {}) == {}
+
+
+def test_filter_known_actions_keeps_an_argless_action_bound_as_a_string_entry():
+    keymap = {"i": "img2txtviz.invert"}
+    actions = {"img2txtviz.invert": {"description": "", "args": {}}}
+    assert filter_known_actions(keymap, actions) == {"i": "img2txtviz.invert"}

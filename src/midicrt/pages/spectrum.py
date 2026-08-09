@@ -51,3 +51,18 @@ class SpectrumPage:
 
     def stop_capture(self) -> None:
         self._capture.stop()
+
+    # -- page-declared actions (Phase 8 Task 6, keymap revamp) ---------------
+    #
+    # See `analyzers.spectrum.SpectrumAnalyzer.adjust_bins`'s own docstring
+    # for why bin-count is the one v1 retuning control this task adds real
+    # mutable state for; the other 21 v1 keys stay disclosed-deferred.
+
+    def _action_bins(self, delta: int) -> dict:
+        return {"bins": self._analyzer.adjust_bins(delta)}
+
+    def actions(self) -> list[tuple[str, object, str, dict[str, str]]]:
+        return [
+            ("spectrum.bins", self._action_bins,
+             "Adjust the spectrum's bin count (clamped to [8, 256])", {"delta": "int"}),
+        ]

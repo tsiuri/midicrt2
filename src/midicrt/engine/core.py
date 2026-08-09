@@ -729,6 +729,18 @@ class Engine:
                               description="Go back to the previous page in the roster")
         self.actions.register("page.goto", self._page_goto,
                               description="Jump to a named page", args={"name": "str"})
+        # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+        # revamp): the roster-POSITIONAL jump action number keys bind to --
+        # see engine/keymap.py's own module docstring ("Why page.jump, not
+        # page.goto") for why this is a SEPARATE action rather than
+        # baking resolved page NAMES into DEFAULT_KEYMAP. Registered
+        # unconditionally, like page.next/.prev/.goto above -- it always
+        # exists structurally, regardless of how many pages THIS build's
+        # roster actually has (`_page_jump`'s own docstring covers the
+        # out-of-range case).
+        self.actions.register("page.jump", self._page_jump,
+                              description="Jump to the Nth page in the roster (1-indexed)",
+                              args={"position": "int"})
         # Phase-3 task 12: sendnotes' one interactive entry point -- ported
         # from v1's real per-keystroke `keypress()` (see pages/sendnotes.py's
         # own module docstring for the full v1 branch-order/KEYMAP-shadowing
@@ -914,8 +926,21 @@ class Engine:
         if warning:
             _LOG.warning("startup: %s; falling back to built-in defaults", warning)
             initial_keymap = dict(keymap_mod.DEFAULT_KEYMAP)
-        self.keymap: dict[str, str] = keymap_mod.filter_known_actions(
-            initial_keymap, self.actions.describe())
+        # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+        # revamp): the per-page counterpart, same never-raises/fall-back-
+        # to-defaults discipline as the global load right above.
+        initial_page_keymaps, page_warning = keymap_mod.load_page_keymaps_or_warn(
+            self._keymap_path)
+        if page_warning:
+            _LOG.warning("startup: %s; falling back to built-in per-page defaults",
+                         page_warning)
+            initial_page_keymaps = dict(keymap_mod.DEFAULT_PAGE_KEYMAPS)
+        self._raw_global_keymap = initial_keymap
+        self._raw_page_keymaps = initial_page_keymaps
+        # `self.keymap_global`/`self.keymap_page`/`self.keymap` (effective,
+        # for THIS build's initial `self.current_page`) all come from this
+        # one call -- see `_recompute_keymap`'s own docstring.
+        self._recompute_keymap()
         # Phase 4 Task 2 (MIDI bindings): log-only, "kept-but-inert" pass
         # (see `validate_binding`'s own docstring for why this is NOT a
         # filter -- unlike `keymap_mod.filter_known_actions` right above,
@@ -997,11 +1022,26 @@ class Engine:
         """
         warnings: list[str] = []
         new_keymap, keymap_warning = keymap_mod.load_keymap_or_warn(self._keymap_path)
+        new_page_keymaps, page_keymap_warning = keymap_mod.load_page_keymaps_or_warn(
+            self._keymap_path)
         if keymap_warning:
             warnings.append(f"{keymap_warning}; keeping last-good keymap")
             _LOG.warning("config.reload: %s; keeping last-good keymap", keymap_warning)
         else:
-            self.keymap = keymap_mod.filter_known_actions(new_keymap, self.actions.describe())
+            self._raw_global_keymap = new_keymap
+        if page_keymap_warning:
+            warnings.append(f"{page_keymap_warning}; keeping last-good per-page keymap")
+            _LOG.warning("config.reload: %s; keeping last-good per-page keymap",
+                         page_keymap_warning)
+        else:
+            self._raw_page_keymaps = new_page_keymaps
+        if not keymap_warning or not page_keymap_warning:
+            # Recompute even if only ONE half actually changed -- `self.
+            # keymap`/`keymap_global`/`keymap_page` are all derived
+            # together (`_recompute_keymap`'s own docstring), so a global-
+            # only or page-only successful re-read still needs a fresh
+            # merge against whichever half DIDN'T change.
+            self._recompute_keymap()
         new_bindings_file, bindings_warning = bindings_mod.BindingsFile.load_or_warn(
             self._bindings_path)
         if bindings_warning:
@@ -1703,17 +1743,66 @@ class Engine:
     def _page_order(self) -> list[str]:
         return list(self.pages)
 
+    def _recompute_keymap(self) -> None:
+        """Recompute `self.keymap_global`/`self.keymap_page`/`self.keymap`
+        (Phase 8 Task 6, docs/gui-phase-decisions-2026-08-08.md keymap
+        revamp) from `self._raw_global_keymap`/`self._raw_page_keymaps` --
+        called at construction, from every `_set_current_page` transition
+        (a new current page has a different `[keys.<page>]` section), and
+        after a successful `config.reload` keymap re-read.
+
+        Filters the global table and the CURRENT page's own section
+        SEPARATELY (each through `keymap_mod.filter_known_actions`
+        against THIS build's action registry) rather than merging first
+        and filtering once -- that's what lets `keymap_global`/`keymap_
+        page` report two genuinely DISTINCT, non-duplicated sections: a
+        key the current page overrides shows up in `keymap_page` only, not
+        as a stale duplicate under `keymap_global` too. `clients/chrome.py`
+        (the on-screen indicator + help-overlay renderers) and `engine/
+        server.py`'s `describe` response both read these two fields
+        directly for that section split; `self.keymap` (their simple
+        union, page winning on a key present in both -- structurally
+        impossible today since a key never survives filtering under both
+        names at once, but page-wins is the documented tie-break) remains
+        the single flat table `dispatch_key`/`bind.learn`/the help PAGE's
+        `keymap_rows` all keep using unchanged."""
+        actions_desc = self.actions.describe()
+        self.keymap_global: dict[str, Any] = keymap_mod.filter_known_actions(
+            self._raw_global_keymap, actions_desc)
+        page_raw = self._raw_page_keymaps.get(self.current_page, {})
+        self.keymap_page: dict[str, Any] = keymap_mod.filter_known_actions(
+            page_raw, actions_desc)
+        self.keymap: dict[str, Any] = {**self.keymap_global, **self.keymap_page}
+
     def _set_current_page(self, name: str) -> dict:
         self.current_page = name
         # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
         # the single funnel point for EVERY page transition regardless of
-        # cause (page.next/.prev/.goto actions, a sysex CMD_SWITCH_PAGE/
-        # CMD_SCREENSAVER-force, an idle pagecycle/screensaver behavior) --
-        # a `page_changed` mark here is complete with no per-origin
-        # plumbing of its own, unlike action marks. No-op when not
-        # recording (`CaptureSink.record_page_changed`'s own guard).
+        # cause (page.next/.prev/.goto/.jump actions, a sysex
+        # CMD_SWITCH_PAGE/CMD_SCREENSAVER-force, an idle pagecycle/
+        # screensaver behavior) -- a `page_changed` mark here is complete
+        # with no per-origin plumbing of its own, unlike action marks.
+        # No-op when not recording (`CaptureSink.record_page_changed`'s
+        # own guard).
         self._capture.record_page_changed(name)
+        # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+        # revamp): `self.keymap_page` (and the effective `self.keymap`) is
+        # PAGE-SCOPED now -- every transition through this one funnel point
+        # must recompute it for the NEW current page BEFORE either event
+        # goes out, so a client reacting to `page_changed` by resubscribing
+        # and one reacting to `keymap_changed` by refetching both see the
+        # post-transition state, never a stale one from the old page.
+        self._recompute_keymap()
         self.emit_event("page_changed", {"page": name})
+        # Emitting `keymap_changed` here too (not just from `config.
+        # reload`) is the load-bearing design choice that makes per-page
+        # keymap sections work with ZERO new client-side event-handling
+        # code: `clients/tui.py`/`clients/fb/app.py` already refetch the
+        # full keymap bundle on this exact event name (Phase 4 Task 1) --
+        # reusing it means "the current page's own key section is live"
+        # falls out of plumbing that already existed, rather than needing
+        # a second event both clients would have to learn to react to.
+        self.emit_event("keymap_changed", {"keymap": self.keymap, "warnings": []})
         return {"page": name}
 
     def _page_next(self) -> dict:
@@ -1730,6 +1819,27 @@ class Engine:
         if name not in self.pages:
             raise ActionError(f"unknown page: {name}")
         return self._set_current_page(name)
+
+    def _page_jump(self, position: int) -> dict:
+        """`page.jump`'s handler (Phase 8 Task 6) -- 1-indexed against the
+        CURRENT roster order (`self._page_order()`, the same order `page.
+        next`/`.prev` walk). Deliberately DIFFERENT failure behavior from
+        `_page_goto` above: a `position` outside `[1, len(order)]` is an
+        ORDINARY, expected situation (`DEFAULT_KEYMAP`, engine/keymap.py,
+        always defines all 20 roster-jump keys regardless of how many
+        pages this build actually has -- pressing "0" on an 8-page roster
+        must not spam a client-visible error on every keypress) -- logged
+        once per occurrence and a plain no-op (`{}`, no `page_changed`/
+        `keymap_changed` emitted), NOT an `ActionError`. A typo'd `page.
+        goto` NAME, by contrast, is a genuine user mistake worth failing
+        loudly on -- that distinction is the whole reason this is a
+        separate action rather than a thin wrapper around `_page_goto`."""
+        order = self._page_order()
+        if not 1 <= position <= len(order):
+            _LOG.info("page.jump: position %d out of range (roster has %d pages) -- no-op",
+                      position, len(order))
+            return {}
+        return self._set_current_page(order[position - 1])
 
     @property
     def topics(self) -> list[str]:

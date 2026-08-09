@@ -75,13 +75,29 @@ chance to drain the sink) -- and phase6-notes item 4 requires alerts to
 surface, full stop. Fixed by giving `alert` events their own bounded,
 sequence-keyed slots (`WebSink._offer_alert`) and the EOF sentinel a
 permanently separate key (`_EOF_KEY`) that can never be coalesced with an
-alert or anything else in either direction. `page_changed`/`learn_*`/
-`capture_*` events keep sharing the legacy `_UNKEYED` slot -- a
-deliberate, disclosed scope cut: none of them has an analogous
-documented burst-generating mechanism (each fires from exactly one
-discrete user/engine action, not a recurring per-tick recheck), so
-generalizing further wasn't asked for and isn't exercised by anything in
-this codebase today.
+alert or anything else in either direction.
+
+Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap revamp)
+found the SAME collision class a third time: every OTHER named event
+(`page_changed`, `learn_*`, `capture_*`, ...) originally shared one
+remaining `_UNKEYED` slot, "a deliberate, disclosed scope cut" at the
+time because none of them had a documented burst-generating mechanism.
+That held only as long as no single discrete action ever emitted TWO
+DIFFERENT event names back-to-back -- `Engine._set_current_page` now
+does exactly that (`page_changed` immediately followed by `keymap_
+changed`, see that method's own docstring), which silently dropped the
+`page_changed` half under the old shared-slot scheme (live-reproduced:
+`test_bridge_follows_page_changed_and_resubscribes`). `WebSink.offer()`
+now keys every event by its `name` (`("event", name)`) instead of
+lumping them all into `_UNKEYED` -- generalizing the same "give a
+distinct, meaningfully-different message its own slot" precedent
+already applied to `alert`/EOF, this time to ALL named events at once
+rather than patching just the one pairing that happened to expose it
+(`learn_armed` immediately followed by `learn_bound`/`learn_cancelled`
+had the identical latent exposure). Repeated SAME-named events still
+correctly coalesce to the latest; only different names stop colliding.
+`_UNKEYED` remains as the defensive fallback for a message that is
+neither a snapshot, an alert, nor a named event.
 """
 import asyncio
 import queue
@@ -225,6 +241,30 @@ class WebSink:
             return
         if isinstance(msg, dict) and msg.get("kind") == "event" and msg.get("name") == "alert":
             self._offer_alert(msg)
+            return
+        if isinstance(msg, dict) and msg.get("kind") == "event" and msg.get("name"):
+            # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
+            # revamp) discovered the SAME collision class Tasks 1/2 already
+            # fixed for snapshots/alerts, one level further: `Engine.
+            # _set_current_page` now emits `page_changed` immediately
+            # followed by `keymap_changed` from the ONE SAME discrete page
+            # transition (see that method's own docstring for why) --
+            # exactly the back-to-back-before-any-consumer-drains pattern
+            # that clobbers a shared `_UNKEYED` slot (drop-and-replace has
+            # no concept of "these are two DIFFERENT event names", so the
+            # second offer silently ate the first). Keying by event NAME
+            # instead generalizes the existing "give a genuinely distinct,
+            # meaningfully-different message its own slot" precedent
+            # (alert/EOF already got this) to every named event kind at
+            # once, not just this one pairing -- `page_changed`+
+            # `keymap_changed` was simply the first pairing that actually
+            # exercised the latent bug; `learn_armed` immediately followed
+            # by `learn_bound`/`learn_cancelled` had the identical exposure
+            # and is fixed by the same change. Repeated same-named events
+            # (e.g. two `page_changed` before a slow sink drains) still
+            # correctly coalesce to the latest -- only DIFFERENT names stop
+            # colliding.
+            self.queue.offer(("event", msg["name"]), msg)
             return
         self.queue.offer(_UNKEYED, msg)
 
