@@ -187,7 +187,18 @@ _ACTIVITY_EVENT_TYPES = {"note_on", "note_off", "control_change"}
 # `_pagecycle_behavior`, so a completely unrelated action (e.g.
 # `sendnotes.key`, `capture.start`) never resets pagecycle's user-pause
 # window.
-_PAGE_NAV_ACTIONS = frozenset({"page.next", "page.prev", "page.goto"})
+#
+# Review finding (Critical, live-reproduced, Phase 8 Task 6 follow-up):
+# `page.jump` (the roster-positional number-key action that task added)
+# was missing from this set at first landing -- a number-key jump moved
+# `current_page` exactly like `page.goto` but never armed `notify_page_
+# action`, so pagecycle yanked the user away after one `pagecycle_
+# interval` instead of honoring `pagecycle_user_pause` the way every
+# OTHER page-nav action already does. Fixed by simply adding it here --
+# `page.jump` is a page-navigation action in exactly the same sense
+# `page.goto` is (both move `current_page` via `_set_current_page`),
+# it just resolves its target differently.
+_PAGE_NAV_ACTIONS = frozenset({"page.next", "page.prev", "page.goto", "page.jump"})
 
 
 @dataclass

@@ -950,6 +950,36 @@ async def test_pagecycle_client_origin_page_action_pauses_rotation():
     assert eng.current_page == "harmony"
 
 
+async def test_pagecycle_page_jump_client_origin_pauses_rotation():
+    # Review finding (Critical, live-reproduced): `page.jump` (Phase 8
+    # Task 6) was missing from `_PAGE_NAV_ACTIONS`, so a number-key jump
+    # never armed `notify_page_action` at all -- pagecycle rotated the
+    # user away after just one `pagecycle_interval` instead of honoring
+    # `pagecycle_user_pause`, unlike `page.goto`/`page.next`/`page.prev`
+    # (all of which DO arm it, `test_pagecycle_client_origin_page_action_
+    # pauses_rotation` above). Same fake-clock-injection shape as that
+    # test (dispositive for the same reason -- see its own comment).
+    fake_now = [0.0]
+    eng = Engine(Config(pagecycle_interval=5.0, pagecycle_user_pause=30.0,
+                        screensaver_enabled=False))
+    eng._clock = lambda: fake_now[0]
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(fake_now[0])   # bootstrap
+    order = eng._page_order()
+    await eng.actions.dispatch("page.jump", {"position": order.index("voices") + 1},
+                              origin="client")
+    assert eng.current_page == "voices"
+    fake_now[0] = 5.0
+    await eng._tick_behaviors(fake_now[0])   # interval elapsed, but paused
+    assert eng.current_page == "voices"
+    fake_now[0] = 29.9
+    await eng._tick_behaviors(fake_now[0])
+    assert eng.current_page == "voices"
+    fake_now[0] = 30.0
+    await eng._tick_behaviors(fake_now[0])   # pause expired -- interval long since elapsed too
+    assert eng.current_page == "harmony"
+
+
 async def test_pagecycle_honors_a_tiny_user_pause_at_fake_clock_scale():
     # Fix round 1 (Important reviewer finding, the specific probe that
     # caught the clock-domain bug): `pagecycle_user_pause=0.001` is

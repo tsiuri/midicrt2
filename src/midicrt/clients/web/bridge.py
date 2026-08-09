@@ -45,9 +45,11 @@ reads. Snapshot messages key on their own `topic` (bounded by the page
 roster + `overlay.status`, at most ~15 distinct keys ever); `alert`
 events get their own bounded, sequence-keyed slots (see `WebSink.
 _offer_alert`, below); the EOF sentinel gets one permanently dedicated
-key of its own; every OTHER event (`page_changed`, `learn_*`,
-`capture_*`) shares one remaining legacy key, unchanged from the original
-single-slot design.
+key of its own; every OTHER named event (`page_changed`, `keymap_
+changed`, `learn_*`, `capture_*`, ...) keys on its own `("event", name)`
+slot too (Phase 8 Task 6 -- see that task's own paragraph further down
+for the collision this replaced); only a message that is none of the
+above still falls back to one remaining legacy `_UNKEYED` slot.
 
 Task 1's review flagged a real bug in the ORIGINAL implementation (a
 single, undifferentiated `maxsize=1 asyncio.Queue` for every message
@@ -220,8 +222,13 @@ class WebSink:
     Backed by `_CoalescingQueue` (see module docstring for the bugs this
     fixes): a snapshot message coalesces on its own `topic`; an `alert`
     event gets its own bounded, sequence-keyed slot (`_offer_alert`); EOF
-    gets one permanently dedicated key; everything else (`page_changed`,
-    `learn_*`, `capture_*`) shares one remaining legacy slot.
+    gets one permanently dedicated key; every OTHER named event
+    (`page_changed`, `keymap_changed`, `learn_*`, `capture_*`, ...) now
+    coalesces on its own `("event", name)` key (Phase 8 Task 6 fix --
+    see module docstring's own writeup of the `page_changed`+`keymap_
+    changed` collision this replaces) instead of sharing one legacy
+    `_UNKEYED` slot; `_UNKEYED` itself survives only as the defensive
+    fallback for a message that is none of the above.
     """
 
     def __init__(self):
