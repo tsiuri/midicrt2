@@ -1074,7 +1074,10 @@ def test_render_pianoroll_frame_draws_a_rect_per_note_in_its_velocity_color():
     px = surf.image.load()
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
-    usable_h = surf.height - app._reserved_chrome_height(font) - header_h
+    # Phase 8 Task 4: the roll body no longer starts right below the header
+    # -- the new "Bars" timeline strip sits between them.
+    roll_top = header_h + app._pianoroll_bars_strip_height(font)
+    usable_h = surf.height - app._reserved_chrome_height(font) - roll_top
     # Phase 8 Task 3: the roll body no longer starts at x=0 -- the label
     # column (app.PIANOROLL_LABEL_MARGIN_CHARS wide -- v1's margin, one
     # char wider than the label text itself) now sits to its left.
@@ -1082,7 +1085,7 @@ def test_render_pianoroll_frame_draws_a_rect_per_note_in_its_velocity_color():
     roll_w = surf.width - roll_x0
     note = PIANOROLL_NOTES[0]   # ch1, y=0.0, loud -- top-left-most rect
     x = roll_x0 + round(note["x0"] * roll_w) + 2
-    y = header_h + round(note["y"] * usable_h) + 1
+    y = roll_top + round(note["y"] * usable_h) + 1
     assert px[x, y] == app._roll_note_color(note["ch"], note["vel"])
 
 
@@ -1126,56 +1129,61 @@ def test_render_pianoroll_frame_reserves_the_bottom_chrome_as_background():
 # Geometry shared by the tests below: PIANOROLL_SURFACE_SIZE=(420, 144),
 # PIANOROLL_LABEL_MARGIN_CHARS=10 * font.width(8) = 80px label column (v1's
 # own margin -- one char wider than the 9-char label text itself, review
-# fix), so roll_x0=80, roll_w=340. usable_h=96, pitch_span=13 -> note_h=7,
-# row_span_h=89. Only guide rows 0 (C5), 6 (F#4), 12 (C4) have a note in
+# fix), so roll_x0=80, roll_w=340. `roll_top` (Phase 8 Task 4: header_h +
+# the new "Bars" strip height, NOT just header_h any more -- see
+# render_pianoroll_frame's own module comment) is the actual y-origin of
+# the pitch-guide roll body. usable_h/pitch_span=13 -> note_h/row_span_h
+# below it. Only guide rows 0 (C5), 6 (F#4), 12 (C4) have a note in
 # PIANOROLL_NOTES (y=0.0/0.5/1.0) -- every other row is a clean probe point
 # for "is the grid visible with nothing drawn over it."
 
 def _pianoroll_layout():
     font = load_font()
     header_h = font.height + 2 * app.HEADER_PAD
-    usable_h = PIANOROLL_SURFACE_SIZE[1] - app._reserved_chrome_height(font) - header_h
+    bars_strip_h = app._pianoroll_bars_strip_height(font)
+    roll_top = header_h + bars_strip_h
+    usable_h = PIANOROLL_SURFACE_SIZE[1] - app._reserved_chrome_height(font) - roll_top
     note_h = usable_h // 13
     row_span_h = usable_h - note_h
     roll_x0 = app.PIANOROLL_LABEL_MARGIN_CHARS * font.width
     roll_w = PIANOROLL_SURFACE_SIZE[0] - roll_x0
-    return font, header_h, usable_h, note_h, row_span_h, roll_x0, roll_w
+    return font, roll_top, usable_h, note_h, row_span_h, roll_x0, roll_w
 
 
 def test_render_pianoroll_frame_draws_dotted_horizontal_pitch_row_guide():
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM, surf)
     px = surf.image.load()
     # Separator at the TOP of guide row 1 ("B4", not-C, no note on this row)
     # -- phase = 1 & 1 = 1, stride 4, so a dot sits at roll_x0 + 1.
     guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
-    y = header_h + round(guide1["y"] * row_span_h)
+    y = roll_top + round(guide1["y"] * row_span_h)
     assert px[roll_x0 + 1, y] == app.LUM_FAINT
 
 
 def test_render_pianoroll_frame_c_row_guide_is_brighter():
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM, surf)
     px = surf.image.load()
     # Separator at the TOP of guide row 12 ("C4", is_c -- x=76 is not under
     # note2's rect, which only covers x>=316 at this row).
     guide12 = PIANOROLL_GRID["pitch_guide_ys"][12]
-    y = header_h + round(guide12["y"] * row_span_h)
+    y = roll_top + round(guide12["y"] * row_span_h)
     assert px[roll_x0 + 4, y] == app.LUM_FAINT_C
 
 
 def test_render_pianoroll_frame_draws_dotted_beat_and_bar_verticals():
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM, surf)
     px = surf.image.load()
     # beat_x=0.3 at guide row 1 ("B4") -- no note ever touches that row, so
     # this probes the guide's dotted vertical column undisturbed.
     x_beat = roll_x0 + round(0.3 * roll_w)
-    y_row1 = header_h + round(PIANOROLL_GRID["pitch_guide_ys"][1]["y"] * row_span_h)
-    assert px[x_beat, y_row1 + 2] == app.LUM_FAINT   # y_row1+2 = 21, a stride-3 dot from roll_top=12
+    y_row1 = roll_top + round(PIANOROLL_GRID["pitch_guide_ys"][1]["y"] * row_span_h)
+    assert px[x_beat, y_row1 + 2] == app.LUM_FAINT   # a stride-3 dot from roll_top (Phase 8 Task 4: now header_h + the Bars strip height)
     # bar_x=0.5 at the same clean row -- brighter tier.
     x_bar = roll_x0 + round(0.5 * roll_w)
     assert px[x_bar, y_row1 + 2] == app.LUM_BAR_GUIDE
@@ -1186,25 +1194,25 @@ def test_render_pianoroll_frame_grid_is_drawn_under_notes_not_over_them():
     # horizontally (x0=0.1..x1=0.9) and vertically (its own row) -- if the
     # grid were drawn AFTER notes, this pixel would show LUM_BAR_GUIDE
     # instead of the note's own velocity color.
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM, surf)
     px = surf.image.load()
     note0 = PIANOROLL_NOTES[0]
     x_bar = roll_x0 + round(0.5 * roll_w)
-    y = header_h + round(note0["y"] * row_span_h) + 3   # +3: inside the note_h=7 tall rect
+    y = roll_top + round(note0["y"] * row_span_h) + 3   # +3: inside the note_h=7 tall rect
     assert x_bar not in (0,)  # sanity: a real column, not a degenerate probe
     assert px[x_bar, y] == app._roll_note_color(note0["ch"], note0["vel"])
     assert px[x_bar, y] != app.LUM_BAR_GUIDE
 
 
 def test_render_pianoroll_frame_label_column_non_c_row_is_dim():
-    font, header_h, _usable_h, note_h, row_span_h, _roll_x0, _roll_w = _pianoroll_layout()
+    font, roll_top, _usable_h, note_h, row_span_h, _roll_x0, _roll_w = _pianoroll_layout()
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM, surf)
     px = surf.image.load()
     guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]   # "B4", not-C, no note
-    y = header_h + round(guide1["y"] * row_span_h)
+    y = roll_top + round(guide1["y"] * row_span_h)
     label = app._pianoroll_label_text(guide1)
     text_px_end = len(label) * font.width
     assert any(
@@ -1225,7 +1233,7 @@ def test_render_pianoroll_frame_label_column_c_row_is_bright():
     # below), not the plain static C-row brightness this test wants in
     # isolation -- hence a synthetic single-row, no-notes grid instead of
     # reusing PIANOROLL_GRID.
-    font, header_h, _usable_h, note_h, _row_span_h, _roll_x0, _roll_w = _pianoroll_layout()
+    font, roll_top, _usable_h, note_h, _row_span_h, _roll_x0, _roll_w = _pianoroll_layout()
     lone_guide = {"y": 0.0, "is_c": True, "pitch": 84, "name": "C6"}
     vm = {**PIANOROLL_VM, "notes": [], "range": {"lo": 84, "hi": 84},
           "grid": {**PIANOROLL_GRID, "pitch_guide_ys": [lone_guide]}}
@@ -1234,16 +1242,16 @@ def test_render_pianoroll_frame_label_column_c_row_is_bright():
     px2 = surf2.image.load()
     label = app._pianoroll_label_text(lone_guide)
     text_px_end = len(label) * font.width
-    usable_h2 = PIANOROLL_SURFACE_SIZE[1] - app._reserved_chrome_height(font) - header_h
+    usable_h2 = PIANOROLL_SURFACE_SIZE[1] - app._reserved_chrome_height(font) - roll_top
     assert any(
         px2[x, yy] == app.LUM_BRIGHT
         for x in range(text_px_end)
-        for yy in range(header_h, header_h + min(usable_h2, note_h))
+        for yy in range(roll_top, roll_top + min(usable_h2, note_h))
     )
 
 
 def test_render_pianoroll_frame_label_column_active_pitch_is_inverted():
-    _font, header_h, _usable_h, _note_h, row_span_h, _roll_x0, _roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, _roll_x0, _roll_w = _pianoroll_layout()
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM, surf)
     px = surf.image.load()
@@ -1251,24 +1259,24 @@ def test_render_pianoroll_frame_label_column_active_pitch_is_inverted():
     # label cell is LUM_MID-filled (invert) rather than left as background
     # in the leading-space region (x=0..3, well before any glyph ink).
     guide6 = PIANOROLL_GRID["pitch_guide_ys"][6]
-    y = header_h + round(guide6["y"] * row_span_h)
+    y = roll_top + round(guide6["y"] * row_span_h)
     assert px[2, y + 1] == app.LUM_MID
     # A non-active row's same leading-space probe stays untouched background.
     guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
-    y1 = header_h + round(guide1["y"] * row_span_h)
+    y1 = roll_top + round(guide1["y"] * row_span_h)
     assert px[2, y1 + 1] == app.BG
 
 
 # -- active-row tint + fade (Phase 8 Task 4, docs/visual-audit.md §9c) -----
 
 def test_render_pianoroll_frame_draws_row_tint_at_full_intensity():
-    _font, header_h, _usable_h, note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
     guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]   # "B4" -- clean row, no note
     vm = {**PIANOROLL_VM, "row_tint": [{"y": guide1["y"], "intensity": 1.0}]}
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(vm, surf)
     px = surf.image.load()
-    y = header_h + round(guide1["y"] * row_span_h)
+    y = roll_top + round(guide1["y"] * row_span_h)
     from midicrt.clients.fb.lum import RAMPS, lum
 
     peak = RAMPS["pianoroll_row_tint"]["peak"]
@@ -1279,12 +1287,12 @@ def test_render_pianoroll_frame_draws_row_tint_at_full_intensity():
 
 
 def test_render_pianoroll_frame_row_tint_intensity_scales_brightness():
-    _font, header_h, _usable_h, note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
     guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
     from midicrt.clients.fb.lum import RAMPS, lum
 
     peak = RAMPS["pianoroll_row_tint"]["peak"]
-    y = header_h + round(guide1["y"] * row_span_h)
+    y = roll_top + round(guide1["y"] * row_span_h)
 
     vm_half = {**PIANOROLL_VM, "row_tint": [{"y": guide1["y"], "intensity": 0.5}]}
     surf_half = Surface(*PIANOROLL_SURFACE_SIZE)
@@ -1305,12 +1313,12 @@ def test_render_pianoroll_frame_row_tint_drawn_under_the_dotted_grid():
     # LUM_FAINT with NO tint present). With a full-intensity tint added
     # underneath, the grid dot must still win -- draw order is tint, THEN
     # grid, matching v1's own layering (module comment in clients/fb/app.py).
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
     guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
     vm = {**PIANOROLL_VM, "row_tint": [{"y": guide1["y"], "intensity": 1.0}]}
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(vm, surf)
-    y = header_h + round(guide1["y"] * row_span_h)
+    y = roll_top + round(guide1["y"] * row_span_h)
     assert surf.image.load()[roll_x0 + 1, y] == app.LUM_FAINT
 
 
@@ -1318,14 +1326,14 @@ def test_render_pianoroll_frame_row_tint_drawn_under_notes():
     # guide row 12 ("C4") has note[2] (PIANOROLL_NOTES) covering x0=0.7..1.0
     # -- a tint on that SAME row must not visually cover the note's own
     # velocity color where the note actually is.
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
     guide12 = PIANOROLL_GRID["pitch_guide_ys"][12]
     vm = {**PIANOROLL_VM, "row_tint": [{"y": guide12["y"], "intensity": 1.0}]}
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(vm, surf)
     note2 = PIANOROLL_NOTES[2]
     x = roll_x0 + round(note2["x0"] * roll_w) + 2
-    y = header_h + round(note2["y"] * row_span_h) + 1
+    y = roll_top + round(note2["y"] * row_span_h) + 1
     assert surf.image.load()[x, y] == app._roll_note_color(note2["ch"], note2["vel"])
 
 
@@ -1343,25 +1351,25 @@ def test_render_pianoroll_frame_row_tint_absent_key_renders_unchanged():
 # -- overlap flash (Phase 8 Task 4, docs/visual-audit.md §9c) ---------------
 
 def test_render_pianoroll_frame_draws_overlap_flash_note_colored_phase():
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
     guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]   # clean row, no note
     region = {"y": guide1["y"], "x0": 0.1, "x1": 0.3, "ch": 5, "vel": 0.9}
     vm = {**PIANOROLL_VM, "overlap_flash": [region]}
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(vm, surf)
-    y = header_h + round(guide1["y"] * row_span_h) + 1
+    y = roll_top + round(guide1["y"] * row_span_h) + 1
     x = roll_x0 + round(0.2 * roll_w)
     assert surf.image.load()[x, y] == app._roll_note_color(5, 0.9)
 
 
 def test_render_pianoroll_frame_draws_overlap_flash_blink_to_bg_phase():
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
     guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
     region = {"y": guide1["y"], "x0": 0.1, "x1": 0.3, "ch": None, "vel": None}
     vm = {**PIANOROLL_VM, "overlap_flash": [region]}
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(vm, surf)
-    y = header_h + round(guide1["y"] * row_span_h) + 1
+    y = roll_top + round(guide1["y"] * row_span_h) + 1
     x = roll_x0 + round(0.2 * roll_w)
     assert surf.image.load()[x, y] == app.BG
 
@@ -1371,14 +1379,14 @@ def test_render_pianoroll_frame_overlap_flash_drawn_over_plain_notes():
     # then a BG-phase overlap-flash region right on top of it -- proves
     # flash paints AFTER (on top of) the plain note rects, v1's own "last
     # pass" layering.
-    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
     note1 = PIANOROLL_NOTES[1]
     region = {"y": note1["y"], "x0": 0.45, "x1": 0.55, "ch": None, "vel": None}
     vm = {**PIANOROLL_VM, "overlap_flash": [region]}
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(vm, surf)
     x = roll_x0 + round(0.5 * roll_w)
-    y = header_h + round(note1["y"] * row_span_h) + 1
+    y = roll_top + round(note1["y"] * row_span_h) + 1
     assert surf.image.load()[x, y] == app.BG
     # Sanity: WITHOUT the flash region, that same pixel is the note's color.
     surf_plain = Surface(*PIANOROLL_SURFACE_SIZE)
@@ -1392,6 +1400,77 @@ def test_render_pianoroll_frame_overlap_flash_absent_key_renders_unchanged():
     surf_empty = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame({**PIANOROLL_VM, "overlap_flash": []}, surf_empty)
     assert surf_missing.image.tobytes() == surf_empty.image.tobytes()
+
+
+# -- the "Bars" solid timeline strip (Phase 8 Task 4, docs/visual-audit.md §9c) --
+#
+# Distinct from the DOTTED backdrop guides tested above: one solid-color
+# row between the header and the pitch-guide roll body.
+
+def test_render_pianoroll_frame_bars_strip_draws_label():
+    font, roll_top, _usable_h, _note_h, _row_span_h, _roll_x0, _roll_w = _pianoroll_layout()
+    header_h = font.height + 2 * app.HEADER_PAD
+    strip_h = app._pianoroll_bars_strip_height(font)
+    assert roll_top == header_h + strip_h   # sanity: the strip is really reserved
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf)
+    px = surf.image.load()
+    label = f"{'Bars':>7} │"
+    label_px_end = len(label) * font.width
+    assert any(
+        px[x, y] == app.LUM_DIM
+        for x in range(label_px_end)
+        for y in range(header_h, roll_top)
+    )
+
+
+def test_render_pianoroll_frame_bars_strip_draws_solid_bar_and_beat_ticks():
+    _font, roll_top, _usable_h, _note_h, _row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    header_h = roll_top - app._pianoroll_bars_strip_height(load_font())
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf)
+    px = surf.image.load()
+    # bar_x=0.5 -- SOLID (every pixel down the strip), not dotted like the
+    # roll-body guide at the same x fraction.
+    x_bar = roll_x0 + round(0.5 * roll_w)
+    for y in range(header_h, roll_top):
+        assert px[x_bar, y] == app.LUM_MID
+    # beat_x=0.3 -- solid LUM_DIM.
+    x_beat = roll_x0 + round(0.3 * roll_w)
+    for y in range(header_h, roll_top):
+        assert px[x_beat, y] == app.LUM_DIM
+
+
+def test_render_pianoroll_frame_bars_strip_ticks_do_not_extend_into_roll_body():
+    # The Bars strip's solid ticks are confined to ITS OWN strip height --
+    # the roll body below it gets the DOTTED guide instead (drawn by
+    # _draw_pianoroll_grid, a completely separate call).
+    _font, roll_top, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf)
+    px = surf.image.load()
+    x_bar = roll_x0 + round(0.5 * roll_w)
+    # A few pixels into the roll body, at a clean (no-note) row -- must NOT
+    # be the strip's own SOLID LUM_MID (the roll body only ever gets the
+    # dotted LUM_BAR_GUIDE tier at this x).
+    guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
+    y_in_body = roll_top + round(guide1["y"] * row_span_h) + 2
+    assert px[x_bar, y_in_body] != app.LUM_MID
+
+
+def test_render_pianoroll_frame_bars_strip_reuses_grid_bar_and_beat_xs_verbatim():
+    # No engine-side change needed for this strip (pages/pianoroll.py's own
+    # module docstring) -- an empty bar_xs/beat_xs must draw NO ticks at all.
+    empty_grid_vm = {**PIANOROLL_VM, "grid": {**PIANOROLL_GRID, "bar_xs": [], "beat_xs": []}}
+    font, roll_top, _usable_h, _note_h, _row_span_h, _roll_x0, _roll_w = _pianoroll_layout()
+    header_h = roll_top - app._pianoroll_bars_strip_height(font)
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(empty_grid_vm, surf)
+    px = surf.image.load()
+    label_px_end = len(f"{'Bars':>7} │") * font.width
+    for x in range(label_px_end, surf.width):
+        for y in range(header_h, roll_top):
+            assert px[x, y] == app.BG
 
 
 def test_render_pianoroll_frame_golden_matches_frozen_fixture():

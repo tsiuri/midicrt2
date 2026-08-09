@@ -528,6 +528,21 @@ PIANOROLL_GRID_LINE_STRIDE = 3
 # for the v1 `_ROLL_ACTIVE_ROW_BASE_RGB=(0,38,12)` byte-exactness proof.
 _ROLL_ROW_TINT_RAMP = RAMPS["pianoroll_row_tint"]
 
+# Phase 8 Task 4 (docs/visual-audit.md §9c): the separate solid "Bars"
+# timeline strip -- v1's own `cell_h`-tall row (`compositor_renderer.py`'s
+# `_render_pianoroll`, the "Timeline row" section), distinct from the
+# DOTTED backdrop guides `_draw_pianoroll_grid` draws through the roll
+# body proper. v2's continuous-height layout has no `cell_h` row-unit to
+# reuse (see `_draw_pianoroll_labels`'s own note_h/row_span_h convention),
+# so this strip gets its own fixed pixel height, same "font row + small
+# pad" sizing convention `_status_strip_height`/`_secondary_strip_height`
+# already use for the bottom chrome strips.
+PIANOROLL_BARS_ROW_PAD = 1
+
+
+def _pianoroll_bars_strip_height(font) -> int:
+    return font.height + 2 * PIANOROLL_BARS_ROW_PAD
+
 
 def _roll_note_color(ch: int, vel: float) -> tuple[int, int, int]:
     floor = _PIANOROLL_RAMP["velocity_floor"]
@@ -650,6 +665,39 @@ def _draw_pianoroll_labels(
             draw_text(surface, 0, y, label, color, font)
 
 
+def _draw_pianoroll_bars_strip(
+    surface: Surface, grid: dict, roll_x0: int, roll_w: int, y: int, strip_h: int, font,
+) -> None:
+    """v1's separate solid bar/beat marker row (the "Bars" timeline strip,
+    docs/visual-audit.md §9c, deferred by Task 3, assigned to this task) --
+    ONE row: a solid `LUM_MID` 1px vertical tick at each bar boundary,
+    `LUM_DIM` at each beat boundary, spanning this strip's own height --
+    distinct from `_draw_pianoroll_grid`'s DOTTED backdrop, which spans the
+    full roll body instead. Needs NO new engine-side data -- reuses
+    `grid["bar_xs"]`/`grid["beat_xs"]` verbatim (already computed for the
+    dotted guides, see pages/pianoroll.py's module docstring: "needs NO
+    engine-side change at all"). The `"{'Bars':>7} │"` label mirrors v1's
+    own `f"{'Bars':>7} \\u2502"` (`compositor_renderer.py:730`) exactly,
+    same `LUM_DIM`/v1 `GREEN_DIM` tone -- reuses `PIANOROLL_LABEL_CHARS`'
+    9-char width convention (not the wider `_MARGIN_CHARS`, since this
+    label has no active-pitch invert to reserve extra room for).
+    """
+    label = f"{'Bars':>7} │"
+    draw_text(surface, 0, y + max(0, (strip_h - font.height) // 2), label, LUM_DIM, font)
+    if roll_w <= 0:
+        return
+    # v1's own loop order (bars first, then beats) -- functionally
+    # order-independent since bar_xs/beat_xs are mutually exclusive
+    # x-positions (pages/pianoroll.py's grid docstring), matched for
+    # literal fidelity anyway.
+    for x_frac in grid["bar_xs"]:
+        x = roll_x0 + round(x_frac * roll_w)
+        surface.vline(x, y, strip_h, LUM_MID)
+    for x_frac in grid["beat_xs"]:
+        x = roll_x0 + round(x_frac * roll_w)
+        surface.vline(x, y, strip_h, LUM_DIM)
+
+
 def render_pianoroll_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     """Render the pianoroll page view-model (pages/pianoroll.py) onto
     `surface`. Pure: reads only `vm` and the cached default font, writes
@@ -664,7 +712,13 @@ def render_pianoroll_frame(vm: dict, surface: Surface, marquee_text: str | None 
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
     draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _pianoroll_header_text(vm)), BG, font)
 
-    usable_h = surface.height - _reserved_chrome_height(font) - header_h
+    # The "Bars" timeline strip sits directly below the header, ABOVE the
+    # pitch-guide roll body -- reserved here the same way the header/bottom
+    # chrome strips are, so the roll body's own note_h/row_span_h account
+    # for it (see _draw_pianoroll_bars_strip's own docstring for why this
+    # needs a fixed pixel height rather than v1's shared cell_h row unit).
+    bars_strip_h = _pianoroll_bars_strip_height(font)
+    usable_h = surface.height - _reserved_chrome_height(font) - header_h - bars_strip_h
     if usable_h <= 0:
         return
     rng = vm["range"]
@@ -674,6 +728,10 @@ def render_pianoroll_frame(vm: dict, surface: Surface, marquee_text: str | None 
     label_w = PIANOROLL_LABEL_MARGIN_CHARS * font.width
     roll_x0 = label_w
     roll_w = max(0, surface.width - label_w)
+    roll_top = header_h + bars_strip_h
+
+    grid = vm["grid"]
+    _draw_pianoroll_bars_strip(surface, grid, roll_x0, roll_w, header_h, bars_strip_h, font)
 
     # Draw order (bottom to top), matching v1's own layering (module
     # comment above): row tint -> grid -> labels -> notes -> overlap flash.
@@ -682,23 +740,22 @@ def render_pianoroll_frame(vm: dict, surface: Surface, marquee_text: str | None 
     # render.py's PIANOROLL_VM) renders exactly as before -- no tint, no
     # flash, byte-identical.
     _draw_pianoroll_row_tint(surface, vm.get("row_tint", []), roll_x0, roll_w,
-                              header_h, row_span_h, note_h)
+                              roll_top, row_span_h, note_h)
 
-    grid = vm["grid"]
-    _draw_pianoroll_grid(surface, grid, roll_x0, roll_w, header_h, usable_h, row_span_h)
+    _draw_pianoroll_grid(surface, grid, roll_x0, roll_w, roll_top, usable_h, row_span_h)
 
     active_ys = {n["y"] for n in vm["notes"]}
-    _draw_pianoroll_labels(surface, grid["pitch_guide_ys"], font, header_h, row_span_h, note_h, active_ys)
+    _draw_pianoroll_labels(surface, grid["pitch_guide_ys"], font, roll_top, row_span_h, note_h, active_ys)
 
     for note in vm["notes"]:
-        y = header_h + round(note["y"] * row_span_h)
+        y = roll_top + round(note["y"] * row_span_h)
         x0 = roll_x0 + round(note["x0"] * roll_w)
         x1 = roll_x0 + round(note["x1"] * roll_w)
         w = max(1, x1 - x0)
         surface.rect(x0, y, w, note_h, _roll_note_color(note["ch"], note["vel"]))
 
     _draw_pianoroll_overlap_flash(surface, vm.get("overlap_flash", []), roll_x0, roll_w,
-                                   header_h, row_span_h, note_h)
+                                   roll_top, row_span_h, note_h)
 
 
 # -- spectrum page (phase-3 task 8) -------------------------------------------
