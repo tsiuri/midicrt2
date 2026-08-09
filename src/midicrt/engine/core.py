@@ -132,6 +132,8 @@ from midicrt import config as config_mod
 from midicrt import proto
 from midicrt.analyzers.beatflash import BeatFlashAnalyzer
 from midicrt.analyzers.loopprogress import LoopProgressAnalyzer
+from midicrt.analyzers.marquee import PAGE_IDS as _MARQUEE_PAGE_IDS
+from midicrt.analyzers.marquee import MarqueeAnalyzer
 from midicrt.analyzers.stucknotes import StuckNotesAnalyzer
 from midicrt.analyzers.timesig import TimesigAnalyzer
 from midicrt.analyzers.transport import TransportAnalyzer
@@ -377,6 +379,18 @@ _ANALYZER_FACTORIES: dict[str, AnalyzerFactory] = {
     # here matching "status"'s own precedent.
     "beatflash": lambda config: BeatFlashAnalyzer(),
     "loopprogress": lambda config: LoopProgressAnalyzer(),
+    # Phase 8 Task 4 (docs/visual-audit.md §20b): v1's header page-title
+    # scrolling marquee -- v1's own primary anti-burn-in device, "always
+    # visible regardless of page" like every other analyzer/overlay here.
+    # `config.pages` filtered to `_PAGE_FACTORIES` (the SAME filter
+    # `Engine.__init__` applies below to build `self.pages`) rather than
+    # `self.pages` itself -- analyzers are constructed BEFORE pages in
+    # `__init__` (see this module's own docstring, "Analyzers" section), so
+    # `self.pages` does not exist yet at this factory's call time.
+    "marquee": lambda config: MarqueeAnalyzer(
+        [name for name in config.pages if name in _PAGE_FACTORIES],
+        speed_cps=config.header_scroll_speed_cps,
+    ),
 }
 
 # Phase-3 task 12 (gap ports): v1 numeric page ID (per README's Pages
@@ -392,11 +406,18 @@ _ANALYZER_FACTORIES: dict[str, AnalyzerFactory] = {
 # ported/folded/dropped dispositions -- `_sysex_switch_page` replies with
 # an error status for any ID not in this map, exactly like v1's own
 # `switch_page()` returning `ok=False` for an invalid page.
-_SYSEX_PAGE_ID_MAP: dict[int, str] = {
-    0: "help", 1: "harmony", 2: "sendnotes", 4: "ccmonitor", 5: "ccdashboard",
-    6: "eventlog", 7: "progchanges", 8: "pianoroll", 9: "spectrum", 10: "tuner",
-    11: "chordkey", 13: "voices", 14: "config", 17: "img2txtviz",
-}
+#
+# Phase 8 Task 4 anti-drift cleanup: this used to be the one and only
+# place v1's page-ID numbering lived. `analyzers/marquee.py::PAGE_IDS`
+# needs the SAME numbering (v1's header marquee is `"[pid:TITLE]"` text,
+# see that module's own docstring) -- rather than keep two independently-
+# maintained copies of the same 14 numbers, this map is now DERIVED from
+# `PAGE_IDS` (inverted), making that module the single source of truth.
+# Values are unchanged (still every ID `analyzers/marquee.py` documents,
+# same four gaps -- 3/12/15/16 -- for the same reasons); this is a pure
+# refactor, not a behavior change, and `test_engine_sysex_dispatch.py`'s
+# existing ID-based tests are the regression coverage that proves it.
+_SYSEX_PAGE_ID_MAP: dict[int, str] = {pid: name for name, pid in _MARQUEE_PAGE_IDS.items()}
 
 
 @dataclass

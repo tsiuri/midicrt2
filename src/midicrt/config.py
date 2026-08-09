@@ -148,6 +148,15 @@ class Config:
     capture_dir: str | None = None
     capture_retention: int = 50
     capture_auto_start: bool = False
+    # Phase 8 Task 4 (docs/visual-audit.md §20b, "the header page-title
+    # scrolling marquee" -- v1's primary anti-burn-in device): v1's own
+    # `core.header_scroll_speed` config key (`~/codex/midicrt/config/
+    # settings.json`, default 4.0 chars/sec, `midicrt.py`'s
+    # `HEADER_SCROLL_SPEED`) -- see `analyzers/marquee.py::MarqueeAnalyzer`
+    # for the port. A flat field (not a nested `core.*` section), matching
+    # this dataclass's own existing convention for every other v1-ported
+    # knob (`screensaver_after_s`, `pagecycle_idle_s`, ...).
+    header_scroll_speed_cps: float = 4.0
 
 
 def load(path: str | None = None) -> Config:

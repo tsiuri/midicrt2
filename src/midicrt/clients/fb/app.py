@@ -138,7 +138,28 @@ OUT_SIZE = (800, 475)
 _SYS_FB = Path("/sys/class/graphics/fb0")
 
 
-def render_frame(vm: dict, surface: Surface) -> None:
+def _header_text(marquee_text: str | None, fallback: str) -> str:
+    """Phase 8 Task 4 (docs/visual-audit.md §20b): every page's reverse-
+    video header row now shows the LIVE header marquee (v1's primary
+    anti-burn-in device -- ported in full at `analyzers/marquee.py` +
+    `clients/chrome.py::marquee_window_text`) instead of a permanently-
+    static per-page title. `marquee_text` is computed ONCE per frame by
+    `_paint_frame` below (the one place that knows both the surface width
+    and has the live `overlay.marquee` snapshot) and threaded down into
+    whichever `render_X_frame` the current page dispatches to.
+
+    `marquee_text=None` -- every `render_X_frame` parameter's own default,
+    i.e. every call site anywhere in this test suite that invokes a
+    renderer directly as `render_X_frame(vm, surface)` with no third
+    argument, completely unchanged by this task -- falls back to the
+    renderer's own OLD static per-page header text instead, so every
+    pre-existing test/golden fixture stays byte-identical with zero edits;
+    only the real run loops (`_paint_frame`) ever pass a real marquee
+    string."""
+    return marquee_text if marquee_text is not None else fallback
+
+
+def render_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     """Render an eventlog view-model onto `surface`. Pure: reads only `vm`
     and the cached default font, writes only to `surface`'s pixels -- no
     I/O, no clock, no global state beyond the font's (side-effect-free)
@@ -163,7 +184,7 @@ def render_frame(vm: dict, surface: Surface) -> None:
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
     header_text = f"{vm['title']}  ({vm['count']} events)"
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, header_text, BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, header_text), BG, font)
 
     line_h = font.height + LINE_GAP
     usable_h = surface.height - _reserved_chrome_height(font)
@@ -173,7 +194,7 @@ def render_frame(vm: dict, surface: Surface) -> None:
         draw_text(surface, LEFT_MARGIN, header_h + i * line_h, line["text"], color, font)
 
 
-def _render_unknown(vm: dict, surface: Surface) -> None:
+def _render_unknown(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     """Fallback for a page name this client build has no renderer for --
     see clients/tui.py's `_render_unknown` for the rationale (wire compat
     is additive-only, so an older client can meet a newer server's extra
@@ -213,7 +234,7 @@ def _voices_header_text(vm: dict) -> str:
     return f"{vm['title']}  (poly {vm['total']}/{vm['total_peak']})"
 
 
-def render_voices_frame(vm: dict, surface: Surface) -> None:
+def render_voices_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     """Render the voices page view-model (pages/voices.py, wrapping
     analyzers/voices.py's VoiceMonitorAnalyzer) onto `surface`. Pure: reads
     only `vm` and the cached default font, writes only to `surface`'s
@@ -225,7 +246,7 @@ def render_voices_frame(vm: dict, surface: Surface) -> None:
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _voices_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _voices_header_text(vm)), BG, font)
 
     rows = vm["rows"]
     if not rows:
@@ -324,7 +345,7 @@ def _harmony_motif_text(vm: dict) -> str:
     return "Motif: --"
 
 
-def render_harmony_frame(vm: dict, surface: Surface) -> None:
+def render_harmony_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     """Render the harmony page view-model (pages/harmony.py, wrapping
     analyzers/harmony.py's HarmonyAnalyzer) onto `surface`. Pure: reads
     only `vm` and the cached default font, writes only to `surface`'s
@@ -336,7 +357,7 @@ def render_harmony_frame(vm: dict, surface: Surface) -> None:
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _harmony_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _harmony_header_text(vm)), BG, font)
 
     line_h = font.height + LINE_GAP
     usable_h = surface.height - _reserved_chrome_height(font)
@@ -394,7 +415,7 @@ def _tuner_header_text(vm: dict) -> str:
     return f"{vm['title']}"
 
 
-def render_tuner_frame(vm: dict, surface: Surface) -> None:
+def render_tuner_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     """Render the tuner page view-model (pages/tuner.py, wrapping
     analyzers/tuner.py's TunerAnalyzer) onto `surface`. Pure: reads only
     `vm` and the cached default font, writes only to `surface`'s pixels --
@@ -407,7 +428,7 @@ def render_tuner_frame(vm: dict, surface: Surface) -> None:
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _tuner_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _tuner_header_text(vm)), BG, font)
 
     line_h = font.height + LINE_GAP
     usable_h = surface.height - _reserved_chrome_height(font)
@@ -578,7 +599,7 @@ def _draw_pianoroll_labels(
             draw_text(surface, 0, y, label, color, font)
 
 
-def render_pianoroll_frame(vm: dict, surface: Surface) -> None:
+def render_pianoroll_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     """Render the pianoroll page view-model (pages/pianoroll.py) onto
     `surface`. Pure: reads only `vm` and the cached default font, writes
     only to `surface`'s pixels -- no I/O, no clock, no global state beyond
@@ -590,7 +611,7 @@ def render_pianoroll_frame(vm: dict, surface: Surface) -> None:
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _pianoroll_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _pianoroll_header_text(vm)), BG, font)
 
     usable_h = surface.height - _reserved_chrome_height(font) - header_h
     if usable_h <= 0:
@@ -643,7 +664,7 @@ def _spectrum_header_text(vm: dict) -> str:
     return f"{vm['title']}  (device: {device})"
 
 
-def render_spectrum_frame(vm: dict, surface: Surface) -> None:
+def render_spectrum_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     """Render the spectrum page view-model (pages/spectrum.py, wrapping
     analyzers/spectrum.py's SpectrumAnalyzer) onto `surface`. Pure: reads
     only `vm` and the cached default font, writes only to `surface`'s
@@ -656,7 +677,7 @@ def render_spectrum_frame(vm: dict, surface: Surface) -> None:
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _spectrum_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _spectrum_header_text(vm)), BG, font)
 
     usable_h = surface.height - _reserved_chrome_height(font) - header_h
     if usable_h <= 0:
@@ -707,7 +728,7 @@ def render_spectrum_frame(vm: dict, surface: Surface) -> None:
 # parameter already set for the engine-side behaviors.
 
 
-def render_screensaver_frame(vm: dict, surface: Surface) -> None:
+def render_screensaver_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     surface.clear(BG)
 
 
@@ -739,13 +760,13 @@ def _img2txtviz_cell_color(value: float) -> tuple[int, int, int]:
     return lum(v)
 
 
-def render_img2txtviz_frame(vm: dict, surface: Surface) -> None:
+def render_img2txtviz_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     font = load_font()
     surface.clear(BG)
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _img2txtviz_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _img2txtviz_header_text(vm)), BG, font)
 
     usable_h = surface.height - _reserved_chrome_height(font) - header_h
     if usable_h <= 0:
@@ -774,13 +795,13 @@ def _config_header_text(vm: dict) -> str:
     return f"{vm['title']}"
 
 
-def render_config_frame(vm: dict, surface: Surface) -> None:
+def render_config_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     font = load_font()
     surface.clear(BG)
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _config_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _config_header_text(vm)), BG, font)
 
     line_h = font.height + LINE_GAP
     usable_h = surface.height - _reserved_chrome_height(font)
@@ -814,13 +835,13 @@ def _help_header_text(vm: dict) -> str:
     return f"{vm['title']}"
 
 
-def render_help_frame(vm: dict, surface: Surface) -> None:
+def render_help_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     font = load_font()
     surface.clear(BG)
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _help_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _help_header_text(vm)), BG, font)
 
     line_h = font.height + LINE_GAP
     usable_h = surface.height - _reserved_chrome_height(font)
@@ -871,13 +892,13 @@ def _progchanges_header_text(vm: dict) -> str:
     return f"{vm['title']}  ({vm['count']} events)"
 
 
-def render_progchanges_frame(vm: dict, surface: Surface) -> None:
+def render_progchanges_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     font = load_font()
     surface.clear(BG)
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _progchanges_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _progchanges_header_text(vm)), BG, font)
 
     line_h = font.height + LINE_GAP
     usable_h = surface.height - _reserved_chrome_height(font)
@@ -904,13 +925,13 @@ def _ccmonitor_row_text(ch_vm: dict) -> str:
     return f"{ch_vm['ch']:02d}  {cells}"
 
 
-def render_ccmonitor_frame(vm: dict, surface: Surface) -> None:
+def render_ccmonitor_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     font = load_font()
     surface.clear(BG)
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _ccmonitor_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _ccmonitor_header_text(vm)), BG, font)
 
     rows = vm["channels"]
     if not rows:
@@ -947,13 +968,13 @@ def _ccdashboard_age_text(entry: dict) -> str:
     return "LIVE" if entry["fresh"] else f"{entry['age_s']:.1f}s"
 
 
-def render_ccdashboard_frame(vm: dict, surface: Surface) -> None:
+def render_ccdashboard_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     font = load_font()
     surface.clear(BG)
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _ccdashboard_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _ccdashboard_header_text(vm)), BG, font)
 
     entries = vm["entries"]
     if not entries:
@@ -1014,13 +1035,13 @@ def _chordkey_key_lines(key: dict) -> tuple[str, str]:
     return line1, line2
 
 
-def render_chordkey_frame(vm: dict, surface: Surface) -> None:
+def render_chordkey_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     font = load_font()
     surface.clear(BG)
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _chordkey_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _chordkey_header_text(vm)), BG, font)
 
     line_h = font.height + LINE_GAP
     usable_h = surface.height - _reserved_chrome_height(font)
@@ -1068,13 +1089,13 @@ def _sendnotes_status_text(vm: dict) -> str:
             f"Vel:{vm['velocity']:03d}  Gate:{vm['gate_ms']}ms  Active:{vm['active']}")
 
 
-def render_sendnotes_frame(vm: dict, surface: Surface) -> None:
+def render_sendnotes_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:
     font = load_font()
     surface.clear(BG)
 
     header_h = font.height + 2 * HEADER_PAD
     surface.rect(0, 0, surface.width, header_h, HEADER_BG)
-    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _sendnotes_header_text(vm), BG, font)
+    draw_text(surface, LEFT_MARGIN, HEADER_PAD, _header_text(marquee_text, _sendnotes_header_text(vm)), BG, font)
 
     line_h = font.height + LINE_GAP
     usable_h = surface.height - _reserved_chrome_height(font)
@@ -1182,9 +1203,20 @@ def _draw_beatprogress(surface: Surface, beatflash_vm: dict, loopprogress_vm: di
     draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, text, BG, font)
 
 
+def _header_char_capacity(surface: Surface, font) -> int:
+    """How many characters the header row can print, starting at
+    `LEFT_MARGIN` -- the fb analog of v1's `SCREEN_COLS` (the marquee's
+    OWN "does this need to scroll" engage condition, `analyzers/
+    marquee.py`'s module docstring). Mirrors `_draw_beatprogress`'s own
+    `num_chars` computation for the same reason: a shared function's width
+    parameter can't assume a screen size, so each fb strip derives its own
+    character budget from the real surface/font."""
+    return max(0, (surface.width - LEFT_MARGIN) // font.width)
+
+
 def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
                   alerts_vm: dict, timesig_vm: dict, beatflash_vm: dict,
-                  loopprogress_vm: dict) -> None:
+                  loopprogress_vm: dict, marquee_vm: dict) -> None:
     """Render `page`'s body, then all THREE chrome strips -- UNLESS `page`
     is the screensaver page (Important fix, task-9 review), in which case
     NO chrome is painted at all, matching v1's true full-screen blank --
@@ -1193,9 +1225,21 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
     chrome paints after, except when screensaving" rule so the three real
     run-loop call sites (`_run_device`'s initial paint + its redraw loop,
     and `run()`'s `--out` one-shot path) can never drift from each other.
+
+    Phase 8 Task 4: `marquee_vm` (`overlay.marquee`) is sliced into
+    `marquee_text` HERE -- the one place that knows both the real surface
+    width (`_header_char_capacity`) and the live scroll-offset snapshot --
+    then threaded into `renderer(...)`'s new optional third argument, so
+    EVERY page's header shows the live scrolling marquee (v1's primary
+    anti-burn-in device) instead of a permanently-static per-page title.
+    The screensaver page's own renderer ignores `marquee_text` entirely
+    (true full-screen blank, chrome included -- see its own module
+    comment), so it is still passed through uniformly rather than
+    special-cased here.
     """
     renderer = RENDERERS.get(page, _render_unknown)
-    renderer(vm, surface)
+    marquee_text = chrome.marquee_window_text(marquee_vm, _header_char_capacity(surface, font))
+    renderer(vm, surface, marquee_text)
     if page == SCREENSAVER_PAGE:
         return
     _draw_secondary(surface, alerts_vm, timesig_vm, font)
@@ -1408,7 +1452,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
              "status_vm": dict(chrome.DEFAULT_STATUS_VM),
              "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
-             "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
+             "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM),
+             "marquee_vm": dict(chrome.DEFAULT_MARQUEE_VM)}
     on_event = _make_page_switcher(client, state, fps)
 
     fb_file, fb_mm = open_fb_mmap(fb_path, stride * height)
@@ -1437,7 +1482,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
         vm_topic = state["topic"]
         _paint_frame(surface, state["page"], vm, font, state["status_vm"],
                      state["alerts_vm"], state["timesig_vm"],
-                     state["beatflash_vm"], state["loopprogress_vm"])
+                     state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"])
         surface.write_to_mmap(fb_mm, stride=stride)
 
         period = 1.0 / fps
@@ -1448,12 +1493,13 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             # (invoked from inside this very call) can switch `state["topic"]`
             # mid-drain, and a same-batch snapshot for the NEW topic must
             # still be recognised, not dropped by a stale membership check.
-            # The five overlay topics are fixed members -- each updates on
+            # The six overlay topics are fixed members -- each updates on
             # its own schedule, independent of the page topic.
             drained = drain_latest(
                 inbox, lambda: {state["topic"], chrome.OVERLAY_STATUS_TOPIC,
                                 chrome.OVERLAY_ALERTS_TOPIC, chrome.OVERLAY_TIMESIG_TOPIC,
-                                chrome.OVERLAY_BEATFLASH_TOPIC, chrome.OVERLAY_LOOPPROGRESS_TOPIC},
+                                chrome.OVERLAY_BEATFLASH_TOPIC, chrome.OVERLAY_LOOPPROGRESS_TOPIC,
+                                chrome.OVERLAY_MARQUEE_TOPIC},
                 on_event=on_event)
             page_updated = state["topic"] in drained
             if page_updated:
@@ -1476,31 +1522,44 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             if chrome.OVERLAY_LOOPPROGRESS_TOPIC in drained:
                 state["loopprogress_vm"] = drained[chrome.OVERLAY_LOOPPROGRESS_TOPIC]
                 beatprogress_updated = True
+            # Phase 8 Task 4: the marquee ticks on its OWN wall-clock
+            # schedule (`analyzers/marquee.py::MarqueeAnalyzer.tick`),
+            # roughly `HEADER_SCROLL_SPEED` times/sec once scrolling is
+            # engaged -- independent of every other overlay/page update.
+            # Without its own `marquee_updated` flag feeding the repaint
+            # gate below, the header would only ever move as a side effect
+            # of SOME OTHER vm changing, defeating the whole point of a
+            # continuously-scrolling anti-burn-in header.
+            marquee_updated = chrome.OVERLAY_MARQUEE_TOPIC in drained
+            if marquee_updated:
+                state["marquee_vm"] = drained[chrome.OVERLAY_MARQUEE_TOPIC]
             # `page_changed` (via `on_event`, inside `drain_latest` above)
             # can flip `state["page"]`/`state["topic"]` immediately, but the
             # NEW topic's own first snapshot can arrive "up to 1/max_rate
             # later" (docs/phase2-notes.md) -- not necessarily this same
             # tick. `vm`/`vm_topic` still describe the OLD page in that gap.
             # An unrelated overlay-only update (status/alerts/timesig/
-            # beatflash/loopprogress, each ticking independently) must not
-            # repaint the body against that stale, mismatched vm -- found
-            # live in phase-3 task 11's supervised CRT smoke (page="eventlog"
-            # painted with a screensaver vm, crashing `render_frame` on the
-            # missing `vm['count']`; see test_run_device_survives_page_
-            # switch_before_new_topics_snapshot_arrives). Skip the WHOLE
-            # repaint (chrome included -- body+chrome are one `_paint_frame`
-            # call) until vm_topic catches up; the overlay update itself
-            # isn't lost, it just gets folded into the next tick that also
-            # carries (or already has) a topic-matching vm.
+            # beatflash/loopprogress/marquee, each ticking independently)
+            # must not repaint the body against that stale, mismatched vm --
+            # found live in phase-3 task 11's supervised CRT smoke
+            # (page="eventlog" painted with a screensaver vm, crashing
+            # `render_frame` on the missing `vm['count']`; see
+            # test_run_device_survives_page_switch_before_new_topics_
+            # snapshot_arrives). Skip the WHOLE repaint (chrome included --
+            # body+chrome are one `_paint_frame` call) until vm_topic
+            # catches up; the overlay update itself isn't lost, it just
+            # gets folded into the next tick that also carries (or already
+            # has) a topic-matching vm.
             vm_is_current = vm_topic == state["topic"]
-            if vm_is_current and (page_updated or status_updated or secondary_updated or beatprogress_updated):
+            if vm_is_current and (page_updated or status_updated or secondary_updated
+                                   or beatprogress_updated or marquee_updated):
                 # `render_frame` clears the WHOLE surface, so all THREE
                 # chrome strips must be repainted on every redraw, not just
                 # when their own vm changed (`_paint_frame` skips them
                 # entirely on the screensaver page -- see its own docstring).
                 _paint_frame(surface, state["page"], vm, font, state["status_vm"],
                              state["alerts_vm"], state["timesig_vm"],
-                             state["beatflash_vm"], state["loopprogress_vm"])
+                             state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"])
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
     finally:
@@ -1513,7 +1572,7 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
     client = EngineClient(socket_path)
     overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
                        chrome.OVERLAY_TIMESIG_TOPIC, chrome.OVERLAY_BEATFLASH_TOPIC,
-                       chrome.OVERLAY_LOOPPROGRESS_TOPIC]
+                       chrome.OVERLAY_LOOPPROGRESS_TOPIC, chrome.OVERLAY_MARQUEE_TOPIC]
     try:
         client.connect()
         page, topic = current_page_topic(client)
@@ -1542,6 +1601,7 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
             status = {"vm": dict(chrome.DEFAULT_STATUS_VM)}
             beatprogress = {"beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
                             "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
+            marquee = {"vm": dict(chrome.DEFAULT_MARQUEE_VM)}
 
             def _capture_status(msg: dict) -> None:
                 if msg.get("kind") != "snapshot":
@@ -1556,12 +1616,15 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
                     beatprogress["beatflash_vm"] = msg["data"]
                 elif msg.get("topic") == chrome.OVERLAY_LOOPPROGRESS_TOPIC:
                     beatprogress["loopprogress_vm"] = msg["data"]
+                elif msg.get("topic") == chrome.OVERLAY_MARQUEE_TOPIC:
+                    marquee["vm"] = msg["data"]
 
             vm = wait_first_snapshot(inbox, topic, _capture_status)
             surface = Surface(*OUT_SIZE)
             _paint_frame(surface, page, vm, load_font(), status["vm"],
                          secondary["alerts_vm"], secondary["timesig_vm"],
-                         beatprogress["beatflash_vm"], beatprogress["loopprogress_vm"])
+                         beatprogress["beatflash_vm"], beatprogress["loopprogress_vm"],
+                         marquee["vm"])
             surface.save_png(out_path)
             return 0
         # Fetched only on this (interactive-device) path -- the headless

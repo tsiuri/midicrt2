@@ -203,6 +203,54 @@ def secondary_status_text(alerts_vm: dict, timesig_vm: dict) -> str:
     return text if text else timesig_text(timesig_vm)
 
 
+OVERLAY_MARQUEE_TOPIC = "overlay.marquee"
+
+DEFAULT_MARQUEE_VM = {"text": "", "doubled": "        ", "offset": 0}   # GAP*2, empty roster
+
+
+def scroll_window(text: str, doubled: str, offset: int, width: int) -> str:
+    """The shared v1 scrolling-marquee slice mechanic (`midicrt.py`'s header
+    marquee AND autoconnect-log rows both do this, see
+    `analyzers/marquee.py`'s module docstring for the full citation): show
+    `text` STATIC when it already fits within `width` characters (v1's `if
+    len(page_titles) <= SCREEN_COLS: draw_line(...)` / `if len(msg) <=
+    window: win_text = msg.ljust(window)`), else slice `width` characters
+    out of the caller's PRE-DOUBLED string starting at `offset`.
+
+    No wraparound handling is needed: whenever execution reaches the
+    slicing branch, `len(text) > width` is true BY CONSTRUCTION (that's the
+    only way to get here), and a correctly-built `doubled` is always `2 *
+    (len(text) + len(gap))` long for some non-empty `gap` -- so `offset +
+    width < len(text) + len(gap) + width < 2 * (len(text) + len(gap)) ==
+    len(doubled)` always holds (`offset` itself is `< len(text) +
+    len(gap)`, the modulo `analyzers/marquee.py::MarqueeAnalyzer` already
+    applies). Matches v1's own implicit assumption -- it never defends
+    against this case either, because it can't actually occur.
+    """
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if not doubled:
+        return ""
+    off = offset % len(doubled)
+    return doubled[off:off + width]
+
+
+def marquee_window_text(vm: dict, width: int) -> str:
+    """v1's exact header marquee (`midicrt.py` row 0) width-aware slice of
+    an `overlay.marquee` view-model -- see `scroll_window()`'s own
+    docstring for the shared mechanic and `analyzers/marquee.py`'s module
+    docstring for the full v1 citation (line numbers, HEADER_SCROLL_SPEED,
+    the doubled-string trick). Screen width is deliberately NOT known to
+    the engine-side `MarqueeAnalyzer` (fb and TUI have different character
+    budgets for the identical roster text) -- "does this need to scroll at
+    all" is decided HERE, per-renderer, from the SAME underlying vm/offset,
+    mirroring `beatprogress_row_text(vm, width)`'s own width-aware
+    precedent above."""
+    return scroll_window(vm.get("text", ""), vm.get("doubled", ""), vm.get("offset", 0), width)
+
+
 def status_text(vm: dict) -> str:
     """Build the one-line transport status text from an `overlay.status`
     view-model. BAR is 0-indexed, BEAT is 1-indexed within a hardcoded 4/4

@@ -13,8 +13,9 @@ from pathlib import Path
 
 from PIL import Image
 
+from midicrt.clients import chrome
 from midicrt.clients.base import ClientError
-from midicrt.clients.chrome import DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM
+from midicrt.clients.chrome import DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, DEFAULT_MARQUEE_VM
 from midicrt.clients.fb import app
 from midicrt.clients.fb.surface import Surface
 from midicrt.clients.fb.text import draw_text, load_font
@@ -311,10 +312,12 @@ def test_paint_frame_skips_all_chrome_on_the_screensaver_page():
     active_beatflash = {"intensity": 1.4, "is_bar": True}
     active_loopprogress = {"fraction": 0.5, "running": True}
 
+    active_marquee = {"text": "[0:HELP]  [1:HARMONY]", "doubled": "[0:HELP]  [1:HARMONY]    " * 2,
+                       "offset": 3}
     surf = Surface(*GOLDEN_SURFACE_SIZE)
     app._paint_frame(surf, "screensaver", {"title": "SCREENSAVER"}, load_font(),
                       active_status, active_alerts, active_timesig,
-                      active_beatflash, active_loopprogress)
+                      active_beatflash, active_loopprogress, active_marquee)
 
     want = Surface(*GOLDEN_SURFACE_SIZE)
     want.clear(app.BG)
@@ -331,10 +334,138 @@ def test_paint_frame_paints_chrome_normally_on_an_ordinary_page():
     surf = Surface(*GOLDEN_SURFACE_SIZE)
     app._paint_frame(surf, "eventlog", EMPTY_VM, load_font(),
                       GOLDEN_STATUS_VM, GOLDEN_ALERTS_VM, GOLDEN_TIMESIG_VM,
-                      GOLDEN_BEATFLASH_VM, GOLDEN_LOOPPROGRESS_VM)
+                      GOLDEN_BEATFLASH_VM, GOLDEN_LOOPPROGRESS_VM, DEFAULT_MARQUEE_VM)
     assert set(surf.image.get_flattened_data()) != {app.BG}
     px = surf.image.load()
     assert px[surf.width - 1, surf.height - 1] == app.HEADER_BG
+
+
+# -- header marquee wiring (Phase 8 Task 4, docs/visual-audit.md §20b) ------
+#
+# v1's primary anti-burn-in device: every page's reverse-video header row
+# now shows the live scrolling page-title marquee (`analyzers/marquee.py` +
+# `clients/chrome.py::marquee_window_text`) instead of a permanently-static
+# per-page title. `_paint_frame` is the one place that slices the marquee
+# vm into text and threads it into whichever `render_X_frame` the current
+# page dispatches to -- see that function's own docstring.
+
+_LONG_MARQUEE_TEXT = "[0:HELP]  [1:HARMONY]  [2:SEND NOTES]  [4:CC MONITOR]"
+_LONG_MARQUEE_GAP = "    "
+_LONG_MARQUEE_VM = {
+    "text": _LONG_MARQUEE_TEXT,
+    "doubled": (_LONG_MARQUEE_TEXT + _LONG_MARQUEE_GAP) * 2,
+    "offset": 0,
+}
+
+
+def test_header_text_falls_back_to_page_text_when_marquee_text_is_none():
+    assert app._header_text(None, "EVENT LOG  (0 events)") == "EVENT LOG  (0 events)"
+
+
+def test_header_text_uses_marquee_text_when_given():
+    assert app._header_text("[0:HELP]  [1:HAR", "EVENT LOG  (0 events)") == "[0:HELP]  [1:HAR"
+
+
+def test_render_frame_draws_marquee_text_instead_of_static_title_when_given():
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    app.render_frame(EMPTY_VM, surf, marquee_text="[0:HELP]  [1:HARMONY]")
+    font = load_font()
+    # The old static title text ("EVENT LOG  (0 events)") must NOT have been
+    # drawn -- proven by re-rendering with marquee_text=None (the old
+    # behavior, still exercised by every pre-existing 2-arg call site) and
+    # confirming the two frames differ.
+    surf_old = Surface(*GOLDEN_SURFACE_SIZE)
+    app.render_frame(EMPTY_VM, surf_old)
+    assert surf.image.tobytes() != surf_old.image.tobytes()
+    # Sanity: the marquee text itself was actually painted somewhere in the
+    # header row (BG-colored text punched into the HEADER_BG reverse fill).
+    header_h = font.height + 2 * app.HEADER_PAD
+    assert any(surf.image.load()[x, y] == app.BG
+               for x in range(app.LEFT_MARGIN, surf.width)
+               for y in range(app.HEADER_PAD, header_h))
+
+
+def test_paint_frame_computes_marquee_text_from_width_aware_slice():
+    # A roster string wider than the surface -- proves _paint_frame
+    # actually calls marquee_window_text with the REAL header character
+    # capacity, not just passing the raw (unsliced) text straight through.
+    # (144px tall -- same convention as PIANOROLL_SURFACE_SIZE below --
+    # leaves enough room for the header AND all three chrome strips without
+    # overlap; a too-short surface would make _paint_frame's chrome strips
+    # spill upward into the header band, an unrelated test-construction
+    # artifact this size avoids.)
+    surf = Surface(200, 144)   # narrower than _LONG_MARQUEE_TEXT -- forces the scroll branch
+    font = load_font()
+    header_chars = app._header_char_capacity(surf, font)
+    assert header_chars < len(_LONG_MARQUEE_TEXT)   # sanity: scroll IS engaged
+    app._paint_frame(surf, "eventlog", EMPTY_VM, font,
+                      chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                      chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM, _LONG_MARQUEE_VM)
+    expected_text = chrome.marquee_window_text(_LONG_MARQUEE_VM, header_chars)
+    want = Surface(200, 144)
+    app.render_frame(EMPTY_VM, want, marquee_text=expected_text)
+    # Only compare the header band -- _paint_frame also paints chrome strips
+    # render_frame alone does not.
+    header_h = font.height + 2 * app.HEADER_PAD
+    got_header = surf.image.crop((0, 0, surf.width, header_h)).tobytes()
+    want_header = want.image.crop((0, 0, surf.width, header_h)).tobytes()
+    assert got_header == want_header
+
+
+def test_screensaver_page_ignores_marquee_text_true_blank_preserved():
+    # Task-9's burn-in-safe true-blank guarantee must survive this task:
+    # the screensaver page draws NOTHING, marquee included.
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf, "screensaver", {"title": "SCREENSAVER"}, load_font(),
+                      chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                      chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM, _LONG_MARQUEE_VM)
+    assert set(surf.image.get_flattened_data()) == {app.BG}
+
+
+# -- THE BURN-IN TRIPWIRE (Phase 8 Task 4 brief) -----------------------------
+#
+# "a test rendering the same VM at t and t+N seconds (tick-driven) must
+# assert pixel-position DIFFERENCE for every audit-marked anti-burn-in
+# mover." The header marquee is v1's primary anti-burn-in device
+# (docs/visual-audit.md §20b) -- this is its tripwire, exercising the REAL
+# `MarqueeAnalyzer` (not a hand-built vm) ticked at two real timestamps,
+# through the REAL `_paint_frame` dispatch, comparing REAL rendered pixels.
+
+def test_burn_in_tripwire_marquee_header_pixels_differ_at_t_and_t_plus_n():
+    from midicrt.analyzers.marquee import MarqueeAnalyzer
+
+    roster = ["eventlog", "voices", "harmony", "pianoroll", "spectrum", "img2txtviz",
+              "config", "help", "progchanges", "ccmonitor", "ccdashboard", "chordkey", "sendnotes"]
+    analyzer = MarqueeAnalyzer(roster, speed_cps=4.0)
+    font = load_font()
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    header_chars = app._header_char_capacity(surf, font)
+    assert header_chars < len(analyzer.view_model()["text"])   # sanity: scroll IS engaged
+
+    analyzer.tick(1000.0)
+    frame_t = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(frame_t, "eventlog", EMPTY_VM, font,
+                      chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                      chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM, analyzer.view_model())
+
+    analyzer.tick(1003.0)   # +3s * 4 chars/sec = +12 chars of genuine scroll
+    frame_t_plus_n = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(frame_t_plus_n, "eventlog", EMPTY_VM, font,
+                      chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                      chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM, analyzer.view_model())
+
+    header_h = font.height + 2 * app.HEADER_PAD
+    header_t = frame_t.image.crop((0, 0, frame_t.width, header_h)).tobytes()
+    header_t_plus_n = frame_t_plus_n.image.crop((0, 0, frame_t_plus_n.width, header_h)).tobytes()
+    assert header_t != header_t_plus_n
+    # Everything BELOW the header (body + chrome, none of which reads the
+    # marquee) must be pixel-IDENTICAL between the two frames -- proves the
+    # difference above is isolated to the marquee's own motion, not some
+    # unrelated nondeterminism.
+    body_t = frame_t.image.crop((0, header_h, frame_t.width, frame_t.height)).tobytes()
+    body_t_plus_n = frame_t_plus_n.image.crop((0, header_h, frame_t_plus_n.width,
+                                                frame_t_plus_n.height)).tobytes()
+    assert body_t == body_t_plus_n
 
 
 def test_render_frame_accent_color_is_brighter_than_normal():
@@ -380,11 +511,25 @@ def _write_isolated_daemon_config(tmp_path) -> str:
     explicitly (not left to `Config()`'s own default, which happens to
     also be `capture_auto_start=False` today) so this test file's
     isolation is an explicit, auditable fact, not a coincidence that would
-    silently break if that default ever changed."""
+    silently break if that default ever changed.
+
+    Phase 8 Task 4: also pins `header_scroll_speed_cps = 0.0` -- the header
+    marquee (`analyzers/marquee.py`) is real wall-clock-driven motion by
+    design (v1's primary anti-burn-in device), which makes its scroll
+    OFFSET at the exact instant `--out` captures a frame a function of
+    real subprocess-startup timing, not just the vm content -- exactly the
+    kind of flakiness a byte-exact golden PNG test cannot tolerate. Pinning
+    the speed to 0 here freezes the marquee at a fixed, deterministic
+    slice (offset 0 -- the roster string's own first N characters) without
+    disabling the marquee mechanism itself (still real `MarqueeAnalyzer`
+    state, still real `overlay.marquee` wire traffic) -- the scroll-speed
+    MATH itself is covered by `tests/test_analyzers_marquee.py`'s own
+    dedicated mechanics tests, not this end-to-end pipeline smoke test."""
     config_path = tmp_path / "isolated-config.toml"
     config_path.write_text(
         "capture_auto_start = false\n"
         f'capture_dir = "{tmp_path / "sessions"}"\n'
+        "header_scroll_speed_cps = 0.0\n"
     )
     return str(config_path)
 

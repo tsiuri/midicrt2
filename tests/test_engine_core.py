@@ -187,7 +187,7 @@ def test_engine_topics_reflects_roster_order():
         "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes",
         "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
-        "overlay.beatflash", "overlay.loopprogress",
+        "overlay.beatflash", "overlay.loopprogress", "overlay.marquee",
     ]
 
 
@@ -276,9 +276,13 @@ def test_default_analyzer_roster_is_status_alerts_timesig():
     # (TimesigAnalyzer) the same way task-3 introduced "status"; task 9
     # adds "beatflash"/"loopprogress" the same way again -- all are v1
     # chrome-class features (always visible regardless of page), never
-    # config-gated, see engine/core.py's module docstring.
+    # config-gated, see engine/core.py's module docstring. Phase 8 Task 4
+    # adds "marquee" (MarqueeAnalyzer) the same way once more -- the header
+    # page-title scrolling marquee, v1's own primary anti-burn-in device.
     eng = Engine(Config())
-    assert list(eng.analyzers) == ["status", "alerts", "timesig", "beatflash", "loopprogress"]
+    assert list(eng.analyzers) == [
+        "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee",
+    ]
 
 
 def test_register_analyzer_appends_to_live_roster():
@@ -286,7 +290,7 @@ def test_register_analyzer_appends_to_live_roster():
     fake = _FakePage()  # same handle()/view_model() shape as an Analyzer
     eng.register_analyzer("second", fake)
     assert list(eng.analyzers) == [
-        "status", "alerts", "timesig", "beatflash", "loopprogress", "second",
+        "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee", "second",
     ]
     assert eng.analyzers["second"] is fake
 
@@ -298,7 +302,7 @@ def test_topics_include_overlay_after_page_topics():
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
         "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes",
         "overlay.status", "overlay.alerts", "overlay.timesig",
-        "overlay.beatflash", "overlay.loopprogress",
+        "overlay.beatflash", "overlay.loopprogress", "overlay.marquee",
     ]
 
 

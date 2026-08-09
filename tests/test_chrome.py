@@ -2,12 +2,14 @@ from midicrt.clients.chrome import (
     DEFAULT_ALERTS_VM,
     DEFAULT_BEATFLASH_VM,
     DEFAULT_LOOPPROGRESS_VM,
+    DEFAULT_MARQUEE_VM,
     DEFAULT_STATUS_VM,
     DEFAULT_TIMESIG_VM,
     LOOPPROGRESS_BAR_WIDTH,
     OVERLAY_ALERTS_TOPIC,
     OVERLAY_BEATFLASH_TOPIC,
     OVERLAY_LOOPPROGRESS_TOPIC,
+    OVERLAY_MARQUEE_TOPIC,
     OVERLAY_STATUS_TOPIC,
     OVERLAY_TIMESIG_TOPIC,
     alerts_text,
@@ -15,6 +17,8 @@ from midicrt.clients.chrome import (
     beatprogress_row_text,
     format_bpm,
     loopprogress_bar,
+    marquee_window_text,
+    scroll_window,
     secondary_status_text,
     status_text,
     timesig_text,
@@ -238,3 +242,67 @@ def test_beatprogress_row_text_places_glyph_at_left_and_bar_centered():
     bar = loopprogress_bar(loopprogress_vm)
     expected_start = (40 - len(bar)) // 2
     assert row[expected_start:expected_start + len(bar)] == bar
+
+
+# -- header marquee (Phase 8 Task 4, docs/visual-audit.md §20b) --------------
+
+def test_overlay_marquee_topic_matches_engine_convention():
+    assert OVERLAY_MARQUEE_TOPIC == "overlay.marquee"
+
+
+def test_default_marquee_vm_matches_analyzer_initial_view_model():
+    from midicrt.analyzers.marquee import MarqueeAnalyzer
+
+    assert DEFAULT_MARQUEE_VM == MarqueeAnalyzer([]).view_model()
+
+
+def test_scroll_window_shows_text_static_when_it_fits_width():
+    assert scroll_window("[0:HELP]", "unused-should-never-be-read", 0, width=40) == "[0:HELP]"
+
+
+def test_scroll_window_returns_empty_for_non_positive_width():
+    assert scroll_window("[0:HELP]", "[0:HELP]    [0:HELP]    ", 0, width=0) == ""
+    assert scroll_window("[0:HELP]", "[0:HELP]    [0:HELP]    ", 0, width=-3) == ""
+
+
+def test_scroll_window_slices_doubled_string_when_wider_than_width():
+    text = "[0:HELP]  [1:HARMONY]"
+    gap = "    "
+    doubled = (text + gap) * 2
+    # width smaller than text -> scrolling branch; offset 3 -> slice starts 3 in.
+    window = scroll_window(text, doubled, offset=3, width=10)
+    assert window == doubled[3:13]
+    assert len(window) == 10
+
+
+def test_scroll_window_never_runs_past_end_of_a_correctly_built_doubled_string():
+    # Exercise the boundary case the docstring's proof covers: offset at its
+    # maximum possible value (modulo - 1) with width just under len(text).
+    text = "[0:HELP]"
+    gap = "    "
+    modulo = len(text) + len(gap)
+    doubled = (text + gap) * 2
+    width = len(text) - 1
+    window = scroll_window(text, doubled, offset=modulo - 1, width=width)
+    assert len(window) == width   # never short -- proves no off-the-end truncation
+
+
+def test_marquee_window_text_reads_text_doubled_and_offset_from_vm():
+    vm = {"text": "[0:HELP]  [1:HARMONY]", "doubled": None, "offset": 0}
+    # text fits a wide-enough width -- static branch, doubled/offset unused.
+    assert marquee_window_text(vm, width=100) == vm["text"]
+
+
+def test_marquee_window_text_scrolls_when_narrower_than_content():
+    text = "[0:HELP]  [1:HARMONY]  [2:SEND NOTES]"
+    gap = "    "
+    doubled = (text + gap) * 2
+    vm = {"text": text, "doubled": doubled, "offset": 5}
+    window = marquee_window_text(vm, width=12)
+    assert window == doubled[5:17]
+    assert len(window) == 12
+
+
+def test_marquee_window_text_default_vm_is_blank_at_any_width():
+    assert marquee_window_text(DEFAULT_MARQUEE_VM, width=40) == ""
+    assert marquee_window_text(DEFAULT_MARQUEE_VM, width=0) == ""
