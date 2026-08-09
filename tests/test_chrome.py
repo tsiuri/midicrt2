@@ -407,11 +407,11 @@ def test_overlay_lines_resolves_page_jump_to_the_target_page_name_when_roster_gi
     assert lines == ["GLOBAL", "  2  -> voices"]
 
 
-def test_overlay_lines_page_jump_out_of_range_position_falls_back_to_bare_name():
+def test_overlay_lines_page_jump_out_of_range_position_shows_unassigned_label():
     roster = ["eventlog"]
     lines = overlay_lines({"5": {"action": "page.jump", "args": {"position": 5}}}, {},
                           "eventlog", roster)
-    assert lines == ["GLOBAL", "  5  page.jump"]
+    assert lines == ["GLOBAL", "  5  5 (unassigned)"]
 
 
 def test_overlay_lines_non_jump_entries_unaffected_by_roster():

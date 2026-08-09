@@ -376,7 +376,7 @@ def header_with_hint(marquee_slice: str, hint_text: str, width: int) -> str:
 # overlay lists, only on how each draws a dim backdrop/box around it.
 
 
-def _entry_display_label(entry, roster: list[str] | None) -> str:
+def _entry_display_label(entry, roster: list[str] | None, key: str | None = None) -> str:
     """The overlay row's label for one entry -- `_entry_action_name`'s bare
     action name, EXCEPT for a `page.jump` entry when `roster` (the live
     page cycle order) is available: those resolve to the actual TARGET
@@ -390,12 +390,15 @@ def _entry_display_label(entry, roster: list[str] | None) -> str:
     unchanged, so this is purely additive. An out-of-range/malformed
     `position` (shouldn't occur for a build's own DEFAULT_KEYMAP, but a
     hand-edited keymap.toml could bind `page.jump` to a position past a
-    SMALLER roster) falls back to the bare name too, rather than raising
-    or showing a bogus name."""
+    SMALLER roster) falls back to `"{key} (unassigned)"` when `key` is
+    provided, otherwise the bare action name."""
     if isinstance(entry, dict) and entry.get("action") == "page.jump" and roster:
         position = entry.get("args", {}).get("position")
         if isinstance(position, int) and 1 <= position <= len(roster):
             return f"-> {roster[position - 1]}"
+        # Out-of-range position: show key with (unassigned) label if key provided
+        if key:
+            return f"{key} (unassigned)"
     return _entry_action_name(entry)
 
 
@@ -404,7 +407,7 @@ def _section_lines(title: str, section: dict, roster: list[str] | None) -> list[
         return []
     lines = [title]
     for key, entry in sorted(section.items()):
-        lines.append(f"  {key}  {_entry_display_label(entry, roster)}")
+        lines.append(f"  {key}  {_entry_display_label(entry, roster, key)}")
     return lines
 
 
