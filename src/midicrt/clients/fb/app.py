@@ -5,15 +5,19 @@ using the vendored PSF console font (fb/text.py), then either writes the
 packed RGB565 buffer to a real Linux framebuffer device or, in `--out` test
 mode, saves a PNG and exits -- see `main()`/`run()` below.
 
-Colour palette ported from v1's default CRT-green scheme
-(`~/codex/midicrt/fb/compositor.py` on the Pi, read-only reference):
-    GREEN_BRIGHT_RGB = (0, 255, 80)   # here: HEADER_BG and ACCENT_FG
-    GREEN_MID_RGB    = (0, 180, 50)   # here: NORMAL_FG
-    BLACK_RGB        = (0, 0, 0)      # here: BG
+Colour palette (Phase 8 Task 2: now sourced from the shared monochrome
+green-luminance framework, `clients/fb/lum.py` -- see that module's
+docstring for the full v1-constant provenance/rationale; this module's own
+BG/HEADER_BG/NORMAL_FG/ACCENT_FG names below are unchanged, just
+re-pointed at `lum.py`'s tiers):
+    LUM_BRIGHT = (0, 255, 80)   # here: HEADER_BG and ACCENT_FG
+    LUM_MID    = (0, 180, 50)   # here: NORMAL_FG
+    LUM_OFF    = (0, 0, 0)      # here: BG
 Accent (note_on) event lines reuse v1's "bright" tone so they read louder
 than the "mid" tone used for ordinary lines, and the header bar's
 reverse-video fill reuses the same bright tone with text punched out in the
-background colour.
+background colour. The pianoroll and img2txtviz renderers additionally use
+`lum.py`'s `lum(level)` continuous ramp -- see their own sections below.
 
 This module does not write to /dev/fb0 during Phase 2 Task 3 -- v1 owns the
 real CRT until Task 4's supervised smoke test exercises the real-device path
@@ -91,17 +95,25 @@ from midicrt.clients.base import (
     switch_topic,
     wait_first_snapshot,
 )
+from midicrt.clients.fb.lum import LUM_BRIGHT, LUM_MID, LUM_OFF, RAMPS, lum
 from midicrt.clients.fb.surface import Surface, open_fb_mmap
 from midicrt.clients.fb.text import draw_text, load_font
 from midicrt.clients.tui import _tail
 
 _LOG = logging.getLogger("midicrt-fb")
 
-# -- palette (see module docstring for provenance) ------------------------
-BG = (0, 0, 0)
-HEADER_BG = (0, 255, 80)
-NORMAL_FG = (0, 180, 50)
-ACCENT_FG = (0, 255, 80)
+# -- palette (Phase 8 Task 2: sourced from the shared monochrome
+# green-luminance framework, clients/fb/lum.py -- see that module's
+# docstring for the v1-constant provenance and the guard test,
+# tests/test_fb_monochrome_guard.py, that keeps a colored literal from ever
+# reappearing here). These four names/values are UNCHANGED from before this
+# task -- every existing call site and golden fixture that uses them keeps
+# rendering byte-identical pixels; only their definition now points at the
+# one shared module instead of re-declaring the same RGB tuples locally.
+BG = LUM_OFF
+HEADER_BG = LUM_BRIGHT
+NORMAL_FG = LUM_MID
+ACCENT_FG = LUM_BRIGHT
 
 # -- layout -----------------------------------------------------------------
 HEADER_PAD = 2   # vertical inset (top+bottom) inside the header bar, px
@@ -424,31 +436,30 @@ def render_tuner_frame(vm: dict, surface: Surface) -> None:
 # poke surface.image directly" convention every fb renderer here already
 # established.
 #
-# Channel-colored + charred (task brief: "channel-colored/charred per v1's
-# approach"): a real color CRT can combine BOTH of v1's mutually-exclusive
-# TUI alt-styles at once -- `ui/renderers/pixel.py`'s "dense" mode's
-# per-channel hue cycling, AND `ui/renderers/text/renderer.py`'s velocity-
-# ramp "charred" intensity -- unlike the plain-text TUI renderer above
-# (clients/tui.py's `render_pianoroll_lines`, which reproduces only v1's
-# DEFAULT "text" style; see that renderer's own comment for why raw ANSI
-# channel color isn't embedded there instead). `_ROLL_CHANNEL_PALETTE`
-# cycles 8 distinct hues by channel (`(ch - 1) % 8`, mirroring `ui/
-# renderers/pixel.py`'s own `(channel - 1) % len(palette)` cycling);
-# `_roll_note_color` blends each hue from a DIM ("charred", low velocity)
-# tone up to its full BRIGHT tone as velocity rises -- the pixel-color
-# equivalent of the TUI renderer's four-glyph density ramp.
-_ROLL_CHANNEL_PALETTE = [
-    (255, 60, 60), (255, 170, 40), (255, 230, 40), (80, 230, 80),
-    (60, 200, 255), (90, 110, 255), (200, 90, 255), (255, 90, 190),
-]
-_ROLL_DIM_FRACTION = 0.25   # velocity 0.0 -> 25% of the channel's full hue
+# Monochrome velocity-brightness (Phase 8 Task 2 -- 2026-08-08
+# gui-phase-decisions doc ruling #1, "the only 'color' is shading/
+# brightness level of green"): this renderer used to cycle 8 rainbow hues
+# by channel (`_ROLL_CHANNEL_PALETTE`, replaced by this task) -- but
+# `docs/visual-audit.md` §9c's build-priority #1 finding is that v1's REAL
+# CRT compositor was never doing that: `_CH_BASE_RGB = [(0, 255, 80)] * 16`
+# is already one hue for every channel, and `_velocity_scale()` is a
+# straight linear 50%->100% brightness ramp (`_VEL_BRIGHTNESS_FLOOR = 0.5`)
+# onto that single base color. `_roll_note_color` below ports that
+# mechanism exactly via `clients/fb/lum.py`'s `lum()`/`RAMPS["pianoroll"]`
+# -- `ch` is kept in the signature (existing call sites still pass it) but
+# no longer affects the output color at all; channel identity moves to the
+# per-pitch label column a later task (T3, per this task's own brief) adds
+# instead of being encoded as hue -- a disclosed, deliberate no-op
+# parameter, not dead code left by oversight.
+_PIANOROLL_RAMP = RAMPS["pianoroll"]
 
 
 def _roll_note_color(ch: int, vel: float) -> tuple[int, int, int]:
-    hue = _ROLL_CHANNEL_PALETTE[(int(ch) - 1) % len(_ROLL_CHANNEL_PALETTE)]
+    floor = _PIANOROLL_RAMP["velocity_floor"]
+    ceiling = _PIANOROLL_RAMP["velocity_ceiling"]
     vel = max(0.0, min(1.0, vel))
-    frac = _ROLL_DIM_FRACTION + (1.0 - _ROLL_DIM_FRACTION) * vel
-    return tuple(round(c * frac) for c in hue)
+    level = floor + (ceiling - floor) * vel
+    return lum(level)
 
 
 def _pianoroll_header_text(vm: dict) -> str:
@@ -585,20 +596,27 @@ def render_screensaver_frame(vm: dict, surface: Surface) -> None:
 # The engine already emits a FIXED `GRID_ROWS` x `GRID_COLS` grid of final
 # [0,1] brightness values (analyzers/img2txtviz.py's own module docstring)
 # -- this renderer's only job is filling one `rect` per grid cell, scaled up
-# to fill the usable body area, colored by scaling `ACCENT_FG` (this
-# module's CRT-green "bright" tone) by each cell's own value -- 0.0 renders
-# black (BG), 1.0 renders full ACCENT_FG, matching the monochrome-CRT-green
-# palette every other renderer here already uses (no new colors
-# introduced). `invert` is already applied engine-side (the grid's own
-# values are already final), so this renderer never reads that flag itself.
+# to fill the usable body area, colored via `clients/fb/lum.py`'s `lum()`
+# (Phase 8 Task 2: was an inline `ACCENT_FG`-scale, now routed through the
+# shared framework -- `RAMPS["img2txtviz"]` declares the "0.0 -> black,
+# 1.0 -> full LUM_BRIGHT" contract as data instead of leaving it implicit;
+# `lum(1.0) == ACCENT_FG` exactly, so this is byte-identical at both
+# endpoints, matching the monochrome-CRT-green palette every other renderer
+# here already uses (no new colors introduced). `invert` is already applied
+# engine-side (the grid's own values are already final), so this renderer
+# never reads that flag itself.
+_IMG2TXTVIZ_RAMP = RAMPS["img2txtviz"]
+
+
 def _img2txtviz_header_text(vm: dict) -> str:
     flag = "  INV" if vm.get("invert") else ""
     return f"{vm['title']}  notes:{vm['active_notes']:02d}{flag}"
 
 
 def _img2txtviz_cell_color(value: float) -> tuple[int, int, int]:
-    v = max(0.0, min(1.0, value))
-    return tuple(round(c * v) for c in ACCENT_FG)
+    lo, hi = _IMG2TXTVIZ_RAMP["cell_min"], _IMG2TXTVIZ_RAMP["cell_max"]
+    v = max(lo, min(hi, value))
+    return lum(v)
 
 
 def render_img2txtviz_frame(vm: dict, surface: Surface) -> None:

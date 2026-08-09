@@ -871,7 +871,14 @@ def test_render_pianoroll_frame_empty_notes_does_not_crash():
     assert px[0, header_h + 2] == app.BG   # nothing drawn below the header
 
 
-def test_render_pianoroll_frame_draws_a_rect_per_note_in_its_channel_color():
+def test_render_pianoroll_frame_draws_a_rect_per_note_in_its_velocity_color():
+    # Renamed (Phase 8 Task 2): this used to be "...its_channel_color" --
+    # channel no longer drives hue at all under the monochrome mandate, see
+    # test_roll_note_color_is_uniform_hue_across_channels above. The test
+    # body itself was already channel-agnostic (it just calls the real
+    # _roll_note_color function rather than duplicating a formula), so no
+    # assertion changes, only the name catching up to what it actually
+    # verifies now.
     surf = Surface(*PIANOROLL_SURFACE_SIZE)
     app.render_pianoroll_frame(PIANOROLL_VM, surf)
     px = surf.image.load()
@@ -884,19 +891,28 @@ def test_render_pianoroll_frame_draws_a_rect_per_note_in_its_channel_color():
     assert px[x, y] == app._roll_note_color(note["ch"], note["vel"])
 
 
-def test_roll_note_color_charred_scales_with_velocity():
+def test_roll_note_color_velocity_floor_matches_v1_constant():
+    # Phase 8 Task 2 (monochrome conversion): v1's real CRT compositor
+    # floors velocity brightness at 50% (`_VEL_BRIGHTNESS_FLOOR = 0.5`,
+    # docs/visual-audit.md §9c) rather than going fully dark at vel=0 --
+    # ported here via clients/fb/lum.py's RAMPS["pianoroll"].
+    from midicrt.clients.fb.lum import RAMPS, lum
+
     dim = app._roll_note_color(1, 0.0)
     bright = app._roll_note_color(1, 1.0)
-    hue = app._ROLL_CHANNEL_PALETTE[0]
-    assert bright == hue
-    assert dim == tuple(round(c * app._ROLL_DIM_FRACTION) for c in hue)
+    assert bright == app.ACCENT_FG   # == LUM_BRIGHT, full velocity
+    assert dim == lum(RAMPS["pianoroll"]["velocity_floor"])
     assert sum(dim) < sum(bright)
 
 
-def test_roll_note_color_cycles_by_channel():
-    colors = {app._roll_note_color(ch, 1.0) for ch in range(1, 9)}
-    assert len(colors) == 8   # 8 distinct palette entries, one per channel 1-8
-    assert app._roll_note_color(1, 1.0) == app._roll_note_color(9, 1.0)   # wraps at 8
+def test_roll_note_color_is_uniform_hue_across_channels():
+    # Monochrome mandate (2026-08-08 gui-phase-decisions doc ruling #1):
+    # channel identity is NOT encoded as hue any more -- a later task (T3,
+    # per this task's own brief) moves it to a per-pitch label column
+    # instead. This replaces the old test_roll_note_color_cycles_by_channel,
+    # which asserted the very rainbow-cycling behavior this task removes.
+    colors = {app._roll_note_color(ch, 0.8) for ch in range(1, 17)}
+    assert len(colors) == 1
 
 
 def test_render_pianoroll_frame_reserves_the_bottom_chrome_as_background():
