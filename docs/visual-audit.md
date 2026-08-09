@@ -401,8 +401,10 @@ semantics restored in `behaviors/pagecycle.py` — a curated subset
 (`last_activity_ts` no longer read for pagecycle's own gating at all), and
 a 3600s `pagecycle_user_pause` suppressing rotation after a recent
 HUMAN page action (v2 has multiple actors where v1 had only "a keypress on
-the one console"; the origin ruling — `{client, sysex}` pause, a learned
-binding or another behavior does not — is a disclosed judgment call, see
+the one console"; the origin ruling — `{client}` ONLY pauses; a SysEx
+command, a learned binding, or another behavior does not, verified against
+v1 source in fix round 1 (2026-08-09) after an initial by-analogy
+inclusion of `sysex` was reversed — see
 that module's own docstring). PRESENT now, moved out of DIFFERENT below.
 
 ### 20f. `plugins/zscreensaver.py` — burn-in prevention, the actual mechanism

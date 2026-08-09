@@ -769,20 +769,73 @@ async def test_pagecycle_client_origin_page_action_pauses_rotation():
     # Origin ruling (behaviors/pagecycle.py's own docstring): a real client
     # action is a human touching page navigation directly -- must pause
     # rotation for `pagecycle_user_pause`.
+    #
+    # Fix round 1 (Important reviewer finding): `eng._clock` is pinned to
+    # this test's own fake timeline (`Engine.__init__`'s injectable clock
+    # source, wired through `_on_action_dispatched` -- see its own
+    # comment) so this assertion is actually dispositive. Before this fix,
+    # `notify_page_action`'s `now` came from a REAL `time.time()` while
+    # `_tick_behaviors` ran on these small FAKE `now` values -- a clock-
+    # domain mismatch that made "still paused" pass regardless of
+    # `pagecycle_user_pause`'s configured value (a real epoch timestamp
+    # trivially exceeds any small fake `now`). See
+    # test_pagecycle_honors_a_tiny_user_pause_at_fake_clock_scale below for
+    # the extreme-scale version of this same proof.
+    fake_now = [0.0]
     eng = Engine(Config(pagecycle_interval=5.0, pagecycle_user_pause=30.0,
                         screensaver_enabled=False))
+    eng._clock = lambda: fake_now[0]
     eng._last_activity_ts = 0.0
-    await eng._tick_behaviors(0.0)   # bootstrap
+    await eng._tick_behaviors(fake_now[0])   # bootstrap
     await eng.actions.dispatch("page.goto", {"name": "voices"}, origin="client")
-    await eng._tick_behaviors(5.0)   # interval elapsed, but paused
+    fake_now[0] = 5.0
+    await eng._tick_behaviors(fake_now[0])   # interval elapsed, but paused
     assert eng.current_page == "voices"
-    await eng._tick_behaviors(29.9)
+    fake_now[0] = 29.9
+    await eng._tick_behaviors(fake_now[0])
     assert eng.current_page == "voices"
+    fake_now[0] = 30.0
+    await eng._tick_behaviors(fake_now[0])   # pause expired -- interval long since elapsed too
+    assert eng.current_page == "harmony"
+
+
+async def test_pagecycle_honors_a_tiny_user_pause_at_fake_clock_scale():
+    # Fix round 1 (Important reviewer finding, the specific probe that
+    # caught the clock-domain bug): `pagecycle_user_pause=0.001` is
+    # deliberately tiny and `eng._clock` is pinned to this test's own fake
+    # timeline. Under the OLD wiring (`notify_page_action` stamped a REAL
+    # `time.time()`, ~1.7 billion), `paused_until` would land near that
+    # real epoch value regardless of the configured 0.001s -- so even a
+    # fake `now` as generous as 1.5 (long past both the tiny pause AND the
+    # 1.0s interval) would still look "paused," making this test fail
+    # against the unfixed wiring and pass falsely-confident under any
+    # `pagecycle_user_pause` value if it DIDN'T check for eventual
+    # resumption. This test's final assertion is what makes it dispositive.
+    fake_now = [0.0]
+    eng = Engine(Config(pagecycle_interval=1.0, pagecycle_user_pause=0.001,
+                        screensaver_enabled=False))
+    eng._clock = lambda: fake_now[0]
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(fake_now[0])   # bootstrap at t=0
+    await eng.actions.dispatch("page.goto", {"name": "voices"}, origin="client")
+    # paused_until = clock()(0.0) + user_pause(0.001) = 0.001
+    fake_now[0] = 0.0005
+    await eng._tick_behaviors(fake_now[0])
+    assert eng.current_page == "voices"   # still inside the tiny pause window
+    fake_now[0] = 1.5
+    await eng._tick_behaviors(fake_now[0])
+    # Both the 1.0s interval (measured from _last_switch, set at bootstrap)
+    # and the 0.001s pause have long elapsed by t=1.5 -- rotation must have
+    # resumed.
+    assert eng.current_page != "voices"
 
 
 async def test_pagecycle_binding_origin_page_action_does_not_pause(tmp_path):
     # A learned MIDI binding driving page.next is the sequencer performing,
-    # not a user -- must NOT pause pagecycle's own rotation.
+    # not a user -- must NOT pause pagecycle's own rotation. No clock-domain
+    # concern here (unlike the "pauses" tests above): a binding origin never
+    # reaches `_HUMAN_ORIGINS` at all, so no `paused_until` of any kind gets
+    # set regardless of which clock stamped it.
     p = tmp_path / "bindings.toml"
     _write_trigger_binding(p, binding_id="b1", action="page.next", number=60)
     eng = Engine(Config(pagecycle_interval=5.0, pagecycle_user_pause=30.0,
@@ -795,17 +848,27 @@ async def test_pagecycle_binding_origin_page_action_does_not_pause(tmp_path):
     assert eng.current_page == "harmony"
 
 
-async def test_pagecycle_sysex_page_switch_pauses_rotation():
-    # A real hardware SysEx page-switch command is a human pressing a
-    # physical control -- ruled a "human origin" alongside "client".
+async def test_pagecycle_sysex_page_switch_does_not_pause_rotation():
+    # Fix round 1 (Important, reviewer-found reversal): an earlier version
+    # of this test asserted the OPPOSITE ("a real hardware SysEx page-
+    # switch command is a human pressing a physical control -- ruled a
+    # human origin alongside client") without verifying it against v1
+    # source. It doesn't hold: v1's own `plugins/sysex.py::_dispatch()`
+    # CMD_SWITCH_PAGE branch calls `midicrt.switch_page()` directly and
+    # never touches `notify_keypress()` -- only a literal physical
+    # keystroke does (`midicrt.py`'s `keyboard_listener()`). See
+    # behaviors/pagecycle.py's "Origin ruling" docstring section for the
+    # full evidence trail. No clock-domain concern here either (see the
+    # binding test above) -- `_sysex_switch_page` no longer calls
+    # `notify_page_action` at all.
     eng = Engine(Config(pagecycle_interval=5.0, pagecycle_user_pause=30.0,
                         screensaver_enabled=False))
     eng._last_activity_ts = 0.0
     await eng._tick_behaviors(0.0)   # bootstrap
     eng._sysex_switch_page(version=None, args=(13,))   # page id 13 = "voices"
     assert eng.current_page == "voices"
-    await eng._tick_behaviors(5.0)   # interval elapsed, but paused by the sysex switch
-    assert eng.current_page == "voices"
+    await eng._tick_behaviors(5.0)   # interval elapsed -- rotation proceeds, unpaused
+    assert eng.current_page == "harmony"
 
 
 async def test_tick_behaviors_activates_and_restores_screensaver():

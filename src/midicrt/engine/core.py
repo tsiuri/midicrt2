@@ -645,6 +645,31 @@ class Engine:
         # freshly booted engine must not look infinitely idle on its very
         # first `_tick_behaviors` call.
         self._last_activity_ts: float = time.time()
+        # Phase 8 Task 5, fix round 1 (Important reviewer finding):
+        # `_on_action_dispatched` (below) needs a "now" for
+        # `PageCycleBehavior.notify_page_action`, but it is called from
+        # deep inside `ActionRegistry.dispatch()` -- a context `run()`'s own
+        # tick loop has no way to thread an injected `now` INTO (unlike
+        # `_tick_analyzers`/`_tick_pages`/`_tick_behaviors`, which all
+        # receive `now` as a plain argument). Calling `time.time()` directly
+        # there put `notify_page_action` on a DIFFERENT clock domain than
+        # whatever fake `now` a test drives through `_tick_behaviors()` --
+        # a test asserting "still paused" a few fake-seconds later would
+        # pass regardless of the CONFIGURED `pagecycle_user_pause` value
+        # (even 0.001s), since a real epoch timestamp (~1.7 billion) trivially
+        # exceeds any small fake `now`, making the assertion non-dispositive
+        # (reviewer-reproduced: `tests/test_engine_core.py::
+        # test_pagecycle_honors_a_tiny_user_pause_at_fake_clock_scale`).
+        # `self._clock` is the fix: a swappable clock SOURCE (defaults to
+        # real `time.time`, exactly today's production behavior -- nothing
+        # changes for the real daemon) that a test can override
+        # (`eng._clock = lambda: fake_now[0]`) to put every clock read
+        # `_on_action_dispatched` makes on the SAME timeline as whatever
+        # fake `now` values that same test feeds `_tick_behaviors()`
+        # directly. Scoped to this one non-tick-loop-injected "now" read --
+        # not a sweeping replacement of every `time.time()` call in this
+        # file, which would be unrelated scope creep for this fix.
+        self._clock: Callable[[], float] = time.time
         # Phase 8 Task 5: `known_pages=set(self.pages)` -- built above, at
         # line ~516, never reassigned after `__init__` -- lets
         # `PageCycleBehavior` skip a configured `pagecycle_pages` entry
@@ -1229,13 +1254,20 @@ class Engine:
         is wired through for every REGISTRY-dispatched page-navigation
         action (client/binding/behavior/auto -- see `_PAGE_NAV_ACTIONS`'s
         own comment and `behaviors/pagecycle.py`'s "Origin ruling" docstring
-        section for which of those actually pause rotation). The two sysex
-        page-navigation call sites bypass this hook the same way they
-        bypass `record_action` above -- see `_sysex_switch_page`/
-        `_sysex_screensaver`'s own matching `notify_page_action` calls."""
+        section for which of those actually pause rotation; filtering to
+        "client" only happens INSIDE `notify_page_action`, not here). Sysex
+        bypasses this hook entirely (same as `record_action` above) and,
+        per that same "Origin ruling" section's fix-round-1 evidence,
+        deliberately never calls `notify_page_action` at all -- v1's own
+        SysEx dispatch never pauses the page cycler either.
+
+        `time.time()` is read via `self._clock()`, not directly -- see
+        `Engine.__init__`'s own comment next to `self._clock` for why a
+        raw `time.time()` here silently broke two fake-clock engine tests
+        (fix round 1, Important reviewer finding)."""
         self._capture.record_action(name, args, origin)
         if name in _PAGE_NAV_ACTIONS:
-            self._pagecycle_behavior.notify_page_action(origin, time.time())
+            self._pagecycle_behavior.notify_page_action(origin, self._clock())
 
     def _capture_write_failed(self, exc: OSError) -> dict:
         """Shared write-failure containment (fix wave, Critical finding:
@@ -2010,12 +2042,16 @@ class Engine:
         # with the equivalent action name/args a `page.goto` action call
         # would have carried.
         self._capture.record_action("page.goto", {"name": name}, "sysex")
-        # Phase 8 Task 5: same "sysex bypasses the normal hook" reasoning
-        # applies to `PageCycleBehavior.notify_page_action` -- a SysEx
-        # page-switch is a human pressing a physical control on the
-        # Cirklon, ruled a "human origin" exactly like a client action (see
-        # behaviors/pagecycle.py's "Origin ruling" docstring section).
-        self._pagecycle_behavior.notify_page_action("sysex", time.time())
+        # Phase 8 Task 5 (fix round 1, reviewer-found reversal): deliberately
+        # does NOT call `PageCycleBehavior.notify_page_action` here -- v1's
+        # own `plugins/sysex.py::_dispatch()` CMD_SWITCH_PAGE branch calls
+        # `midicrt.switch_page()` directly and never touches
+        # `notify_keypress()` either (verified by reading v1 source; only a
+        # literal physical keystroke does, `midicrt.py`'s
+        # `keyboard_listener()`). A SysEx page switch is remote-control/
+        # automation territory in v1 ITSELF, the same category as a learned
+        # binding -- see behaviors/pagecycle.py's "Origin ruling" docstring
+        # section for the full evidence trail.
         if version is not None:
             self._midi_out.send_sysex(
                 sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x00, (page_id,)))
@@ -2054,13 +2090,9 @@ class Engine:
             # same "sysex bypasses the dispatch hook, call the primitive
             # directly" reasoning.
             self._capture.record_action("page.goto", {"name": "screensaver"}, "sysex")
-            # Phase 8 Task 5: same origin-ruling reasoning as
-            # `_sysex_switch_page` -- a human forced the screensaver on via
-            # a physical Cirklon control, so it counts toward pagecycle's
-            # own user-pause window too (harmless overlap with the
-            # screensaver-page guard already blocking pagecycle here; this
-            # matters once the display later leaves the screensaver page).
-            self._pagecycle_behavior.notify_page_action("sysex", time.time())
+            # Phase 8 Task 5 (fix round 1): same origin-ruling reasoning as
+            # `_sysex_switch_page` -- no `notify_page_action` call here
+            # either, v1's own SysEx dispatch never pauses the page cycler.
         if version is not None:
             self._midi_out.send_sysex(sysex_mod.build_reply(
                 version, sysex_mod.CMD_SCREENSAVER, 0x00, (int(args[0] != 0),)))

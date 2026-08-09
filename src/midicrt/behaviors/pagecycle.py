@@ -58,37 +58,70 @@ page IS `zharmony.py`'s primary UI surface); ID 6 (`eventlog.py`) ->
 "pianoroll", "spectrum"]` (`config.py`'s default, same order as v1's
 list -- order matters, see "Cursor mechanics" below).
 
-Origin ruling: which page actions count as "a human touched it" (judgment
-call, flagged for review per the task brief)
+Origin ruling: which page actions count as "a human touched it" (verified
+against v1 source -- fix round 1, reviewer-found reversal)
 ---------------------------------------------------------------------------
-v1's "activity" signal is a literal physical keypress on the one console
-this software runs on -- there is no other actor in v1's world at all. v2
-has several: a real client (fb/TUI/CLI/keymap-bound key/web -- ALL of
-these funnel through the ONE `origin="client"` dispatch call in
-`engine/server.py:236`, see `engine/actions.py`'s own "four dispatch
-origins" comment -- there is no separate "keymap"/"web" origin string
-anywhere in this codebase to distinguish them), a real hardware SysEx
-command from the Cirklon control surface (`origin="sysex"`, bypasses the
-dispatch registry entirely -- see `engine/core.py`'s `_sysex_switch_page`/
-`_sysex_screensaver`), a LEARNED MIDI BINDING (`origin="binding:<id>"`),
-and an unattended internal BEHAVIOR tick (`origin="behavior"`, this
-module's own auto-advance included).
+An earlier version of this section ruled `{"client", "sysex"}` as "human"
+by ANALOGY ("a SysEx command is a human pressing a physical button on the
+Cirklon, just arriving over a different wire") without actually reading
+whether v1's own SysEx page-switch path calls `notify_keypress()`. It does
+not. Read in full for this fix round, `~/codex/midicrt/plugins/sysex.py`'s
+`_dispatch()` handles `CMD_SWITCH_PAGE` by calling `midicrt.switch_page(page)`
+directly:
 
-Ruling: `_HUMAN_ORIGINS = {"client", "sysex"}` pause rotation;
-`"binding:*"`/`"behavior"`/anything else does NOT. Rationale -- a client
-action is a human at a keyboard/TUI/CLI/web control, exactly v1's keypress
-substrate. A SysEx command is a human pressing a physical button on the
-Cirklon, just arriving over a different wire -- still a person, still
-"stop moving the display out from under me." A learned BINDING firing
+    ok, resolved = midicrt.switch_page(page)   # sysex.py's own CMD_SWITCH_PAGE branch
+
+and `midicrt.py`'s `switch_page()` (~line 610) is a plain state setter with
+no side channel to the page cycler at all:
+
+    def switch_page(page):
+        ...
+        current_page = page_id
+        return True, page_id
+
+`notify_keypress()` is called from EXACTLY ONE place in the entire v1
+codebase: `midicrt.py`'s `keyboard_listener()` thread (~line 1765), inside
+the `with term.cbreak():` loop, on a literal physical keystroke. v1's own
+SysEx-driven page switches -- remote control "from the Cirklon or any
+device that can send SysEx" per that plugin's own module comment -- never
+touch `_last_keypress` and therefore never pause rotation in v1. This is
+the same category v2's learned MIDI bindings already occupy: an external
+control surface driving pages IS automation/cue territory, not a human
+at the console -- v1 itself treats it that way, this was simply not
+verified against source the first time this docstring was written.
+
+v2 has several actors that can move `current_page`: a real client
+(fb/TUI/CLI/keymap-bound key/web -- ALL of these funnel through the ONE
+`origin="client"` dispatch call in `engine/server.py:236`, see
+`engine/actions.py`'s own "four dispatch origins" comment -- there is no
+separate "keymap"/"web" origin string among v2's PAGE-NAVIGATION dispatch
+sites, though `origin="auto"`/`"shutdown"` exist elsewhere for capture
+bookkeeping), a real hardware SysEx command from the Cirklon control
+surface (`origin="sysex"`, bypasses the dispatch registry entirely -- see
+`engine/core.py`'s `_sysex_switch_page`/`_sysex_screensaver`), a LEARNED
+MIDI BINDING (`origin="binding:<id>"`), and an unattended internal
+BEHAVIOR tick (`origin="behavior"`, this module's own auto-advance
+included).
+
+**Ruling (corrected): `_HUMAN_ORIGINS = {"client"}` pauses rotation;
+`"sysex"`/`"binding:*"`/`"behavior"`/anything else does NOT.** Rationale --
+a client action is a human at a keyboard/TUI/CLI/web control, exactly v1's
+keypress substrate (the one origin v1's own evidence directly supports). A
+SysEx command, per the v1 evidence above, is remote-control/automation
+territory in v1 ITSELF, not a keypress -- grouping it with the learned-
+binding case below, not the client case. A learned BINDING firing
 `page.goto` means a NOTE OR CC the sequencer is playing is driving the
-page -- that is the SEQUENCER performing, not a user asking for a page;
-pausing rotation because the song itself hit a bound note would be
-backwards (the whole point of pagecycle is ambient variety DURING
-playback). A BEHAVIOR-origin page action (this module's own auto-advance,
-or `ScreensaverBehavior`'s activate/restore) is unattended machinery, not
-a person -- and critically, this module's own dispatched `page.goto` must
-NOT pause ITSELF (an origin-blind pause would make every second rotation
-immediately re-pause the first).
+page -- the SEQUENCER performing, not a user asking for a page; pausing
+rotation because the song itself hit a bound note (or a SysEx cue from the
+same sequencer) would be backwards (the whole point of pagecycle is
+ambient variety DURING playback). A BEHAVIOR-origin page action (this
+module's own auto-advance, or `ScreensaverBehavior`'s activate/restore) is
+unattended machinery, not a person -- and critically, this module's own
+dispatched `page.goto` must NOT pause ITSELF (an origin-blind pause would
+make every second rotation immediately re-pause the first).
+
+`docs/phase3-parity.md`'s `pagecycle.py` row (§2) is updated to state this
+origin set was verified against v1 source, not assumed by analogy.
 
 What v2 keeps unconditionally from v1: rotation is NOT gated by MIDI/idle
 state at all
@@ -116,14 +149,17 @@ now)` mirrors v1's shape as a second, additive, side-effect-free (no I/O,
 no dispatch, just an internal timestamp write) entry point -- NOT a
 violation of the "returns an intent, never acts" contract, since it never
 returns an action itself, only changes what a LATER `tick()` call decides.
-The engine wires this at the ONE seam that sees every successful page
-navigation regardless of entry point (bindings/behaviors/client all
-dispatch through `ActionRegistry`, whose post-dispatch hook is
-`Engine._on_action_dispatched`; sysex bypasses the registry, so its two
-`page.goto`-equivalent call sites -- `_sysex_switch_page`,
-`_sysex_screensaver`'s force-on branch -- call it directly, right next to
-the `record_action(..., "sysex")` call each already makes for capture
-provenance. Same shape, reused, not a new seam invented).
+The engine wires this at the ONE seam that sees every REGISTRY-dispatched
+page navigation (client/binding/behavior/auto all dispatch through
+`ActionRegistry`, whose post-dispatch hook is `Engine._on_action_dispatched`)
+-- filtering to `_HUMAN_ORIGINS` happens inside `notify_page_action` itself,
+not at the call site, so the hook can call it unconditionally for every
+`page.next`/`page.prev`/`page.goto`. Sysex bypasses this registry entirely
+(see `engine/core.py`'s `_sysex_switch_page`/`_sysex_screensaver`) and,
+per the "Origin ruling" section above (fix round 1), deliberately does
+NOT call `notify_page_action` at all -- v1's own SysEx dispatch never
+touches `notify_keypress()` either, so there is nothing to wire here, not
+an oversight.
 
 Cursor mechanics: independent of `current_page`, in configured order
 ---------------------------------------------------------------------------
@@ -217,10 +253,14 @@ _LOG = logging.getLogger(__name__)
 
 # Origins that count as "a human directly touched page navigation" for
 # v1's USER_PAUSE mechanism -- see module docstring's "Origin ruling"
-# section for the full rationale. Exact-string membership (not a prefix
-# check) is deliberate: "binding:b1" etc. never equals "client"/"sysex" as
-# a plain string, so no separate stripping logic is needed to exclude it.
-_HUMAN_ORIGINS = frozenset({"client", "sysex"})
+# section for the full rationale, including fix round 1's reviewer-found
+# reversal on "sysex" (verified against v1 source: `plugins/sysex.py`'s
+# CMD_SWITCH_PAGE calls `midicrt.switch_page()` directly and never touches
+# `notify_keypress()` -- only a literal physical keystroke does). Exact-
+# string membership (not a prefix check) is deliberate: "binding:b1" never
+# equals "client" as a plain string, so no separate stripping logic is
+# needed to exclude it.
+_HUMAN_ORIGINS = frozenset({"client"})
 
 
 class PageCycleBehavior:
@@ -238,12 +278,15 @@ class PageCycleBehavior:
 
     `notify_page_action(origin, now) -> None`
         Called by the engine whenever a `page.next`/`page.prev`/`page.goto`
-        action successfully lands, from ANY entry point (registry dispatch
-        OR the two sysex call sites that bypass it) -- see `engine/core.py`'s
-        `_on_action_dispatched`/`_sysex_switch_page`/`_sysex_screensaver`.
-        No I/O, no dispatch -- purely an internal bookkeeping write, so this
-        does not violate `behaviors/__init__.py`'s "acts only through
-        `tick()`'s return value" contract for what a behavior may originate.
+        action successfully lands through the ActionRegistry (client/
+        binding/behavior/auto) -- see `engine/core.py`'s
+        `_on_action_dispatched`. NOT called for sysex (v1's own SysEx
+        dispatch never touches `notify_keypress()` either -- see module
+        docstring's "Origin ruling" section, fix round 1). No I/O, no
+        dispatch -- purely an internal bookkeeping write (filtered to
+        `_HUMAN_ORIGINS` internally), so this does not violate
+        `behaviors/__init__.py`'s "acts only through `tick()`'s return
+        value" contract for what a behavior may originate.
     """
 
     def __init__(self, enabled: bool, interval: float, pages: list[str],

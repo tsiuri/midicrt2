@@ -175,15 +175,24 @@ def test_client_origin_page_action_pauses_rotation():
     assert b.tick(now=21.9, last_activity_ts=0.0, current_page="eventlog") is None
 
 
-def test_sysex_origin_page_action_pauses_rotation():
-    # A real hardware SysEx page-switch command is just as much "a human
-    # pressed something" as a client keypress -- see the origin ruling.
+def test_sysex_origin_page_action_does_not_pause_rotation():
+    # Fix round 1 (Important, reviewer-found reversal): an earlier version
+    # of this test asserted the OPPOSITE, by analogy ("a SysEx command is
+    # just as much a human pressing something as a client keypress")
+    # without verifying it against v1 source. It doesn't hold: v1's own
+    # `plugins/sysex.py::_dispatch()` CMD_SWITCH_PAGE branch calls
+    # `midicrt.switch_page()` directly and never touches
+    # `notify_keypress()` -- only a literal physical keystroke
+    # (`midicrt.py`'s `keyboard_listener()`) does. A SysEx page switch is
+    # remote-control/automation territory in v1 ITSELF, the same category
+    # as a learned MIDI binding -- see behaviors/pagecycle.py's "Origin
+    # ruling" docstring section for the full evidence trail.
     b = PageCycleBehavior(enabled=True, interval=10.0, pages=["harmony", "eventlog"],
                           user_pause=20.0)
     b.tick(now=0.0, last_activity_ts=0.0, current_page="eventlog")
     b.notify_page_action("sysex", now=2.0)
-    assert b.tick(now=10.0, last_activity_ts=0.0, current_page="eventlog") is None
-    assert b.tick(now=21.9, last_activity_ts=0.0, current_page="eventlog") is None
+    assert b.tick(now=10.0, last_activity_ts=0.0, current_page="eventlog") == \
+        ("page.goto", {"name": "harmony"})
 
 
 def test_binding_origin_page_action_does_not_pause():
