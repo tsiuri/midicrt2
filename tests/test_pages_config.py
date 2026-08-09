@@ -44,11 +44,16 @@ def test_instrument_count_row_reports_a_count_not_the_full_list():
 
 
 def test_behavior_knob_rows_reflect_pagecycle_and_screensaver_config():
-    cfg = Config(pagecycle_enabled=False, pagecycle_idle_s=99.0,
+    # Phase 8 Task 5: `pagecycle_idle_s` (idle-triggered re-interpretation)
+    # is gone -- replaced by `pagecycle_interval`/`pagecycle_pages`, the
+    # restored v1 knobs (see config.py's own comment and
+    # behaviors/pagecycle.py's module docstring).
+    cfg = Config(pagecycle_enabled=False, pagecycle_interval=99.0,
+                 pagecycle_pages=["harmony", "eventlog", "pianoroll"],
                  screensaver_enabled=True, screensaver_after_s=12.5)
     page = ConfigPage(cfg)
     rows = page.view_model()["config_rows"]
-    assert _row_value(rows, "pagecycle") == "off (idle 99s)"
+    assert _row_value(rows, "pagecycle") == "off (every 99s, 3 pages)"
     assert _row_value(rows, "screensaver") == "on (after 12.5s)"
 
 

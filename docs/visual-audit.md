@@ -389,16 +389,21 @@ runs continuously **while the transport plays or not**, gated purely on
 recent-keypress, not on MIDI/idle activity. This is itself a mild
 anti-static-content device (forces page variety over a long unattended
 session). Per the 2026-08-08 decisions doc: **"TURN BACK ON with v1
-semantics"** — `phase3-parity.md`'s Task-9 port re-interpreted this as
-idle-*activity*-triggered cycling through the *whole* roster instead
-(`behaviors/pagecycle.py`), which the parity doc's own fix-wave review
-found is **currently unreachable** under stock config (the screensaver's
-60s idle threshold always fires first and blocks it, per that doc's
-`pagecycle.py` row). **DIFFERENT, explicitly slated for a redo**: v2
-needs the literal v1 semantics restored (curated 4-page subset, 300s
-interval, rotates while *playing*, suppressed only by a recent keypress
-for 3600s, NOT idle-gated) — this is a confirmed, named, already-decided
-build item, not an open question.
+semantics"** — `phase3-parity.md`'s Task-9 port had re-interpreted this as
+idle-*activity*-triggered cycling through the *whole* roster instead,
+which the parity doc's own fix-wave review found was **unreachable**
+under stock config (the screensaver's 60s idle threshold always fired
+first and blocked it). **DONE (Phase 8 Task 5, 2026-08-09)**: v1's literal
+semantics restored in `behaviors/pagecycle.py` — a curated subset
+(`pagecycle_pages`, defaulting to v1's 4-page set mapped to v2 names:
+1→`harmony`, 6→`eventlog`, 8→`pianoroll`, 9→`spectrum`), a 300s
+`pagecycle_interval`, rotation independent of MIDI/idle activity
+(`last_activity_ts` no longer read for pagecycle's own gating at all), and
+a 3600s `pagecycle_user_pause` suppressing rotation after a recent
+HUMAN page action (v2 has multiple actors where v1 had only "a keypress on
+the one console"; the origin ruling — `{client, sysex}` pause, a learned
+binding or another behavior does not — is a disclosed judgment call, see
+that module's own docstring). PRESENT now, moved out of DIFFERENT below.
 
 ### 20f. `plugins/zscreensaver.py` — burn-in prevention, the actual mechanism
 
@@ -502,7 +507,7 @@ Every visual-relevant key not already cited inline above:
 | `stuck_notes.hold_after` | 15.0 | §20a row 4 — v1's actual shipped value for the "STUCK CLEARED" message linger. |
 | `stuck_notes.panic_on_crit` | **true** | v1's actual shipped default — note the 2026-08-08 decision to build this in v2 specifies **default OFF**, a deliberate posture change from v1's own default, not a restoration. |
 | `stuck_notes.y_pos_offset` | 4 | Confirms the exact chrome-row math used throughout §20a. |
-| `pagecycle.enabled`/`cycle_pages`/`interval`/`user_pause` | `true` / `[1,6,8,9]` / `300.0` / `3600.0` | §20e — the exact v1 semantics the decisions doc wants restored verbatim. |
+| `pagecycle.enabled`/`cycle_pages`/`interval`/`user_pause` | `true` / `[1,6,8,9]` / `300.0` / `3600.0` | §20e — the exact v1 semantics, RESTORED verbatim in v2 (Phase 8 Task 5, `config.pagecycle_enabled`/`pagecycle_pages`/`pagecycle_interval`/`pagecycle_user_pause`). |
 | `tuner.*` (method/tolerance/silence_db/min_conf/smoothing) | yin/0.8/-55.0/0.3/0.55 | Non-visual detection tuning, no rendering effect — listed for completeness since the brief asks for every visual-relevant key and this section's ABSENCE of any visual key confirms tuner has no display-side config at all. |
 | *(absent)* `pianoroll_perf` section | not present in the file (code defaults only, `_PIANOROLL_PERF_DEFAULTS` in `compositor_renderer.py`) | Confirms the fb compositor's adaptive perf-tier tracker has never had its defaults overridden on this deployment; the tier thresholds are the as-shipped code defaults. **Correction from an earlier draft of this audit**: the computed tier does NOT actually gate `overlap_flash`/`row_fade`/`dotted_guides` at runtime. `_update_pianoroll_perf_tier()` updates `self._pr_perf_tier` (0–3) every frame based on measured frame time, and `_render_pianoroll` reads it into a local `perf_tier` variable (`compositor_renderer.py:716`) — but that local is never referenced again anywhere in the function. The three effect flags actually used (`compositor_renderer.py:717-722`) come only from the static `effects` config dict, independent of `perf_tier`, and the code's own comment right there explains why: "Keep core piano-roll visuals stable even if adaptive perf tier moves. Tier oscillation can otherwise look like grid/backlight pulsing." So the tier is tracked (presumably for future/diagnostic use) but is a deliberately inert measurement today, not a live effects gate — a v2 port must not invent a tier→effects coupling that doesn't exist in v1. |
 | *(absent)* `pixel_renderer` section | not present | Confirms §21c's dormant-since-install finding. |
@@ -521,8 +526,8 @@ engine-side `analyzers/img2txtviz.py` — nothing is left in an unresolved
 
 | status | count | rows |
 |---|---|---|
-| **PRESENT** | 32 | Help text (as data-equivalent)†, CC Monitor, CC Dashboard bar+age, Event Log, Program Changes, pianoroll TUI velocity ramp, pianoroll projection-mode toggle (action exists, unbound), Audio Spectrum bars, Tuner meter+readout, Chord+Key (all 4 field groups), Voice Monitor counts, Config (narrowed-by-design, itself a disclosed PRESENT), Notes chord/scale-conf/key/harmonic-rhythm/motif lines (5 sub-rows), Notes tension bar, sysex command dispatch, screensaver (improved), pagecycle mechanism (present but wrong semantics — see DIFFERENT), psf font renderer port, img2txtviz energy/spark/splash transients (confirmed ported verbatim), **pianoroll fb dotted pitch-row grid + C-row brightness** (Phase 8 Task 3), **pianoroll fb dotted beat/bar vertical guides** (Phase 8 Task 3, amended to cover beats too — v1 only dots bars in the roll body), **pianoroll fb per-pitch note-name label column incl. its dynamic active-pitch invert** (Phase 8 Task 3), **header page-title scrolling marquee** (Phase 8 Task 4, fb only — v1's own primary anti-burn-in device), **pianoroll fb solid "Bars" timeline strip** (Phase 8 Task 4, no engine change needed — reuses Task 3's grid data), **pianoroll fb active-row tint + 1s fade-out** (Phase 8 Task 4), **pianoroll fb overlap-flash** (Phase 8 Task 4, n+1 phases incl. blink-to-BG) |
-| **DIFFERENT** | 14 | Notes chord/scale reverse-spotlight → lost (moot on real CRT either way, §0.3); Notes inside/outside → reshaped+lost reverse (same §0.3 caveat); Help page → live-data replacement; beatflash → confirmed 5-state ramp instead of binary (not 4-state as an earlier pass here said; re-verified Phase 8 Task 4, no code change warranted); timeclock TIMER blink → moot on real CRT either way; pagecycle → wrong semantics (idle-gated vs interval-while-playing), explicitly slated for redo; transport metronome dot → dropped (beatflash-only now); pianoroll channel color → rainbow hue cycle instead of monochrome brightness (**the** monochrome-mandate item); img2txtviz wave-field → confirmed disclosed simplification (3-term field vs v1's ~8-term; drifting ring center/shimmer/gamma-control/trail-decay all absent); PixelRenderer per-channel ANSI color → dormant, not the deployment path; **autoconnect-log independent scroll** (Phase 8 Task 4 — mechanism/window-sizing formula ported and unit-tested, but no v2 autoconnect-log data source exists to feed it, disclosed dormant) |
+| **PRESENT** | 32 | Help text (as data-equivalent)†, CC Monitor, CC Dashboard bar+age, Event Log, Program Changes, pianoroll TUI velocity ramp, pianoroll projection-mode toggle (action exists, unbound), Audio Spectrum bars, Tuner meter+readout, Chord+Key (all 4 field groups), Voice Monitor counts, Config (narrowed-by-design, itself a disclosed PRESENT), Notes chord/scale-conf/key/harmonic-rhythm/motif lines (5 sub-rows), Notes tension bar, sysex command dispatch, screensaver (improved), pagecycle mechanism (Phase 8 Task 5 — v1 semantics restored verbatim, moved here from DIFFERENT), psf font renderer port, img2txtviz energy/spark/splash transients (confirmed ported verbatim), **pianoroll fb dotted pitch-row grid + C-row brightness** (Phase 8 Task 3), **pianoroll fb dotted beat/bar vertical guides** (Phase 8 Task 3, amended to cover beats too — v1 only dots bars in the roll body), **pianoroll fb per-pitch note-name label column incl. its dynamic active-pitch invert** (Phase 8 Task 3), **header page-title scrolling marquee** (Phase 8 Task 4, fb only — v1's own primary anti-burn-in device), **pianoroll fb solid "Bars" timeline strip** (Phase 8 Task 4, no engine change needed — reuses Task 3's grid data), **pianoroll fb active-row tint + 1s fade-out** (Phase 8 Task 4), **pianoroll fb overlap-flash** (Phase 8 Task 4, n+1 phases incl. blink-to-BG) |
+| **DIFFERENT** | 13 (was 14 — `pagecycle` moved to PRESENT, Phase 8 Task 5) | Notes chord/scale reverse-spotlight → lost (moot on real CRT either way, §0.3); Notes inside/outside → reshaped+lost reverse (same §0.3 caveat); Help page → live-data replacement; beatflash → confirmed 5-state ramp instead of binary (not 4-state as an earlier pass here said; re-verified Phase 8 Task 4, no code change warranted); timeclock TIMER blink → moot on real CRT either way; transport metronome dot → dropped (beatflash-only now); pianoroll channel color → rainbow hue cycle instead of monochrome brightness (**the** monochrome-mandate item); img2txtviz wave-field → confirmed disclosed simplification (3-term field vs v1's ~8-term; drifting ring center/shimmer/gamma-control/trail-decay all absent); PixelRenderer per-channel ANSI color → dormant, not the deployment path; **autoconnect-log independent scroll** (Phase 8 Task 4 — mechanism/window-sizing formula ported and unit-tested, but no v2 autoconnect-log data source exists to feed it, disclosed dormant) |
 | **MISSING** | 19 | Notes per-channel note-NAME list (not just counts); Notes inline CC badge (moot on real CRT even in v1, §0.3); pianoroll fb note-bar outline (static visual-clarity device, not an animation — out of this task's animation/burn-in scope by the audit's own categorization); pianoroll channel-visibility filter keys; pianoroll pitch-window scroll keys; pianoroll style-toggle key; Send Notes keymap (all bound-nothing); pianoroll_exp session-memory browser (whole subsystem, Phase 5); Stuck Heatmap page; TimeSig Exp page; loopprogress scheduler/sysex diagnostic text; zstucknotes PANIC_ON_CRIT + HOLD_AFTER linger (both now slated to build per decisions doc); Audio Spectrum's 23 retuning keys (corrected from 20); pianoroll_exp CC-lane rows; img2txtviz audio-reactivity (explicitly skipped per decision); notes badge / mini-roll-spectrum-piano panel (§ below — build-priority #6, **assigned to Phase 9 (instruments & tools)** as a ranked animation item, not dropped — not named in Task 4's own scope list) |
 | **N/A** (chrome/plumbing, no port needed) | 3 | Transport page (folded into chrome by design), row-2 blank spacer, legacy_contract_bridge shim |
 
@@ -585,9 +590,12 @@ dropped).
 4. **Pagecycle semantics fix** — already fully decided (2026-08-08 doc:
    "TURN BACK ON with v1 semantics"), already scoped in `phase3-parity.md`
    (exact config values known: `[1,6,8,9]`/300s/3600s/rotates-while-
-   playing). Not a design question, just an implementation debt. **Not
-   part of Phase 8 Task 4's scope** (feature/behavior work, not an
-   animation/burn-in visual row) — still open.
+   playing). Not a design question, just an implementation debt. **DONE
+   (Phase 8 Task 5, 2026-08-09)** — `behaviors/pagecycle.py` rewritten to
+   v1's literal mechanism (see §20e and `phase3-parity.md`'s updated
+   `pagecycle.py` row for the full account, including the origin ruling
+   for v2's multiple human-actor surfaces, a judgment call v1 never needed
+   to make).
 5. **Pianoroll active-row fade + overlap-flash** — smaller in screen
    footprint than #1/#2 but both are genuine continuous animations (the
    brief's "every animation… is valuable"), and overlap-flash specifically

@@ -108,26 +108,35 @@ class Config:
     # here.
     audio_device: str | None = None
     spectrum_bins: int = 96
-    # Phase-3 task 9 (behaviors/pagecycle.py, behaviors/screensaver.py):
-    # defaults carried over from v1's ACTUAL deployed
+    # Phase-3 task 9 (behaviors/screensaver.py) / Phase 8 task 5
+    # (behaviors/pagecycle.py, v1-semantics restoration -- see that
+    # module's own docstring for the FULL story, including the ID->name
+    # mapping evidence): defaults carried over from v1's ACTUAL deployed
     # `~/codex/midicrt/config/settings.json` sections on the Pi (verified,
     # not invented) --
     #   "pagecycle": {"enabled": true, "cycle_pages": [1, 6, 8, 9],
     #                 "interval": 300.0, "user_pause": 3600.0}
     #   "screensaver": {"idle_timeout": 60.0}
-    # `pagecycle_idle_s` takes v1's `interval` (the cadence of automatic
-    # advances, see behaviors/pagecycle.py's module docstring for why this
-    # is the closest honest analog under the brief's idle-triggered
-    # re-interpretation -- v1's own `cycle_pages`/`user_pause` have no
-    # clean v2 mapping and are not ported). `screensaver_after_s` takes
-    # v1's `idle_timeout` directly (a 1:1 port, no re-interpretation
-    # needed there). `screensaver_enabled` defaults `True` even though v1
-    # has no enable/disable key for it at all (see behaviors/
-    # screensaver.py's module docstring: v1's plugin is simply always
-    # loaded, i.e. permanently "enabled") -- v2 adds the knob the brief
-    # requires without changing the out-of-the-box behavior.
+    # `pagecycle_interval`/`pagecycle_pages`/`pagecycle_user_pause` are a
+    # 1:1 port of v1's `interval`/`cycle_pages`/`user_pause` (`cycle_pages`
+    # IDs mapped to v2 page names via behaviors/pagecycle.py's own
+    # docstring evidence: 1->harmony, 6->eventlog, 8->pianoroll,
+    # 9->spectrum). This REPLACES the phase-3 task 9 `pagecycle_idle_s`
+    # field (an idle-triggered re-interpretation of v1's `interval`,
+    # explicitly ruled OUT by the 2026-08-08 decisions doc -- "TURN BACK ON
+    # with v1 semantics" -- and removed outright, a disclosed breaking
+    # config change pre-cutover; no deployed config.toml on the Pi had ever
+    # set it). `screensaver_after_s` takes v1's `idle_timeout` directly (a
+    # 1:1 port, unaffected by this task). `screensaver_enabled` defaults
+    # `True` even though v1 has no enable/disable key for it at all (see
+    # behaviors/screensaver.py's module docstring: v1's plugin is simply
+    # always loaded, i.e. permanently "enabled") -- v2 adds the knob the
+    # brief requires without changing the out-of-the-box behavior.
     pagecycle_enabled: bool = True
-    pagecycle_idle_s: float = 300.0
+    pagecycle_interval: float = 300.0
+    pagecycle_pages: list[str] = field(
+        default_factory=lambda: ["harmony", "eventlog", "pianoroll", "spectrum"])
+    pagecycle_user_pause: float = 3600.0
     screensaver_enabled: bool = True
     screensaver_after_s: float = 60.0
     # Phase 5 Task 1 (event-sourced capture, docs/phase5-notes.md):
@@ -155,7 +164,7 @@ class Config:
     # `HEADER_SCROLL_SPEED`) -- see `analyzers/marquee.py::MarqueeAnalyzer`
     # for the port. A flat field (not a nested `core.*` section), matching
     # this dataclass's own existing convention for every other v1-ported
-    # knob (`screensaver_after_s`, `pagecycle_idle_s`, ...).
+    # knob (`screensaver_after_s`, `pagecycle_interval`, ...).
     header_scroll_speed_cps: float = 4.0
 
 

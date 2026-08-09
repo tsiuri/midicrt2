@@ -55,8 +55,15 @@ async def make(tmp_path, keymap_path=None, config_path=None, **cfg):
     # screensaver behavior activates mid-test
     # (`test_client_base.py::test_request_correlates_amid_interleaved_
     # snapshots` caught this: `status()["page"]` came back "screensaver",
-    # not "eventlog"). A test that DOES want to exercise the behaviors
-    # through a real server can still pass `pagecycle_enabled=True`/
+    # not "eventlog"). Phase 8 Task 5: pagecycle no longer shares this
+    # epoch-zero risk at all -- it bootstraps its own `_last_switch` off
+    # whatever `now` its first real `_tick_behaviors` call sees, completely
+    # independent of `_last_activity_ts` (see behaviors/pagecycle.py's own
+    # docstring) -- still defaulted off here for test isolation (a stock
+    # `pagecycle_pages` roster hop mid-test would be just as confusing to
+    # an unrelated protocol-plumbing test as screensaver's own epoch-zero
+    # bug was). A test that DOES want to exercise the behaviors through a
+    # real server can still pass `pagecycle_enabled=True`/
     # `screensaver_enabled=True` explicitly via **cfg.
     cfg.setdefault("pagecycle_enabled", False)
     cfg.setdefault("screensaver_enabled", False)

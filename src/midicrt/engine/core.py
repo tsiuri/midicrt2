@@ -97,7 +97,7 @@ swallowed rather than propagated, since an internal, unattended behavior
 tick crashing the whole `run()` loop would be far worse than one skipped
 auto-action.
 
-Both behaviors need "has anything happened recently" as their idle
+`ScreensaverBehavior` needs "has anything happened recently" as its idle
 reference point, which -- like `_tick_analyzers`'s `now` -- only the
 engine is positioned to track: `_handle(ev)` stamps `self._last_activity_ts
 = ev.ts` for `note_on`/`note_off`/`control_change` events ONLY, mirroring
@@ -109,15 +109,23 @@ screensaver.py's module docstring). `self._last_activity_ts` is seeded to
 starts its idle clocks from boot time rather than looking infinitely idle
 on its very first tick.
 
-`pagecycle_idle_s` and `screensaver_after_s` are two INDEPENDENT clocks
-measured off this SAME `_last_activity_ts` -- with `Config()`'s own
-shipped defaults (300s/60s, both enabled) a fully idle engine crosses BOTH
-thresholds, not just the first one reached. `behaviors/pagecycle.py`'s own
-`tick()` is what prevents its later threshold from un-blanking the
-screensaver (see that module's "Arbitration with the screensaver" docstring
-section for the full failure mode a reviewer once reproduced here, and the
-fix) -- `Engine.__init__`'s own comment next to `self._behaviors` restates
-this at the wiring site.
+Phase 8 Task 5 (`behaviors/pagecycle.py`'s own docstring has the full
+story -- v1-semantics restoration, ruled by the 2026-08-08 decisions doc):
+`PageCycleBehavior` no longer reads `_last_activity_ts` for its OWN gating
+at all -- it rotates on a pure wall-clock `pagecycle_interval`, paused only
+by a recent HUMAN page action (`notify_page_action`, wired below and at
+the sysex page-switch call sites), exactly like v1's real "unconditional
+interval timer, gated only by a recent keypress" mechanism. It still takes
+`last_activity_ts` as a `tick()` parameter (signature parity with
+`ScreensaverBehavior`, since both are called identically from the loop
+below) but ignores it. The practical consequence: pagecycle's timer keeps
+counting down completely obliviously to whether the engine is idle or
+not, so `behaviors/pagecycle.py`'s own screensaver-page guard (skip acting
+whenever `current_page` IS the screensaver page) is now the ONLY thing
+preventing a long idle stretch from having pagecycle un-blank the
+screensaver -- see that module's own "Arbitration with the screensaver"
+docstring section for the full mechanism and the re-arm-on-block-end fix
+carried over from the original Task-9 fix round.
 """
 import asyncio
 import contextlib
@@ -170,6 +178,16 @@ _LOG = logging.getLogger(__name__)
 # behaviors/screensaver.py's own docstring for why a free-running MIDI
 # clock must NOT count as activity).
 _ACTIVITY_EVENT_TYPES = {"note_on", "note_off", "control_change"}
+
+# Phase 8 Task 5 (behaviors/pagecycle.py's own "notify_page_action" +
+# "Origin ruling" docstring sections): every action name that moves
+# `current_page` -- `_on_action_dispatched` (below) and the two sysex
+# call sites that bypass the dispatch registry (`_sysex_switch_page`,
+# `_sysex_screensaver`) all check membership here before notifying
+# `_pagecycle_behavior`, so a completely unrelated action (e.g.
+# `sendnotes.key`, `capture.start`) never resets pagecycle's user-pause
+# window.
+_PAGE_NAV_ACTIONS = frozenset({"page.next", "page.prev", "page.goto"})
 
 
 @dataclass
@@ -627,42 +645,41 @@ class Engine:
         # freshly booted engine must not look infinitely idle on its very
         # first `_tick_behaviors` call.
         self._last_activity_ts: float = time.time()
+        # Phase 8 Task 5: `known_pages=set(self.pages)` -- built above, at
+        # line ~516, never reassigned after `__init__` -- lets
+        # `PageCycleBehavior` skip a configured `pagecycle_pages` entry
+        # that isn't actually in THIS deploy's roster (see that module's
+        # own "Missing-page skip" docstring section) instead of dispatching
+        # a `page.goto` `_tick_behaviors` would just swallow as an
+        # ActionError.
         self._pagecycle_behavior = PageCycleBehavior(
-            enabled=config.pagecycle_enabled, idle_s=config.pagecycle_idle_s)
+            enabled=config.pagecycle_enabled, interval=config.pagecycle_interval,
+            pages=config.pagecycle_pages, user_pause=config.pagecycle_user_pause,
+            known_pages=set(self.pages))
         self._screensaver_behavior = ScreensaverBehavior(
             enabled=config.screensaver_enabled, after_s=config.screensaver_after_s)
-        # CORRECTED (task-9 review): an earlier version of this comment
-        # claimed "order rarely matters under sane configs" because
-        # screensaver_after_s=60 fires before pagecycle_idle_s=300 ever
-        # could -- that reasoning was WRONG and a reviewer reproduced the
-        # failure against the actual shipped defaults: pagecycle_idle_s and
-        # screensaver_after_s are two INDEPENDENT clocks measured from the
-        # SAME last_activity_ts, so a fully idle engine crosses 60s
-        # (screensaver activates) and then, inevitably, ALSO crosses 300s
-        # (pagecycle's own threshold) with no new activity in between --
-        # order of activation is irrelevant to that. The actual fix lives
-        # in `behaviors/pagecycle.py`'s `tick()` (see its own "Arbitration
-        # with the screensaver" docstring section): it refuses to act at
-        # all while `current_page` is the screensaver page, however that
-        # page was reached. List order below is therefore now genuinely
-        # inconsequential (pagecycle is a no-op whenever screensaver owns
-        # the display, regardless of which behavior's `tick()` runs first
-        # within a given `_tick_behaviors` call) -- verified by
-        # `test_engine_core.py::
-        # test_pagecycle_does_not_unblank_screensaver_with_shipped_defaults`,
-        # which sweeps a fake clock from t=0 to t=900 against Config()'s own
-        # shipped defaults (both behaviors enabled) and asserts the engine
-        # reaches the screensaver at t=60 and STAYS there.
-        #
-        # 2nd review pass: that fix alone introduced a SIBLING gap -- a
-        # MANUAL escape from the screensaver (no MIDI activity) left
-        # pagecycle's own idle timer stale, firing `page.next` on the very
-        # next tick and discarding the manual choice. Both
-        # `behaviors/pagecycle.py` AND `behaviors/screensaver.py` now
-        # re-arm their respective idle references to `now` when a block/
-        # activation ends WITHOUT a real activity advance -- see each
-        # module's own docstring ("Re-arming after a manual escape" /
-        # "A manual override now buys a FRESH after_s grace period").
+        # Phase 8 Task 5 (behaviors/pagecycle.py's own docstring has the
+        # full story -- v1-semantics restoration): `PageCycleBehavior` no
+        # longer shares ANY clock with `ScreensaverBehavior` -- it rotates
+        # on its own wall-clock `pagecycle_interval`, completely oblivious
+        # to `_last_activity_ts`/idle state. The screensaver-page guard in
+        # `PageCycleBehavior.tick()` (refuse to act while `current_page` IS
+        # the screensaver page, checked first, however that page was
+        # reached) is carried over UNCHANGED from the Phase-3 Task 9
+        # arbitration fix this replaces -- it is now the ONLY thing
+        # preventing a long idle stretch from having pagecycle un-blank a
+        # just-activated screensaver, since there is no shared idle-clock
+        # math left to reason about. On block-end, `tick()` re-arms its own
+        # `_last_switch` to `now` (a full fresh `pagecycle_interval` before
+        # the next auto-advance) -- the direct descendant of the Task-9
+        # fix round's "re-arm after a manual escape" fix, now needed for
+        # every block-end path uniformly (see that module's own "Arbitration
+        # with the screensaver" docstring section for why the OLD two-path
+        # distinction collapsed into one). List order below remains
+        # inconsequential for the same reason it always was: pagecycle is a
+        # no-op whenever screensaver owns the display, regardless of which
+        # behavior's `tick()` runs first within a given `_tick_behaviors`
+        # call.
         self._behaviors: list = [self._pagecycle_behavior, self._screensaver_behavior]
         # Phase-3 task 12 (gap ports): registered UNCONDITIONALLY --
         # `_pagecycle_behavior` always exists regardless of `config.pages`
@@ -1206,8 +1223,19 @@ class Engine:
         itself explicitly, before this hook would even see it) --
         harmless overlap either way, since by the time this hook fires for
         `capture.stop`, recording has already ended and `record_action`'s
-        own guard makes this a no-op."""
+        own guard makes this a no-op.
+
+        Phase 8 Task 5: also the seam `PageCycleBehavior.notify_page_action`
+        is wired through for every REGISTRY-dispatched page-navigation
+        action (client/binding/behavior/auto -- see `_PAGE_NAV_ACTIONS`'s
+        own comment and `behaviors/pagecycle.py`'s "Origin ruling" docstring
+        section for which of those actually pause rotation). The two sysex
+        page-navigation call sites bypass this hook the same way they
+        bypass `record_action` above -- see `_sysex_switch_page`/
+        `_sysex_screensaver`'s own matching `notify_page_action` calls."""
         self._capture.record_action(name, args, origin)
+        if name in _PAGE_NAV_ACTIONS:
+            self._pagecycle_behavior.notify_page_action(origin, time.time())
 
     def _capture_write_failed(self, exc: OSError) -> dict:
         """Shared write-failure containment (fix wave, Critical finding:
@@ -1982,6 +2010,12 @@ class Engine:
         # with the equivalent action name/args a `page.goto` action call
         # would have carried.
         self._capture.record_action("page.goto", {"name": name}, "sysex")
+        # Phase 8 Task 5: same "sysex bypasses the normal hook" reasoning
+        # applies to `PageCycleBehavior.notify_page_action` -- a SysEx
+        # page-switch is a human pressing a physical control on the
+        # Cirklon, ruled a "human origin" exactly like a client action (see
+        # behaviors/pagecycle.py's "Origin ruling" docstring section).
+        self._pagecycle_behavior.notify_page_action("sysex", time.time())
         if version is not None:
             self._midi_out.send_sysex(
                 sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x00, (page_id,)))
@@ -2020,6 +2054,13 @@ class Engine:
             # same "sysex bypasses the dispatch hook, call the primitive
             # directly" reasoning.
             self._capture.record_action("page.goto", {"name": "screensaver"}, "sysex")
+            # Phase 8 Task 5: same origin-ruling reasoning as
+            # `_sysex_switch_page` -- a human forced the screensaver on via
+            # a physical Cirklon control, so it counts toward pagecycle's
+            # own user-pause window too (harmless overlap with the
+            # screensaver-page guard already blocking pagecycle here; this
+            # matters once the display later leaves the screensaver page).
+            self._pagecycle_behavior.notify_page_action("sysex", time.time())
         if version is not None:
             self._midi_out.send_sysex(sysex_mod.build_reply(
                 version, sysex_mod.CMD_SCREENSAVER, 0x00, (int(args[0] != 0),)))

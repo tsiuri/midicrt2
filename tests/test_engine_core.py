@@ -703,20 +703,22 @@ def test_activity_ts_updates_on_note_on_note_off_control_change_only():
     assert eng._last_activity_ts == 100000.0
 
 
-async def test_tick_behaviors_dispatches_page_next_when_pagecycle_behavior_fires():
-    eng = Engine(Config(pagecycle_idle_s=5.0, screensaver_enabled=False))
+async def test_tick_behaviors_dispatches_page_goto_when_pagecycle_behavior_fires():
+    # Phase 8 Task 5 (v1-semantics restoration): REPLACES the T9-era
+    # `..._dispatches_page_next_...` test -- the new behavior dispatches
+    # `page.goto` to the FIRST configured `pagecycle_pages` entry
+    # ("harmony", Config()'s own default), never the roster-wide
+    # `page.next` the idle-triggered version used.
+    eng = Engine(Config(pagecycle_interval=5.0, screensaver_enabled=False))
     eng._last_activity_ts = 0.0
-    await eng._tick_behaviors(0.0)   # bootstraps the idle window -- no fire yet
+    await eng._tick_behaviors(0.0)   # bootstraps -- no fire yet
     assert eng.current_page == "eventlog"
     await eng._tick_behaviors(5.0)
-    assert eng.current_page == "voices"
+    assert eng.current_page == "harmony"
 
 
 async def test_tick_behaviors_pagecycle_dispatch_is_observable_via_a_spy():
-    # Task brief: "fake-clock idle progression -> page.next fired via a spy
-    # on dispatch" -- exercised literally here, alongside the state-based
-    # assertion above.
-    eng = Engine(Config(pagecycle_idle_s=5.0, screensaver_enabled=False))
+    eng = Engine(Config(pagecycle_interval=5.0, screensaver_enabled=False))
     eng._last_activity_ts = 0.0
     calls = []
     original_dispatch = eng.actions.dispatch
@@ -728,11 +730,30 @@ async def test_tick_behaviors_pagecycle_dispatch_is_observable_via_a_spy():
     eng.actions.dispatch = spy
     await eng._tick_behaviors(0.0)
     await eng._tick_behaviors(5.0)
-    assert calls == [("page.next", {})]
+    assert calls == [("page.goto", {"name": "harmony"})]
+
+
+async def test_pagecycle_rotates_on_a_fixed_interval_even_while_midi_is_continuously_active():
+    # Phase 8 Task 5's headline contract, proven end to end (not just in
+    # behaviors/pagecycle.py's own unit tests): a real `note_on` arriving
+    # on EVERY tick -- continuously "active" by any idle-gate definition --
+    # must not push pagecycle's rotation out by even one tick. The T9-era
+    # idle-triggered version would never have fired at all under this
+    # traffic pattern (activity resets its idle clock every tick).
+    eng = Engine(Config(pagecycle_interval=5.0, screensaver_enabled=False))
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(0.0)   # bootstrap
+    for t in range(1, 5):
+        eng._handle(ev(type="note_on", ts=float(t)))
+        await eng._tick_behaviors(float(t))
+        assert eng.current_page == "eventlog"
+    eng._handle(ev(type="note_on", ts=5.0))
+    await eng._tick_behaviors(5.0)
+    assert eng.current_page == "harmony"
 
 
 def test_pagecycle_disabled_by_config_never_fires():
-    eng = Engine(Config(pagecycle_idle_s=5.0, pagecycle_enabled=False, screensaver_enabled=False))
+    eng = Engine(Config(pagecycle_interval=5.0, pagecycle_enabled=False, screensaver_enabled=False))
     eng._last_activity_ts = 0.0
 
     async def run_ticks():
@@ -742,6 +763,49 @@ def test_pagecycle_disabled_by_config_never_fires():
 
     asyncio.run(run_ticks())
     assert eng.current_page == "eventlog"
+
+
+async def test_pagecycle_client_origin_page_action_pauses_rotation():
+    # Origin ruling (behaviors/pagecycle.py's own docstring): a real client
+    # action is a human touching page navigation directly -- must pause
+    # rotation for `pagecycle_user_pause`.
+    eng = Engine(Config(pagecycle_interval=5.0, pagecycle_user_pause=30.0,
+                        screensaver_enabled=False))
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(0.0)   # bootstrap
+    await eng.actions.dispatch("page.goto", {"name": "voices"}, origin="client")
+    await eng._tick_behaviors(5.0)   # interval elapsed, but paused
+    assert eng.current_page == "voices"
+    await eng._tick_behaviors(29.9)
+    assert eng.current_page == "voices"
+
+
+async def test_pagecycle_binding_origin_page_action_does_not_pause(tmp_path):
+    # A learned MIDI binding driving page.next is the sequencer performing,
+    # not a user -- must NOT pause pagecycle's own rotation.
+    p = tmp_path / "bindings.toml"
+    _write_trigger_binding(p, binding_id="b1", action="page.next", number=60)
+    eng = Engine(Config(pagecycle_interval=5.0, pagecycle_user_pause=30.0,
+                        screensaver_enabled=False), bindings_path=str(p))
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(0.0)   # bootstrap
+    eng._handle(ev(type="note_on", data1=60, data2=100))
+    await eng._dispatch_bindings()   # fires page.next via origin="binding:b1"
+    await eng._tick_behaviors(5.0)   # must still fire -- no pause was armed
+    assert eng.current_page == "harmony"
+
+
+async def test_pagecycle_sysex_page_switch_pauses_rotation():
+    # A real hardware SysEx page-switch command is a human pressing a
+    # physical control -- ruled a "human origin" alongside "client".
+    eng = Engine(Config(pagecycle_interval=5.0, pagecycle_user_pause=30.0,
+                        screensaver_enabled=False))
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(0.0)   # bootstrap
+    eng._sysex_switch_page(version=None, args=(13,))   # page id 13 = "voices"
+    assert eng.current_page == "voices"
+    await eng._tick_behaviors(5.0)   # interval elapsed, but paused by the sysex switch
+    assert eng.current_page == "voices"
 
 
 async def test_tick_behaviors_activates_and_restores_screensaver():
@@ -793,7 +857,7 @@ async def test_run_loop_fires_pagecycle_via_real_wall_clock():
     # End-to-end proof (real run() loop, real time.time() reads) that
     # _tick_behaviors is actually wired into the run loop, not just
     # unit-callable in isolation.
-    eng = Engine(Config(pagecycle_idle_s=0.05, screensaver_enabled=False, tick_hz=200.0))
+    eng = Engine(Config(pagecycle_interval=0.05, screensaver_enabled=False, tick_hz=200.0))
     task = asyncio.create_task(eng.run())
     await asyncio.sleep(0.25)
     eng.stop()
@@ -802,18 +866,21 @@ async def test_run_loop_fires_pagecycle_via_real_wall_clock():
 
 
 async def test_pagecycle_does_not_unblank_screensaver_with_shipped_defaults():
-    # CRITICAL fix (task-9 review): reproduced against the actual shipped
-    # defaults (pagecycle_idle_s=300, screensaver_after_s=60, BOTH
-    # enabled -- Config()'s own defaults, no overrides). Before the fix,
-    # PageCycleBehavior.tick() never looked at current_page at all, so at
-    # t=300 (its own idle threshold, measured from the SAME
-    # last_activity_ts screensaver uses) it unconditionally dispatched
-    # page.next -- un-blanking the screensaver that had already activated
-    # at t=60 -- and then kept doing so every further 300s while the
-    # engine stayed fully idle (t=600, t=900, ...). See behaviors/
-    # pagecycle.py's own "Arbitration with the screensaver" docstring
-    # section for the fix. A fully idle engine must reach the screensaver
-    # at t=60 and STAY there through at least t=900.
+    # Guard KEPT verbatim from the task-9 review (task brief's explicit
+    # requirement) even though pagecycle's OWN gating mechanism changed
+    # completely (Phase 8 Task 5: no longer idle-triggered off
+    # `last_activity_ts` at all -- a pure wall-clock `pagecycle_interval`,
+    # see behaviors/pagecycle.py's own "Arbitration with the screensaver"
+    # docstring section). If anything the guard matters MORE now: pagecycle
+    # no longer shares any clock with the screensaver, so a fully idle
+    # engine's pagecycle timer keeps counting down completely obliviously
+    # to `last_activity_ts` -- the screensaver-page check in
+    # `PageCycleBehavior.tick()` is the ONLY thing standing between that and
+    # un-blanking a just-activated screensaver. Reproduced against
+    # Config()'s actual shipped defaults (pagecycle_interval=300,
+    # screensaver_after_s=60, both enabled): a fully idle engine must reach
+    # the screensaver at t=60 and STAY there through at least t=900 (three
+    # full pagecycle intervals' worth of idle time).
     eng = Engine(Config())
     eng._last_activity_ts = 0.0
     seen_screensaver_at = None
@@ -830,30 +897,28 @@ async def test_pagecycle_does_not_unblank_screensaver_with_shipped_defaults():
 
 
 async def test_pagecycle_does_not_immediately_override_a_manual_screensaver_escape():
-    # 2nd review pass: fixing the Critical bug above introduced a NEW
-    # Important interaction -- with the fix as first shipped, pagecycle's
-    # `_idle_since` stays frozen while blocked, so a MANUAL escape from the
-    # screensaver (a client dispatching page.goto/next directly, with no
-    # MIDI activity) left the stale elapsed check already satisfied on the
-    # very next tick, firing page.next immediately and discarding the
-    # user's manual choice -- the exact symptom the Important fix above
-    # closed, now via the sibling behavior. See behaviors/pagecycle.py's
-    # own "Re-arming after a manual escape" docstring section for the fix.
+    # Guard-interaction test carried over from the task-9 review, updated
+    # for Phase 8 Task 5's new re-arm mechanism: `PageCycleBehavior.tick()`
+    # re-arms `_last_switch = now` the instant `current_page` stops being
+    # the screensaver page (see that module's own "Arbitration with the
+    # screensaver" docstring section) -- a manual escape must NOT be
+    # immediately overridden by a stale elapsed-interval check. Unlike the
+    # T9-era version of this test, the old "was it activity-driven or
+    # manual" distinction no longer applies (this module's re-arm no
+    # longer keys off `last_activity_ts` at all) -- see
+    # test_behaviors_pagecycle.py::
+    # test_rearms_with_a_fresh_interval_once_the_screensaver_block_ends for
+    # the isolated timing contract this engine-level smoke test exercises
+    # against real dual-behavior wiring instead.
     #
-    # This is an engine-level smoke test using REAL dual-behavior wiring
-    # (both enabled, shipped defaults) for the setup + the critical
-    # non-firing assertion. It deliberately does NOT project all the way
-    # out to pagecycle's own full re-armed idle_s (that exact timing
-    # contract is covered in isolation by test_behaviors_pagecycle.py::
-    # test_rearms_after_a_manual_screensaver_escape_instead_of_firing_immediately)
-    # -- with the shipped defaults, screensaver's own SHORTER after_s (60s)
-    # will legitimately reclaim the display again well before pagecycle's
-    # longer idle_s (300s) could ever elapse uninterrupted (a real,
-    # disclosed, and arguably correct consequence of screensaver taking
-    # priority -- see behaviors/pagecycle.py's `Engine.__init__` comment),
-    # which would make asserting a specific later page value here brittle
-    # and would actually be testing screensaver's OWN timer, not
-    # pagecycle's.
+    # This deliberately does NOT project all the way out to pagecycle's own
+    # full re-armed interval -- with the shipped defaults, screensaver's own
+    # SHORTER after_s (60s) will legitimately reclaim the display again well
+    # before pagecycle's longer interval (300s) could ever elapse
+    # uninterrupted (a real, disclosed, and arguably correct consequence of
+    # screensaver taking priority), which would make asserting a specific
+    # later page value here brittle and would actually be testing
+    # screensaver's OWN timer, not pagecycle's.
     eng = Engine(Config())
     eng._last_activity_ts = 0.0
     for now in range(501):
@@ -878,7 +943,7 @@ async def test_pagecycle_does_not_immediately_override_a_manual_screensaver_esca
     assert eng.current_page == "voices", (
         "pagecycle overrode the manual escape on the very next tick"
     )
-    assert ("page.next", {}) not in calls
+    assert calls == [], "no behavior should have dispatched anything on this tick"
 
 
 # -- img2txtviz page (phase-3 task 10) ---------------------------------------
@@ -2909,18 +2974,20 @@ async def test_capture_records_provenance_for_all_four_dispatch_origins(tmp_path
     eng._handle(ev(type="note_on", data1=60, data2=100))
     await eng._dispatch_bindings()
 
-    # 2. behavior origin -- force a huge idle gap so PageCycleBehavior fires.
-    # Two calls needed (same shape as test_tick_behaviors_pagecycle_
-    # dispatch_is_observable_via_a_spy above): the FIRST tick only ARMS
-    # `_idle_since` (a freshly constructed behavior always treats its very
-    # first tick as "activity moved forward", see behaviors/pagecycle.py's
-    # own `tick()` docstring); the SECOND tick, far enough past `idle_s`,
-    # actually fires `page.next`. No real wall-clock wait needed -- `now`
-    # is injected, same "inject now" precedent every other behavior/
-    # analyzer tick test uses.
+    # 2. behavior origin -- force a huge elapsed-interval gap so
+    # PageCycleBehavior fires. Two calls needed (same shape as
+    # test_tick_behaviors_pagecycle_dispatch_is_observable_via_a_spy
+    # above): the FIRST tick only bootstraps `_last_switch` (a freshly
+    # constructed behavior always treats its very first tick as "nothing
+    # to measure elapsed time from yet", see behaviors/pagecycle.py's own
+    # `tick()` docstring); the SECOND tick, far enough past
+    # `pagecycle_interval`, actually fires `page.goto` (Phase 8 Task 5:
+    # never `page.next` anymore -- see that module's docstring). No real
+    # wall-clock wait needed -- `now` is injected, same "inject now"
+    # precedent every other behavior/analyzer tick test uses.
     eng._last_activity_ts = 0.0
     await eng._tick_behaviors(now=0.0)
-    await eng._tick_behaviors(now=eng.config.pagecycle_idle_s + 100.0)
+    await eng._tick_behaviors(now=eng.config.pagecycle_interval + 100.0)
 
     # 3. client origin -- exactly what engine/server.py's own action
     # dispatch branch does.

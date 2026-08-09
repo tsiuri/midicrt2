@@ -71,7 +71,8 @@ def _config_rows(cfg: Config) -> list[dict]:
         {"label": "spectrum_bins", "value": str(cfg.spectrum_bins)},
         {"label": "eventlog_capacity", "value": str(cfg.eventlog_capacity)},
         {"label": "pagecycle",
-         "value": f"{_fmt_bool(cfg.pagecycle_enabled)} (idle {cfg.pagecycle_idle_s:g}s)"},
+         "value": f"{_fmt_bool(cfg.pagecycle_enabled)} (every {cfg.pagecycle_interval:g}s, "
+                  f"{len(cfg.pagecycle_pages)} pages)"},
         {"label": "screensaver",
          "value": f"{_fmt_bool(cfg.screensaver_enabled)} (after {cfg.screensaver_after_s:g}s)"},
         # No "capture" section exists in `Config` yet -- see module

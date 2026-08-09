@@ -6,16 +6,23 @@ v1 never loads an image file at all -- it's a real-time MIDI-reactive
 procedural ASCII generator, not an image viewer.
 
 Roster placement (`config.pages` -- see config.py's own comment): v1's
-idle-triggered `pagecycle` plugin does NOT include this page (PAGE_ID 17)
-in its curated `cycle_pages=[1,6,8,9]` subset -- but task 9's own report
-already established that v2's `behaviors/pagecycle.py` does not model that
-curated-subset concept at all (it idle-advances through the WHOLE
-`config.pages` roster instead, a disclosed re-interpretation made in task
-9's port). So "was this page in v1's cycle_pages" is not the signal that
-decides v2 default-roster membership -- the actual precedent already
-established by "voices"/"harmony"/"pianoroll"/"spectrum" (and the COUNTER-
-example, "tuner") is "does this page show something real by default with
-no unbuilt dependency." This page is a fully self-contained MIDI + wall-
+`pagecycle` plugin (an unconditional wall-clock interval timer, NOT
+idle-triggered -- see behaviors/pagecycle.py's own docstring, corrected
+Phase 8 Task 5) does NOT include this page (PAGE_ID 17) in its curated
+`cycle_pages=[1,6,8,9]` subset. At the time this page was ported (task 9),
+`behaviors/pagecycle.py` didn't model that curated-subset concept at all
+(it idle-advanced through the WHOLE `config.pages` roster instead, a
+disclosed re-interpretation since REVERSED -- Phase 8 Task 5 restored the
+curated-subset mechanism verbatim, `config.pagecycle_pages` defaulting to
+exactly v1's four mapped names). Even under the restored mechanism,
+img2txtviz's absence from `pagecycle_pages` is still correctly NOT the
+signal that decided this page's presence in the default ROSTER
+(`config.pages`, distinct from `pagecycle_pages` -- membership in the
+roster only means `page.next`/`.prev`/`.goto` can reach it, not that
+pagecycle auto-visits it): the actual precedent already established by
+"voices"/"harmony"/"pianoroll"/"spectrum" (and the COUNTER-example,
+"tuner") is "does this page show something real by default with no
+unbuilt dependency." This page is a fully self-contained MIDI + wall-
 clock animation with no missing dependency (unlike "tuner", which is
 permanently idle until a future audio-capture task), so it DOES join
 `config.pages`'s default list.

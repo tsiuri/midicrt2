@@ -201,7 +201,7 @@ CONTINUOUS_FILL_TOKEN = "$midicrt_fill_from_cc$"
 # `Config` field -- this is a fixed UX timing decision (how long a human
 # has to hit a key/knob after arming), not a per-deployment tunable
 # anything in this codebase's `config.toml` precedent would suggest making
-# adjustable (contrast `tick_hz`/`pagecycle_idle_s`, which really do vary
+# adjustable (contrast `tick_hz`/`pagecycle_interval`, which really do vary
 # per rig). Both `engine/core.py`'s own timeout check AND `clients/cli.py`'s
 # `midicrt bind learn` wait-timeout default (this value plus slack for
 # wire round-trip latency) read this SAME constant rather than each
