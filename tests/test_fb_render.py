@@ -1259,6 +1259,141 @@ def test_render_pianoroll_frame_label_column_active_pitch_is_inverted():
     assert px[2, y1 + 1] == app.BG
 
 
+# -- active-row tint + fade (Phase 8 Task 4, docs/visual-audit.md §9c) -----
+
+def test_render_pianoroll_frame_draws_row_tint_at_full_intensity():
+    _font, header_h, _usable_h, note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
+    guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]   # "B4" -- clean row, no note
+    vm = {**PIANOROLL_VM, "row_tint": [{"y": guide1["y"], "intensity": 1.0}]}
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(vm, surf)
+    px = surf.image.load()
+    y = header_h + round(guide1["y"] * row_span_h)
+    from midicrt.clients.fb.lum import RAMPS, lum
+
+    peak = RAMPS["pianoroll_row_tint"]["peak"]
+    # roll_x0+2 avoids the row's own dotted-guide dot columns (phase 1,
+    # stride 4 -- dots sit at roll_x0+1, +5, +9, ... per the dotted-guide
+    # test above), so this probes the PURE tint fill.
+    assert px[roll_x0 + 2, y + note_h // 2] == lum(peak * 1.0)
+
+
+def test_render_pianoroll_frame_row_tint_intensity_scales_brightness():
+    _font, header_h, _usable_h, note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
+    guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
+    from midicrt.clients.fb.lum import RAMPS, lum
+
+    peak = RAMPS["pianoroll_row_tint"]["peak"]
+    y = header_h + round(guide1["y"] * row_span_h)
+
+    vm_half = {**PIANOROLL_VM, "row_tint": [{"y": guide1["y"], "intensity": 0.5}]}
+    surf_half = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(vm_half, surf_half)
+    assert surf_half.image.load()[roll_x0 + 2, y + note_h // 2] == lum(peak * 0.5)
+
+    vm_full = {**PIANOROLL_VM, "row_tint": [{"y": guide1["y"], "intensity": 1.0}]}
+    surf_full = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(vm_full, surf_full)
+    full_color = surf_full.image.load()[roll_x0 + 2, y + note_h // 2]
+    half_color = surf_half.image.load()[roll_x0 + 2, y + note_h // 2]
+    assert sum(full_color) > sum(half_color) > 0
+
+
+def test_render_pianoroll_frame_row_tint_drawn_under_the_dotted_grid():
+    # roll_x0+1 IS a dot column for guide row 1 (phase 1&1=1, stride 4 --
+    # same position the dotted-guide test above already proves is
+    # LUM_FAINT with NO tint present). With a full-intensity tint added
+    # underneath, the grid dot must still win -- draw order is tint, THEN
+    # grid, matching v1's own layering (module comment in clients/fb/app.py).
+    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, _roll_w = _pianoroll_layout()
+    guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
+    vm = {**PIANOROLL_VM, "row_tint": [{"y": guide1["y"], "intensity": 1.0}]}
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(vm, surf)
+    y = header_h + round(guide1["y"] * row_span_h)
+    assert surf.image.load()[roll_x0 + 1, y] == app.LUM_FAINT
+
+
+def test_render_pianoroll_frame_row_tint_drawn_under_notes():
+    # guide row 12 ("C4") has note[2] (PIANOROLL_NOTES) covering x0=0.7..1.0
+    # -- a tint on that SAME row must not visually cover the note's own
+    # velocity color where the note actually is.
+    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    guide12 = PIANOROLL_GRID["pitch_guide_ys"][12]
+    vm = {**PIANOROLL_VM, "row_tint": [{"y": guide12["y"], "intensity": 1.0}]}
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(vm, surf)
+    note2 = PIANOROLL_NOTES[2]
+    x = roll_x0 + round(note2["x0"] * roll_w) + 2
+    y = header_h + round(note2["y"] * row_span_h) + 1
+    assert surf.image.load()[x, y] == app._roll_note_color(note2["ch"], note2["vel"])
+
+
+def test_render_pianoroll_frame_row_tint_absent_key_renders_unchanged():
+    # Defensive .get(..., []) -- an older/synthetic vm with no "row_tint"
+    # key at all (every pre-Phase-8-Task-4 fixture) must render identically
+    # to one with an explicit empty list.
+    surf_missing = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf_missing)
+    surf_empty = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame({**PIANOROLL_VM, "row_tint": []}, surf_empty)
+    assert surf_missing.image.tobytes() == surf_empty.image.tobytes()
+
+
+# -- overlap flash (Phase 8 Task 4, docs/visual-audit.md §9c) ---------------
+
+def test_render_pianoroll_frame_draws_overlap_flash_note_colored_phase():
+    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]   # clean row, no note
+    region = {"y": guide1["y"], "x0": 0.1, "x1": 0.3, "ch": 5, "vel": 0.9}
+    vm = {**PIANOROLL_VM, "overlap_flash": [region]}
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(vm, surf)
+    y = header_h + round(guide1["y"] * row_span_h) + 1
+    x = roll_x0 + round(0.2 * roll_w)
+    assert surf.image.load()[x, y] == app._roll_note_color(5, 0.9)
+
+
+def test_render_pianoroll_frame_draws_overlap_flash_blink_to_bg_phase():
+    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    guide1 = PIANOROLL_GRID["pitch_guide_ys"][1]
+    region = {"y": guide1["y"], "x0": 0.1, "x1": 0.3, "ch": None, "vel": None}
+    vm = {**PIANOROLL_VM, "overlap_flash": [region]}
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(vm, surf)
+    y = header_h + round(guide1["y"] * row_span_h) + 1
+    x = roll_x0 + round(0.2 * roll_w)
+    assert surf.image.load()[x, y] == app.BG
+
+
+def test_render_pianoroll_frame_overlap_flash_drawn_over_plain_notes():
+    # note[1] (PIANOROLL_NOTES: ch2, y=0.5, x0=0.4..0.6) drawn as usual,
+    # then a BG-phase overlap-flash region right on top of it -- proves
+    # flash paints AFTER (on top of) the plain note rects, v1's own "last
+    # pass" layering.
+    _font, header_h, _usable_h, _note_h, row_span_h, roll_x0, roll_w = _pianoroll_layout()
+    note1 = PIANOROLL_NOTES[1]
+    region = {"y": note1["y"], "x0": 0.45, "x1": 0.55, "ch": None, "vel": None}
+    vm = {**PIANOROLL_VM, "overlap_flash": [region]}
+    surf = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(vm, surf)
+    x = roll_x0 + round(0.5 * roll_w)
+    y = header_h + round(note1["y"] * row_span_h) + 1
+    assert surf.image.load()[x, y] == app.BG
+    # Sanity: WITHOUT the flash region, that same pixel is the note's color.
+    surf_plain = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf_plain)
+    assert surf_plain.image.load()[x, y] == app._roll_note_color(note1["ch"], note1["vel"])
+
+
+def test_render_pianoroll_frame_overlap_flash_absent_key_renders_unchanged():
+    surf_missing = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame(PIANOROLL_VM, surf_missing)
+    surf_empty = Surface(*PIANOROLL_SURFACE_SIZE)
+    app.render_pianoroll_frame({**PIANOROLL_VM, "overlap_flash": []}, surf_empty)
+    assert surf_missing.image.tobytes() == surf_empty.image.tobytes()
+
+
 def test_render_pianoroll_frame_golden_matches_frozen_fixture():
     assert GOLDEN_PIANOROLL_FRAME.exists(), (
         "golden fixture missing -- see freeze procedure in task-9-report.md"

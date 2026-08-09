@@ -523,6 +523,11 @@ PIANOROLL_LABEL_MARGIN_CHARS = 10
 PIANOROLL_GRID_ROW_STRIDE = 4
 PIANOROLL_GRID_LINE_STRIDE = 3
 
+# Phase 8 Task 4 (docs/visual-audit.md §9c): active-row tint's peak-
+# brightness ramp -- see clients/fb/lum.py's own "pianoroll_row_tint" entry
+# for the v1 `_ROLL_ACTIVE_ROW_BASE_RGB=(0,38,12)` byte-exactness proof.
+_ROLL_ROW_TINT_RAMP = RAMPS["pianoroll_row_tint"]
+
 
 def _roll_note_color(ch: int, vel: float) -> tuple[int, int, int]:
     floor = _PIANOROLL_RAMP["velocity_floor"]
@@ -540,6 +545,52 @@ def _pianoroll_header_text(vm: dict) -> str:
 
 def _pianoroll_label_text(guide: dict) -> str:
     return f"{guide['name']:>7} │"
+
+
+def _draw_pianoroll_row_tint(
+    surface: Surface, row_tint: list[dict], roll_x0: int, roll_w: int,
+    header_h: int, row_span_h: int, note_h: int,
+) -> None:
+    """Active-row background tint + 1s fade-out (Phase 8 Task 4,
+    docs/visual-audit.md §9c) -- drawn FIRST (under the grid, labels, AND
+    notes -- v1's own draw order, `compositor_renderer.py`'s row-tint pass
+    runs before its dotted-guide pass, see pages/pianoroll.py's module
+    docstring). One full-width rect per `row_tint` entry (`pages/
+    pianoroll.py::PianorollState._row_tint()`, already normalized `{y,
+    intensity}` data -- no music/timing math here), colored via
+    `clients/fb/lum.py`'s `lum()` scaled to this ramp's `"peak"` level
+    (v1's `_ROLL_ACTIVE_ROW_BASE_RGB` at full intensity, a continuous fade
+    at every intensity in between -- see that ramp's own docstring)."""
+    if roll_w <= 0:
+        return
+    peak = _ROLL_ROW_TINT_RAMP["peak"]
+    for entry in row_tint:
+        y = header_h + round(entry["y"] * row_span_h)
+        color = lum(peak * max(0.0, min(1.0, entry["intensity"])))
+        surface.rect(roll_x0, y, roll_w, note_h, color)
+
+
+def _draw_pianoroll_overlap_flash(
+    surface: Surface, overlap_flash: list[dict], roll_x0: int, roll_w: int,
+    header_h: int, row_span_h: int, note_h: int,
+) -> None:
+    """Overlap flash (Phase 8 Task 4, docs/visual-audit.md §9c) -- drawn
+    LAST (on TOP of the plain note rects, v1's own "overlap flash pass"
+    runs after its note-bar pass). One rect per `overlap_flash` region
+    (`pages/pianoroll.py::PianorollState._overlap_flash()`, already
+    phase-resolved data): `ch`/`vel` given -> that note's own color (reuses
+    `_roll_note_color`, the SAME velocity-brightness ramp every plain note
+    rect uses); `ch is None` -> the "blink to BG" phase (v1's `total_phases
+    = n + 1`'s extra phase)."""
+    if roll_w <= 0:
+        return
+    for region in overlap_flash:
+        y = header_h + round(region["y"] * row_span_h)
+        x0 = roll_x0 + round(region["x0"] * roll_w)
+        x1 = roll_x0 + round(region["x1"] * roll_w)
+        w = max(1, x1 - x0)
+        color = BG if region["ch"] is None else _roll_note_color(region["ch"], region["vel"])
+        surface.rect(x0, y, w, note_h, color)
 
 
 def _draw_pianoroll_grid(
@@ -624,6 +675,15 @@ def render_pianoroll_frame(vm: dict, surface: Surface, marquee_text: str | None 
     roll_x0 = label_w
     roll_w = max(0, surface.width - label_w)
 
+    # Draw order (bottom to top), matching v1's own layering (module
+    # comment above): row tint -> grid -> labels -> notes -> overlap flash.
+    # `.get(..., [])` on both new keys: an older/synthetic vm shape without
+    # them (every pre-Phase-8-Task-4 test fixture, e.g. tests/test_fb_
+    # render.py's PIANOROLL_VM) renders exactly as before -- no tint, no
+    # flash, byte-identical.
+    _draw_pianoroll_row_tint(surface, vm.get("row_tint", []), roll_x0, roll_w,
+                              header_h, row_span_h, note_h)
+
     grid = vm["grid"]
     _draw_pianoroll_grid(surface, grid, roll_x0, roll_w, header_h, usable_h, row_span_h)
 
@@ -636,6 +696,9 @@ def render_pianoroll_frame(vm: dict, surface: Surface, marquee_text: str | None 
         x1 = roll_x0 + round(note["x1"] * roll_w)
         w = max(1, x1 - x0)
         surface.rect(x0, y, w, note_h, _roll_note_color(note["ch"], note["vel"]))
+
+    _draw_pianoroll_overlap_flash(surface, vm.get("overlap_flash", []), roll_x0, roll_w,
+                                   header_h, row_span_h, note_h)
 
 
 # -- spectrum page (phase-3 task 8) -------------------------------------------

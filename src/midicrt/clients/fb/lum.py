@@ -135,4 +135,15 @@ RAMPS: dict[str, dict[str, float]] = {
     # here (rather than assumed inline) so the contract "0.0 -> black,
     # 1.0 -> full LUM_BRIGHT" is visible as data, not just as a comment.
     "img2txtviz": {"cell_min": 0.0, "cell_max": 1.0},
+    # Pianoroll active-row tint (Phase 8 Task 4, docs/visual-audit.md §9c):
+    # v1's `_ROLL_ACTIVE_ROW_BASE_RGB = (0, 38, 12)` (a 15%-of-LUM_BRIGHT
+    # tint at full intensity) is exactly `lum(38 / 255)` — `round(255 *
+    # 38/255) == 38`, `round(80 * 38/255) == 12` — so this ramp's single
+    # "peak" level, scaled by the row's own fade fraction (`pages/
+    # pianoroll.py`'s `row_tint[i]["intensity"]`, 0..1) and fed through
+    # `lum()`, reproduces v1's tint color exactly at full intensity and a
+    # smooth CONTINUOUS fade at every intensity in between — a disclosed
+    # improvement over v1's own 64-step quantized LUT (`_roll_row_fade_lut`),
+    # same class of change as `analyzers/beatflash.py`'s continuous decay.
+    "pianoroll_row_tint": {"peak": 38 / 255},
 }

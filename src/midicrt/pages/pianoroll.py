@@ -113,7 +113,18 @@ computes)
                 "vel": 0..1, "active": bool}, ...],
      "window": {"mode": "wallclock"|"tempo", "span_s": float,
                 "span_beats": float, "zoom": float},
-     "range": {"lo": midi, "hi": midi}}
+     "range": {"lo": midi, "hi": midi},
+     "grid": {...},   # see "Paper grid" section below
+     "row_tint": [{"y": 0..1, "intensity": 0..1}, ...],
+     "overlap_flash": [{"y": 0..1, "x0": 0..1, "x1": 0..1,
+                         "ch": int | None, "vel": 0..1 | None}, ...]}
+
+- `row_tint`/`overlap_flash` (Phase 8 Task 4): see this module's own
+  "Active-row tint + 1s fade-out, and overlap-flash" docstring section
+  below for the full v1-mechanics citation. Both are semantic 0..1/
+  fraction data, not colors -- the renderer maps them through `clients/
+  fb/lum.py`'s ramps, same convention `window`/`range`/`grid` already
+  establish.
 
 - `y`: 0 at the HIGHEST visible pitch, 1 at the lowest -- matches v1's own
   top-down convention (`pitches = range(pitch_high, pitch_low-1, -1)`, drawn
@@ -320,27 +331,75 @@ longer than any real session's window could ever need -- generous enough
 that no plausible bpm/zoom/span combination in this module's own
 documented ranges gets clipped).
 
-Not ported (disclosed, out of THIS task's scope -- see task-3-brief.md and
-docs/visual-audit.md §9c's own row-by-row build-priority list)
+Active-row tint + 1s fade-out, and overlap-flash (Phase 8 Task 4,
+docs/visual-audit.md §9c) -- the two per-frame ANIMATIONS Task 3 deferred
 ---------------------------------------------------------------------------
-- **Active-row background tint + 1s fade-out** and **overlap flash** (both
-  distinct §9c audit rows from the label-column invert this task DOES add)
-  are per-frame ANIMATIONS keyed off wall-clock, not projected VM state --
-  phase-8's task-4 brief ("Animation & burn-in catalog... the audit is the
-  checklist") is the one that owns porting animated/burn-in rows; adding
-  them here would pre-empt that task's own TDD pass over the exact same
-  audit rows.
-- **The separate solid "Bars" timeline strip** (§9c: one pixel-ROW of solid
-  GREEN_MID/GREEN_DIM ticks, distinct from the dotted guides this task
-  ports) -- not requested by this task's brief ("faint beat/bar gridlines
-  behind the roll" -- the dotted backdrop, not a second chrome row) and no
-  v2 renderer currently reserves space for a fourth chrome strip; flagged
-  here rather than silently folded in or silently dropped. **Ownership
-  (review fix)**: this is a §9c row same as the two items above it, so it
-  belongs to Task 4's "implement every MISSING/DIFFERENT row from the
-  audit's animation/burn-in tables... the audit is the checklist" catalog,
-  not a permanently-unscheduled gap -- explicitly assigned there rather
-  than left ambiguous about which future task (if any) owns it.
+Both read from `~/codex/midicrt/fb/compositor_renderer.py::_render_pianoroll`
+(the same function Task 3 already read in full) -- specifically the
+"Pitches with any visible note data" block (lines 772-825) and the
+"Overlap flash pass" block (lines 933-1000).
+
+**Row tint + fade**: v1's `highlight_pitches` ("any span/column entry with
+`velocity>0` whose tick range overlaps the current visible window" --
+lines 772-793) is EXACTLY this port's own `_visible_spans()` filter
+(channel + pitch-range + window-membership) -- the same set `notes[]`
+itself is already built from, since v2's `notes[]` is already "spans
+currently visible in the window" by construction (task-3-report.md's own
+citation of this equivalence for the label-column invert). `tick(now)`
+refreshes `_row_fade_until[pitch] = now + _ROLL_ROW_FADE_S` for every
+CURRENTLY visible pitch (mirrors v1's own `fade_until = now_mono +
+_ROLL_ACTIVE_ROW_FADE_S` refresh, lines 795-798) and drops any expired,
+no-longer-visible entry -- `view_model()`'s `row_tint` field then reports
+one `{"y", "intensity"}` per still-tinted pitch: `intensity=1.0` while
+visible, else `(fade_until - now) / _ROLL_ACTIVE_ROW_FADE_S` (linear decay
+to 0, matching v1's own `frac` calculation exactly -- v1 quantizes this
+into a 64-step LUT (`_roll_row_fade_lut`) purely as a rendering-side
+color-precompute optimization; this port reports the CONTINUOUS fraction
+and lets the renderer map it through `clients/fb/lum.py::lum()` instead,
+a disclosed strict-precision improvement over v1's own quantization, same
+class of change as `analyzers/beatflash.py`'s continuous-decay vs. v1's
+binary flag). The 15%-peak-brightness tint color itself
+(`_ROLL_ACTIVE_ROW_BASE_RGB = (0, 38, 12)`) is a RENDERER concern, not
+reported here -- see `clients/fb/app.py`'s own row-tint section (this VM
+reports a plain semantic 0..1 intensity, matching every other continuous
+ramp in this codebase's "VM carries the semantic value, renderer maps it
+through a named ramp" convention, e.g. img2txtviz's cell grid).
+
+**Overlap flash**: v1's per-pixel interval sweep (lines 941-1000) is
+ported here in FRACTION space instead of pixel space -- v2's `notes[]`
+already carries continuous `x0`/`x1` fractions through the SAME `_x()`
+projection notes and the grid both use, so "do two notes on the same
+pitch overlap" is a property of that already-computed data, not a
+rendering-resolution artifact the way v1's own "drawn pixel intervals"
+comment implies it needed to be. `_overlap_flash()` groups `notes[]` by
+`y` (two different pitches never visually overlap on the same row) and
+runs v1's exact sweep-line algorithm per group (`_overlap_regions_for_row`,
+a module-level pure function): sort start/end events, track the active
+set, and for every sub-interval where >=2 notes are simultaneously active,
+emit ONE region tagged with EITHER a note's own `(ch, vel)` (so the
+renderer can reuse `_roll_note_color`) or `(None, None)` -- the "blink to
+BG" phase v1's own `total_phases = n + 1` reserves. Phase selection
+(`int(now * flash_hz) % total_phases`) uses THIS state's own `self._now`
+(the same injected wall-clock every other continuous animation in this
+class already uses -- `_beat_zero_ts`'s anchor, `_row_fade_until`'s
+timestamps) rather than v1's `time.monotonic()` -- both are arbitrary
+absolute wall-clock references only ever used for a MODULO phase
+calculation, so the epoch difference is immaterial; a disclosed adaptation
+for consistency with this class's own single-clock-domain convention, not
+a v1 mismatch. The `_FLASH_HZ=16.0` base rate and the count-based
+multiplier table (`0.90`/`1.30`/`1.70` for 2/3/4+ simultaneous notes) are
+byte-for-byte v1's own tuned constants. **Not needed here**: v1's own
+"deduplicate same note press" step (`seen_keys` keyed by `(orig_start,
+ch)`) exists because v1's pixel-space drawing could register the SAME
+logical note press more than once in `overlap_drawn`; v2's `notes[]` has
+exactly ONE entry per `_Span` already (this module's own storage
+substrate), so there is no duplicate-press artifact to de-duplicate.
+
+**The separate solid "Bars" timeline strip** (§9c: one pixel-ROW of solid
+GREEN_MID/GREEN_DIM ticks, distinct from the dotted guides Task 3 ports)
+needs NO engine-side change at all -- it reuses this module's existing
+`grid.bar_xs`/`grid.beat_xs` data verbatim (a renderer-only addition, see
+`clients/fb/app.py`'s own module comment for where it lands).
 """
 from __future__ import annotations
 
@@ -395,6 +454,75 @@ _PROJECTION_MODES = ("wallclock", "tempo")
 # bpm is ~5333 instants) so no realistic bpm/zoom/span combination is ever
 # clipped -- this only bites a malformed/adversarial clock_tick pair.
 _GRID_MAX_INSTANTS = 8192
+
+# -- active-row tint + fade tunables (Phase 8 Task 4, module docstring's own
+# "Active-row tint + 1s fade-out" section) -- v1's exact
+# `_ROLL_ACTIVE_ROW_FADE_S` (`compositor_renderer.py:85`).
+_ROLL_ROW_FADE_S = 1.0
+
+# -- overlap-flash tunables (Phase 8 Task 4, module docstring's own
+# "Overlap flash" section) -- v1's exact `_FLASH_HZ` (`compositor_renderer.py:940`)
+# and count-based speed multipliers (`compositor_renderer.py`'s inline
+# comment: "slowest: 70%, 2-note: 90%, 3-note: 130%, 4+-note: 170%").
+_FLASH_HZ = 16.0
+_FLASH_MULT_2 = 0.90
+_FLASH_MULT_3 = 1.30
+_FLASH_MULT_4_PLUS = 1.70
+_FLASH_MULT_DEFAULT = 0.70   # v1's own "<2 concurrently active" branch --
+                             # effectively unreachable, flash only starts at 2
+
+
+def _flash_mult(n: int) -> float:
+    """v1's count-based overlap-flash speed multiplier (module docstring's
+    "Overlap flash" section) -- `n` is the number of simultaneously-active
+    notes at the sweep position being evaluated."""
+    if n >= 4:
+        return _FLASH_MULT_4_PLUS
+    if n == 3:
+        return _FLASH_MULT_3
+    if n == 2:
+        return _FLASH_MULT_2
+    return _FLASH_MULT_DEFAULT   # unreachable in practice, see module docstring
+
+
+def _overlap_regions_for_row(notes_on_row: list[dict], now: float) -> list[dict]:
+    """v1's exact overlap-flash sweep-line (module docstring's "Overlap
+    flash" section), ported from PIXEL space to FRACTION space: `notes_on_
+    row` is a list of `{"x0", "x1", "ch", "vel"}` dicts already sharing the
+    same pitch row (the caller groups by `y` first). Returns one region per
+    sub-interval where >=2 notes' `[x0, x1)` ranges overlap: `{"x0", "x1",
+    "ch", "vel"}` naming the note whose color is "on" this instant, or
+    `{"x0", "x1", "ch": None, "vel": None}` for the "blink to BG" phase
+    (`phase_idx == n`, v1's `total_phases = n + 1`). Fewer than 2 notes on
+    the row can never overlap -- returns `[]` immediately, matching v1's
+    own `if len(intervals) < 2: continue` guard."""
+    if len(notes_on_row) < 2:
+        return []
+    events: list[tuple[float, int, int]] = []
+    for i, note in enumerate(notes_on_row):
+        events.append((note["x0"], 1, i))   # start
+        events.append((note["x1"], 0, i))   # end
+    events.sort()
+    active: set[int] = set()
+    prev_x: float | None = None
+    regions: list[dict] = []
+    for x, etype, idx in events:
+        if prev_x is not None and len(active) >= 2 and x > prev_x:
+            active_sorted = sorted(active)
+            n = len(active_sorted)
+            flash_hz = _FLASH_HZ * _flash_mult(n)
+            phase_idx = int(now * flash_hz) % (n + 1)
+            if phase_idx < n:
+                note = notes_on_row[active_sorted[phase_idx]]
+                regions.append({"x0": prev_x, "x1": x, "ch": note["ch"], "vel": note["vel"]})
+            else:
+                regions.append({"x0": prev_x, "x1": x, "ch": None, "vel": None})
+        if etype == 1:
+            active.add(idx)
+        else:
+            active.discard(idx)
+        prev_x = x
+    return regions
 
 
 @dataclass
@@ -483,6 +611,14 @@ class PianorollState:
         # needing its own cache-busting code -- see `_pitch_guide_ys()`.
         self._pitch_guide_cache_key: tuple[int, int] | None = None
         self._pitch_guide_cache: list[dict] | None = None
+        # Active-row tint + fade (Phase 8 Task 4, module docstring's own
+        # section) -- pitch -> the real timestamp its tint should fade back
+        # to background by, refreshed every `tick(now)` for every pitch
+        # currently visible in the window (`_refresh_row_fade()`), mirroring
+        # v1's own `self._roll_row_fade_until` dict (owned by the RENDERER
+        # in v1, owned by this engine-side state here -- see module
+        # docstring for why).
+        self._row_fade_until: dict[int, float] = {}
 
     # -- event handling ------------------------------------------------------
 
@@ -592,12 +728,28 @@ class PianorollState:
     def tick(self, now: float) -> bool:
         self._now = float(now)
         self._prune()
+        self._refresh_row_fade()
         return bool(self._active) or bool(self._closed)
 
     def _prune(self) -> None:
         cutoff = self._now - HISTORY_RETENTION_S
         while self._closed and self._closed[0].release_ts < cutoff:
             self._closed.popleft()
+
+    def _refresh_row_fade(self) -> None:
+        """Active-row tint + fade (module docstring's own section): refresh
+        `_row_fade_until` for every pitch CURRENTLY visible in the window
+        (mirrors v1's own per-frame `fade_until = now_mono + _ROLL_ACTIVE_
+        ROW_FADE_S` refresh), and drop any entry that has both expired AND
+        is no longer visible (an unbounded dict would otherwise grow by one
+        entry per distinct pitch ever touched across a long session)."""
+        visible = {int(s.pitch) for s, _end_ts in self._visible_spans()}
+        for pitch in visible:
+            self._row_fade_until[pitch] = self._now + _ROLL_ROW_FADE_S
+        expired = [p for p, until in self._row_fade_until.items()
+                   if p not in visible and until <= self._now]
+        for p in expired:
+            del self._row_fade_until[p]
 
     # -- live controls (engine/core.py's pianoroll.* actions call these) -----
 
@@ -752,9 +904,16 @@ class PianorollState:
         yield from self._closed
         yield from self._active.values()
 
-    def view_model(self) -> dict:
+    def _visible_spans(self):
+        """Yield `(span, end_ts)` for every span "currently visible in the
+        window" -- channel filter, pitch-range filter, and window-membership
+        (not yet scrolled entirely past the left edge). This is v1's own
+        `highlight_pitches` condition (module docstring's "Active-row tint
+        + 1s fade-out" section) AND the exact filter `view_model()`'s
+        `notes[]` is already built from -- factored out once so
+        `_refresh_row_fade()` (tick-time) and `view_model()` (read-time)
+        can never drift from each other's idea of "visible."""
         span = self._span()
-        notes = []
         for s in self._iter_spans():
             if s.ch not in self._visible_channels:
                 continue
@@ -763,6 +922,51 @@ class PianorollState:
             end_ts = s.release_ts if s.release_ts is not None else self._now
             if span > 0 and self._dist(end_ts) > span:
                 continue   # scrolled entirely past the window's left edge
+            yield s, end_ts
+
+    def _row_tint(self, visible_pitches: set[int]) -> list[dict]:
+        """Active-row tint + fade VM data (module docstring's own section):
+        one `{"y", "intensity"}` per pitch still tinted -- `intensity=1.0`
+        while `pitch` is in `visible_pitches` (freshly refreshed by
+        `_refresh_row_fade()` at the last `tick()`), else the linear
+        fade-out fraction `(fade_until - now) / _ROLL_ROW_FADE_S`, dropped
+        entirely once that reaches 0 (no need to draw a fully-decayed row)."""
+        entries = []
+        for pitch, until in self._row_fade_until.items():
+            if pitch < self._pitch_lo or pitch > self._pitch_hi:
+                continue   # panned out of the visible pitch range entirely
+            if pitch in visible_pitches:
+                intensity = 1.0
+            else:
+                remain = until - self._now
+                if remain <= 0.0:
+                    continue
+                intensity = max(0.0, min(1.0, remain / _ROLL_ROW_FADE_S))
+            entries.append({"y": self._y(pitch), "intensity": round(intensity, 4)})
+        return entries
+
+    def _overlap_flash(self, notes: list[dict]) -> list[dict]:
+        """Overlap-flash VM data (module docstring's own section): groups
+        `notes` (already-built VM note dicts) by `y` -- float-exact, the
+        same "no epsilon needed" convention `pages/pianoroll.py`'s own grid/
+        label-invert matching already established, since two notes on the
+        SAME pitch always produce the IDENTICAL `_y(pitch)` value -- and
+        runs `_overlap_regions_for_row` per group."""
+        by_y: dict[float, list[dict]] = {}
+        for note in notes:
+            by_y.setdefault(note["y"], []).append(note)
+        regions = []
+        for y, notes_on_row in by_y.items():
+            for region in _overlap_regions_for_row(notes_on_row, self._now):
+                regions.append({"y": y, **region})
+        return regions
+
+    def view_model(self) -> dict:
+        span = self._span()
+        notes = []
+        visible_pitches: set[int] = set()
+        for s, end_ts in self._visible_spans():
+            visible_pitches.add(int(s.pitch))
             notes.append({
                 "ch": s.ch,
                 "y": self._y(s.pitch),
@@ -778,6 +982,8 @@ class PianorollState:
             "window": self._window(),
             "range": {"lo": self._pitch_lo, "hi": self._pitch_hi},
             "grid": self._grid(),
+            "row_tint": self._row_tint(visible_pitches),
+            "overlap_flash": self._overlap_flash(notes),
         }
 
 

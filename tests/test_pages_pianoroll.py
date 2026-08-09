@@ -14,10 +14,13 @@ import pytest
 
 from midicrt.engine.core import MidiEvent
 from midicrt.pages.pianoroll import (
+    _ROLL_ROW_FADE_S,
     ZOOM_MAX,
     ZOOM_MIN,
     PianorollPage,
     PianorollState,
+    _flash_mult,
+    _overlap_regions_for_row,
     _parse_channel_spec,
 )
 
@@ -714,3 +717,185 @@ def test_grid_pitch_guide_ys_cache_invalidates_on_range_change():
     third = s.view_model()["grid"]["pitch_guide_ys"]
     assert third is not second
     assert third == first
+
+
+# -- active-row tint + 1s fade-out (Phase 8 Task 4, docs/visual-audit.md §9c) -
+#
+# v1's `highlight_pitches`: "any span with visible note data in the current
+# window," which is EXACTLY the filter `notes[]` is already built from --
+# see pages/pianoroll.py's own "Active-row tint + 1s fade-out" docstring
+# section.
+
+def test_row_tint_intensity_is_full_while_note_is_visible():
+    s = PianorollState(now=0.0, span_s=8.0)
+    s.handle(note_on(0, 60, vel=100, ts=0.0))
+    s.tick(0.5)
+    tint = s.view_model()["row_tint"]
+    assert len(tint) == 1
+    assert tint[0]["y"] == pytest.approx(s._y(60))
+    assert tint[0]["intensity"] == pytest.approx(1.0)
+
+
+def test_row_tint_absent_for_a_pitch_never_touched():
+    s = PianorollState(now=0.0, span_s=8.0)
+    s.tick(1.0)
+    assert s.view_model()["row_tint"] == []
+
+
+def test_row_tint_fades_linearly_after_note_scrolls_off_the_window():
+    # span_s=8.0 -- a note onset at ts=0.0 released at ts=0.1 scrolls fully
+    # off-window once dist(release_ts) > span, i.e. once now > 8.1. At that
+    # instant `_row_fade_until` was last refreshed to (the tick just BEFORE
+    # it left the window) + _ROLL_ROW_FADE_S -- drive it precisely via two
+    # ticks straddling that boundary.
+    s = PianorollState(now=0.0, span_s=8.0)
+    s.handle(note_on(0, 60, vel=100, ts=0.0))
+    s.handle(note_off(0, 60, ts=0.1))
+    s.tick(8.0)   # still (barely) visible: dist(0.1) = 7.9 <= 8.0
+    fade_until = s._row_fade_until[60]
+    assert fade_until == pytest.approx(8.0 + _ROLL_ROW_FADE_S)
+    s.tick(8.0 + _ROLL_ROW_FADE_S / 2)   # halfway through the fade window
+    tint = {t["y"]: t["intensity"] for t in s.view_model()["row_tint"]}
+    assert tint[s._y(60)] == pytest.approx(0.5, abs=0.01)
+    s.tick(8.0 + _ROLL_ROW_FADE_S + 1.0)   # well past the fade window
+    assert s._y(60) not in {t["y"] for t in s.view_model()["row_tint"]}
+    assert 60 not in s._row_fade_until   # expired entry is actually dropped
+
+
+def test_row_tint_refreshes_continuously_while_note_stays_visible():
+    # A note that never leaves the window (span_s=8.0, note only 1s old)
+    # must NOT start fading just because 1 real second has passed since
+    # its onset -- _refresh_row_fade() re-arms fade_until every tick while
+    # still visible.
+    s = PianorollState(now=0.0, span_s=8.0)
+    s.handle(note_on(0, 60, vel=100, ts=0.0))
+    s.tick(0.5)
+    s.tick(1.0)   # 1.0s after onset -- would be MID-FADE if not re-armed
+    tint = {t["y"]: t["intensity"] for t in s.view_model()["row_tint"]}
+    assert tint[s._y(60)] == pytest.approx(1.0)
+
+
+# -- overlap flash (Phase 8 Task 4, docs/visual-audit.md §9c) ----------------
+#
+# Pure phase-math tests against `_flash_mult`/`_overlap_regions_for_row`
+# first (full control over `now`), then a PianorollState-level integration
+# test proving the real class actually wires two overlapping notes into
+# `overlap_flash` grouped by `y`.
+
+def test_flash_mult_matches_v1_count_based_speed_table():
+    assert _flash_mult(1) == pytest.approx(0.70)   # unreachable in practice, still correct
+    assert _flash_mult(2) == pytest.approx(0.90)
+    assert _flash_mult(3) == pytest.approx(1.30)
+    assert _flash_mult(4) == pytest.approx(1.70)
+    assert _flash_mult(10) == pytest.approx(1.70)   # 4+ all share the same tier
+
+
+def test_overlap_regions_empty_for_fewer_than_two_notes():
+    assert _overlap_regions_for_row([], now=0.0) == []
+    assert _overlap_regions_for_row([{"x0": 0.0, "x1": 1.0, "ch": 1, "vel": 1.0}], now=0.0) == []
+
+
+def test_overlap_regions_empty_when_notes_do_not_overlap():
+    notes = [{"x0": 0.0, "x1": 0.3, "ch": 1, "vel": 1.0},
+             {"x0": 0.5, "x1": 0.8, "ch": 2, "vel": 1.0}]
+    assert _overlap_regions_for_row(notes, now=0.0) == []
+
+
+def test_overlap_regions_emits_one_region_for_two_overlapping_notes():
+    notes = [{"x0": 0.75, "x1": 1.0, "ch": 1, "vel": 1.0},
+             {"x0": 0.875, "x1": 1.0, "ch": 2, "vel": 0.5}]
+    # n=2 -> total_phases=3, flash_hz = 16.0*0.90 = 14.4. Pick `now` so
+    # int(now*flash_hz) % 3 == 0 -> phase_idx 0 -> the FIRST active note
+    # (active_sorted = [0, 1], sorted by ORIGINAL LIST INDEX) shows.
+    now = 0.0   # int(0*14.4) % 3 == 0
+    regions = _overlap_regions_for_row(notes, now=now)
+    assert len(regions) == 1
+    assert regions[0]["x0"] == pytest.approx(0.875)
+    assert regions[0]["x1"] == pytest.approx(1.0)
+    assert regions[0]["ch"] == 1
+    assert regions[0]["vel"] == pytest.approx(1.0)
+
+
+def test_overlap_regions_cycles_through_phases_including_blink_to_bg():
+    notes = [{"x0": 0.0, "x1": 1.0, "ch": 1, "vel": 1.0},
+             {"x0": 0.0, "x1": 1.0, "ch": 2, "vel": 0.5}]
+    flash_hz = 16.0 * _flash_mult(2)   # 14.4, total_phases=3
+    period = 1.0 / flash_hz
+    # phase 0 -> note ch=1 (active_sorted[0])
+    r0 = _overlap_regions_for_row(notes, now=0.0 * period)
+    assert r0[0]["ch"] == 1
+    # phase 1 -> note ch=2 (active_sorted[1])
+    r1 = _overlap_regions_for_row(notes, now=1.0 * period)
+    assert r1[0]["ch"] == 2
+    # phase 2 (== n) -> blink to BG, ch/vel both None
+    r2 = _overlap_regions_for_row(notes, now=2.0 * period)
+    assert r2[0]["ch"] is None
+    assert r2[0]["vel"] is None
+    # phase 3 wraps back to 0
+    r3 = _overlap_regions_for_row(notes, now=3.0 * period)
+    assert r3[0]["ch"] == 1
+
+
+def test_overlap_regions_three_way_overlap_uses_four_phases():
+    notes = [{"x0": 0.0, "x1": 1.0, "ch": 1, "vel": 1.0},
+             {"x0": 0.0, "x1": 1.0, "ch": 2, "vel": 1.0},
+             {"x0": 0.0, "x1": 1.0, "ch": 3, "vel": 1.0}]
+    flash_hz = 16.0 * _flash_mult(3)   # n=3 -> total_phases=4
+    period = 1.0 / flash_hz
+    chs = [_overlap_regions_for_row(notes, now=k * period)[0]["ch"] for k in range(4)]
+    assert chs == [1, 2, 3, None]
+
+
+def test_pianoroll_state_wires_two_overlapping_notes_on_same_pitch_into_overlap_flash():
+    # ch1 held from ts=0.0, ch2 held from ts=1.0 -- BOTH still active at
+    # now=2.0, both on pitch 60 -- their projected [x0,x1] windows overlap
+    # ([0.75,1.0] and [0.875,1.0] at span_s=8.0), matching the pure-function
+    # scenario above but exercised through the real class end-to-end.
+    s = PianorollState(now=0.0, span_s=8.0, pitch_lo=60, pitch_hi=60)
+    s.handle(note_on(0, 60, vel=100, ts=0.0))
+    s.handle(note_on(1, 60, vel=80, ts=1.0))
+    s.tick(2.0)
+    vm = s.view_model()
+    notes_by_ch = {n["ch"]: n for n in vm["notes"]}
+    assert notes_by_ch[1]["x0"] == pytest.approx(0.75)
+    assert notes_by_ch[2]["x0"] == pytest.approx(0.875)
+    assert notes_by_ch[1]["x1"] == pytest.approx(1.0)
+    assert notes_by_ch[2]["x1"] == pytest.approx(1.0)
+    overlap = vm["overlap_flash"]
+    assert len(overlap) == 1
+    assert overlap[0]["y"] == pytest.approx(s._y(60))
+    assert overlap[0]["x0"] == pytest.approx(0.875)
+    assert overlap[0]["x1"] == pytest.approx(1.0)
+    assert overlap[0]["ch"] in (None, 1, 2)   # exact phase depends on wall-clock `now`
+
+
+def test_pianoroll_state_overlap_flash_empty_for_non_overlapping_notes():
+    s = PianorollState(now=0.0, span_s=8.0, pitch_lo=60, pitch_hi=60)
+    s.handle(note_on(0, 60, vel=100, ts=0.0))
+    s.handle(note_off(0, 60, ts=1.0))
+    s.handle(note_on(1, 60, vel=80, ts=5.0))
+    s.tick(5.5)
+    assert s.view_model()["overlap_flash"] == []
+
+
+def test_pianoroll_state_overlap_flash_empty_for_a_single_note():
+    s = PianorollState(now=0.0, span_s=8.0)
+    s.handle(note_on(0, 60, vel=100, ts=0.0))
+    s.tick(1.0)
+    assert s.view_model()["overlap_flash"] == []
+
+
+def test_pianoroll_state_overlap_flash_groups_by_pitch_row_not_globally():
+    # Two overlapping notes on pitch 60 and two SEPARATE overlapping notes
+    # on pitch 64 -- must produce independent overlap regions per row, not
+    # cross-contaminate.
+    s = PianorollState(now=0.0, span_s=8.0, pitch_lo=60, pitch_hi=64)
+    s.handle(note_on(0, 60, vel=100, ts=0.0))
+    s.handle(note_on(1, 60, vel=80, ts=1.0))
+    s.handle(note_on(2, 64, vel=100, ts=0.0))
+    s.handle(note_on(3, 64, vel=80, ts=1.0))
+    s.tick(2.0)
+    overlap = s.view_model()["overlap_flash"]
+    ys = {r["y"] for r in overlap}
+    assert ys == {s._y(60), s._y(64)}
+    assert len(overlap) == 2
