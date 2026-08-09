@@ -1,5 +1,13 @@
 # v1 Visual-Feature Audit
 
+**The "2026-08-08 decisions doc" cited throughout this file** lives at
+`~/projects/pivisualizer/docs/gui-phase-decisions-2026-08-08.md` on
+**motherbase** (not on this Pi, and not in this repo) — the user's
+point-by-point ruling on the gap-page findings (MONOCHROME MANDATE, "all
+animations are valuable," renderer-first, etc.). Reviewers working from
+the Pi checkout alone won't find it locally; this pointer is here because
+more than one review pass has looked for it.
+
 Phase 8 Task 1. Pure code-reading exercise (comments included) over v1
 (`~/codex/midicrt` on the Pi) to extract every visual/animation/shading/
 burn-in feature, cross-checked against v2's actual renderers
@@ -515,7 +523,7 @@ engine-side `analyzers/img2txtviz.py` — nothing is left in an unresolved
 |---|---|---|
 | **PRESENT** | 32 | Help text (as data-equivalent)†, CC Monitor, CC Dashboard bar+age, Event Log, Program Changes, pianoroll TUI velocity ramp, pianoroll projection-mode toggle (action exists, unbound), Audio Spectrum bars, Tuner meter+readout, Chord+Key (all 4 field groups), Voice Monitor counts, Config (narrowed-by-design, itself a disclosed PRESENT), Notes chord/scale-conf/key/harmonic-rhythm/motif lines (5 sub-rows), Notes tension bar, sysex command dispatch, screensaver (improved), pagecycle mechanism (present but wrong semantics — see DIFFERENT), psf font renderer port, img2txtviz energy/spark/splash transients (confirmed ported verbatim), **pianoroll fb dotted pitch-row grid + C-row brightness** (Phase 8 Task 3), **pianoroll fb dotted beat/bar vertical guides** (Phase 8 Task 3, amended to cover beats too — v1 only dots bars in the roll body), **pianoroll fb per-pitch note-name label column incl. its dynamic active-pitch invert** (Phase 8 Task 3), **header page-title scrolling marquee** (Phase 8 Task 4, fb only — v1's own primary anti-burn-in device), **pianoroll fb solid "Bars" timeline strip** (Phase 8 Task 4, no engine change needed — reuses Task 3's grid data), **pianoroll fb active-row tint + 1s fade-out** (Phase 8 Task 4), **pianoroll fb overlap-flash** (Phase 8 Task 4, n+1 phases incl. blink-to-BG) |
 | **DIFFERENT** | 14 | Notes chord/scale reverse-spotlight → lost (moot on real CRT either way, §0.3); Notes inside/outside → reshaped+lost reverse (same §0.3 caveat); Help page → live-data replacement; beatflash → confirmed 5-state ramp instead of binary (not 4-state as an earlier pass here said; re-verified Phase 8 Task 4, no code change warranted); timeclock TIMER blink → moot on real CRT either way; pagecycle → wrong semantics (idle-gated vs interval-while-playing), explicitly slated for redo; transport metronome dot → dropped (beatflash-only now); pianoroll channel color → rainbow hue cycle instead of monochrome brightness (**the** monochrome-mandate item); img2txtviz wave-field → confirmed disclosed simplification (3-term field vs v1's ~8-term; drifting ring center/shimmer/gamma-control/trail-decay all absent); PixelRenderer per-channel ANSI color → dormant, not the deployment path; **autoconnect-log independent scroll** (Phase 8 Task 4 — mechanism/window-sizing formula ported and unit-tested, but no v2 autoconnect-log data source exists to feed it, disclosed dormant) |
-| **MISSING** | 19 | Notes per-channel note-NAME list (not just counts); Notes inline CC badge (moot on real CRT even in v1, §0.3); pianoroll fb note-bar outline (static visual-clarity device, not an animation — out of this task's animation/burn-in scope by the audit's own categorization); pianoroll channel-visibility filter keys; pianoroll pitch-window scroll keys; pianoroll style-toggle key; Send Notes keymap (all bound-nothing); pianoroll_exp session-memory browser (whole subsystem, Phase 5); Stuck Heatmap page; TimeSig Exp page; loopprogress scheduler/sysex diagnostic text; zstucknotes PANIC_ON_CRIT + HOLD_AFTER linger (both now slated to build per decisions doc); Audio Spectrum's 23 retuning keys (corrected from 20); pianoroll_exp CC-lane rows; img2txtviz audio-reactivity (explicitly skipped per decision); notes badge / mini-roll-spectrum-piano panel (§ below, deferred — build-priority #6, lower urgency than this task's animation/burn-in items, not named in Task 4's own scope list) |
+| **MISSING** | 19 | Notes per-channel note-NAME list (not just counts); Notes inline CC badge (moot on real CRT even in v1, §0.3); pianoroll fb note-bar outline (static visual-clarity device, not an animation — out of this task's animation/burn-in scope by the audit's own categorization); pianoroll channel-visibility filter keys; pianoroll pitch-window scroll keys; pianoroll style-toggle key; Send Notes keymap (all bound-nothing); pianoroll_exp session-memory browser (whole subsystem, Phase 5); Stuck Heatmap page; TimeSig Exp page; loopprogress scheduler/sysex diagnostic text; zstucknotes PANIC_ON_CRIT + HOLD_AFTER linger (both now slated to build per decisions doc); Audio Spectrum's 23 retuning keys (corrected from 20); pianoroll_exp CC-lane rows; img2txtviz audio-reactivity (explicitly skipped per decision); notes badge / mini-roll-spectrum-piano panel (§ below — build-priority #6, **assigned to Phase 9 (instruments & tools)** as a ranked animation item, not dropped — not named in Task 4's own scope list) |
 | **N/A** (chrome/plumbing, no port needed) | 3 | Transport page (folded into chrome by design), row-2 blank spacer, legacy_contract_bridge shim |
 
 *(† "Help text" counted PRESENT because it satisfies the same user need
@@ -536,7 +544,17 @@ label, all inside a bordered box, refreshed at `_BADGE_UPDATE_HZ=24`.
 This is a real, distinctive, always-present-on-the-home-page animated
 chrome element with **zero v2 equivalent** in either client (confirmed:
 no "badge"/"jungle" hits anywhere in `fb/app.py`/`tui.py`). Counted in
-the MISSING total above.
+the MISSING total above. **Ownership**: not user-deferred and not moot
+(unlike the img2txtviz wave-field richness or the Notes-page reverse-video
+rows) — a real, live, animated burn-in-relevant chrome element with no
+assigned home. Per the same disclosed-ownership precedent Phase 8 Task 3
+set for the "Bars" timeline strip (rather than leaving a real gap
+ambiguous about who picks it up): **assigned to Phase 9 (instruments &
+tools) as a ranked animation item** — the 2026-08-08 decisions doc's
+"ALL of v1's animations are valuable" ruling means this gets built, just
+not inside Phase 8 Task 4's scope (build-priority #6 in this doc's own
+ranking, lower urgency than the primary pianoroll/marquee items, but not
+dropped).
 
 ### Build-priority ranking (most visually load-bearing MISSING/DIFFERENT items, judgment call)
 
@@ -582,7 +600,10 @@ the MISSING total above.
    distinctiveness (it's the one place v1 shows 3 different data views
    at once, animated, on the app's default/home page) but lower urgency
    than the pianoroll items since it's a secondary decorative element, not
-   the primary content of any page.
+   the primary content of any page. **Assigned to Phase 9 (instruments &
+   tools)** as a ranked animation item (Phase 8 Task 4 review fix) — not
+   user-deferred, not moot on the real CRT, just not in this phase's scope;
+   the "ALL of v1's animations are valuable" ruling means it gets built.
 7. **zstucknotes PANIC_ON_CRIT + HOLD_AFTER** — already decided to build,
    feature work more than visual work (the CRIT reverse-video emphasis
    itself is moot on real CRT per §0.2, so this is about behavior/config,

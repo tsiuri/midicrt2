@@ -139,13 +139,32 @@ def test_every_literal_rgb_tuple_or_list_in_fb_and_chrome_is_a_green_shade():
 # silently going unguarded.
 _FONT = load_font()
 
+# Phase 8 Task 4 review fix (Minor #2): fbr.PIANOROLL_VM alone has neither
+# "row_tint" nor "overlap_flash" populated (both default to `[]` via
+# render_pianoroll_frame's own `.get(key, [])` back-compat), so the
+# pianoroll case below was exercising `_draw_pianoroll_row_tint`/
+# `_draw_pianoroll_overlap_flash` only in their early-return branches —
+# the output-level pixel layer never actually painted a tinted row or a
+# flash region, only construction/by-reasoning ("lum()/_roll_note_color
+# are the only color sources, both already green") covered those two
+# paths. This variant adds one of each, reusing the same guide/note
+# geometry `tests/test_fb_render.py`'s own row-tint/overlap-flash tests
+# already probe (guide row 1 for the tint; note[1]'s row for the flash),
+# so BOTH new draw functions actually run their real fill/rect calls here.
+_PIANOROLL_VM_WITH_TINT_AND_FLASH = {
+    **fbr.PIANOROLL_VM,
+    "row_tint": [{"y": fbr.PIANOROLL_GRID["pitch_guide_ys"][1]["y"], "intensity": 0.6}],
+    "overlap_flash": [{"y": fbr.PIANOROLL_NOTES[1]["y"], "x0": 0.45, "x1": 0.55,
+                        "ch": 5, "vel": 0.9}],
+}
+
 _PAGE_CASES: dict[str, tuple[tuple[int, int], object]] = {
     "eventlog": (fbr.GOLDEN_SURFACE_SIZE, lambda s: app.render_frame(fbr.VM, s)),
     "voices": (fbr.VOICES_SURFACE_SIZE, lambda s: app.render_voices_frame(fbr.VOICES_VM, s)),
     "harmony": (fbr.HARMONY_SURFACE_SIZE, lambda s: app.render_harmony_frame(fbr.HARMONY_VM, s)),
     "tuner": (fbr.TUNER_SURFACE_SIZE, lambda s: app.render_tuner_frame(fbr.TUNER_LOCKED_VM, s)),
     "pianoroll": (fbr.PIANOROLL_SURFACE_SIZE,
-                  lambda s: app.render_pianoroll_frame(fbr.PIANOROLL_VM, s)),
+                  lambda s: app.render_pianoroll_frame(_PIANOROLL_VM_WITH_TINT_AND_FLASH, s)),
     "spectrum": (fbr.SPECTRUM_SURFACE_SIZE, lambda s: app.render_spectrum_frame(fbr.SPECTRUM_VM, s)),
     "screensaver": ((64, 64), lambda s: app.render_screensaver_frame({"title": "SCREENSAVER"}, s)),
     "img2txtviz": (fbr.IMG2TXTVIZ_SURFACE_SIZE,
