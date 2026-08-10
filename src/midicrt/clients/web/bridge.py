@@ -100,9 +100,80 @@ had the identical latent exposure). Repeated SAME-named events still
 correctly coalesce to the latest; only different names stop colliding.
 `_UNKEYED` remains as the defensive fallback for a message that is
 neither a snapshot, an alert, nor a named event.
+
+Engine-restart reconnect (Phase 9 Task 4, user ruling: "option B")
+--------------------------------------------------------------------------
+Through Phase 6-8, an EOF on the engine socket (`midicrtd` restarting)
+permanently killed this bridge's usefulness: `_pump_loop` read the `None`
+sentinel once, offered it to every sink (which made `app.py::_handle_ws`
+close that browser's websocket), and returned -- nothing ever reconnected
+`self.client`. A browser reconnecting afterward got a completely
+normal-looking `hello_message()` built from `self.engine_hello` (captured
+once at the ORIGINAL `start()` and never cleared) plus a replay of
+whatever stale snapshots were still sitting in `self._latest` -- an
+honest-looking lie, then permanent silence (`docs/phase6-web.md` §7,
+pre-fix, documented this in full; that writeup is deleted as part of this
+fix, not just superseded).
+
+**Option B (user ruling, binding): browsers KEEP their websockets across
+an engine outage.** `_pump_loop` no longer offers the EOF sentinel to
+sinks on an ordinary engine disconnect -- only a genuine `stop()` does
+that now (`_on_shutdown`, the bridge itself going away, e.g. `midicrt-web`
+process exit -- see `stop()`'s own docstring). An engine-side EOF instead
+runs `_reconnect_loop()` **on the same pump thread** (blocking there is
+fine -- it is a dedicated daemon thread, never the event loop): clear the
+stale `engine_hello`/`_latest` immediately (`_on_disconnected`, scheduled
+onto the loop via the usual `call_soon_threadsafe` bridge) so any NEW
+websocket connecting mid-outage gets an honest empty hello instead of a
+misleadingly normal one, then retry `connect()` + subscribe + `start_
+reader()` against a **brand-new** `EngineClient` (reusing the dead one is
+a trap: `start_reader()` is a no-op once `_reader_thread` is non-None, and
+the old reader thread can never be restarted) with bounded, jittered,
+doubling backoff (`DEFAULT_RECONNECT_BASE_DELAY`/`_MAX_DELAY`, deliberately
+mirroring `page.html`'s OWN browser-side reconnect backoff shape --
+500ms first retry, doubling, capped at 10s -- so the two reconnect loops
+this one feature now has, browser<->midicrt-web and bridge<->midicrtd,
+read as one consistent posture, not two arbitrarily different ones), kept
+running **indefinitely** (the daemon may be down for minutes -- a
+`systemctl restart midicrtd` or a real crash-and-supervisor-restart cycle,
+not a sub-second blip) until it succeeds or `stop()` sets `self.
+_stopping` (checked before every attempt AND used to short-circuit an
+in-progress backoff sleep via `threading.Event.wait`'s own timeout-or-set
+return value, so a bridge shutdown mid-outage doesn't leave this thread
+sleeping for up to 10 more seconds first).
+
+Once reconnected, `_on_reconnected` (loop thread) re-derives the CURRENT
+page fresh via `current_page_topic()` against the NEW connection rather
+than assuming the pre-outage topic still matches -- `midicrtd` restarting
+is a fresh process; nothing guarantees its default current page is the
+same one browsers were looking at before, and subscribing to a topic that
+is no longer the engine's live "current" page would just freeze that
+topic's snapshot forever (exactly the tui/fb clients' own reasoning for
+always tracking current-page-via-`switch_topic`, never a client-remembered
+page name). A `page_changed`-shaped event is synthesized here too, but
+ONLY if the page actually differs, so `page.html`'s nav-highlight state
+(`currentPage`, driven by `hello`/`page_changed` frames, not by snapshot
+content) stays honest across a restart that lands on a different default
+page -- the fresh snapshot itself would render the right BODY regardless
+(every `PAGE_RENDERERS` entry fully replaces `#page-body`'s innerHTML off
+the snapshot's OWN `topic`, never merges into stale DOM -- verified by
+reading `page.html`'s renderers, not assumed; this is the "drop-and-
+replace protocol" the brief asked to double check), but the top nav
+button would otherwise still highlight the pre-outage page.
+
+A `bridge_status` event (`{"kind": "event", "name": "bridge_status",
+"data": {"status": "reconnecting" | "connected"}}`) is fanned out on both
+transitions -- wired into the ONE indicator `page.html` already had
+(`#conn`, previously driven only by the browser's own websocket open/
+close) rather than inventing a second one; see that file's `handleMessage`
+for the two-line addition this required. `hello_message()` also grew a
+`"status"` field so a websocket that connects (or reconnects) while the
+bridge itself is mid-outage sees this honestly from its very first frame,
+not just from a live event it might have connected too late to catch.
 """
 import asyncio
 import queue
+import random
 import threading
 from collections import deque
 
@@ -120,6 +191,20 @@ from midicrt.clients.base import (
 # makes a higher rate here pure waste (the queue can hold exactly one
 # pending frame regardless).
 DEFAULT_SUBSCRIBE_RATE = 5.0
+
+# Reconnect backoff (module docstring's "Engine-restart reconnect" section):
+# deliberately the SAME shape page.html's own browser-side reconnect uses
+# (500ms first retry, doubling, capped at 10s) -- one consistent reconnect
+# posture across both legs of this feature (bridge<->midicrtd here,
+# browser<->midicrt-web there), not two arbitrarily different ones.
+DEFAULT_RECONNECT_BASE_DELAY = 0.5   # seconds -- first retry, before jitter
+DEFAULT_RECONNECT_MAX_DELAY = 10.0   # seconds -- backoff ceiling, before jitter
+DEFAULT_RECONNECT_JITTER = 0.2       # +/-20% spread applied to each computed delay
+
+# `bridge_status` event values fanned out to sinks (and mirrored in
+# `hello_message()`'s own "status" field) -- see module docstring.
+BRIDGE_STATUS_CONNECTED = "connected"
+BRIDGE_STATUS_RECONNECTING = "reconnecting"
 
 
 # Shared coalescing key for every message that isn't a per-topic snapshot,
@@ -306,46 +391,97 @@ class WebSink:
 
 
 class Bridge:
-    """One EngineClient connection, fanned out to N WebSinks."""
+    """One EngineClient connection, fanned out to N WebSinks. Survives an
+    engine restart -- see the module docstring's "Engine-restart reconnect"
+    section for the full design (Option B: sinks/websockets stay open
+    across the outage; only the `EngineClient` leg reconnects)."""
 
-    def __init__(self, client: EngineClient, subscribe_rate: float = DEFAULT_SUBSCRIBE_RATE):
+    def __init__(self, client: EngineClient, subscribe_rate: float = DEFAULT_SUBSCRIBE_RATE,
+                 reconnect_base_delay: float = DEFAULT_RECONNECT_BASE_DELAY,
+                 reconnect_max_delay: float = DEFAULT_RECONNECT_MAX_DELAY,
+                 reconnect_jitter: float = DEFAULT_RECONNECT_JITTER):
         self.client = client
+        # Captured once here (not re-read off `self.client` later) so every
+        # reconnect attempt can build a BRAND NEW `EngineClient` against the
+        # same path -- reusing a dead client is a trap, see the module
+        # docstring's "Engine-restart reconnect" section.
+        self._socket_path = client.socket_path
         self.subscribe_rate = subscribe_rate
+        self._reconnect_base_delay = reconnect_base_delay
+        self._reconnect_max_delay = reconnect_max_delay
+        self._reconnect_jitter = reconnect_jitter
         self.loop: asyncio.AbstractEventLoop | None = None
         self.engine_hello: dict = {}
         self.state = {"page": None, "topic": None, "status_vm": dict(chrome.DEFAULT_STATUS_VM)}
+        # "connected" | "reconnecting" -- see BRIDGE_STATUS_* / hello_
+        # message()'s own "status" field / the module docstring.
+        self.status: str = BRIDGE_STATUS_CONNECTED
         self._latest: dict[str, dict] = {}
         self._sinks: set[WebSink] = set()
         self._inbox: queue.Queue | None = None
         self._pump_thread: threading.Thread | None = None
+        # Set by stop() -- checked by _reconnect_loop() before every retry
+        # attempt AND used to short-circuit an in-progress backoff sleep
+        # (Event.wait's own timeout-or-set-early return value), so a real
+        # shutdown mid-outage doesn't leave the pump thread sleeping for up
+        # to _reconnect_max_delay more seconds first.
+        self._stopping = threading.Event()
 
     # -- lifecycle -----------------------------------------------------------
-    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+    def _connect_client(self, client: EngineClient) -> tuple[dict, str, str, queue.Queue]:
         """Blocking: connect, hello, ask which page is CURRENT (not an
         assumed "eventlog" -- see `current_page_topic`'s docstring),
-        subscribe to it plus `overlay.status`, THEN start the reader thread
-        and this bridge's own pump thread. Same ordering as
-        `run_tui`/`fb.app.run`: subscribe() happens on the pre-reader sync
-        path deliberately (see `EngineClient.request`'s docstring). Must be
-        called off the event loop thread (e.g. via `asyncio.to_thread`)
-        since every step here blocks on socket I/O; `loop` is the loop
-        `_on_message`/`_on_eof` get scheduled onto, captured explicitly
-        because `asyncio.get_running_loop()` would raise off the loop thread.
+        subscribe to it plus `overlay.status`, then start THAT client's
+        reader thread. Shared by `start()` (the first connect) and
+        `_reconnect_loop()` (every retry after an engine-side EOF) so the
+        two paths can never drift apart -- every step here blocks on
+        socket I/O, so both callers must run this off the event loop
+        thread. Returns `(hello, page, topic, inbox)`; raises `ClientError`
+        on any failure (connect refused, hello rejected, or the connection
+        dying again mid-handshake) -- callers decide what "failed to
+        (re)connect" means for their own context."""
+        hello = client.connect()
+        page, topic = current_page_topic(client)
+        client.subscribe([topic, chrome.OVERLAY_STATUS_TOPIC], max_rate=self.subscribe_rate)
+        inbox = client.start_reader()
+        return hello, page, topic, inbox
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Blocking: `_connect_client()` against this bridge's original
+        `self.client`, THEN start this bridge's own pump thread. Same
+        ordering as `run_tui`/`fb.app.run`: subscribe() happens on the
+        pre-reader sync path deliberately (see `EngineClient.request`'s
+        docstring). Must be called off the event loop thread (e.g. via
+        `asyncio.to_thread`) since every step here blocks on socket I/O;
+        `loop` is the loop `_on_message`/`_on_disconnected`/`_on_
+        reconnected`/`_on_shutdown` get scheduled onto, captured explicitly
+        because `asyncio.get_running_loop()` would raise off the loop
+        thread.
         """
         self.loop = loop
-        self.engine_hello = self.client.connect()
-        page, topic = current_page_topic(self.client)
-        self.client.subscribe([topic, chrome.OVERLAY_STATUS_TOPIC], max_rate=self.subscribe_rate)
+        self.engine_hello, page, topic, self._inbox = self._connect_client(self.client)
         self.state["page"], self.state["topic"] = page, topic
-        self._inbox = self.client.start_reader()
+        self.status = BRIDGE_STATUS_CONNECTED
         self._pump_thread = threading.Thread(target=self._pump_loop, daemon=True)
         self._pump_thread.start()
 
     def stop(self) -> None:
-        """Blocking: closes the single shared engine connection. Call via
+        """Blocking: tells the pump thread to give up (checked before every
+        reconnect attempt and used to cut short an in-progress backoff
+        sleep) and closes the currently-active engine connection. Call via
         `asyncio.to_thread` from async code (e.g. an aiohttp `on_cleanup`
-        hook) for the same reason `start()` does."""
+        hook) for the same reason `start()` does.
+
+        Unlike an ordinary engine-side EOF (Option B: reconnect, sinks stay
+        open), a deliberate `stop()` means THIS bridge is going away for
+        good -- schedules `_on_shutdown` (offers every sink the `None` EOF
+        sentinel, same as the pre-reconnect behavior) so already-open
+        websockets close cleanly instead of just going dark when the
+        process exits."""
+        self._stopping.set()
         self.client.close()
+        if self.loop is not None and not self.loop.is_closed():
+            self.loop.call_soon_threadsafe(self._on_shutdown)
 
     def _pump_loop(self) -> None:
         while True:
@@ -365,12 +501,100 @@ class Bridge:
             if self.loop.is_closed():
                 return
             if msg is None:
-                self.loop.call_soon_threadsafe(self._on_eof)
-                return
+                # Engine-side EOF -- try to reconnect (Option B) rather than
+                # treating this pump thread's life as over. `_reconnect_loop`
+                # itself checks `_stopping` first thing and returns False
+                # immediately for a genuine `stop()`-driven EOF, so this
+                # branch degrades to the old "read one EOF and exit" shape
+                # exactly when the bridge is actually shutting down.
+                if not self._reconnect_loop():
+                    return
+                continue  # resume reading from the NEW self._inbox
             self.loop.call_soon_threadsafe(self._on_message, msg)
 
+    def _reconnect_loop(self) -> bool:
+        """Blocking (runs ON the pump thread -- see module docstring for
+        why that's fine here): retry connecting to the engine with bounded,
+        jittered, doubling backoff until it succeeds or `stop()` is called.
+        Returns True once reconnected (`self.client`/`self._inbox` updated
+        in place, ready for `_pump_loop` to resume reading), False if
+        `stop()` won the race (the pump thread should exit, matching the
+        pre-reconnect EOF-then-exit shape).
+        """
+        if self._stopping.is_set() or self.loop.is_closed():
+            return False
+        self.loop.call_soon_threadsafe(self._on_disconnected)
+        delay = self._reconnect_base_delay
+        while True:
+            if self._stopping.is_set():
+                return False
+            try:
+                # A brand-new EngineClient every attempt -- reusing the dead
+                # one is a trap, see the module docstring.
+                client = EngineClient(self._socket_path)
+                hello, page, topic, inbox = self._connect_client(client)
+            except ClientError:
+                if self._stopping.wait(self._jittered_delay(delay)):
+                    return False  # stop() fired during the backoff sleep
+                delay = min(delay * 2.0, self._reconnect_max_delay)
+                continue
+            self.client = client
+            self._inbox = inbox
+            if not self.loop.is_closed():
+                self.loop.call_soon_threadsafe(self._on_reconnected, hello, page, topic)
+            return True
+
+    def _jittered_delay(self, delay: float) -> float:
+        """+/- `self._reconnect_jitter` fraction of `delay`, never negative
+        -- avoids a fleet of bridges (or, more realistically here, repeated
+        retry attempts) all waking on the exact same cadence. A jitter
+        fraction of 0 (or less) disables jitter entirely, for tests that
+        want deterministic delays."""
+        if self._reconnect_jitter <= 0:
+            return delay
+        spread = delay * self._reconnect_jitter
+        return max(0.0, delay + random.uniform(-spread, spread))
+
     # -- loop-thread handlers (everything below here runs ON the loop) ------
-    def _on_eof(self) -> None:
+    def _on_disconnected(self) -> None:
+        """Engine-side EOF detected -- clear stale state so a NEW websocket
+        connecting mid-outage gets an honest empty hello (not a normal-
+        looking one built from a captured-at-`start()`-time `engine_hello`
+        that's now a lie), and tell already-open sinks we're reconnecting.
+        Deliberately does NOT offer sinks the `None` EOF sentinel -- Option
+        B (user ruling) keeps existing browser websockets open across the
+        outage; they see a data gap, then fresh snapshots resume on the
+        SAME socket once the engine comes back (see `_on_reconnected`)."""
+        self.status = BRIDGE_STATUS_RECONNECTING
+        self.engine_hello = {}
+        self._latest = {}
+        self._fan_out({"kind": "event", "name": "bridge_status",
+                       "data": {"status": BRIDGE_STATUS_RECONNECTING}})
+
+    def _on_reconnected(self, hello: dict, page: str, topic: str) -> None:
+        """Engine connection restored. Re-derives current page/topic FRESH
+        (via `_reconnect_loop`'s own `_connect_client` call) rather than
+        assuming the pre-outage topic still matches -- see the module
+        docstring for why. Emits `page_changed` only if the page actually
+        changed, so `page.html`'s nav highlight stays honest without
+        spuriously re-flagging a page that didn't move."""
+        self.engine_hello = hello
+        old_page = self.state["page"]
+        self.state["page"], self.state["topic"] = page, topic
+        self.status = BRIDGE_STATUS_CONNECTED
+        self._fan_out({"kind": "event", "name": "bridge_status",
+                       "data": {"status": BRIDGE_STATUS_CONNECTED}})
+        if page != old_page:
+            self._fan_out({"kind": "event", "name": "page_changed", "data": {"page": page}})
+
+    def _on_shutdown(self) -> None:
+        """This bridge is going away for good (a real `stop()`, not a
+        transient reconnect) -- unlike `_on_disconnected` (Option B: sinks
+        stay open across an engine-restart gap), tell every open sink to
+        close, same EOF sentinel `app.py::_handle_ws` already knows how to
+        act on (this is the pre-reconnect behavior, preserved for this one
+        case: the process itself is exiting, so there is no "fresh
+        snapshot" to eventually resume with)."""
         for sink in list(self._sinks):
             sink.offer(None)
 
@@ -453,6 +677,10 @@ class Bridge:
             "engine_version": self.engine_hello.get("engine_version"),
             "page": self.state["page"],
             "topic": self.state["topic"],
+            # Phase 9 Task 4: so a websocket that connects (or is already
+            # open) during a mid-outage reconnect sees this honestly from
+            # its very first frame -- see module docstring.
+            "status": self.status,
         }
 
     # -- request/response proxies (blocking; call via asyncio.to_thread) -----

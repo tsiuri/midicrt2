@@ -208,27 +208,23 @@ Screensaver correctly suppresses **all three** chrome rows (fixed in Task
   daemon with a subscribed client watching `describe`'s `current_page` and
   the destination page's own topic) to confirm the fix wave introduced no
   regression on that path, not just re-trust the pre-fix-wave result.
-- **`midicrt-web` silent-freeze on a `midicrtd` restart** (Phase 6 Task 3
-  doc review, live-reproduced; full writeup `docs/phase6-web.md` §7,
-  corrected there too): the browser side is not the problem — `page.html`
-  already has a real `close`/`error`-driven reconnect with exponential
-  backoff (~500ms first retry), and it fires correctly on a `midicrtd`
-  restart. The freeze is entirely **bridge-side**: `Bridge._pump_loop()`
-  exits after its one EOF, nothing ever reconnects the underlying
-  `EngineClient` to `midicrtd`, and the browser's honest reconnect lands
-  on a bridge that replays a normal-looking `hello` plus stale cached
-  snapshots (`engine_hello`/`_latest`, neither ever cleared) and then goes
-  silent forever — socket open, no error either way. `Restart=on-failure`
-  cannot help since the process itself never exits. **Before cutover,
-  decide whether this stays a documented limitation or gets fixed** — a
-  bridge-side reconnect-to-`midicrtd` loop (or, at minimum, clearing
-  `Bridge._latest`/`engine_hello` on disconnect so a post-restart
-  connection gets an honest immediate error instead of a misleadingly
-  normal `hello`) is the real fix. **Cheapest ops-level mitigation, no
-  code change**: add `PartOf=midicrtd.service` to `midicrt-web.service` so
-  systemd bounces the web client on every daemon restart instead of
-  leaving it running stale — not applied here, a cutover decision on the
-  unit file itself, just the cheapest item on this menu.
+- **`midicrt-web` silent-freeze on a `midicrtd` restart — RESOLVED,
+  2026-08-10 (Phase 9 Task 4).** Was: a live-reproduced bug (Phase 6 Task 3
+  doc review) where `Bridge._pump_loop()` exited after its one EOF and
+  never reconnected the underlying `EngineClient` to `midicrtd`, so a
+  browser's own honest websocket reconnect landed on a bridge replaying a
+  normal-looking `hello` plus permanently stale cached snapshots. Fixed,
+  not just documented differently: `Bridge` now retries the engine
+  connection with bounded, jittered, doubling backoff (indefinitely, until
+  it succeeds or the bridge itself shuts down) while already-open browser
+  websockets stay open the whole time (user ruling, "option B") — a data
+  gap, then a fresh snapshot flow resumes on the SAME socket once
+  `midicrtd` comes back, verified via a real scratch-`midicrtd` restart
+  mid-websocket-session. This item is no longer a cutover decision to make
+  — nothing left to decide before Phase 7. Full design + live smoke
+  transcript: `docs/phase6-web.md` §10 (the freeze writeup this item used
+  to cross-reference was deleted from that doc's §7, not just corrected
+  again) and `task-4-report.md` (this phase's SDD folder).
 
 ---
 

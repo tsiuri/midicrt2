@@ -5,12 +5,13 @@ fixture-reuse discipline as test_web_bridge.py and tests/test_client_base.py.
 """
 import asyncio
 
+import pytest
 from aiohttp.test_utils import TestClient, TestServer
 from test_server import make
 
 from midicrt.clients import chrome
 from midicrt.clients.base import EngineClient
-from midicrt.clients.web.app import create_app
+from midicrt.clients.web.app import _build_arg_parser, create_app
 from midicrt.clients.web.bridge import Bridge
 
 
@@ -306,3 +307,50 @@ async def test_index_page_has_no_local_status_format_copy(tmp_path):
 
     await client.close()
     eng.stop(); await task; await srv.close()
+
+
+async def test_index_page_wires_up_bridge_status_indicator(tmp_path):
+    """Phase 9 Task 4 (bridge reconnect): the served page must handle the
+    `bridge_status` event (bridge.py fans it out on both an engine-side
+    disconnect and reconnect) and read `hello`'s own `"status"` field --
+    static content pin, same discipline as `test_index_page_renderer_
+    registry_covers_full_default_roster`'s `"<name>":` grep, since there's
+    no browser/JS test harness in this Python-only suite to execute it."""
+    eng, srv, task, client = await _client_for(tmp_path)
+    resp = await client.get("/")
+    body = await resp.text()
+    assert "bridge_status" in body
+    assert "msg.status" in body  # hello's own status field, not just the live event
+
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
+# -- Phase 9 Task 4: control-on-by-default CLI posture -----------------------
+#
+# User ruling: "web control ON, no auth". `main()`'s CLI flag inverted from
+# an opt-IN `--allow-control` to an opt-OUT `--read-only` -- see app.py's
+# module docstring / `main()`'s own comment for why the flag NAME had to
+# invert along with its default. `_build_arg_parser()` is split out from
+# `main()` specifically so this is testable without invoking
+# `web.run_app()` (which blocks forever).
+
+def test_read_only_flag_defaults_to_control_on():
+    args = _build_arg_parser().parse_args([])
+    assert args.read_only is False  # i.e. `main()`'s allow_control = not args.read_only -> True
+
+
+def test_read_only_flag_disables_control_when_passed():
+    args = _build_arg_parser().parse_args(["--read-only"])
+    assert args.read_only is True
+
+
+def test_arg_parser_still_has_no_allow_control_flag():
+    """Pin the inversion, not just the new flag's existence: the OLD
+    `--allow-control` flag name must be gone (a stray `store_true` left in
+    place alongside the new flag would silently do nothing -- neither
+    erroring nor actually gating anything -- which is worse than not
+    having it at all)."""
+    parser = _build_arg_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["--allow-control"])

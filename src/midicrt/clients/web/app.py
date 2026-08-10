@@ -1,11 +1,26 @@
 """midicrt-web -- aiohttp HTTP/WS wiring around Bridge (see bridge.py for
 the EngineClient<->asyncio fan-out design this module is just plumbing
-for). Observer parity first, control surface second (spec's web goals):
-with `--allow-control` off (the default), `/api/action` refuses with 403
-and the served page hides its control UI via the `ALLOW_CONTROL` flag
-baked into the page at request time -- both gates exist independently so a
-browser that ignores the hidden UI (hand-crafted fetch/curl) still can't
-drive the engine.
+for).
+
+Control posture (Phase 9 Task 4, user ruling: "web control ON, no auth" --
+flips the Phase 6 parity-era default): control is ON by default. `main()`'s
+CLI flag inverted from an opt-IN `--allow-control` to an opt-OUT
+`--read-only` -- see `main()`'s own comment for why keeping the OLD flag
+name with its default merely flipped would have been confusing (a flag
+literally named "allow control" that's already true by default can't be
+used to turn control back OFF). The internal `allow_control: bool` plumbing
+itself (`create_app`, `_ALLOW_CONTROL_KEY`, `_handle_action`'s 403 gate,
+the served page's `ALLOW_CONTROL` JS constant) is unchanged -- only the CLI
+boundary in `main()` translates the new flag to that same internal value,
+so `create_app(bridge, allow_control=...)`'s own contract (and every test
+against it) needed no changes.
+
+With control ON, `/api/action` accepts requests and the served page shows
+its control UI via the `ALLOW_CONTROL` flag baked into the page at request
+time; with `--read-only` passed, `/api/action` refuses with 403 and the
+control UI stays hidden -- both gates exist independently so a browser
+that ignores the hidden UI (hand-crafted fetch/curl) still can't drive the
+engine when `--read-only` is set.
 """
 import argparse
 import asyncio
@@ -136,21 +151,39 @@ def create_app(bridge: Bridge, allow_control: bool) -> web.Application:
     return app
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Split out from `main()` so the flag semantics (defaults, help text)
+    are testable without invoking `web.run_app` (which blocks forever)."""
     ap = argparse.ArgumentParser(prog="midicrt-web")
     ap.add_argument("--socket", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
-    ap.add_argument("--allow-control", action="store_true")
-    args = ap.parse_args()
+    # Phase 9 Task 4 (user ruling: "web control ON, no auth" -- control is
+    # now the DEFAULT posture, inverting Phase 6's parity-era opt-IN
+    # `--allow-control` flag). An opt-OUT `--read-only` flag replaces it
+    # rather than just flipping `--allow-control`'s own default: a flag
+    # literally named "allow control" that already defaults to true offers
+    # no way to turn control back OFF (`store_true` can only ever push a
+    # flag's value AWAY from its default, never restore it) -- the flag
+    # NAME has to invert along with its default, or the CLI becomes
+    # unusable for the one case (an operator who explicitly wants
+    # read-only) that most needs a flag at all.
+    ap.add_argument("--read-only", action="store_true",
+                    help="disable the control surface (default: control is ON)")
+    return ap
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(name)s %(levelname)s %(message)s")
+    args = _build_arg_parser().parse_args()
+    allow_control = not args.read_only
 
     socket_path = args.socket or config_mod.load(None).socket_path
     client = EngineClient(socket_path)
     bridge = Bridge(client)
-    app = create_app(bridge, allow_control=args.allow_control)
+    app = create_app(bridge, allow_control=allow_control)
     _LOG.info("midicrt-web up on http://%s:%d (allow_control=%s, socket=%s)",
-              args.host, args.port, args.allow_control, socket_path)
+              args.host, args.port, allow_control, socket_path)
     web.run_app(app, host=args.host, port=args.port, print=None)
 
 

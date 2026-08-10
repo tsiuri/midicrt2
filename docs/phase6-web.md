@@ -6,11 +6,26 @@ merge + protocol-drift reconciliation (Task 1), the full 14-page observer
 parity + capture/alert surfaces (Task 2), and this task's own service unit +
 deployment decision + live smoke.
 
+**Revised 2026-08-10 (Phase 9 Task 4)**: two of this doc's own Phase 6
+decisions were superseded, not just carried forward. (1) **Control is now
+ON by default** (user ruling: "web control ON, no auth") — §2's flag table,
+§3, and §4's unit file are rewritten below; §8's live-smoke evidence is
+LEFT AS WRITTEN, an accurate historical record of Task 3's own test run
+against the flags that existed *then* (`--allow-control`), not a claim
+about today's default. (2) **The `midicrtd`-restart silent-freeze bug §7
+used to document is fixed** — `bridge.py` now reconnects automatically
+(bounded, jittered backoff) instead of freezing; the old troubleshooting
+entry is deleted (not just corrected again) and replaced by §10's design
+writeup. Full details, decision rationale, test list, and this task's own
+live smoke transcript: `task-4-report.md` (this phase's SDD folder).
+
 Companion reading: `docs/phase6-notes.md` (the phase's carry-over design
 notes this whole phase implements — item 7 is the deployment decision this
-doc documents), `docs/phase3-parity.md` (the Phase 7 cutover checklist this
-doc's "revisit at cutover" note points at), `docs/phase5-capture.md` (the
-capture/replay subsystem `midicrt-web`'s REC surface is a thin UI over).
+doc documents, now superseded per the note above), `docs/phase3-parity.md`
+(the Phase 7 cutover checklist this doc's "revisit at cutover" note points
+at — its own §7 carried the freeze bug forward as a cutover checklist item;
+also updated, see that doc), `docs/phase5-capture.md` (the capture/replay
+subsystem `midicrt-web`'s REC surface is a thin UI over).
 
 ---
 
@@ -34,7 +49,7 @@ the same `midicrtd` engine daemon over its Unix socket
 ## 2. Usage
 
 ```
-midicrt-web [--socket PATH] [--host HOST] [--port PORT] [--allow-control]
+midicrt-web [--socket PATH] [--host HOST] [--port PORT] [--read-only]
 ```
 
 | Flag | Default | Meaning |
@@ -42,7 +57,7 @@ midicrt-web [--socket PATH] [--host HOST] [--port PORT] [--allow-control]
 | `--socket` | `config.toml`'s `socket_path` (`/run/midicrt/ctl.sock`) | Engine daemon socket to connect to. |
 | `--host` | `127.0.0.1` | HTTP/WS bind address. The installed unit (§4) overrides this to `0.0.0.0`. |
 | `--port` | `8766` (`DEFAULT_PORT` in `app.py`) | v1's own web observer already owns `8765` (`midicrt-web-observer.service`) — v2 picked the next port over specifically so both can run side by side during the parity period; see §4/§6. |
-| `--allow-control` | off | Gates `/api/action` server-side AND hides the control UI client-side (both gates exist independently — see §3). |
+| `--read-only` | off (control is ON) | **Phase 9 Task 4** (user ruling: "web control ON, no auth"): gates `/api/action` server-side AND hides the control UI client-side when passed (both gates exist independently — see §3). Replaces the Phase 6-era opt-IN `--allow-control` flag — inverted, not just re-defaulted: a flag named "allow control" that already defaulted to true would offer no way to turn control back off. |
 
 Routes: `GET /` (the page, with `ALLOW_CONTROL` baked in server-side at
 request time), `GET /ws` (the live feed — hello frame, then snapshot/event
@@ -50,61 +65,63 @@ frames), `GET /api/describe` (proxies the engine's `describe` request:
 roster, actions+arg schemas, keymap), `POST /api/action` (control surface,
 gated).
 
-## 3. Security posture: `0.0.0.0:8766`, READ-ONLY by default
+## 3. Security posture: `0.0.0.0:8766`, control ON by default
 
-**Decision (phase6-notes.md item 7):** the installed unit
+**Current decision (Phase 9 Task 4, user ruling: "web control ON, no
+auth" — supersedes the Phase 6 decision below):** the installed unit
 (`packaging/midicrt-web.service`) binds `0.0.0.0:8766` — LAN-reachable, no
-auth of any kind — but does **not** pass `--allow-control`, so `/api/action`
-unconditionally 403s and the served page's control UI (REC toggle, generic
-action form, prev/next buttons) never renders.
+auth of any kind — and does **not** pass `--read-only`, so `/api/action`
+accepts requests and the served page's control UI (REC toggle, generic
+action form, prev/next buttons, per-page nav buttons) renders normally.
+Anyone who can reach the port can drive the engine (change pages,
+start/stop capture, fire arbitrary actions) — there is still no login, no
+token, no per-action permission model (see §6). Pass `--read-only` (an
+`ExecStart=` edit, not a runtime toggle — same high-friction-opt-out shape
+the old opt-in had, just inverted) to revert a given deployment to
+observer-only.
 
-**Why LAN-open rather than loopback:** this mirrors v1's own web observer
-(`midicrt-web-observer.service`, also `0.0.0.0`, also read-only, already
-live on this exact Pi today at `:8765` — see the repo README's Access
-section) — v2 ships the *same* trust posture the box already runs, not a
-stricter or looser one invented just for this new unit. The Pi is a
-single-purpose LAN appliance with no firewall; nothing about the web surface
-changes that fact either way, so there is no meaningful security *gain*
-from binding loopback-only here while every other network-facing thing on
-the box (VNC on `:5900`, the v1 observer) is already open the same way. What
-the read-only default DOES buy: even on this open network, nobody browsing
-to the dashboard can drive the engine (change pages, start/stop capture,
-fire arbitrary actions) — only observe it.
+**Why LAN-open rather than loopback:** unchanged reasoning from Phase 6 —
+this mirrors v1's own web observer (`midicrt-web-observer.service`, also
+`0.0.0.0`, already live on this exact Pi today at `:8765` — see the repo
+README's Access section) and the Pi's own general posture: a single-purpose
+LAN appliance with no firewall, where VNC (`:5900`) and now this dashboard
+are already unauthenticated-but-LAN-scoped. Binding loopback-only here
+would not close any real gap while everything else on the box stays open
+the same way.
 
-**Why control is opt-in-off, not removed:** the control surface (built in
-Task 2) is real and tested, gated behind a flag that operationally requires
-someone to explicitly restart the unit with `--allow-control` (an
-`ExecStart=` edit, not a runtime toggle) — a deliberate, high-friction
-opt-in rather than a runtime setting a browser could ever flip. `--allow-
-control` has no accompanying auth of its own (no login, no token) — turning
-it on means "anyone who can reach this port can drive the engine," which is
-why it stays off by default.
+**Why the Phase 6 read-only default flipped:** that decision was explicitly
+scoped to the *parity* period (v2's web surface running alongside v1's
+`:8765` observer as an additional, optional dashboard nobody depended on
+yet) and flagged its own criteria for revisiting: "whether `--allow-
+control` becomes the norm once this is a trusted operator's only remote
+control path." The user's Phase 9 ruling settles that question directly —
+control on, no auth — rather than waiting for a formal Phase 7 cutover
+milestone; this is a deliberate, explicit choice, not scope creep.
 
-**Double gate, not just a UI hint:** `_handle_action` in `app.py` checks
+**Double gate, not just a UI hint (mechanism unchanged, only the default
+flipped):** `_handle_action` in `app.py` checks
 `request.app[_ALLOW_CONTROL_KEY]` server-side and 403s *before* touching the
-bridge, independent of whatever the served HTML says — a hand-crafted
-`curl -X POST /api/action` against a read-only instance 403s exactly like a
-browser would, confirmed live (§8.4). The page's own `ALLOW_CONTROL` JS
-constant only controls whether the control UI *renders*; it is not itself a
-security boundary, and isn't relied on as one.
+bridge whenever `--read-only` IS passed, independent of whatever the served
+HTML says — a hand-crafted `curl -X POST /api/action` against a
+`--read-only` instance still 403s exactly like a browser would (this
+mechanism itself was verified live at Phase 6 Task 3, §8.4 below — that
+evidence is unchanged, only which flag reaches it is different now). The
+page's own `ALLOW_CONTROL` JS constant only controls whether the control UI
+*renders*; it is not itself a security boundary, and isn't relied on as
+one.
 
-**Revisit at cutover:** this decision is scoped to the *parity* period,
-where v2's web surface runs alongside v1's `:8765` observer as an
-additional, optional dashboard nobody depends on yet. `docs/phase3-parity.md`
-tracks the Phase 7 cutover criteria; once `midicrt-web` is the *only* web
-surface in play (v1's observer retired), the bind/auth posture should be
-re-examined on its own merits rather than inherited from a parity-era
-precedent — e.g. whether `--allow-control` becomes the norm once this is a
-trusted operator's only remote control path, and whether the Pi's
-still-open, still-firewall-less LAN posture (a standing revamp-backlog item
-in the repo README) gets addressed as its own project rather than deferred
-per-service forever.
+**Still no auth of any kind** — this was true under the Phase 6 read-only
+default and remains true now that control is on: `--read-only` is a binary
+control/no-control switch, not a permission system. The Pi's still-open,
+still-firewall-less LAN posture (a standing revamp-backlog item in the repo
+README) is unchanged by either default and remains its own, separate
+project.
 
 ## 4. `packaging/midicrt-web.service`
 
 ```ini
 [Unit]
-Description=midicrt2 web observer (read-only)
+Description=midicrt2 web dashboard (control on, LAN-open, no auth)
 After=midicrtd.service
 Wants=midicrtd.service
 
@@ -118,6 +135,12 @@ Environment=PYTHONUNBUFFERED=1
 [Install]
 WantedBy=multi-user.target
 ```
+
+(Phase 9 Task 4: no flag change needed in `ExecStart=` to get control ON —
+that's `midicrt-web`'s own default now; pass `--read-only` here instead if
+a deployment needs to revert to observer-only. The `Description=` line was
+updated to match; every other line is byte-identical to the Phase 6
+original.)
 
 No `Group=` override (unlike `midicrtd.service`'s `Group=audio`, needed for
 PortAudio, or `midicrt-fb.service`'s `Group=video` +
@@ -135,9 +158,12 @@ reasoning `midicrt-fb.service` already established).
 
 **Installed 2026-08-08, NOT enabled and NOT started** — `systemctl is-
 enabled midicrt-web` reports `disabled`, `is-active` reports `inactive`,
-verified live (§8.1). Phase 7 (cutover) is expected to flip it on per
-`docs/phase3-parity.md`'s own sign-off checklist; nothing in Phase 6 starts
-it automatically.
+verified live (§8.1). **Redeployed 2026-08-10 (Phase 9 Task 4)** for the
+control-on default above (`daemon-reload`'d, still deliberately left
+disabled/not-started — standing rule: the user starts it when wanted, this
+task does not flip that). Phase 7 (cutover) is expected to enable it per
+`docs/phase3-parity.md`'s own sign-off checklist; nothing in Phase 6 or
+Phase 9 starts it automatically.
 
 ## 5. Parity notes (what "observer parity" means here)
 
@@ -195,8 +221,9 @@ it automatically.
   `chrome.REC_MARKER` (`"● REC  "`) — rendered server-side via the exact
   same `chrome.status_text()` function every other client's status row
   calls (Task 1's merge-reconciliation fix: one rendering path, not a
-  second JS copy that can drift). Behind `--allow-control`: a dedicated
-  `#rec-toggle` button (posts `capture.start`/`.stop`) plus a `#last-
+  second JS copy that can drift). Behind the control surface (ON by
+  default since Phase 9 Task 4; hidden if started with `--read-only`): a
+  dedicated `#rec-toggle` button (posts `capture.start`/`.stop`) plus a `#last-
   session` panel, both kept current by `refreshCaptureStatus()` — which
   POSTs the existing `capture.status` action (no new endpoint) rather than
   trusting the `capture_started`/`capture_stopped` event payloads directly
@@ -247,7 +274,7 @@ it automatically.
   `WebSink`'s own drop-and-replace queue can only ever hold one pending
   frame per topic regardless of rate, so a higher push rate here would be
   pure waste, not smoother rendering.
-- **No auth of any kind**, at any control level — see §3. `--allow-control`
+- **No auth of any kind**, at any control level — see §3. `--read-only`
   is a binary control/no-control switch, not a permission system; there is
   no notion of a read-only-but-authenticated user, or of per-action
   permissions.
@@ -262,61 +289,25 @@ it automatically.
 
 ## 7. Troubleshooting
 
-- **`/api/action` 403s even though I meant to allow control**: the unit's
-  `ExecStart=` must include `--allow-control` explicitly — it is not a
-  runtime toggle, and the shipped unit (§4) deliberately omits it.
-  `systemctl cat midicrt-web` to check what's actually configured;
-  `sudo systemctl daemon-reload` after any edit.
+- **`/api/action` 403s even though I expected control to be on**: control
+  is ON by default (Phase 9 Task 4) — a 403 here means the unit's
+  `ExecStart=` has `--read-only` in it. `systemctl cat midicrt-web` to
+  check what's actually configured; `sudo systemctl daemon-reload` after
+  any edit. `--read-only` is not a runtime toggle either way.
 - **Page shows "no renderer for `page.X` yet — raw snapshot below"**: either
   a genuinely new page this build predates (fine — it's still usable, just
   unstyled), or a typo'd/renamed page name in `config.toml`'s `pages` list
   that no longer matches a `PAGE_RENDERERS` key.
-- **A `midicrtd` restart leaves `midicrt-web` SILENTLY frozen — a
-  "connected"-looking dashboard is NOT proof of fresh data (live-
-  reproduced during review)**: **correction to an earlier draft of this
-  doc**, which claimed `page.html` wires up no `onclose`/`onerror` handler
-  at all — false. `page.html` has genuinely had a
-  `ws.addEventListener("close", ...)` handler with exponential-backoff
-  reconnect since the original branch (`backoff` starts at 500ms, doubles,
-  caps at 10s — see the "websocket connection with auto-reconnect" block
-  near the end of the file). On a real `midicrtd` restart the browser DOES
-  notice and DOES reconnect: the server-side close reaches the client,
-  `connEl` flips to "disconnected", and `connect()` opens a fresh websocket
-  roughly 500ms later. The freeze is not a client-detection gap — it is
-  entirely **bridge-side**. `Bridge._pump_loop()` reads the dead
-  `EngineClient`'s `None` EOF sentinel exactly once, calls `_on_eof()`
-  (which offers that sentinel only to sinks registered AT THAT MOMENT),
-  and returns — nothing in `bridge.py` ever reconnects the underlying
-  `EngineClient` to `midicrtd`. The browser's new websocket lands on
-  `app.py`'s `_handle_ws`, which calls `Bridge.add_sink()`, which
-  immediately sends a completely normal-looking `hello_message()` (built
-  from `self.engine_hello`, captured once at the bridge's original
-  `start()` and never cleared) plus a replay of whatever STALE snapshots
-  are still sitting in `self._latest` from before the daemon died — then
-  never sends that sink anything else, ever, because the pump thread that
-  would feed it new messages already exited. So the honest reconnect the
-  client correctly performs lands on a bridge that lies to it: a
-  normal-looking `hello`, honest-looking-but-stale data, then permanent
-  silence, no close frame and no error frame the second time. Net symptom
-  is unchanged: a dashboard reading "connected", showing a page that never
-  changes again. **No layer detects or surfaces this on its own**; the
-  only fix today is a manual `midicrt-web` restart. `Restart=on-failure`
-  cannot help either way, since the aiohttp process itself never exits or
-  errors. **The real fix, when scheduled, is entirely bridge-side** —
-  either give `Bridge` its own reconnect-to-`midicrtd` loop (mirroring
-  what `page.html` already does for the browser leg), or at minimum clear
-  `self._latest`/`self.engine_hello` on EOF so a post-restart connection
-  gets an honest immediate error instead of a misleadingly normal `hello`.
-  **Cheapest ops-level mitigation, no code change**: add
-  `PartOf=midicrtd.service` to `midicrt-web.service` (§4) so systemd
-  bounces the web client on every daemon restart instead of leaving it
-  running stale — not applied here (a cutover decision on the unit file,
-  out of scope for this doc), just listed as the cheapest item on the
-  Phase 7 menu alongside the bridge-side reconnect fix. Not exercised by
-  this task's own live smoke (§8) — found and confirmed live during this
-  doc's review, not during the original smoke run. See
-  `docs/phase3-parity.md` §7 for the carried-forward cutover hardening
-  note.
+- **A `midicrtd` restart used to leave `midicrt-web` silently frozen —
+  fixed, Phase 9 Task 4.** This was previously the single longest entry in
+  this section (a `Bridge._pump_loop()` design gap: an engine-side EOF was
+  read once and never reconnected, so a browser's own honest websocket
+  reconnect landed on a bridge that replayed a normal-looking but
+  permanently stale `hello`). It is deleted here, not just corrected again
+  — the underlying bug is fixed, not merely better-documented. See §10 for
+  the current reconnect design and `task-4-report.md` for the live smoke
+  transcript proving it. If a dashboard ever again looks "connected" but
+  stops updating, that is now a genuine bug report, not this known issue.
 - **Port already in use**: v1's observer owns `:8765`; v2's is `:8766` by
   default (`DEFAULT_PORT`) specifically to avoid the collision — verified
   live, no conflict, both ports independently reachable (§8.1/§8.6).
@@ -414,3 +405,61 @@ scratch socket/config/capture directory were removed; production's
 `tests/test_web_bridge.py` (20 tests) + `tests/test_web_app.py` (13 tests) —
 33 tests total, part of the full suite's 1354/1354 passing at this doc's
 HEAD (`15876a0`). `ruff check src tests`: clean.
+
+**Updated 2026-08-10 (Phase 9 Task 4):** `tests/test_web_bridge.py` (31
+tests, +11: the reconnect loop, backoff shape, `bridge_status`/`hello`
+status field, and the web-action-arms-pagecycle-pause integration test) +
+`tests/test_web_app.py` (17 tests, +4: the `bridge_status` JS content pin
+and the `--read-only` CLI flag semantics) — 48 tests total, part of the
+full suite's 1775/1775 passing at this task's own HEAD. `ruff check src
+tests`: clean. Full test list and design rationale: `task-4-report.md`.
+
+## 10. Engine-restart reconnect (Phase 9 Task 4)
+
+**What used to happen:** see the deleted §7 entry's replacement note above
+— a `midicrtd` restart silently froze `midicrt-web` forever, surviving only
+a manual `midicrt-web` restart.
+
+**What happens now (user ruling: "option B"):** an already-open browser
+websocket is untouched by an engine restart — no close frame, no
+reconnect on the browser's own leg. Only the bridge's OWN `EngineClient`
+connection to `midicrtd` needs to recover, and now does: `Bridge._pump_
+loop` treats an engine-side EOF as "reconnect", not "give up" — it clears
+`engine_hello`/`_latest` immediately (so a websocket that connects mid-
+outage gets an honest empty hello, not a stale-but-normal-looking one),
+fans a `bridge_status: reconnecting` event out to every already-open sink,
+then retries `connect()` against a **brand-new** `EngineClient` (the dead
+one can never restart its own reader thread) with bounded, jittered,
+doubling backoff — 500ms first retry, doubling, capped at 10s, ±20%
+jitter (`bridge.py`'s `DEFAULT_RECONNECT_BASE_DELAY`/`_MAX_DELAY`/
+`_JITTER`), deliberately the SAME shape `page.html`'s own browser-side
+reconnect already used, so the two reconnect loops this feature now has
+read as one consistent posture. Retries run **indefinitely** — the daemon
+may be down for minutes (a real `systemctl restart midicrtd`, not a
+sub-second blip) — until it succeeds or `midicrt-web` itself shuts down.
+
+Once reconnected, the bridge re-derives the CURRENT page **fresh** from the
+newly-connected engine (not the pre-outage topic — `midicrtd` restarting is
+a new process with no guarantee its default current page matches what
+browsers were looking at before) and fans a `bridge_status: connected`
+event plus, if the page actually changed, a synthesized `page_changed`
+event so `page.html`'s nav highlight stays honest. The next real snapshot
+for that topic then reaches already-open sinks completely normally — every
+`PAGE_RENDERERS` entry replaces `#page-body`'s content wholesale off that
+snapshot's own data, never merges into stale DOM, so "drop-and-replace" on
+reconnect needed no client-side fix, only verifying it (done — see
+`page.html`'s renderers).
+
+The ONE case Option B does NOT change: a genuine `midicrt-web` process
+shutdown (`bridge.stop()`, e.g. `systemctl stop midicrt-web`) still closes
+every open sink (the pre-existing EOF-sentinel-to-sinks behavior,
+preserved for this one case via `Bridge._on_shutdown`) — there is no
+"fresh snapshot" to eventually resume with once the process itself is
+gone.
+
+Full design rationale (backoff shape, status surfacing, flag semantics),
+test list, and this task's own live smoke transcript (a scratch `midicrtd`
+restarted mid-websocket-session, showing gap → reconnect → fresh snapshot
+flow resuming on the SAME websocket): `task-4-report.md` (this phase's SDD
+folder). `bridge.py`'s own module docstring ("Engine-restart reconnect"
+section) is the from-the-source-code version of this same design.

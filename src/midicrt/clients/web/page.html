@@ -649,10 +649,28 @@ function renderPage(topic, vm) {
 }
 
 // -- websocket message dispatch --------------------------------------------
+// -- connection indicator (#conn): TWO independent legs feed this ONE
+// element. `ws.addEventListener("close"/"error", ...)` below (browser <->
+// midicrt-web) still sets it directly -- unchanged from before this task.
+// The bridge <-> midicrtd leg (Phase 9 Task 4: the engine daemon itself
+// restarting) is Option B (user ruling): THIS browser's websocket stays
+// open across that outage -- it never sees a close/error frame -- so
+// without this, #conn would keep reading "connected" the whole time even
+// though nothing is actually updating (the exact misleading-dashboard
+// symptom docs/phase6-web.md §7 used to document as a bug). `hello`'s own
+// "status" field (a fresh/reconnecting websocket's first frame) and the
+// live `bridge_status` event (already-open sinks, mid-session) both route
+// through this one function -- reusing the SAME indicator element rather
+// than adding a second one, per the task's own "wire it if cheap" ask.
+function renderConnStatus(status) {
+  connEl.textContent = status;
+  connEl.className = status === "connected" ? "up" : "down";
+}
+
 function handleMessage(msg) {
   if (msg.kind === "hello") {
     currentPage = msg.page;
-    connEl.textContent = "connected"; connEl.className = "up";
+    renderConnStatus(msg.status || "connected");
     if (describeCache) renderPageNav(currentPage, pageRoster(describeCache));
     return;
   }
@@ -675,6 +693,12 @@ function handleMessage(msg) {
   if (msg.name === "page_changed") {
     currentPage = msg.data.page;
     if (describeCache) renderPageNav(currentPage, pageRoster(describeCache));
+  } else if (msg.name === "bridge_status") {
+    // Phase 9 Task 4: the bridge<->midicrtd leg reconnecting/recovering --
+    // see renderConnStatus's own comment. `msg.data` is always present for
+    // this event (bridge.py always attaches {"status": ...}), but guard it
+    // anyway, same defensive style every other handler here already uses.
+    renderConnStatus((msg.data && msg.data.status) || "connected");
   } else if (msg.name === "alert") {
     pushAlert(msg.data || {});
   } else if (msg.name === "learn_armed") {
@@ -776,7 +800,7 @@ function connect() {
     try { handleMessage(JSON.parse(ev.data)); } catch (e) { /* ignore malformed frame */ }
   });
   ws.addEventListener("close", () => {
-    connEl.textContent = "disconnected"; connEl.className = "down";
+    renderConnStatus("disconnected");
     setTimeout(connect, backoff);
     backoff = Math.min(backoff * 2, 10000);
   });

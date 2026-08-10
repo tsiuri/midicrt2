@@ -1,5 +1,5 @@
 [Unit]
-Description=midicrt2 web observer (read-only)
+Description=midicrt2 web dashboard (control on, LAN-open, no auth)
 After=midicrtd.service
 Wants=midicrtd.service
 
@@ -15,17 +15,23 @@ User=billie
 # file plus traversal on /run/midicrt, both already satisfied by matching
 # midicrtd's own User=billie -- no supplementary group needed.
 ExecStart=/home/billie/midicrt2-venv/bin/midicrt-web --host 0.0.0.0 --port 8766
-# Deployment decision (docs/phase6-notes.md item 7, docs/phase6-web.md):
-# bind 0.0.0.0:8766 (LAN-reachable, no auth) but READ-ONLY -- --allow-control
-# is deliberately NOT passed here. This mirrors v1's own web observer
-# (midicrt-web-observer.service, :8765, also 0.0.0.0, also read-only) so v2
-# ships the SAME trust posture the Pi already runs today, not a stricter or
-# looser one invented for this unit alone. The Pi has no firewall and this
-# is a single-purpose LAN appliance; control (page navigation, capture
-# start/stop, bindings) stays reachable only via `midicrt`/`midicrt-fb`/the
-# TUI on the box itself, or a future explicit `--allow-control` opt-in.
-# Revisit at Phase 7 cutover (see docs/phase3-parity.md) once this is the
-# ONLY web surface in play, not a parity add-on running alongside v1's.
+# Deployment decision (Phase 9 Task 4, user ruling: "web control ON, no
+# auth" -- supersedes the Phase 6 parity-era read-only default documented
+# in docs/phase6-notes.md item 7 / docs/phase6-web.md §3): bind
+# 0.0.0.0:8766 (LAN-reachable, no auth) WITH control on -- no flag needed
+# here at all, since control is now midicrt-web's own default (app.py's
+# CLI inverted from an opt-IN `--allow-control` to an opt-OUT
+# `--read-only`; pass `--read-only` here instead if this box's posture
+# ever needs to revert to observer-only). The Pi has no firewall and this
+# is a single-purpose LAN appliance already trusted with unauthenticated
+# control via `midicrt`/`midicrt-fb`/the TUI on the box itself and v1's
+# own long-running :8765 observer -- this unit now matches that same
+# "anyone on the LAN can drive it" posture explicitly, rather than being
+# the one web-reachable surface that couldn't.
+#
+# Installed 2026-08-10, NOT enabled and NOT started (standing rule: the
+# user starts it when wanted) -- `systemctl is-enabled midicrt-web`
+# reports `disabled`, `is-active` reports `inactive`.
 Restart=on-failure
 RestartSec=2
 Environment=PYTHONUNBUFFERED=1
