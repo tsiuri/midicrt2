@@ -3,6 +3,7 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
 import signal
 
 from midicrt import config as config_mod
@@ -10,6 +11,86 @@ from midicrt.engine.core import Engine
 from midicrt.engine.server import ProtocolServer
 
 _LOG = logging.getLogger("midicrtd")
+
+
+class ShutdownWatchdog:
+    """Delivers SIGTERM/SIGINT to an `asyncio.Event` through a PRIVATE
+    self-pipe, deliberately NOT `loop.add_signal_handler` (Phase 9 Task 2b,
+    docs/... task-2b-report.md -- the 2026-08-10 production shutdown-hang
+    incident, `systemctl stop midicrtd` needing SIGKILL after `TimeoutStopSec`
+    twice in one night).
+
+    Root cause (proven by reproduction, see the task report): asyncio's
+    `loop.add_signal_handler` -- the ONLY thing this daemon used to use --
+    makes `signal.set_wakeup_fd()` point at the loop's own internal self-pipe
+    (a `socket.socketpair()`, `loop._csock`), the EXACT SAME fd every
+    `loop.call_soon_threadsafe()` call (from ANY thread) also writes a
+    wakeup byte to -- that's how `MidiInput._enqueue` gets a queued MIDI
+    event from the RtMidi callback thread over to the loop thread. Under a
+    sustained callback-thread flood (an ALSA input-error storm) combined
+    with ANY stretch where the loop thread itself isn't back at
+    `epoll_wait()` (e.g. `Engine.run()`'s own per-tick burst-drain loop
+    processing a large backlog synchronously -- see `core.py`'s
+    `_MAX_BURST_PER_TICK` for the matching other half of this fix), that
+    shared self-pipe's kernel send buffer (212992 bytes on this Pi,
+    measured) can genuinely saturate. Once full, ANY write to it --
+    including the raw OS signal trampoline's own wakeup-byte write for a
+    real SIGTERM -- gets `EWOULDBLOCK` and is SILENTLY DROPPED (CPython
+    prints "Exception ignored when trying to write to the signal wakeup
+    fd" from `asyncio/unix_events.py`'s `_sighandler_noop` and moves on --
+    exactly the incident's own log line). Nothing retries it. Since
+    `stop.set()` was only ever wired to fire via that exact dropped byte
+    being read back out of the self-pipe, the SIGTERM vanishes completely
+    and `run()` never returns -- systemd's `stop-sigterm` state times out
+    and escalates to SIGKILL.
+
+    This class sidesteps the shared pipe entirely: `signal.signal()` (POSIX,
+    raw -- does NOT touch `set_wakeup_fd`) registers a handler that CPython
+    always runs on the main thread at the next bytecode safepoint, no self-
+    pipe write from the OS signal trampoline involved at all. That handler
+    does the self-pipe trick itself, but against a dedicated `os.pipe()`
+    that NOTHING else on this process ever writes to -- a MIDI-flood-driven
+    `call_soon_threadsafe` storm, however large, cannot ever contend for
+    this fd's buffer, so the one wakeup byte this pipe ever needs to carry
+    can never be crowded out."""
+
+    def __init__(self, loop: asyncio.AbstractEventLoop, stop_event: asyncio.Event,
+                sigs: tuple[signal.Signals, ...] = (signal.SIGTERM, signal.SIGINT)) -> None:
+        self._loop = loop
+        self._stop_event = stop_event
+        self._sigs = tuple(sigs)
+        self._read_fd, self._write_fd = os.pipe()
+        os.set_blocking(self._read_fd, False)
+        os.set_blocking(self._write_fd, False)
+        self._prev_handlers: dict[signal.Signals, object] = {}
+        for sig in self._sigs:
+            self._prev_handlers[sig] = signal.signal(sig, self._on_signal)
+        loop.add_reader(self._read_fd, self._on_pipe_readable)
+
+    def _on_signal(self, signum, frame) -> None:
+        # Runs on the main thread at the next bytecode safepoint (CPython's
+        # own guarantee for `signal.signal()`-registered handlers) -- NOT
+        # inside the raw OS signal trampoline, so an ordinary blocking
+        # `os.write` is safe here (the textbook self-pipe trick, just
+        # against a fd nothing else can ever fill). One pending byte is all
+        # `_on_pipe_readable` needs, so an already-full (i.e. one byte
+        # already pending) pipe is a harmless no-op, never a lost signal.
+        try:
+            os.write(self._write_fd, b"\x00")
+        except BlockingIOError:
+            pass
+
+    def _on_pipe_readable(self) -> None:
+        with contextlib.suppress(BlockingIOError):
+            os.read(self._read_fd, 4096)
+        self._stop_event.set()
+
+    def close(self) -> None:
+        self._loop.remove_reader(self._read_fd)
+        for sig, prev in self._prev_handlers.items():
+            signal.signal(sig, prev)
+        os.close(self._read_fd)
+        os.close(self._write_fd)
 
 
 def build(cfg, socket_path: str, use_midi: bool, config_path: str | None = None):
@@ -66,8 +147,12 @@ async def run(cfg, socket_path: str, use_midi: bool, use_audio: bool = True,
     _LOG.info("midicrtd up on %s (midi=%s, audio=%s)", socket_path, bool(midi), audio_active)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop.set)
+    # Phase 9 Task 2b (shutdown-hang fix): NOT `loop.add_signal_handler`
+    # anymore -- see `ShutdownWatchdog`'s own docstring for the full
+    # incident this replaces it for (a saturated, SHARED self-pipe could
+    # silently drop SIGTERM under an ALSA-error-storm-driven
+    # call_soon_threadsafe flood, hanging shutdown until SIGKILL).
+    watchdog = ShutdownWatchdog(loop, stop)
     engine_task = asyncio.create_task(engine.run())
     await stop.wait()
     _LOG.info("shutting down")
@@ -79,6 +164,7 @@ async def run(cfg, socket_path: str, use_midi: bool, use_audio: bool = True,
     with contextlib.suppress(Exception):
         await asyncio.wait_for(engine_task, timeout=2)
     await server.close()
+    watchdog.close()
 
 
 def main() -> None:

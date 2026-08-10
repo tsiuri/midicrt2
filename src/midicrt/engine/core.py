@@ -192,6 +192,32 @@ _ACTIVITY_EVENT_TYPES = {"note_on", "note_off", "control_change"}
 # MIDI output once per toggle.
 _PANIC_COOLDOWN_S = 3.0
 
+# Phase 9 Task 2b (shutdown-hang fix, docs/... task-2b-report.md): caps how
+# many already-queued events `run()`'s own per-tick burst-drain loop
+# (`_drain_queue_burst` below) will process synchronously in one `run()`
+# step. Uncapped, a sufficiently large backlog (a sustained MIDI-input
+# storm can queue events far faster than `ShutdownWatchdog`'s dedicated
+# self-pipe, or anything else, gets a chance to be noticed) turns that
+# `while not self.queue.empty()` loop into an unbounded synchronous
+# stretch on the loop thread -- no `await` anywhere inside it -- during
+# which the loop never calls back into `_run_once()`/`epoll_wait()` at
+# all, so NOTHING registered via `add_reader`/`add_signal_handler`/an
+# `asyncio.Event` waiter gets a chance to run either, however cleanly it
+# was delivered. Bounding the burst guarantees `run()`'s `while
+# self._running:` loop always returns control to the event loop within a
+# bounded number of `_handle()` calls, regardless of how large the queue
+# backlog gets. 500 is generous relative to the measured warm `_handle()`
+# cost (~0.6ms/call, test_engine_perf.py) -- comfortably above every real
+# burst this codebase's own perf tripwires exercise (the continuous-
+# binding CC-burst test drains 128) while still bounding worst-case
+# per-tick synchronous time to a few hundred milliseconds even under a
+# pathological storm. Any remainder simply waits for the very next `run()`
+# iteration -- `_tick_capture_flush`/`_flush_dirty` etc. below still run
+# every tick regardless of backlog size, matching this loop's pre-existing
+# "so a MIDI storm doesn't starve the flush cadence" invariant (see
+# `run()`'s own comment on `_tick_capture_flush` below).
+_MAX_BURST_PER_TICK = 500
+
 # Phase 8 Task 5 (behaviors/pagecycle.py's own "notify_page_action" +
 # "Origin ruling" docstring sections): every action name that moves
 # `current_page` -- `_on_action_dispatched` (below) and the two sysex
@@ -2787,15 +2813,34 @@ class Engine:
                 self._broadcast(snap)
         self._dirty.clear()
 
+    def _drain_queue_burst(self, first: MidiEvent) -> int:
+        """Handles `first` (already popped off `self.queue` by the caller,
+        `run()` below) plus up to `_MAX_BURST_PER_TICK - 1` MORE already-
+        queued events, synchronously -- extracted from `run()`'s own loop
+        body (Phase 9 Task 2b, shutdown-hang fix) so it's directly callable
+        from a synchronous test with no real asyncio `run()` task needed,
+        the same "extracted for testability" precedent `_flush_dirty()`
+        above already set. Bounded by `_MAX_BURST_PER_TICK` -- see that
+        constant's own docstring for why draining the WHOLE queue here,
+        unbounded, can turn into an unbounded synchronous stretch on the
+        loop thread that starves everything else the event loop would
+        otherwise get a chance to service, shutdown included. Returns the
+        number of events actually handled (`run()` itself doesn't need the
+        count; a test asserting "hit the cap, not queue-empty" does)."""
+        self._handle(first)
+        handled = 1
+        while handled < _MAX_BURST_PER_TICK and not self.queue.empty():
+            self._handle(self.queue.get_nowait())
+            handled += 1
+        return handled
+
     async def run(self) -> None:
         self._running = True
         tick = 1.0 / max(self.config.tick_hz, 1.0)
         while self._running:
             try:
                 ev = await asyncio.wait_for(self.queue.get(), timeout=tick)
-                self._handle(ev)
-                while not self.queue.empty():          # coalesce a burst
-                    self._handle(self.queue.get_nowait())
+                self._drain_queue_burst(ev)
             except TimeoutError:
                 pass
             # Phase 4 Task 2 (MIDI bindings): dispatch every intent this
@@ -2820,11 +2865,13 @@ class Engine:
             # maybe_flush`'s own docstring for why this tick-driven cadence
             # (piggybacking on `run()`'s existing per-iteration wall clock,
             # not a dedicated thread/asyncio task) is the deliberate,
-            # disclosed choice here: `run()` already drains a whole queued
-            # burst of events before reaching this point (the `while not
-            # self.queue.empty()` loop above), so a MIDI storm doesn't
-            # starve the flush cadence, and `tick_hz`'s default 30Hz
-            # (~33ms) comfortably services a ~1s cadence without a second
+            # disclosed choice here: `run()` already drains a (now bounded,
+            # `_MAX_BURST_PER_TICK` -- Phase 9 Task 2b) queued burst of
+            # events before reaching this point (`_drain_queue_burst`
+            # above), so a MIDI storm doesn't starve the flush cadence --
+            # EVERY tick still reaches this line regardless of backlog
+            # size -- and `tick_hz`'s default 30Hz (~33ms) comfortably
+            # services a ~1s cadence without a second
             # concurrency domain to reason about. Critical fix
             # (docs/phase5-notes.md fix wave): calls `_tick_capture_flush`
             # (NOT `self._capture.maybe_flush(now)` directly anymore) --

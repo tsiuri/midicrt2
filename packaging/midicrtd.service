@@ -25,6 +25,15 @@ StateDirectory=midicrt
 ExecStart=/home/billie/midicrt2-venv/bin/midicrtd
 Restart=on-failure
 RestartSec=2
+# Phase 9 Task 2b (shutdown-hang fix): belt-and-suspenders ONLY, in
+# addition to the real fix (daemon.ShutdownWatchdog + Engine.
+# _MAX_BURST_PER_TICK, see both docstrings) -- NOT a substitute for it.
+# The real fix bounds shutdown to a few seconds even under a simulated
+# ALSA-error-storm (see task-2b-report.md); this just tightens the
+# systemd-level backstop from the 90s default down to 20s so ANY future
+# regression of the real fix still fails fast under `systemctl stop`
+# instead of silently reverting to a 90s hang-then-SIGKILL.
+TimeoutStopSec=20
 Environment=PYTHONUNBUFFERED=1
 # Phase-3 task 8 (analyzers/spectrum.py): this is a SYSTEM service (not a
 # user session), so it does not inherit billie's login-session environment
