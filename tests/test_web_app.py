@@ -257,7 +257,7 @@ async def _wait_for_page_snapshot(ws, topic, timeout=3.0):
 
 async def test_ws_full_roster_page_cycle_delivers_real_snapshot_for_every_page(tmp_path):
     """Observer parity, full-stack e2e (phase6-notes item 3): drives
-    `page.goto` across the ENTIRE default 14-page roster -- not just
+    `page.goto` across the ENTIRE default 15-page roster -- not just
     eventlog/voices, the pre-merge branch's only real renderers -- and
     proves a real, page-specific snapshot (non-empty `title`, i.e. NOT an
     empty/error-shaped placeholder a fallback renderer would have to
@@ -277,7 +277,7 @@ async def test_ws_full_roster_page_cycle_delivers_real_snapshot_for_every_page(t
     await asyncio.wait_for(ws.receive_json(), timeout=2.0)  # hello
 
     roster = eng.config.pages
-    assert len(roster) == 14  # sanity: this exercises the REAL stock default roster
+    assert len(roster) == 15  # sanity: this exercises the REAL stock default roster
 
     for name in roster:
         resp = await client.post("/api/action", json={"name": "page.goto", "args": {"name": name}})

@@ -1238,6 +1238,48 @@ def test_render_tuner_frame_golden_matches_frozen_fixture():
     assert surf.image.tobytes() == golden.tobytes()
 
 
+# -- tuner page, "no audio input" state (Phase 9 Task 3) ----------------------
+#
+# Third render state alongside idle/locked above -- the graceful-degrade
+# placeholder `AudioCapture.mark_unavailable()` drives when no input device
+# is present, distinct from "audio present, no pitch locked" (TUNER_IDLE_VM,
+# which omits "available" entirely -- `render_tuner_frame` defaults it to
+# True so that older-shaped VM stays on the idle/locked branches unchanged).
+
+GOLDEN_TUNER_NO_AUDIO_FRAME = FIXTURES / "fb_tuner_no_audio_frame_golden.png"
+TUNER_NO_AUDIO_VM = {"title": "TUNER", "note": "", "cents": 0.0, "hz": 0.0,
+                     "confidence": 0.0, "db": -120.0, "has_signal": False,
+                     "available": False, "device": None}
+
+
+def test_render_tuner_frame_no_audio_draws_only_one_row():
+    surf = Surface(*TUNER_SURFACE_SIZE)
+    app.render_tuner_frame(TUNER_NO_AUDIO_VM, surf)
+    px = surf.image.load()
+    font = load_font()
+    header_h = font.height + 2 * app.HEADER_PAD
+    line_h = font.height + app.LINE_GAP
+    assert any(px[x, header_h + 2] == app.NORMAL_FG for x in range(app.LEFT_MARGIN, surf.width))
+    # Second body row (the "Tuning:" meter when locked) stays background --
+    # same single-row contract the idle state already proves above.
+    assert px[app.LEFT_MARGIN, header_h + line_h] == app.BG
+
+
+def test_render_tuner_frame_golden_matches_frozen_fixture_no_audio():
+    assert GOLDEN_TUNER_NO_AUDIO_FRAME.exists(), (
+        "golden fixture missing -- see freeze procedure in task-9-report.md"
+    )
+    surf = Surface(*TUNER_SURFACE_SIZE)
+    app.render_tuner_frame(TUNER_NO_AUDIO_VM, surf)
+    app._draw_secondary(surf, TUNER_ALERTS_VM, TUNER_TIMESIG_VM, load_font())
+    app._draw_status(surf, TUNER_STATUS_VM, load_font())
+    app._draw_beatprogress(surf, DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, load_font())
+
+    golden = Image.open(GOLDEN_TUNER_NO_AUDIO_FRAME).convert("RGB")
+    assert golden.size == TUNER_SURFACE_SIZE
+    assert surf.image.tobytes() == golden.tobytes()
+
+
 # -- pianoroll page (phase-3 task 7) ------------------------------------------
 #
 # Same FIXED synthetic note set as tests/test_tui_render.py's pianoroll

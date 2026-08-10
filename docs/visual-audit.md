@@ -253,7 +253,8 @@ this is the "both v1 pianoroll variants" the brief calls out.
 |---|---|---|---|
 | Tuning meter | Text gauge: fixed-width dashes with `\|` at center and `^` at the cents-offset position (`_meter`) | per audio block when signal present | **PRESENT, reused verbatim** — `analyzers/tuner.py::tuning_meter` ported the exact `_meter` math (both clients call the shared function). |
 | Note/pitch/cents/confidence/level line | Plain text | per audio block | PRESENT. |
-| — | Whole page is **inert pending audio wiring** in v2 (math ported, capture path proven, `on_pitch_sample()` has no caller — `phase3-parity.md` ID 10) — will only ever show "Listening..." until a follow-up wires it. Not a visual gap, a functional one; noted here since it directly affects what's actually visible today. | | |
+| "no audio input" placeholder | Plain text, same wording/placement convention as spectrum's own `available` gate | continuous while no input device is open | **PRESENT (Phase 9 Task 3 addition)** — v2-only third render state (v1's tuner had no such state since it always shared spectrum's already-open capture); fb/tui/web all implement it, goldens frozen for both. |
+| — | **RESOLVED, Phase 9 Task 3**: pitch detection is now live-wired — `pages/tuner.py`'s own independent `AudioCapture` feeds `analyzers/tuner.py::TunerAnalyzer.on_audio_block()` a dependency-free numpy YIN detector (aubio confirmed NOT viable on this Pi — a real C-extension build failure against this venv's numpy, not a missing package; see `analyzers/tuner.py`'s module docstring and task-3-report.md). Joined the default page roster (config.py); degrades gracefully to the "no audio input" row above when no input device is present, same contract as spectrum. | | |
 
 ## 13. Page 11 — Chord+Key (`pages/chordkey.py`)
 

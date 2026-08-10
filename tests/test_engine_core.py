@@ -150,20 +150,21 @@ async def test_clear_action_and_status():
 def test_default_roster_from_config_is_eventlog_voices_harmony_pianoroll_spectrum():
     # Phase-3 task 4 added "voices"; task 5 appends "harmony"; task 7
     # appends "pianoroll"; task 8 appends "spectrum"; task 9 appends
-    # "screensaver" (see config.py's own comment for why it -- unlike
-    # "tuner" -- joins the default roster); task 10 appends "img2txtviz"
-    # (same "no unbuilt dependency" precedent, NOT because v1's own
-    # cycle_pages happened to include it -- see pages/img2txtviz.py's own
-    # module docstring) and "config" (the task-10 brief's explicit ask,
-    # a zero-dependency read-only viewer) -- all live by default
-    # (config.py's Config.pages default) so they're reachable with no
-    # config.toml on a stock deploy. "eventlog" stays first/current --
-    # order is preserved from config.pages.
+    # "screensaver"; task 10 appends "img2txtviz" (same "no unbuilt
+    # dependency" precedent, NOT because v1's own cycle_pages happened to
+    # include it -- see pages/img2txtviz.py's own module docstring) and
+    # "config" (the task-10 brief's explicit ask, a zero-dependency
+    # read-only viewer) -- all live by default (config.py's Config.pages
+    # default) so they're reachable with no config.toml on a stock deploy.
+    # Phase 9 Task 3 appends "tuner" last (live pitch detection finally
+    # wired -- see config.py's own comment for the full history of why it
+    # was excluded before). "eventlog" stays first/current -- order is
+    # preserved from config.pages.
     eng = Engine(Config())
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
         "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
-        "chordkey", "sendnotes",
+        "chordkey", "sendnotes", "tuner",
     ]
     assert eng.current_page == "eventlog"
 
@@ -175,7 +176,7 @@ def test_register_page_appends_to_live_roster():
     assert list(eng.pages) == [
         "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
         "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
-        "chordkey", "sendnotes", "second",
+        "chordkey", "sendnotes", "tuner", "second",
     ]
     assert eng.pages["second"] is fake
 
@@ -186,7 +187,7 @@ def test_engine_topics_reflects_roster_order():
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
-        "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes",
+        "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes", "page.tuner",
         "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress", "overlay.marquee",
@@ -314,7 +315,7 @@ def test_topics_include_overlay_after_page_topics():
     assert eng.topics == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
-        "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes",
+        "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes", "page.tuner",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress", "overlay.marquee", "overlay.polylimit",
     ]
@@ -406,9 +407,14 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "sendnotes"
     await eng.actions.dispatch("page.next", {})
+    # Phase 9 Task 3: "tuner" now sits between "sendnotes" and the
+    # dynamically-registered "second" -- it's the newest default-roster
+    # append (config.py).
+    assert eng.current_page == "tuner"
+    await eng.actions.dispatch("page.next", {})
     assert eng.current_page == "second"
     await eng.actions.dispatch("page.prev", {})
-    assert eng.current_page == "sendnotes"
+    assert eng.current_page == "tuner"
 
     # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
     # revamp): `_set_current_page` now ALSO emits `keymap_changed` on every
@@ -419,12 +425,12 @@ async def test_page_next_prev_cycle_and_emit_page_changed():
     # per-page keymap sections on page nav. See engine/core.py::
     # Engine._set_current_page's own docstring.
     names = [e["name"] for e in events]
-    assert names == ["page_changed", "keymap_changed"] * 15
+    assert names == ["page_changed", "keymap_changed"] * 16
     page_events = [e for e in events if e["name"] == "page_changed"]
     assert [e["data"]["page"] for e in page_events] == [
         "voices", "harmony", "pianoroll", "spectrum", "screensaver", "img2txtviz",
         "config", "help", "progchanges", "ccmonitor", "ccdashboard", "chordkey",
-        "sendnotes", "second", "sendnotes",
+        "sendnotes", "tuner", "second", "tuner",
     ]
 
 
@@ -918,16 +924,21 @@ async def test_run_loop_calls_tick_pages_without_crashing():
     await task   # must not raise
 
 
-# -- tuner page (phase-3 task 6) ---------------------------------------------
+# -- tuner page (phase-3 task 6; live-wired Phase 9 Task 3) ------------------
 
-def test_tuner_is_not_in_the_default_roster():
-    # Disclosed scope choice (pages/tuner.py's module docstring): the tuner
-    # page can only ever show v1's idle state until a separate, not-yet-
-    # built audio-capture task feeds it real pitch samples, so it is NOT
-    # forced into config.py's default `pages` list the way voices/harmony
-    # were in tasks 4/5.
+def test_tuner_is_in_the_default_roster():
+    # Phase 9 Task 3: the tuner page now runs real pitch detection (a
+    # dependency-free numpy YIN, see analyzers/tuner.py's module docstring
+    # for the aubio-vs-YIN investigation) and degrades gracefully to a
+    # "no audio input" state exactly like spectrum when no input device is
+    # present -- so it joins config.py's default `pages` list the same way
+    # voices/harmony did in tasks 4/5. (Previously excluded: it could only
+    # ever show v1's idle state before pitch detection existed to feed it
+    # -- see git history / config.py's own comment for that prior
+    # reasoning.)
     eng = Engine(Config())
-    assert "tuner" not in eng.pages
+    assert "tuner" in eng.pages
+    assert eng.pages["tuner"].view_model()["title"] == "TUNER"
 
 
 def test_tuner_is_reachable_via_config_pages():
@@ -952,13 +963,18 @@ async def test_page_goto_valid_and_unknown():
 # -- digit-nav reconciliation) -----------------------------------------------
 
 async def test_page_goto_known_v1_id_page_absent_from_roster_is_a_graceful_noop(caplog):
-    # "tuner" has a real v1 page ID (marquee.PAGE_IDS) but is excluded
-    # from config.py's default roster -- dispatching page.goto at it (as
-    # DEFAULT_KEYMAP's own shift+0 binding does, engine/keymap.py) must
-    # not raise, must not move current_page, and must log once -- the
-    # SAME "ordinary, expected" treatment `_page_jump`'s out-of-range
-    # position already gets (see Engine._page_goto's own docstring).
-    eng = Engine(Config())
+    # "tuner" has a real v1 page ID (marquee.PAGE_IDS) -- Phase 9 Task 3
+    # put it IN the stock default roster, so this test now synthesizes a
+    # deliberately narrowed roster (a custom config.toml could do the
+    # same) to keep exercising the graceful no-op path: dispatching
+    # page.goto at a known-v1-ID name that's absent from THIS PARTICULAR
+    # build's roster (as DEFAULT_KEYMAP's own shift+0 binding could hit,
+    # engine/keymap.py) must not raise, must not move current_page, and
+    # must log once -- the SAME "ordinary, expected" treatment
+    # `_page_jump`'s out-of-range position already gets (see
+    # Engine._page_goto's own docstring).
+    narrowed = [p for p in Config().pages if p != "tuner"]
+    eng = Engine(Config(pages=narrowed))
     assert "tuner" not in eng.pages
     with caplog.at_level(logging.INFO):
         r = await eng.actions.dispatch("page.goto", {"name": "tuner"})

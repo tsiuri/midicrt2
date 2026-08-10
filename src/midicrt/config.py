@@ -42,16 +42,22 @@ class Config:
     # default (no config.toml required) so `page.next`/`page.goto` have
     # somewhere real to go on a stock deploy. "harmony" is phase-3 task 5's
     # page, appended the same way. "pianoroll" (phase-3 task 7) shows real
-    # data with just a running daemon + MIDI input too, same as those two --
-    # unlike "tuner" (task 6), which stays out of this default list since it
-    # can only ever show its idle state until a future audio-capture task
-    # lands (see pages/tuner.py's own docstring). "spectrum" (phase-3 task 8)
-    # DOES join this list despite also depending on audio hardware --
-    # unlike tuner, it was built with graceful degradation as a first-class
+    # data with just a running daemon + MIDI input too, same as those two.
+    # "spectrum" (phase-3 task 8) joins despite depending on audio
+    # hardware -- it was built with graceful degradation as a first-class
     # state (`available: false` -> "no audio input" placeholder, see
     # analyzers/spectrum.py's module docstring), so a stock deploy with no
     # USB audio device plugged in still shows a real, correct page instead
-    # of a permanently-broken one; tuner has no such fallback to show yet.
+    # of a permanently-broken one. "tuner" (phase-3 task 6, live-wired
+    # Phase 9 Task 3) USED to be excluded here -- it could only ever show
+    # its idle state until pitch detection existed to feed it (see
+    # analyzers/tuner.py's own module docstring for the aubio-vs-numpy-YIN
+    # investigation that finally wired it) -- but now shows real, live
+    # pitch data with just a running daemon + an audio-capable input, and
+    # degrades gracefully to the SAME "no audio input" placeholder as
+    # spectrum when none is present (its own independent `AudioCapture`,
+    # not spectrum's -- see pages/tuner.py's module docstring), so it joins
+    # the default roster by the identical precedent spectrum already set.
     # "screensaver" (phase-3 task 9) joins the default roster too, despite
     # being reachable in the ordinary v1-page sense only via
     # `behaviors/screensaver.py`'s own `page.goto screensaver` -- unlike
@@ -84,19 +90,20 @@ class Config:
     # + pages/ccdashboard.py, analyzers/ccmonitor.py), "chordkey"
     # (pages/chordkey.py), and "sendnotes" (pages/sendnotes.py) all join
     # the default roster too -- every one is self-contained with no
-    # unbuilt dependency (the "voices"/"harmony"/.../"config" precedent),
-    # unlike "tuner" (excluded: permanently idle until a future
-    # audio-capture task). "sendnotes" shows real, useful status (dev/ch/
-    # octave/velocity/gate/active) even though the actual note-trigger
-    # keys have no client-side keyboard binding yet (same Phase-4 gap as
-    # every other page's own unbound interactive keys, e.g. pianoroll's
-    # channel-visibility editor) -- reachable via `midicrt action
-    # sendnotes.key`, matching the "img2txtviz.charset"/.invert precedent.
+    # unbuilt dependency (the "voices"/"harmony"/.../"config" precedent).
+    # "sendnotes" shows real, useful status (dev/ch/octave/velocity/gate/
+    # active) even though the actual note-trigger keys have no client-side
+    # keyboard binding yet (same Phase-4 gap as every other page's own
+    # unbound interactive keys, e.g. pianoroll's channel-visibility
+    # editor) -- reachable via `midicrt action sendnotes.key`, matching
+    # the "img2txtviz.charset"/.invert precedent. "tuner" is appended last
+    # (Phase 9 Task 3, see this field's own comment above) -- newest
+    # addition, same convention every prior task's page followed.
     pages: list[str] = field(
         default_factory=lambda: [
             "eventlog", "voices", "harmony", "pianoroll", "spectrum", "screensaver",
             "img2txtviz", "config", "help", "progchanges", "ccmonitor", "ccdashboard",
-            "chordkey", "sendnotes"])
+            "chordkey", "sendnotes", "tuner"])
     instruments: list[str] = field(default_factory=lambda: list(DEFAULT_INSTRUMENTS))
     # Phase-3 task 8 (analyzers/spectrum.py): `audio_device` substring-
     # matches a PortAudio input device name (case-insensitive, v1's
@@ -105,7 +112,13 @@ class Config:
     # `_device_index = None` convention. `spectrum_bins` is v1's
     # `TARGET_BINS` (default 96), clamped to v1's own [8, 256] keypress
     # range by `SpectrumAnalyzer.__init__` regardless of what's configured
-    # here.
+    # here. Phase 9 Task 3: `audio_device` is ALSO passed to `TunerPage`
+    # (`engine/core.py`'s `_PAGE_FACTORIES["tuner"]`) -- one config knob
+    # for both audio-consuming pages, since they're expected to want the
+    # same physical input device, not two independently configured ones,
+    # even though each page owns its own separate `AudioCapture` (see
+    # pages/tuner.py's module docstring for why the capture itself isn't
+    # shared).
     audio_device: str | None = None
     spectrum_bins: int = 96
     # Phase-3 task 9 (behaviors/screensaver.py) / Phase 8 task 5

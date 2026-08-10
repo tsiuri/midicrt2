@@ -555,6 +555,50 @@ function renderScreensaver() {
   bodyEl.innerHTML = "";
 }
 
+// -- tuner page (analyzers/tuner.py, live-wired Phase 9 Task 3): note/
+// cents/confidence/level readout + the v1 ASCII needle gauge -- mirrors
+// clients/tui.py's/fb/app.py's own `_tuner_body_lines`/`render_tuner_
+// frame`, including a straight JS port of `analyzers/tuner.py::
+// tuning_meter` (no shared-source mechanism across Python/JS in this
+// codebase, same "renderer reproduces the engine's already-tested math"
+// precedent this file's own `renderSpectrum` follows for spectrum's bars).
+// Three states, same precedence order as the other two clients: no audio
+// hardware -> "no audio input" (mirrors renderSpectrum's identical text);
+// audio present but no pitch locked -> "Listening..."; locked -> note +
+// meter.
+function tuningMeterText(cents, width) {
+  width = Math.max(7, Math.floor(width));
+  const center = Math.floor(width / 2);
+  let pos = center + Math.round((cents / 50.0) * center);
+  pos = Math.max(0, Math.min(width - 1, pos));
+  const chars = new Array(width).fill("-");
+  chars[center] = "|";
+  chars[pos] = "^";
+  return chars.join("");
+}
+
+function renderTuner(vm) {
+  if (!vm.available) {
+    bodyEl.innerHTML =
+      `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+      `<div>no audio input</div>`;
+    return;
+  }
+  if (!vm.has_signal) {
+    bodyEl.innerHTML =
+      `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+      `<div>Listening...  Conf:${vm.confidence.toFixed(2)}  Level:${vm.db.toFixed(1)} dB</div>`;
+    return;
+  }
+  const centsText = `${vm.cents >= 0 ? "+" : ""}${vm.cents.toFixed(1)}`;
+  const meter = tuningMeterText(vm.cents, 40);
+  bodyEl.innerHTML =
+    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    `<div>Note:${escapeHtml(vm.note)}  Pitch:${vm.hz.toFixed(2)} Hz  ` +
+    `Cents:${centsText}  Conf:${vm.confidence.toFixed(2)}  Level:${vm.db.toFixed(1)} dB</div>` +
+    `<pre class="ascii-grid">Tuning: ${escapeHtml(meter)}</pre>`;
+}
+
 // Any future page this build has no dedicated renderer for still shows up
 // (ugly but visible) as raw JSON -- mirrors clients/tui.py's/fb/app.py's
 // own `_render_unknown` fallback contract: wire compat is additive-only.
@@ -565,13 +609,14 @@ function renderUnknown(topic, vm) {
 }
 
 // Observer parity (phase6-notes item 3): one entry per default-roster page
-// name (see config.py::Config.pages for the real 14-name list this must
+// name (see config.py::Config.pages for the real 15-name list this must
 // track) -- "progchanges" reuses renderEventlog verbatim since
 // pages/progchanges.py's own module docstring documents it as
 // deliberately sharing eventlog's exact `{title, count, lines}` shape.
 // Keys are quoted strings (not bare identifiers) so the roster-coverage
 // test (test_web_app.py) can grep the served JS for `"<name>":` per page
-// without needing a browser to execute it.
+// without needing a browser to execute it. "tuner" added Phase 9 Task 3
+// (live pitch detection finally wired, joined the default roster).
 const PAGE_RENDERERS = {
   "eventlog": renderEventlog,
   "progchanges": renderEventlog,
@@ -587,6 +632,7 @@ const PAGE_RENDERERS = {
   "config": renderConfig,
   "img2txtviz": renderImg2TxtViz,
   "screensaver": renderScreensaver,
+  "tuner": renderTuner,
 };
 
 function renderPage(topic, vm) {

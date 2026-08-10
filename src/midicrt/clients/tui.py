@@ -325,6 +325,14 @@ def _tuner_header_text(vm: dict) -> str:
 
 
 def _tuner_body_lines(vm: dict) -> list[str]:
+    # Phase 9 Task 3: "no audio input" -- the SAME text `render_spectrum_
+    # lines` already uses for its own identical `available` gate --
+    # distinct from "audio present, no pitch locked" (has_signal=False
+    # with available still True, below). Defaults `available` to True so
+    # older VMs with no such key (this module's own pre-Task-3 fixtures)
+    # keep rendering the "Listening..."/locked states unchanged.
+    if not vm.get("available", True):
+        return ["no audio input", ""]
     if not vm.get("has_signal"):
         return [
             f"Listening...  Conf:{vm['confidence']:.2f}  Level:{vm['db']:5.1f} dB",

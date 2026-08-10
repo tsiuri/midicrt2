@@ -144,7 +144,18 @@ async def run(cfg, socket_path: str, use_midi: bool, use_audio: bool = True,
     audio_active = use_audio and spectrum_page is not None
     if audio_active:
         spectrum_page.start_capture()
-    _LOG.info("midicrtd up on %s (midi=%s, audio=%s)", socket_path, bool(midi), audio_active)
+    # Phase 9 Task 3: identical wiring for the tuner page's OWN independent
+    # audio-capture thread -- see pages/tuner.py's module docstring for why
+    # this is a second, separate `AudioCapture` rather than sharing
+    # spectrum's (a disclosed architecture decision, not an oversight).
+    # Same `--no-audio` opt-out covers both -- there is one physical audio
+    # input either page might be reading from, so one flag stops both.
+    tuner_page = engine.pages.get("tuner")
+    tuner_audio_active = use_audio and tuner_page is not None
+    if tuner_audio_active:
+        tuner_page.start_capture()
+    _LOG.info("midicrtd up on %s (midi=%s, audio=%s, tuner_audio=%s)",
+             socket_path, bool(midi), audio_active, tuner_audio_active)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     # Phase 9 Task 2b (shutdown-hang fix): NOT `loop.add_signal_handler`
@@ -160,6 +171,8 @@ async def run(cfg, socket_path: str, use_midi: bool, use_audio: bool = True,
         midi.stop()
     if audio_active:
         spectrum_page.stop_capture()
+    if tuner_audio_active:
+        tuner_page.stop_capture()
     engine.stop()
     with contextlib.suppress(Exception):
         await asyncio.wait_for(engine_task, timeout=2)

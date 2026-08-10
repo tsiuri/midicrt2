@@ -716,6 +716,42 @@ def test_tuner_renderers_dispatch_table_has_tuner():
     assert RENDERERS["tuner"] is render_tuner_lines
 
 
+# -- tuner page, "no audio input" state (Phase 9 Task 3) ----------------------
+#
+# Third render state alongside idle/locked above -- mirrors
+# tests/test_fb_render.py's own identical TUNER_NO_AUDIO_VM addition; see
+# that file's comment for the full "available defaults True" rationale.
+
+TUNER_NO_AUDIO_VM = {"title": "TUNER", "note": "", "cents": 0.0, "hz": 0.0,
+                     "confidence": 0.0, "db": -120.0, "has_signal": False,
+                     "available": False, "device": None}
+
+# Frozen against an actual run of render_tuner_lines(TUNER_NO_AUDIO_VM, 60, 5)
+# -- same "freeze from a real run" discipline as GOLDEN_TUNER_LOCKED_FRAME/
+# GOLDEN_TUNER_IDLE_FRAME above.
+GOLDEN_TUNER_NO_AUDIO_FRAME = [
+    "TUNER  [n]ext page [q]uit                                   ",
+    "no audio input                                              ",
+    "                                                            ",
+    "                                                            ",
+    "                                                            ",
+]
+
+
+def test_tuner_render_matches_frozen_golden_frame_when_no_audio():
+    out = render_tuner_lines(TUNER_NO_AUDIO_VM, width=60, height=5)
+    assert out == GOLDEN_TUNER_NO_AUDIO_FRAME
+    assert all(len(line) == 60 for line in out)
+
+
+def test_tuner_render_no_audio_state_has_no_note_meter_or_listening_text():
+    out = render_tuner_lines(TUNER_NO_AUDIO_VM, width=60, height=5)
+    assert "no audio input" in out[1]
+    assert "Listening" not in out[1]
+    assert "Note:" not in out[1]
+    assert out[2].strip() == ""
+
+
 # -- pianoroll page (phase-3 task 7) ------------------------------------------
 #
 # A FIXED synthetic note set (three notes, spread across pitch rows/velocity

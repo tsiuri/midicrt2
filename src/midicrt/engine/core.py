@@ -365,27 +365,33 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # ["eventlog", "voices", "harmony"] (config.py).
     "harmony": lambda config: HarmonyPage(),
     # Phase-3 task 6: v1's audio tuner page (pages/tuner.py) -- see
-    # pages/tuner.py's + analyzers/tuner.py's module docstrings for why
-    # this is registered here (reachable via config.toml/register_page)
-    # but deliberately NOT in config.py's default `pages` list: it can
-    # only ever show v1's idle state until a separate, not-yet-built audio-
-    # capture task feeds it real pitch samples.
-    "tuner": lambda config: TunerPage(),
+    # pages/tuner.py's + analyzers/tuner.py's module docstrings. Originally
+    # registered here but deliberately kept OUT of config.py's default
+    # `pages` list (it could only ever show v1's idle state before pitch
+    # detection existed). Phase 9 Task 3 wired real pitch detection (a
+    # dependency-free numpy YIN -- aubio failed to build on this Pi, see
+    # analyzers/tuner.py's investigation) AND joined the default roster --
+    # same "device=config.audio_device" knob spectrum reads below, own
+    # independent `AudioCapture` (see pages/tuner.py's module docstring for
+    # why it's not a shared tap). The actual capture thread is NOT started
+    # here -- `daemon.py`'s `run()` calls `TunerPage.start_capture()`
+    # explicitly, mirroring spectrum's own wiring one-for-one.
+    "tuner": lambda config: TunerPage(device=config.audio_device),
     # Phase-3 task 7: v1's flagship two-projection-mode scrolling note
     # display -- see pages/pianoroll.py's module docstring for the full
     # port. `config.pages` now defaults to [..., "pianoroll"] (config.py):
-    # unlike "tuner", it shows real data with just a running daemon + MIDI
-    # input, matching the "voices"/"harmony" precedent for default-roster
-    # inclusion.
+    # it shows real data with just a running daemon + MIDI input, matching
+    # the "voices"/"harmony" precedent for default-roster inclusion.
     "pianoroll": lambda config: PianorollPage(),
     # Phase-3 task 8: v1's audio spectrum analyzer (pages/audiospectrum.py)
     # -- see pages/spectrum.py's + analyzers/spectrum.py's module
     # docstrings for the full port (real USB audio hardware found on the
     # Pi, v1's log-band FFT mapping, the v2-only peak-hold addition).
-    # `config.pages` now defaults to [..., "spectrum"] (config.py): unlike
-    # "tuner", this page degrades gracefully (`available: false` -> "no
-    # audio input" placeholder) instead of being permanently idle, so it
-    # joins the default roster despite also depending on audio hardware.
+    # `config.pages` now defaults to [..., "spectrum"] (config.py): this
+    # page degrades gracefully (`available: false` -> "no audio input"
+    # placeholder) instead of being permanently idle, so it joins the
+    # default roster despite depending on audio hardware (the same
+    # graceful-degrade contract "tuner" above now shares, Phase 9 Task 3).
     # The actual capture thread is NOT started here -- `daemon.py`'s
     # `run()` calls `SpectrumPage.start_capture()` explicitly, after the
     # roster is built, guarded by a `--no-audio` opt-out mirroring
@@ -403,7 +409,7 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # and the disclosed wave-field adaptation. `config.pages` now defaults
     # to [..., "img2txtviz"] (config.py): a self-contained animation with
     # no unbuilt dependency, matching the "voices"/"harmony"/"pianoroll"/
-    # "spectrum" precedent, not "tuner"'s.
+    # "spectrum" precedent.
     "img2txtviz": lambda config: Img2TxtVizPage(),
     # Phase-3 task 10: spec §5's read-only config viewer -- see
     # pages/configview.py's module docstring. `config.pages` now defaults
@@ -1990,17 +1996,21 @@ class Engine:
         Phase 9 Task 0 (docs/gui-phase-decisions-2026-08-08.md digit-nav
         reconciliation) narrows that: a `name` that IS one of `marquee.
         PAGE_IDS`' known v1-mapped page names but simply isn't in THIS
-        build's roster (e.g. "tuner" -- has a real v1 ID, excluded from
-        config.py's default `pages` list) is treated as the SAME kind of
-        ordinary, expected situation `_page_jump`'s out-of-range position
-        already is below -- logged once and a plain no-op (`{}`), NOT an
-        `ActionError`. This is what lets `engine/keymap.py::DEFAULT_
-        KEYMAP`'s digit bindings (baked unconditionally from the FULL
-        `PAGE_IDS` table, regardless of any one build's roster -- see that
-        module's own docstring) stay harmless on a build that doesn't
-        happen to include every v1-numbered page, instead of a keypress
-        surfacing an "unknown page: tuner" `ClientError` to the user for a
-        page name that isn't actually a mistake at all.
+        build's roster (e.g. a custom `config.toml` that narrows `pages`
+        down and drops "tuner" -- which has a real v1 ID but, as of Phase 9
+        Task 3, IS in the stock default roster; every `PAGE_IDS` name
+        happens to be in the stock roster today, so this situation is only
+        reachable via a deliberately narrowed custom config, not a stock
+        deploy) is treated as the SAME kind of ordinary, expected situation
+        `_page_jump`'s out-of-range position already is below -- logged
+        once and a plain no-op (`{}`), NOT an `ActionError`. This is what
+        lets `engine/keymap.py::DEFAULT_KEYMAP`'s digit bindings (baked
+        unconditionally from the FULL `PAGE_IDS` table, regardless of any
+        one build's roster -- see that module's own docstring) stay
+        harmless on a build that doesn't happen to include every
+        v1-numbered page, instead of a keypress surfacing an "unknown
+        page: tuner" `ClientError` to the user for a page name that isn't
+        actually a mistake at all.
 
         This narrowing only ever makes MORE names succeed silently, never
         fewer error out: `_MARQUEE_PAGE_IDS` is a small, fixed vocabulary

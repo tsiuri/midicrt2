@@ -115,15 +115,27 @@ def test_default_keymap_v1_id_bindings_cover_every_default_roster_page_with_an_i
             assert name in goto_targets
 
 
-def test_default_keymap_v1_id_bindings_also_cover_pages_outside_the_default_roster():
-    # "tuner" (v1 ID 10) has a binding even though it's excluded from the
-    # default roster -- "binding present" per the brief; see
+def test_default_keymap_v1_id_bindings_are_independent_of_any_one_roster():
+    # DEFAULT_KEYMAP's digit bindings are baked from the FULL `PAGE_IDS`
+    # table at module load time (engine/keymap.py's own docstring) -- NOT
+    # filtered by any one build's `config.pages` roster. Originally
+    # illustrated with "tuner" (v1 ID 10), the one PAGE_IDS page excluded
+    # from the default roster at the time -- Phase 9 Task 3 wired live
+    # pitch detection and added it to the default roster (config.py), so
+    # every PAGE_IDS name is now roster-default today and that concrete
+    # illustration is gone. The underlying property (a binding exists
+    # whether or not a page happens to be in any PARTICULAR roster) still
+    # needs a live check, so this synthesizes a narrowed roster instead of
+    # relying on a real currently-excluded page -- see
     # engine/core.py::Engine._page_goto's graceful no-op for what actually
-    # happens when it's pressed on a build that lacks it.
-    assert "tuner" not in Config().pages
+    # happens if this binding is pressed on a build that narrows "tuner"
+    # back out.
+    narrowed_roster = [p for p in Config().pages if p != "tuner"]
+    assert "tuner" not in narrowed_roster   # sanity: the exclusion is real
     goto_targets = {entry["args"]["name"] for entry in DEFAULT_KEYMAP.values()
                     if isinstance(entry, dict) and entry.get("action") == "page.goto"}
-    assert "tuner" in goto_targets
+    assert set(PAGE_IDS) <= goto_targets   # every v1-mapped name always has a binding
+    assert "tuner" in goto_targets   # binding survives regardless of any one roster
 
 
 def test_default_page_keymaps_cover_the_pages_this_task_restored_keys_for():

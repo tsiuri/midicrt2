@@ -443,6 +443,14 @@ def render_tuner_frame(vm: dict, surface: Surface, marquee_text: str | None = No
         draw_text(surface, LEFT_MARGIN, y, text, NORMAL_FG, font)
         y += line_h
 
+    # Phase 9 Task 3: "no audio input" -- the SAME text/placement/color
+    # convention `render_spectrum_frame` already established for its own
+    # identical `available` gate -- distinct from "audio present, no pitch
+    # locked" (has_signal=False with available still True, below).
+    if not vm.get("available", True):
+        _row("no audio input")
+        return
+
     if not vm.get("has_signal"):
         _row(f"Listening...  Conf:{vm['confidence']:.2f}  Level:{vm['db']:5.1f} dB")
         return

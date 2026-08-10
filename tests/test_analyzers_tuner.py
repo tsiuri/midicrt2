@@ -1,23 +1,51 @@
 """TDD for TunerAnalyzer: pure pitch-reading math + smoothing/gating state
 machine, ported from v1's `~/codex/midicrt/pages/tuner.py`. Unlike every
 other v2 analyzer, this one is NOT MIDI-driven -- see analyzers/tuner.py's
-module docstring for why (v1's tuner has no MIDI handler at all, and the
-audio-capture pipeline that would feed it real pitch samples is a separate,
-not-yet-ported v2 task). Tests exercise the injected-data
-`on_pitch_sample()` method with synthetic pitch-detector readings, standing
-in for that future audio path.
+module docstring for why (v1's tuner has no MIDI handler at all).
+
+Phase 9 Task 3 (live wiring): `on_pitch_sample()` is still tested directly
+below with synthetic pitch-detector readings (the smoothing/gating state
+machine is unchanged), but it is no longer the only entry point -- the new
+`on_audio_block(block, sr)` method (tested in its own section, "audio-block
+wiring" below) is the REAL production path, computing `detect_pitch()`
+(this module's own dependency-free numpy YIN, see its docstring for the
+aubio-vs-YIN investigation) + a v1-formula RMS/dB reading from a raw PCM
+block, then delegating into the same `on_pitch_sample()` gate these older
+tests exercise directly. `mark_available`/`mark_unavailable` (own section
+below) mirror `analyzers/spectrum.py::SpectrumAnalyzer`'s identically-named
+methods -- the "no audio hardware" signal `AudioCapture` drives, distinct
+from "audio present, no pitch locked".
 """
+import numpy as np
 import pytest
 
-from midicrt.analyzers.tuner import MIN_CONF, SILENCE_DB, TunerAnalyzer, freq_to_note, tuning_meter
+from midicrt.analyzers.tuner import (
+    MIN_CONF,
+    SILENCE_DB,
+    TUNER_FMAX_HZ,
+    TUNER_FMIN_HZ,
+    YIN_THRESHOLD,
+    TunerAnalyzer,
+    detect_pitch,
+    freq_to_note,
+    tuning_meter,
+)
 from midicrt.engine.core import MidiEvent
+
+SR = 44100
+BLOCK_N = 1024
+
+
+def _sine(freq: float, sr: int = SR, n: int = BLOCK_N, amp: float = 0.5) -> np.ndarray:
+    t = np.arange(n) / sr
+    return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float32)
 
 
 def test_initial_view_model_shows_no_signal():
     a = TunerAnalyzer()
     vm = a.view_model()
     assert vm == {"note": "", "cents": 0.0, "hz": 0.0, "confidence": 0.0,
-                  "db": -120.0, "has_signal": False}
+                  "db": -120.0, "has_signal": False, "available": False, "device": None}
 
 
 def test_handle_is_a_true_noop_for_any_midi_event():
@@ -171,6 +199,171 @@ def test_on_pitch_sample_always_reports_dirty():
 def test_never_reads_a_clock_or_does_io():
     # No `import time`/`aubio`/audio I/O anywhere in the module -- a
     # structural guard, mirrors the sibling analyzers' own clock-read tests.
+    # `numpy` IS imported (the YIN math needs it) -- same precedent as
+    # `analyzers/spectrum.py`'s own FFT math -- only `time`/`aubio` are
+    # actually forbidden here.
     import midicrt.analyzers.tuner as mod
     assert not hasattr(mod, "time")
     assert not hasattr(mod, "aubio")
+
+
+# -- detect_pitch: dependency-free numpy YIN (Phase 9 Task 3) ----------------
+#
+# aubio investigation (see module docstring + task-3-report.md for the full
+# evidence): aubio 0.4.9 has NO prebuilt wheel for aarch64/cp313 on PyPI
+# (sdist only), and an actual from-source build attempt on this exact Pi
+# FAILS outright -- `python/ext/ufuncs.c` uses a ufunc-loop function pointer
+# signature (`npy_intp*`) incompatible with the numpy version installed
+# here (which wants `const npy_intp*`), a real compile error, not a missing
+# system package. A dependency-free numpy YIN (de Cheveigné & Kawahara
+# 2002) is used instead, per the task brief's own presumptive preference.
+#
+# `MIN_CONF` is recalibrated to 0.65 for THIS detector's own confidence
+# metric (see module docstring) -- v1's literal 0.30 was tuned for aubio's
+# own internal confidence computation, a different metric numerically; a
+# 500-seed white-noise sweep at this block size never exceeds confidence
+# 0.61 (see module docstring's own empirical table), so 0.65 leaves
+# deliberate headroom above the noise ceiling while staying well below
+# real-signal confidence (~0.82-1.0 even at 6-20dB SNR, ~1.0 for a clean
+# tone).
+
+def test_detect_pitch_440hz_sine_locks_a4_at_zero_cents():
+    hz, confidence = detect_pitch(_sine(440.0), SR)
+    assert hz == pytest.approx(440.0, abs=0.5)
+    assert confidence >= MIN_CONF
+    note, cents = freq_to_note(hz)
+    assert note == "A4"
+    assert cents == pytest.approx(0.0, abs=2.0)
+
+
+def test_detect_pitch_446hz_sine_is_23_cents_sharp_of_a4():
+    # The task brief's own worked example: 446Hz -> A4, +23 cents ballpark.
+    hz, confidence = detect_pitch(_sine(446.0), SR)
+    assert hz == pytest.approx(446.0, abs=0.5)
+    assert confidence >= MIN_CONF
+    note, cents = freq_to_note(hz)
+    assert note == "A4"
+    assert cents == pytest.approx(23.5, abs=2.0)
+
+
+@pytest.mark.parametrize("name,freq", [
+    ("E2", 82.41), ("A2", 110.0), ("D3", 146.83),
+    ("G3", 196.0), ("B3", 246.94), ("E4", 329.63),
+])
+def test_detect_pitch_covers_the_six_open_guitar_strings(name, freq):
+    hz, confidence = detect_pitch(_sine(freq), SR)
+    assert hz == pytest.approx(freq, rel=0.01)
+    assert confidence >= MIN_CONF
+
+
+def test_detect_pitch_white_noise_is_low_confidence():
+    # A fixed seed, not a hunt for a lucky one -- the module docstring's
+    # own 500-seed sweep is the real evidence this threshold holds broadly;
+    # this test just proves the wiring rejects a representative noisy
+    # block, not that a single seed is special.
+    rng = np.random.default_rng(0)
+    noise = (rng.standard_normal(BLOCK_N) * 0.3).astype(np.float32)
+    _hz, confidence = detect_pitch(noise, SR)
+    assert confidence < MIN_CONF
+
+
+def test_detect_pitch_silence_is_zero_confidence():
+    _hz, confidence = detect_pitch(np.zeros(BLOCK_N, dtype=np.float32), SR)
+    assert confidence == pytest.approx(0.0)
+
+
+def test_detect_pitch_too_short_block_returns_no_pitch():
+    hz, confidence = detect_pitch(np.zeros(4, dtype=np.float32), SR)
+    assert hz == 0.0
+    assert confidence == 0.0
+
+
+def test_detect_pitch_empty_block_returns_no_pitch():
+    hz, confidence = detect_pitch(np.zeros(0, dtype=np.float32), SR)
+    assert hz == 0.0
+    assert confidence == 0.0
+
+
+def test_detect_pitch_uses_the_documented_default_range():
+    assert TUNER_FMIN_HZ < 82.41   # covers guitar low E2 with margin
+    assert TUNER_FMAX_HZ > 1000.0
+    assert 0.0 < YIN_THRESHOLD < 1.0
+
+
+# -- on_audio_block: the real production wiring (Phase 9 Task 3) -------------
+#
+# `on_audio_block(block, sr)` is what `AudioCapture`'s callback thread
+# actually calls (mirrors `analyzers/spectrum.py::SpectrumAnalyzer.
+# on_audio_block`'s own shape/name so the same `AudioCapture` class, built
+# for spectrum, works here unmodified via duck typing -- see pages/tuner.py
+# for the wiring). Computes dB via v1's own formula (`pages/tuner.py`'s
+# `draw()`: `rms = sqrt(mean(x*x))`, `db = 20*log10(rms+1e-12)`), pitch via
+# `detect_pitch()` above, then delegates into the SAME `on_pitch_sample`
+# gate the older tests above already cover directly -- no new gating logic,
+# just a new caller.
+
+def test_on_audio_block_locks_a_note_from_a_loud_clean_sine():
+    a = TunerAnalyzer()
+    changed = a.on_audio_block(_sine(440.0, amp=0.5), SR)
+    assert changed is True
+    vm = a.view_model()
+    assert vm["has_signal"] is True
+    assert vm["note"] == "A4"
+    assert vm["hz"] == pytest.approx(440.0, abs=1.0)
+    assert vm["db"] > SILENCE_DB   # a 0.5-amplitude sine is well above -55dB
+
+
+def test_on_audio_block_silent_block_shows_no_signal():
+    a = TunerAnalyzer()
+    a.on_audio_block(np.zeros(BLOCK_N, dtype=np.float32), SR)
+    vm = a.view_model()
+    assert vm["has_signal"] is False
+    assert vm["note"] == ""
+    assert vm["db"] < SILENCE_DB
+
+
+def test_on_audio_block_db_matches_v1s_rms_formula():
+    import math
+    a = TunerAnalyzer()
+    block = _sine(440.0, amp=0.5)
+    a.on_audio_block(block, SR)
+    rms = math.sqrt(float(np.mean(block.astype(np.float64) ** 2)))
+    expected_db = 20.0 * math.log10(rms + 1e-12)
+    assert a.view_model()["db"] == pytest.approx(expected_db, abs=0.1)
+
+
+def test_on_audio_block_always_reports_dirty():
+    a = TunerAnalyzer()
+    assert a.on_audio_block(_sine(440.0), SR) is True
+    assert a.on_audio_block(np.zeros(BLOCK_N, dtype=np.float32), SR) is True
+
+
+def test_on_audio_block_quiet_signal_below_silence_db_shows_no_signal():
+    # A real tone, but too quiet to pass v1's SILENCE_DB gate -- proves the
+    # dB computed from the real block (not just an injected constant) is
+    # what actually gates, not just confidence.
+    a = TunerAnalyzer()
+    a.on_audio_block(_sine(440.0, amp=0.0005), SR)
+    vm = a.view_model()
+    assert vm["db"] < SILENCE_DB
+    assert vm["has_signal"] is False
+
+
+# -- mark_available / mark_unavailable (Phase 9 Task 3, graceful audio- -----
+# -- absent degrade, mirrors analyzers/spectrum.py::SpectrumAnalyzer) -------
+
+def test_mark_available_sets_device_and_flag():
+    a = TunerAnalyzer()
+    a.mark_available("USB Audio Device")
+    vm = a.view_model()
+    assert vm["available"] is True
+    assert vm["device"] == "USB Audio Device"
+
+
+def test_mark_unavailable_clears_device_and_flag():
+    a = TunerAnalyzer()
+    a.mark_available("USB Audio Device")
+    a.mark_unavailable()
+    vm = a.view_model()
+    assert vm["available"] is False
+    assert vm["device"] is None
