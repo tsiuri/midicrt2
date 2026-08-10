@@ -3047,7 +3047,29 @@ class Engine:
             # code was originally written to prevent. Suppressed, not
             # logged again: `_capture_write_failed` already logged ONE
             # error and emitted an `alert` for this exact incident.
-            with contextlib.suppress(ActionError):
+            #
+            # Phase 9 close-out fix wave (widened to `ValueError`/`OSError`
+            # too): a SIGTERM (this method) can land while `capture.stop`'s
+            # own async dispatch wrapper (`_capture_stop_action_dispatch`,
+            # registered as the actual action -- see that method's own
+            # docstring) is ALREADY mid-flight on a worker thread
+            # (`asyncio.to_thread`, Task 6 second review round) -- both
+            # paths call into the SAME `CaptureSink.stop()` body on the
+            # SAME instance, concurrently, from two different threads. A
+            # `CaptureSink` lifecycle lock (`self._lifecycle_lock`, see that
+            # class's own `__init__` docstring) now serializes the two
+            # calls so their STATE mutations can't interleave -- but this
+            # `suppress` is the independent, mandatory backstop regardless
+            # of exactly what a residual race window could still produce
+            # (a `ValueError` from an unexpected double-operation on the
+            # shared file object, a transient `OSError`, or the documented
+            # `ActionError`): NONE of them may ever be allowed to skip this
+            # method's own remaining shutdown ordering (sendnotes flush,
+            # `_midi_out.close()`, and further down, the server/watchdog
+            # close) -- a shutdown that dies partway through on an
+            # UNRELATED capture-layer race is a strictly worse outcome than
+            # one capture-stop attempt losing its own error message.
+            with contextlib.suppress(ActionError, ValueError, OSError):
                 self._capture_stop_action(origin="shutdown")
         # Phase-3 task 12 fix (Important, live-reproduced): flush any
         # still-gated Send Notes BEFORE closing midi_out -- a routine

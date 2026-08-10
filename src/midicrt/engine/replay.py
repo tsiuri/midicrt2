@@ -126,6 +126,42 @@ two concrete rules this module implements:
     live dispatch already computed once, for free. See test_replay.py's
     own "page_changed marks: applied as direct state mutations" section
     for the concrete proof this doesn't touch analyzer state.
+  - `panic.release` marks (Phase 9 close-out fix wave): applied as a
+    DIRECT state mutation, the SAME "state change with zero MIDI trace"
+    category `page_changed` above is in -- NOT re-dispatched through
+    `ActionRegistry.dispatch` (see the safety argument for "every other
+    action mark" right below for why that distinction matters). Live,
+    `Engine._release_for_panic` (a stuck-note CRIT panic's own internal
+    half, `engine/core.py`) routes each released note through `_dispatch_
+    to_state` directly -- exactly like `_handle`'s own tail does for a
+    REAL event, fanning out to every analyzer's/page's `handle(ev)` --
+    and ONLY records a `panic.release` mark (`{"ch", "notes"}`, `origin:
+    "alert"`) as the provenance trace; no `kind: "event"` line is ever
+    written for it (docs/phase5-capture.md §2's own "internal action,
+    not a fake wire event" framing). Before this fix, replay only ever
+    COUNTED this mark (the generic "every other action mark" rule below)
+    -- meaning a replayed session's voice/harmony state STILL SHOWED the
+    panicked note(s) held, even though live playback had already released
+    them: a real, disclosed-as-fixed correctness gap (reviewer-verified:
+    `voices.total` stayed nonzero after a replayed panic cycle that had,
+    live, driven it back to zero). Fixed by building the SAME synthetic
+    `note_off` `MidiEvent` `_release_for_panic` itself builds (`source=
+    "panic:release"`, `type="note_off"`, `data2=0`, the SAME `summary`
+    format) and calling `engine._dispatch_to_state(ev)` for each note in
+    the mark's own `"notes"` list -- one call per note, matching the live
+    per-note loop exactly. **Index conversion, the one sharp edge**: the
+    mark's own `"ch"` field is 1-INDEXED (v1-style channel numbering,
+    matching `_maybe_panic`'s own `alert["ch"]` convention) while every
+    `MidiEvent.channel`/analyzer-internal channel value is 0-INDEXED --
+    `_release_for_panic` itself converts via `channel=ch - 1` when
+    building its OWN synthetic event, and replay's mark-applier must
+    perform the IDENTICAL conversion or every released note lands on the
+    WRONG channel's held-note ledger (silently correct-LOOKING, since
+    nothing raises -- just wrong). A malformed mark (missing/non-`int`
+    `"ch"`, non-list `"notes"`, missing/non-numeric `"ts"`) is logged and
+    skipped, same "an optional/derived field's corruption is never fatal"
+    discipline every other per-line parse failure in this module already
+    follows.
   - Every other `action` mark: COUNTED (`actions_by_origin[origin] += 1`
     in the summary) and NEVER re-executed. This is a deliberate safety
     property, not merely "not yet implemented" -- see
@@ -140,7 +176,19 @@ two concrete rules this module implements:
     replay an arbitrary action's mark as a real dispatch without auditing
     every current AND future action for replay-safety one at a time. Mark
     counting has no such risk: it's a pure read of the mark's own
-    `origin` field.
+    `origin` field. `panic.release` (and, before it, `page_changed`) are
+    the two EXCEPTIONS to this rule, and both are exceptions for the
+    SAME reason: neither one is EVER dispatched through `ActionRegistry.
+    dispatch` in the first place, live -- both are direct, internal state
+    mutations already, so "applying" them in replay carries none of the
+    real-file/real-MIDI/real-config risk a genuinely re-dispatched client
+    action would. `panic.notes_off` (the OTHER panic-cycle mark, the
+    external All-Notes-Off CC send) is deliberately NOT given the same
+    treatment -- it has no internal state effect of its own to replay (see
+    `engine/core.py::_maybe_panic`'s own docstring: the state-mutating
+    half is entirely `panic.release`'s job), so there is nothing for a
+    mark-applier to DO with it beyond the counting every other mark
+    already gets.
   - `tempo` lines: informational only (v1's tempo-segment-timeline port,
     see engine/capture.py's module docstring) -- ignored by this module
     entirely. Replaying the "clock_tick" events these were derived FROM
@@ -329,14 +377,50 @@ def _iter_lines(path: str):
             yield parsed
 
 
+def _apply_panic_release_mark(engine: Engine, line: dict, path: str) -> None:
+    """Applies one `panic.release` mark (`{"ch", "notes"}`, `origin:
+    "alert"`) as a state mutation -- see module docstring's "Mark
+    application semantics" section for the full "why this is safe, why
+    the channel needs `- 1`" writeup; this is the mechanical half. Builds
+    the SAME synthetic `note_off` `MidiEvent` `Engine._release_for_panic`
+    itself builds live (`engine/core.py`) for each note in `"notes"`, and
+    routes it through `engine._dispatch_to_state` -- the identical
+    analyzer/page fan-out a real event gets, WITHOUT re-entering `_handle`
+    (no raw-capture bookkeeping, no `events_total` bump -- this is a mark
+    being APPLIED, not a second fake wire event, exactly the same
+    distinction `_release_for_panic`'s own docstring draws live).
+
+    A malformed mark (missing/non-numeric `"ts"`, missing/non-`int`
+    `"ch"`, non-list `"notes"`) is logged and skipped entirely -- never
+    partially applied -- matching this module's own "an optional/derived
+    field's corruption is never fatal" discipline for every other
+    per-line parse failure (`_iter_lines`'s malformed-JSON handling, the
+    `event`/`page_changed` branches' own `try/except` guards)."""
+    args = line.get("args") or {}
+    ts = line.get("ts")
+    ch = args.get("ch")
+    notes = args.get("notes")
+    if not isinstance(ts, int | float) or not isinstance(ch, int) or not isinstance(notes, list):
+        _LOG.warning("replay: skipping malformed panic.release mark in %s: %r", path, line)
+        return
+    for note in notes:
+        if not isinstance(note, int):
+            continue
+        engine._dispatch_to_state(MidiEvent(
+            ts=ts, source="panic:release", type="note_off",
+            channel=ch - 1, data1=note, data2=0,
+            summary=f"panic release ch{ch} n{note}",
+        ))
+
+
 def stream_session(engine: Engine, path: str, *, speed: float = 1.0,
                    instant: bool = False,
                    sleep_fn: Callable[[float], None] | None = None) -> dict:
     """Streams `path` (a `CaptureSink`-written `.jsonl`) through `engine`
     and returns the end-of-replay summary. See module docstring for the
-    full per-`kind` handling (`event` -> `Engine._handle`, `page_changed`
-    -> direct state mutation, `action`/`tempo` -> counted/ignored) and the
-    timing model (`speed`/`instant`).
+    full per-`kind` handling (`event` -> `Engine._handle`, `page_changed`/
+    `panic.release` -> direct state mutations, every other `action`/
+    `tempo` -> counted/ignored) and the timing model (`speed`/`instant`).
 
     `sleep_fn` defaults to the real `time.sleep` -- injectable (mirrors
     `engine/midi_out.py::MidiOutput`'s own `backend` param convention) so
@@ -416,6 +500,8 @@ def stream_session(engine: Engine, path: str, *, speed: float = 1.0,
         if kind == "action":
             origin = line.get("origin", "unknown")
             actions_by_origin[origin] = actions_by_origin.get(origin, 0) + 1
+            if line.get("name") == "panic.release":
+                _apply_panic_release_mark(engine, line, path)
             continue
 
         if kind == "page_changed":

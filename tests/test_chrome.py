@@ -283,19 +283,69 @@ def test_secondary_status_text_stuck_alerts_win_over_polylimit_flash():
     assert text.startswith("STUCK WARN:")
 
 
-def test_secondary_status_text_lingering_cleared_message_wins_over_polylimit_flash():
+def test_secondary_status_text_polylimit_flash_wins_over_lingering_cleared():
+    # Phase 9 close-out (controller ruling, chrome re-rank): a DIMMED,
+    # already-resolved historical relic must never mask a LIVE, actionable
+    # poly-limit flash -- this is the flip side of the OLD (now-wrong)
+    # behavior this test used to pin (lingering-cleared winning over the
+    # flash). See secondary_status_text's own docstring for the full
+    # reordered chain (live alert > polylimit-flash > sysex-status >
+    # lingering-cleared > timesig).
     cleared_vm = {"alerts": [], "cleared": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}]}
     text = secondary_status_text(cleared_vm, DEFAULT_TIMESIG_VM, {"flashing": True})
+    assert text == "POLY LIMIT EXCEEDED"
+
+
+def test_secondary_status_text_sysex_status_wins_over_lingering_cleared():
+    # Same controller ruling as the polylimit case immediately above --
+    # sysex-status is also more timely/actionable than a dimmed historical
+    # relic.
+    cleared_vm = {"alerts": [], "cleared": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}]}
+    text = secondary_status_text(cleared_vm, DEFAULT_TIMESIG_VM, None,
+                                 {"text": "sx: rx 4B Roland", "active": True})
+    assert text == "sx: rx 4B Roland"
+
+
+def test_secondary_status_text_lingering_cleared_still_wins_over_timesig_when_alone():
+    # The coordinator's own explicit "cleared-linger alone -> still shows"
+    # check -- no poly-limit/sysex in play, lingering-cleared still beats
+    # the routine timesig fallback (unchanged by the re-rank; a sibling of
+    # test_secondary_status_text_shows_cleared_message_over_timesig above,
+    # written explicitly against this rung of the NEW chain).
+    cleared_vm = {"alerts": [], "cleared": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}]}
+    text = secondary_status_text(cleared_vm, DEFAULT_TIMESIG_VM, {"flashing": False},
+                                 {"text": "", "active": False})
     assert text.startswith("STUCK CLEARED:")
 
 
 def test_secondary_status_dim_is_false_while_the_polylimit_flash_is_showing():
     from midicrt.clients.chrome import secondary_status_dim
 
-    # The flash is urgent (full brightness), not the dimmed linger state --
-    # secondary_status_dim only ever looks at alerts_vm, unaffected by the
-    # (separate-topic) polylimit flash.
+    # The flash is urgent (full brightness), not the dimmed linger state.
     assert secondary_status_dim(DEFAULT_ALERTS_VM) is False
+
+
+def test_secondary_status_dim_is_false_when_a_polylimit_flash_outranks_lingering_cleared():
+    from midicrt.clients.chrome import secondary_status_dim
+
+    # Phase 9 close-out (controller ruling): THE bug this fix closes --
+    # secondary_status_dim used to look at alerts_vm ALONE, so it would
+    # report True (dim the row) here even though secondary_status_text
+    # (given the SAME polylimit_vm) actually renders the full-brightness
+    # "POLY LIMIT EXCEEDED" flash, not the dimmed lingering message -- a
+    # real render/dim mismatch. Now consistent: both functions agree.
+    cleared_vm = {"alerts": [], "cleared": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}]}
+    assert secondary_status_dim(cleared_vm, {"flashing": True}) is False
+    # Sanity: the SAME vm, with no flash, still dims (the base case).
+    assert secondary_status_dim(cleared_vm, {"flashing": False}) is True
+
+
+def test_secondary_status_dim_is_false_when_sysex_status_outranks_lingering_cleared():
+    from midicrt.clients.chrome import secondary_status_dim
+
+    cleared_vm = {"alerts": [], "cleared": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}]}
+    assert secondary_status_dim(cleared_vm, None, {"text": "sx: rx 4B", "active": True}) is False
+    assert secondary_status_dim(cleared_vm, None, {"text": "", "active": False}) is True
 
 
 # -- sysex-status text (Phase 9 Task 5, SysEx manager): v1 parity item --

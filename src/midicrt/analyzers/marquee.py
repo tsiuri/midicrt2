@@ -121,11 +121,18 @@ GAP = "    "                # v1's literal 4-space seam (midicrt.py:901's "    "
 # build "[pid:TITLE]" text without a second lookup. `engine/core.py`'s
 # `_SYSEX_PAGE_ID_MAP` derives from this table (see module docstring) --
 # values copied from that map's own already-verified v1 IDs, not
-# re-derived. "tuner" is included (has a real v1 ID, `10`) even though it
-# is NOT in `config.py`'s default page roster -- `MarqueeAnalyzer` only
-# ever sees whatever roster it's actually constructed with, so an
-# unreachable page name simply never appears in that instance's text; the
-# table itself lists every v1-numbered page v2 knows about.
+# re-derived. This table lists every v1-numbered page v2 knows about,
+# regardless of whether any PARTICULAR build's roster actually includes
+# it -- `MarqueeAnalyzer` only ever sees whatever roster it's actually
+# constructed with, so a page name absent from a CUSTOM/narrowed
+# `config.pages` roster simply never appears in that instance's text.
+# (Stale-claim fix, Phase 9 close-out: this comment used to cite "tuner"
+# -- v1 ID `10` -- as an example of a page absent from the STOCK default
+# roster; Phase 9 Task 3, 96b1c12 "feat: live tuner", added it to that
+# default roster, so that claim is no longer true -- every entry below is
+# currently reachable on a stock build. The general point stands: a
+# hand-edited config.toml can still narrow the roster and drop any of
+# these.)
 PAGE_IDS: dict[str, int] = {
     "help": 0, "harmony": 1, "sendnotes": 2, "ccmonitor": 4, "ccdashboard": 5,
     "eventlog": 6, "progchanges": 7, "pianoroll": 8, "spectrum": 9, "tuner": 10,

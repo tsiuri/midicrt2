@@ -166,6 +166,7 @@ import json
 import logging
 import os
 import tempfile
+import threading
 import time
 import uuid
 from collections import deque
@@ -375,6 +376,32 @@ class CaptureSink:
         # under its own `last_session` key instead, so the LIVE `counts`
         # key always accurately reflects "nothing" while idle.
         self._last_session: dict | None = None
+        # Phase 9 close-out fix wave: `start()`/`stop()`/`fail()` are the
+        # three LIFECYCLE methods that mutate `self._recording`/`self._fh`/
+        # `self._session_id`/etc. as a compound, multi-statement operation
+        # -- since Task 6's second review round, `stop()`'s own call site
+        # (`Engine._capture_stop_action_dispatch`, engine/core.py) can run
+        # on a WORKER THREAD (`asyncio.to_thread`) while a SIGTERM-driven
+        # `Engine.stop()` calls the sync `_capture_stop_action` directly on
+        # the main thread -- both paths reach this SAME `CaptureSink`
+        # instance's `stop()` body concurrently. A `threading.RLock`
+        # (REENTRANT, not a plain `Lock`) serializes all three lifecycle
+        # methods against each other so their state mutations can never
+        # interleave -- reentrant because `start()` itself calls `self.
+        # stop()` inline when a session is already recording (see that
+        # method's own "finalize whatever was running" precedent), which
+        # would deadlock a non-reentrant lock the instant the SAME thread
+        # tried to acquire it twice. This is the "fuller cure" alongside
+        # `Engine.stop()`'s own widened `except (ActionError, ValueError,
+        # OSError)` suppress (engine/core.py) -- that suppress is the
+        # MANDATORY backstop regardless of what a race produces; this lock
+        # is what keeps the race from being able to corrupt shared state in
+        # the first place. Deliberately NOT extended to the hot-path
+        # `record_event`/`record_action`/`record_page_changed`/`flush`/
+        # `maybe_flush` methods -- those run per MIDI event/per tick and
+        # must stay fast/non-blocking; this lock only ever guards the
+        # human-rate/session-boundary lifecycle operations.
+        self._lifecycle_lock = threading.RLock()
 
     # -- introspection ------------------------------------------------------
 
@@ -417,32 +444,37 @@ class CaptureSink:
         recording implicitly stops (and indexes) the prior session first --
         mirrors `MemoryCaptureManager._begin_session`'s own "finalize
         whatever was running" precedent rather than leaking an orphaned
-        open file handle."""
-        if self._recording:
-            self.stop()
-        self._sweep_retention()
-        os.makedirs(self._dir, exist_ok=True)
-        session_id = f"session-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
-        # Deliberately NOT a `with` block -- this handle is long-lived,
-        # spanning every `flush()` call for the rest of this session's
-        # life (potentially hours), closed explicitly in `stop()`.
-        self._fh = open(self.session_path(session_id), "a", encoding="utf-8")  # noqa: SIM115
-        self._session_id = session_id
-        self._started_ts = time.time()
-        self._counts = {}
-        self._last_bpm = None
-        self._last_flush_ts = self._started_ts
-        self._recording = True
-        self._buffer.append({
-            "kind": "header",
-            "format": FORMAT_VERSION,
-            "session_id": session_id,
-            "started_ts": self._started_ts,
-            "engine_version": self._engine_version,
-            "instruments": list(self._instruments),
-        })
-        self.flush()
-        return {"session_id": session_id, "started_ts": self._started_ts}
+        open file handle.
+
+        Locked (`self._lifecycle_lock`, see `__init__`'s own docstring) --
+        REENTRANT, since this method's own `self.stop()` call right below
+        re-acquires the SAME lock on the SAME thread."""
+        with self._lifecycle_lock:
+            if self._recording:
+                self.stop()
+            self._sweep_retention()
+            os.makedirs(self._dir, exist_ok=True)
+            session_id = f"session-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            # Deliberately NOT a `with` block -- this handle is long-lived,
+            # spanning every `flush()` call for the rest of this session's
+            # life (potentially hours), closed explicitly in `stop()`.
+            self._fh = open(self.session_path(session_id), "a", encoding="utf-8")  # noqa: SIM115
+            self._session_id = session_id
+            self._started_ts = time.time()
+            self._counts = {}
+            self._last_bpm = None
+            self._last_flush_ts = self._started_ts
+            self._recording = True
+            self._buffer.append({
+                "kind": "header",
+                "format": FORMAT_VERSION,
+                "session_id": session_id,
+                "started_ts": self._started_ts,
+                "engine_version": self._engine_version,
+                "instruments": list(self._instruments),
+            })
+            self.flush()
+            return {"session_id": session_id, "started_ts": self._started_ts}
 
     def stop(self) -> dict:
         """`capture.stop`: flush unconditionally (never rely on the cadence
@@ -504,36 +536,51 @@ class CaptureSink:
         (still logs a warning and lets the session become an ORPHAN --
         the SAME, already-handled, already-tested drift class `list_
         sessions`/`repair_index`, engine/sessions.py, exist to report/
-        heal) -- only the ORDER relative to the state reset changed."""
-        if not self._recording:
-            return {"session_id": None, "counts": {}}
-        self.flush()
-        session_id = self._session_id
-        started_ts = self._started_ts
-        ended_ts = time.time()
-        counts = dict(self._counts)
-        if self._fh is not None:
-            with contextlib.suppress(OSError):
-                self._fh.close()
-        # Reset FIRST -- see this method's own "THIRD review round"
-        # docstring section above for why this order is the actual fix.
-        self._recording = False
-        self._fh = None
-        self._session_id = None
-        self._started_ts = None
-        self._counts = {}
-        self._buffer.clear()
-        try:
-            self._update_index_on_stop(session_id, started_ts, ended_ts, counts)
-        except IndexLockBusy as exc:
-            _LOG.warning("capture.stop: index.json busy, session %s left as an orphan "
-                        "(no index row yet) -- run `midicrt sessions repair-index` to "
-                        "adopt it (%s)", session_id, exc)
-        self._last_session = {
-            "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
-            "counts": counts,
-        }
-        return {"session_id": session_id, "counts": counts}
+        heal) -- only the ORDER relative to the state reset changed.
+
+        Phase 9 close-out fix wave: also now locked (`self._lifecycle_
+        lock`, see `__init__`'s own docstring) for the ENTIRE body,
+        including `_update_index_on_stop`'s own bounded lock-wait -- a
+        SECOND concurrent `start`/`stop`/`fail` call (the exact SIGTERM-
+        vs-worker-stop race `Engine.stop()`'s own widened `suppress`
+        exists to backstop, engine/core.py) now genuinely WAITS for this
+        call to finish rather than interleaving state mutations with it.
+        The cost (a second caller blocked for up to `capture_mod.
+        ENGINE_LOCK_TIMEOUT_S` seconds in the rare case both really do
+        race) is a `threading` lock wait on a worker thread, not an
+        event-loop stall -- `asyncio.to_thread`'s own thread pool is
+        exactly what worker-thread blocking is for; this never touches
+        the loop."""
+        with self._lifecycle_lock:
+            if not self._recording:
+                return {"session_id": None, "counts": {}}
+            self.flush()
+            session_id = self._session_id
+            started_ts = self._started_ts
+            ended_ts = time.time()
+            counts = dict(self._counts)
+            if self._fh is not None:
+                with contextlib.suppress(OSError):
+                    self._fh.close()
+            # Reset FIRST -- see this method's own "THIRD review round"
+            # docstring section above for why this order is the actual fix.
+            self._recording = False
+            self._fh = None
+            self._session_id = None
+            self._started_ts = None
+            self._counts = {}
+            self._buffer.clear()
+            try:
+                self._update_index_on_stop(session_id, started_ts, ended_ts, counts)
+            except IndexLockBusy as exc:
+                _LOG.warning("capture.stop: index.json busy, session %s left as an orphan "
+                            "(no index row yet) -- run `midicrt sessions repair-index` to "
+                            "adopt it (%s)", session_id, exc)
+            self._last_session = {
+                "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
+                "counts": counts,
+            }
+            return {"session_id": session_id, "counts": counts}
 
     def fail(self, error: BaseException) -> dict:
         """Write-failure containment (fix wave, Critical finding): an
@@ -571,34 +618,39 @@ class CaptureSink:
         flushed) at the moment of failure is dropped -- the same loss-
         window disclosure the module docstring already makes for an
         unclean shutdown, just triggered by a write error instead of a
-        crash."""
-        session_id = self._session_id
-        started_ts = self._started_ts
-        counts = dict(self._counts)
-        ended_ts = time.time()
-        if self._fh is not None:
-            with contextlib.suppress(Exception):
-                self._fh.close()
-        self._recording = False
-        self._fh = None
-        self._session_id = None
-        self._started_ts = None
-        self._counts = {}
-        self._buffer.clear()
-        error_text = str(error)
-        if session_id:
-            self._last_session = {
-                "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
-                "counts": counts, "error": error_text,
-            }
-            with contextlib.suppress(Exception), _try_index_write_lock(self._dir):
-                rows = [r for r in self._load_index() if r.get("id") != session_id]
-                rows.append({
+        crash.
+
+        Phase 9 close-out fix wave: locked (`self._lifecycle_lock`, see
+        `__init__`'s own docstring and `stop()`'s own identical addition)
+        for the same "serialize every lifecycle mutation" reason."""
+        with self._lifecycle_lock:
+            session_id = self._session_id
+            started_ts = self._started_ts
+            counts = dict(self._counts)
+            ended_ts = time.time()
+            if self._fh is not None:
+                with contextlib.suppress(Exception):
+                    self._fh.close()
+            self._recording = False
+            self._fh = None
+            self._session_id = None
+            self._started_ts = None
+            self._counts = {}
+            self._buffer.clear()
+            error_text = str(error)
+            if session_id:
+                self._last_session = {
                     "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
-                    "counts": counts, "pinned": False, "error": error_text,
-                })
-                self._save_index(rows)
-        return {"session_id": session_id, "counts": counts, "error": error_text}
+                    "counts": counts, "error": error_text,
+                }
+                with contextlib.suppress(Exception), _try_index_write_lock(self._dir):
+                    rows = [r for r in self._load_index() if r.get("id") != session_id]
+                    rows.append({
+                        "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
+                        "counts": counts, "pinned": False, "error": error_text,
+                    })
+                    self._save_index(rows)
+            return {"session_id": session_id, "counts": counts, "error": error_text}
 
     def pin(self, session_id: str) -> dict:
         """`capture.pin {id}`: only ever targets a row already in

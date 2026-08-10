@@ -665,3 +665,114 @@ def test_start_retention_sweep_lock_wait_never_lets_a_concurrent_event_corrupt_s
     assert not start_errors, f"start() itself raised: {start_errors}"
     # The event recorded before recording ever went True must be dropped.
     assert sink.status()["counts"] == {}
+
+
+# -- lifecycle-lock serialization (Phase 9 close-out fix wave, item 2's
+# "fuller cure") -------------------------------------------------------------
+#
+# Independent of engine/core.py's own `Engine.stop()` suppress-widening
+# (test_engine_core.py's own proof), this is the CaptureSink-level "fuller
+# cure": `start`/`stop`/`fail` now serialize against each other via
+# `self._lifecycle_lock` (a `threading.RLock`), so the SIGTERM-vs-worker-
+# stop race (Task 6 second review round's own `asyncio.to_thread` offload
+# made this reachable in the first place) can never let two concurrent
+# calls interleave their state mutations.
+
+def test_concurrent_capture_stop_calls_are_serialized_by_the_lifecycle_lock(
+        tmp_path, monkeypatch):
+    """Two THREADS both calling `sink.stop()` for the SAME recording
+    session, forced to genuinely overlap (a monkeypatched `flush()` sleeps
+    on its first call, holding the lock the whole time) -- must never
+    raise, and exactly ONE of the two actually stops a real session (the
+    other cleanly sees "nothing recording", not a torn/interleaved
+    partial state). Verified RED against a version of this fix with the
+    lock removed (see task report for the transcript) before landing."""
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    sink.start()
+
+    real_flush = sink.flush
+    call_state = {"n": 0}
+
+    def slow_flush():
+        call_state["n"] += 1
+        if call_state["n"] == 1:
+            time.sleep(0.2)
+        return real_flush()
+
+    monkeypatch.setattr(sink, "flush", slow_flush)
+
+    results = []
+    errors = []
+
+    def do_stop():
+        try:
+            results.append(sink.stop())
+        except Exception as exc:   # noqa: BLE001 -- deliberately broad, see assertion below
+            errors.append(exc)
+
+    t1 = threading.Thread(target=do_stop)
+    t1.start()
+    time.sleep(0.05)   # let t1 get past the recording-check and into flush()
+    t2 = threading.Thread(target=do_stop)
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert not errors, f"concurrent stop() calls raised: {errors}"
+    assert len(results) == 2
+    real_stops = [r for r in results if r["session_id"] is not None]
+    noop_stops = [r for r in results if r["session_id"] is None]
+    assert len(real_stops) == 1, (
+        f"expected exactly one real stop, got {len(real_stops)}: {results}")
+    assert len(noop_stops) == 1
+
+
+def test_concurrent_start_and_stop_do_not_corrupt_state(tmp_path, monkeypatch):
+    """A second flavor of the same race: `start()`'s own inline `self.
+    stop()` (finalizing a prior session) racing a SEPARATE, concurrent
+    direct `stop()` call for that SAME prior session -- must never raise,
+    and the final state is consistent (a real session recording, with a
+    fresh id, once both threads finish)."""
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    sink.start()
+
+    real_flush = sink.flush
+    call_state = {"n": 0}
+
+    def slow_flush():
+        call_state["n"] += 1
+        if call_state["n"] == 1:
+            time.sleep(0.2)
+        return real_flush()
+
+    monkeypatch.setattr(sink, "flush", slow_flush)
+
+    errors = []
+
+    def do_stop():
+        try:
+            sink.stop()
+        except Exception as exc:   # noqa: BLE001
+            errors.append(exc)
+
+    def do_start():
+        try:
+            sink.start()
+        except Exception as exc:   # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=do_stop)
+    t1.start()
+    time.sleep(0.05)
+    t2 = threading.Thread(target=do_start)
+    t2.start()
+    t1.join(timeout=5)
+    t2.join(timeout=5)
+
+    assert not errors, f"concurrent start()/stop() raised: {errors}"
+    # Exactly one session ended up recording, with a real, non-None id --
+    # not a corrupted half-state from the two threads interleaving.
+    assert sink.is_recording is True
+    assert sink._session_id is not None
+    assert sink._fh is not None
+    assert not sink._fh.closed

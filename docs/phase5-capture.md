@@ -296,6 +296,37 @@ ever reaches real hardware.
   absolute-result record, so replay needs no page-roster-order knowledge
   of `page.next`/`page.prev`'s *relative* semantics to reproduce the same
   final answer live dispatch already computed once.
+- **`panic.release` marks** (Phase 9 close-out fix wave — added to the
+  exception list alongside `page_changed`, a reviewer-verified fix) are
+  ALSO applied as a DIRECT state mutation, for the identical reason
+  `page_changed` is: `Engine._release_for_panic` (a stuck-note CRIT
+  panic's internal half) routes each released note through
+  `_dispatch_to_state` directly, live — the SAME analyzer/page fan-out a
+  real event gets — and was NEVER dispatched through `ActionRegistry.
+  dispatch` in the first place (see §2's own origin table: `alert`-origin
+  marks bypass the dispatcher entirely). "Applying" this mark in replay
+  therefore carries none of the real-file/real-MIDI/real-config risk the
+  "never re-executed" rule right below exists to guard against — it's a
+  pure in-memory state mutation, not a re-dispatched client action.
+  Before this fix, replay only ever COUNTED this mark (the generic rule
+  below) — meaning a replayed session showed the panicked note STILL
+  held even though the LIVE session had already released it (reviewer's
+  own live reproduction: `voices.total` stayed nonzero after a replayed
+  panic cycle that had, live, driven it back to zero). Fixed by building
+  the SAME synthetic `note_off` `MidiEvent` `_release_for_panic` itself
+  builds (per note in the mark's own `"notes"` list) and routing it
+  through `_dispatch_to_state`. **Index conversion, the one sharp edge**:
+  the mark's own `"ch"` is 1-INDEXED (`Engine._maybe_panic`'s own
+  `alert["ch"]` convention — see the `panic.release` row in §2's origin
+  table above), while every `MidiEvent.channel` is 0-INDEXED — the
+  replayer must apply the SAME `channel = ch - 1` conversion
+  `_release_for_panic` itself does live, or every released note lands on
+  the WRONG channel's held-note ledger (no error, just silently wrong).
+  `midicrt sessions trim` (`engine/sessions.py::trim_session`) has the
+  IDENTICAL fix in its own pre-window sustain scan, for the sibling
+  reason: a note released by panic before a trim window must not get a
+  bogus synthetic boundary `note_on` either — see that function's own
+  docstring.
 - **Every other `action` mark** is COUNTED (`actions_by_origin[origin]
   += 1`) and **never re-executed** — a deliberate safety property, not
   "not yet implemented": a genuinely re-dispatched `capture.start` would
@@ -305,7 +336,12 @@ ever reaches real hardware.
   is no safe, general way to replay an arbitrary action mark as a real
   dispatch without auditing every current AND future action one at a
   time — mark-counting has no such risk, since it's a pure read of the
-  mark's own `origin` field.
+  mark's own `origin` field. `panic.notes_off` (the OTHER panic-cycle
+  mark, the external All-Notes-Off CC send) stays in THIS generic
+  counted-only bucket — it has no internal state effect of its own to
+  replay (see §2's own origin table: the state-mutating half is entirely
+  `panic.release`'s job), so there's nothing for a mark-applier to DO
+  with it beyond counting.
 - **`tempo` lines**: ignored entirely (see §2 — no information replay
   needs that isn't already in the `clock_tick` events).
 - **Any other/future mark `kind`**: silently ignored (forward-compatible

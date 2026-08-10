@@ -429,6 +429,81 @@ def test_trim_session_synthesizes_independently_per_channel(tmp_path):
     assert synthetic[0]["data1"] == 60
 
 
+# -- panic-release consumption in the pre-window sustain scan (Phase 9
+# close-out fix wave, reviewer-verified regression) --------------------------
+#
+# `engine/core.py::_release_for_panic` records a `panic.release` mark
+# (`{"ch", "notes"}`, 1-INDEXED `ch` -- see that method's own docstring) for
+# a note it silences internally via `_dispatch_to_state`, WITHOUT a matching
+# `kind="event"` note_off line. Before this fix, trim's pre-window scan only
+# ever looked at `kind="event"` lines, so a note panic already released
+# BEFORE the trim window still looked "active" at the boundary (its real
+# `note_on` seen, no `note_off` EVENT ever seen) -- trim would synthesize a
+# bogus boundary note_on for a note that was honestly silent. `CaptureSink.
+# record_action` has no `ts`-injection point (always `time.time()`), so
+# these tests append the `panic.release` line directly to the raw `.jsonl`
+# file (bypassing the sink) to get a precise, session-relative `ts` --
+# exactly like a real capture would order it, just with one line's `ts`
+# rigged for the test.
+
+def _append_raw_line(tmp_path, session_id, line):
+    path = os.path.join(str(tmp_path), f"{session_id}.jsonl")
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(line) + "\n")
+
+
+def test_trim_session_does_not_synthesize_a_note_panic_already_released(tmp_path):
+    sink = make_sink(tmp_path)
+    start = sink.start()
+    base = start["started_ts"]
+    sid = start["session_id"]
+    # ch0 (0-indexed) n60: turned on before the window, no real note_off --
+    # but IS released by a panic.release mark (1-indexed ch=1) at 0.8s,
+    # still before --from=1.0.
+    sink.record_event(make_event(type="note_on", ts=base + 0.5, channel=0, data1=60, data2=100))
+    sink.flush()
+    _append_raw_line(tmp_path, sid, {"kind": "action", "ts": base + 0.8, "name": "panic.release",
+                                     "args": {"ch": 1, "notes": [60]}, "origin": "alert"})
+    sink.stop()
+
+    result = sessions.trim_session(str(tmp_path), sid, 1.0, 5.0,
+                                   now_fn=lambda: 1786170000.0,
+                                   id_fn=lambda now: "session-trim-panic-released")
+    lines = read_jsonl(result["path"])
+    events = [line for line in lines if line["kind"] == "event"]
+    assert not any(e.get("synthetic") for e in events)
+    assert not any(e["data1"] == 60 for e in events)   # not present at all -- honestly silent
+
+
+def test_trim_session_panic_release_channel_index_conversion_is_honored(tmp_path):
+    """The reviewer's own explicitly-flagged trap: the mark's `ch` is
+    1-indexed, the event/synthesis `channel` field is 0-indexed. A
+    `panic.release` mark for `ch=1` (-> 0-indexed channel 0) must NOT
+    release a held note on a DIFFERENT channel -- proven here by holding
+    the SAME note number on channel 1 (0-indexed) too, which the mark must
+    leave untouched."""
+    sink = make_sink(tmp_path)
+    start = sink.start()
+    base = start["started_ts"]
+    sid = start["session_id"]
+    sink.record_event(make_event(type="note_on", ts=base + 0.5, channel=0, data1=60, data2=100))
+    sink.record_event(make_event(type="note_on", ts=base + 0.6, channel=1, data1=60, data2=90))
+    sink.flush()
+    # ch=1 (1-indexed) -> 0-indexed channel 0 -- releases ONLY the ch0 note.
+    _append_raw_line(tmp_path, sid, {"kind": "action", "ts": base + 0.8, "name": "panic.release",
+                                     "args": {"ch": 1, "notes": [60]}, "origin": "alert"})
+    sink.stop()
+
+    result = sessions.trim_session(str(tmp_path), sid, 1.0, 5.0,
+                                   now_fn=lambda: 1786170000.0,
+                                   id_fn=lambda now: "session-trim-panic-channel")
+    lines = read_jsonl(result["path"])
+    synthetic = [line for line in lines if line.get("synthetic")]
+    assert len(synthetic) == 1
+    assert synthetic[0]["channel"] == 1   # the UNRELEASED note, on 0-indexed channel 1
+    assert synthetic[0]["data1"] == 60
+
+
 def test_trim_session_refuses_the_live_session(tmp_path):
     sink = make_sink(tmp_path)
     result = sink.start()

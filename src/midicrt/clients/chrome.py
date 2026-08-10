@@ -86,6 +86,31 @@ def _fmt_alert_parts(entries: list[dict]) -> str:
     return " | ".join(parts)
 
 
+def _live_alert_text(vm: dict) -> str:
+    """The LIVE half of `alerts_text()` (a currently-active `STUCK WARN/
+    CRIT: ...` alert), factored out so `secondary_status_text`/
+    `secondary_status_dim` (Phase 9 close-out, controller ruling: chrome
+    re-rank) can check it INDEPENDENTLY of the lingering-cleared half at
+    its own, higher-priority rung -- see `secondary_status_text`'s own
+    docstring for the full chain. `""` when no live alert is active."""
+    alerts = vm.get("alerts") or []
+    if not alerts:
+        return ""
+    level = "CRIT" if any(a["level"] == "crit" for a in alerts) else "WARN"
+    return f"STUCK {level}: " + _fmt_alert_parts(alerts)
+
+
+def _lingering_cleared_text(vm: dict) -> str:
+    """The LINGERING half of `alerts_text()` (a DIMMED, historical "STUCK
+    CLEARED: ..." message, `config.stuck_hold_after` -- v1's `HOLD_AFTER`)
+    -- see `_live_alert_text`'s own docstring for why this is a separate
+    function now. `""` when nothing is lingering."""
+    cleared = vm.get("cleared") or []
+    if not cleared:
+        return ""
+    return "STUCK CLEARED: " + _fmt_alert_parts(cleared)
+
+
 def alerts_text(vm: dict) -> str:
     """Build v1's "STUCK WARN/CRIT: ..." banner line from an
     `overlay.alerts` view-model, falling back to a DIMMED (see
@@ -96,30 +121,59 @@ def alerts_text(vm: dict) -> str:
     v1's octave-letter name (`_fmt_note`, e.g. note 60 -> "C6(060)") -- see
     analyzers/stucknotes.py's module docstring for why that convention
     isn't reproduced.
-    """
-    alerts = vm.get("alerts") or []
-    if alerts:
-        level = "CRIT" if any(a["level"] == "crit" for a in alerts) else "WARN"
-        return f"STUCK {level}: " + _fmt_alert_parts(alerts)
-    cleared = vm.get("cleared") or []
-    if cleared:
-        return "STUCK CLEARED: " + _fmt_alert_parts(cleared)
-    return ""
+
+    This function's OWN contract is unchanged by the Phase 9 close-out
+    chrome re-rank (still combined live-then-lingering, live always wins
+    when both are present) -- it is a thin wrapper around `_live_alert_
+    text`/`_lingering_cleared_text` now, kept as its own public, tested
+    entry point for any caller that only cares about "what would the
+    alerts widget alone show," not the FULL shared-row priority chain
+    `secondary_status_text` builds (which needs the two halves at
+    DIFFERENT rungs, interleaved with poly-limit/sysex -- see that
+    function's own docstring)."""
+    live = _live_alert_text(vm)
+    if live:
+        return live
+    return _lingering_cleared_text(vm)
 
 
-def secondary_status_dim(alerts_vm: dict) -> bool:
+def secondary_status_dim(alerts_vm: dict, polylimit_vm: dict | None = None,
+                         sysex_vm: dict | None = None) -> bool:
     """True exactly when the second chrome row is about to show the
-    DIMMED, lingering "STUCK CLEARED" message (Phase 9 Task 2) instead of
-    a live alert or the routine time-signature line -- the renderer's cue
-    to paint a LOWER luminance ramp tier (monochrome mandate: "dim" is a
-    shading level, never a separate hue or a blink) instead of the normal
-    bright reverse-video fill. False whenever a real alert is active (full
-    brightness, urgent -- matches v1's own CRIT reverse-video emphasis) or
-    the row is showing the ordinary time-signature line (also full
-    brightness -- v1 never dims that line either)."""
-    alerts = alerts_vm.get("alerts") or []
-    cleared = alerts_vm.get("cleared") or []
-    return not alerts and bool(cleared)
+    DIMMED, lingering "STUCK CLEARED" message (Phase 9 Task 2) -- the
+    renderer's cue to paint a LOWER luminance ramp tier (monochrome
+    mandate: "dim" is a shading level, never a separate hue or a blink)
+    instead of the normal bright reverse-video fill. False whenever
+    anything HIGHER-priority than the lingering message is what's
+    actually being shown instead -- a live alert, a poly-limit flash, or
+    active sysex-status text (all full brightness, urgent/confirmatory)
+    -- or the row has fallen all the way through to the ordinary time-
+    signature line (also full brightness -- v1 never dims that line
+    either).
+
+    Phase 9 close-out (controller ruling, chrome re-rank): `polylimit_vm`/
+    `sysex_vm` are NEW, OPTIONAL params (default `None`/"not active", so
+    every pre-existing 1-arg call site keeps working unchanged) --
+    REQUIRED for this function to stay consistent with `secondary_status_
+    text`'s own reordered priority chain (live alerts > poly flash >
+    sysex status > lingering-cleared > timesig). Before this fix, this
+    function computed dim-ness from `alerts_vm` ALONE, independently of
+    whether `secondary_status_text` was ACTUALLY about to render the
+    lingering message at all -- a real bug once poly-limit/sysex could
+    both outrank it: the row would render poly-limit's or sysex's own
+    full-brightness text while this function told the caller to dim the
+    background under it, a visible mismatch. Callers that don't (or
+    can't) supply the two new args keep the OLD, narrower "no live alert"
+    behavior, which is only WRONG in the exact scenario this fix closes
+    (a simultaneous poly-flash/sysex-active condition) -- see `clients/
+    fb/app.py::_draw_secondary`'s own call site, which DOES supply both."""
+    if _live_alert_text(alerts_vm):
+        return False
+    if polylimit_vm and polylimit_vm.get("flashing"):
+        return False
+    if sysex_vm and sysex_vm.get("active") and sysex_vm.get("text"):
+        return False
+    return bool(_lingering_cleared_text(alerts_vm))
 
 
 def timesig_text(vm: dict) -> str:
@@ -245,16 +299,16 @@ def secondary_status_text(alerts_vm: dict, timesig_vm: dict, polylimit_vm: dict 
     """The shared second chrome row's text -- priority chain (most urgent
     wins, routine timesig only shows when NOTHING more urgent is active):
 
-    1. `alerts_text()` (stuck alerts, live or lingering-cleared) -- v1's
-       own `zstucknotes.py` CRIT reverse-video urgency, this row's
-       original tenant.
+    1. `_live_alert_text()` (a CURRENTLY-ACTIVE stuck alert, WARN or CRIT)
+       -- v1's own `zstucknotes.py` CRIT reverse-video urgency, this row's
+       original tenant. Rung 1, unconditionally, no exceptions.
     2. The poly-limit chrome flash (Phase 9 Task 2, `polylimit_vm[
        "flashing"]` -- disclosed v2-native addition, v1's
        `zvoicemonitor.py` has no chrome home of its own, see
        `analyzers/voices.py`'s module docstring) -- also an urgent,
-       device-malfunction-adjacent condition, same tier as alerts in
-       spirit (both mean "something is wrong RIGHT NOW"), but alerts win
-       when both are simultaneously true (a stuck note is the more
+       device-malfunction-adjacent condition, same tier as a live alert in
+       spirit (both mean "something is wrong RIGHT NOW"), but a live alert
+       wins when both are simultaneously true (a stuck note is the more
        actionable of the two).
     3. The sysex-status text (Phase 9 Task 5, `sysex_vm["active"]` --
        v1 parity item, `plugins/loopprogress.py`'s own left-of-bar
@@ -262,29 +316,29 @@ def secondary_status_text(alerts_vm: dict, timesig_vm: dict, polylimit_vm: dict 
        sysex_store.py` finally gives it a v2 data source; see
        `engine/core.py::_SysexStatusOverlay`'s own docstring and
        docs/task-5-report.md's v1-extraction section). Deliberately
-       ranked BELOW alerts/poly-limit and ABOVE timesig: this is a
-       disclosed, v2-native ROW-PLACEMENT decision, not a literal replay
-       of v1's own layout -- v1 showed this text on a COMPLETELY
-       DIFFERENT row (the loopprogress bar's row, not the stuck-notes
-       row this function builds), with nothing else ever competing for
-       that space. v2 already established the precedent of consolidating
-       cheap/glanceable, non-alert diagnostic text onto this SAME shared
-       row rather than reserving a new one per widget (`timesig_text`
-       itself has "no v1 chrome row of its own" and shares this exact
-       row for the identical reason, see the module-level comment above
-       `alerts_text`) -- sysex-status joins for the same reason: it is
-       informational/confirmatory ("your remote-control command fired and
-       here's what it did"), never as urgent as a stuck note or an
-       exceeded polyphony limit, but still more timely than the
-       always-present routine timesig baseline, so it wins that
-       tie-break. Review fix (controller ruling, re-checking the v1
-       extraction under review): `sysex_vm["text"]` is fed EXCLUSIVELY by
-       the pre-existing midicrt CMD-dispatch subsystem's own outcomes
-       (`engine/sysex.py::build_status_text`, `Engine._handle_sysex`) --
-       NOT by generic incoming sysex traffic, and NOT by the browser-
-       facing sysex MANAGER's own save/play/delete actions (`engine/
-       sysex_store.py`'s ring/library CRUD) either. v1's real
-       `sysex_status` only ever lit up for an actual midicrt remote-
+       ranked BELOW live-alert/poly-limit and ABOVE the lingering-cleared
+       message AND timesig: this is a disclosed, v2-native ROW-PLACEMENT
+       decision, not a literal replay of v1's own layout -- v1 showed this
+       text on a COMPLETELY DIFFERENT row (the loopprogress bar's row, not
+       the stuck-notes row this function builds), with nothing else ever
+       competing for that space. v2 already established the precedent of
+       consolidating cheap/glanceable, non-alert diagnostic text onto this
+       SAME shared row rather than reserving a new one per widget
+       (`timesig_text` itself has "no v1 chrome row of its own" and shares
+       this exact row for the identical reason, see the module-level
+       comment above `alerts_text`) -- sysex-status joins for the same
+       reason: it is informational/confirmatory ("your remote-control
+       command fired and here's what it did"), never as urgent as a stuck
+       note or an exceeded polyphony limit, but still more timely than
+       either the lingering-cleared relic below it or the always-present
+       routine timesig baseline. Review fix (controller ruling, re-
+       checking the v1 extraction under review): `sysex_vm["text"]` is
+       fed EXCLUSIVELY by the pre-existing midicrt CMD-dispatch
+       subsystem's own outcomes (`engine/sysex.py::build_status_text`,
+       `Engine._handle_sysex`) -- NOT by generic incoming sysex traffic,
+       and NOT by the browser-facing sysex MANAGER's own save/play/delete
+       actions (`engine/sysex_store.py`'s ring/library CRUD) either. v1's
+       real `sysex_status` only ever lit up for an actual midicrt remote-
        control command outcome (`plugins/sysex.py:55-57`, called only
        from `_dispatch()`'s own branches) -- a real Cirklon rig's other,
        non-midicrt sysex chatter never touched it, and this row must not
@@ -292,19 +346,37 @@ def secondary_status_text(alerts_vm: dict, timesig_vm: dict, polylimit_vm: dict 
        constantly (noise v1 deliberately never had). See engine/
        sysex_store.py's own module docstring for the full v1-evidence
        writeup.
-    4. `timesig_text()` -- the routine fallback, wins only when nothing
+    4. `_lingering_cleared_text()` (a DIMMED, historical "STUCK CLEARED:
+       ..." message -- see `secondary_status_dim`) -- Phase 9 close-out,
+       CONTROLLER RULING: this used to be bundled into rung 1 (`alerts_
+       text()` returned live-or-lingering as ONE combined value, so a
+       stale, already-resolved, dimmed relic could outrank a LIVE
+       poly-limit flash or an active sysex confirmation -- both more
+       urgent, more actionable, more RIGHT-NOW facts than "a note used to
+       be stuck"). Moved down here, its own rung, BELOW poly-limit and
+       sysex: a dimmed historical relic must never mask live urgent info.
+       Still ranked ABOVE the routine timesig fallback -- a recently-
+       cleared stuck note is more noteworthy than the routine baseline,
+       just not as noteworthy as anything actually live.
+    5. `timesig_text()` -- the routine fallback, wins only when nothing
        above is active.
 
     `polylimit_vm`/`sysex_vm` are both OPTIONAL (default `None`/"not
     active") so every pre-existing 2- and 3-arg call site keeps working
-    unchanged."""
-    text = alerts_text(alerts_vm)
-    if text:
-        return text
+    unchanged. `secondary_status_dim()` (above) mirrors this EXACT same
+    priority chain so the renderer's "should this row be dimmed" decision
+    can never disagree with what text this function actually returns --
+    see that function's own docstring for the bug this fix also closes."""
+    live = _live_alert_text(alerts_vm)
+    if live:
+        return live
     if polylimit_vm and polylimit_vm.get("flashing"):
         return POLYLIMIT_FLASH_TEXT
     if sysex_vm and sysex_vm.get("active") and sysex_vm.get("text"):
         return sysex_vm["text"]
+    lingering = _lingering_cleared_text(alerts_vm)
+    if lingering:
+        return lingering
     return timesig_text(timesig_vm)
 
 
@@ -510,14 +582,19 @@ def _entry_display_label(entry, roster: list[str] | None, key: str | None = None
       place). Unlike `page.jump` above, this does NOT need `roster` at
       all -- the v1 ID comes from the STATIC `PAGE_IDS` table, not the
       live cycle order, so it resolves identically whether or not the
-      named page is actually reachable on this build (e.g. "tuner",
-      v1 ID 10, absent from the default roster -- see `engine/
-      core.py::Engine._page_goto`'s own graceful-no-op docstring for what
-      actually happens if this key IS pressed). A `page.goto` entry naming
-      a page with NO v1 ID (e.g. a hand-written keymap.toml binding a key
-      to "screensaver") falls back to the bare `"-> {name}"` -- still more
-      informative than the literal action name, just without an ID tag it
-      genuinely doesn't have."""
+      named page is actually reachable on this build (a `PAGE_IDS` entry
+      excluded by a narrowed/custom `config.pages` roster -- the STOCK
+      default roster currently includes every `PAGE_IDS`-mapped page, so
+      this is only reachable via a hand-edited roster today; stale-claim
+      fix, Phase 9 close-out: this used to cite "tuner", v1 ID 10, as the
+      concrete example, but Task 3 (96b1c12, "feat: live tuner") added it
+      to the default roster -- see `engine/core.py::Engine._page_goto`'s
+      own graceful-no-op docstring for what actually happens if a digit
+      key naming a truly roster-absent page IS pressed). A `page.goto`
+      entry naming a page with NO v1 ID (e.g. a hand-written keymap.toml
+      binding a key to "screensaver") falls back to the bare
+      `"-> {name}"` -- still more informative than the literal action
+      name, just without an ID tag it genuinely doesn't have."""
     if isinstance(entry, dict) and entry.get("action") == "page.jump" and roster:
         position = entry.get("args", {}).get("position")
         if isinstance(position, int) and 1 <= position <= len(roster):

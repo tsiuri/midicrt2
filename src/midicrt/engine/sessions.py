@@ -521,6 +521,26 @@ def trim_session(capture_dir: str, session_id: str, from_s: float, to_s: float, 
     window" -- no duplicate synthesis, by construction, not by a special
     case (see test_sessions.py's own boundary-exact test).
 
+    `panic.release` consumption (Phase 9 close-out fix wave, reviewer-
+    verified sibling regression): the SAME pre-window scan ALSO consumes
+    `panic.release` action marks (`engine/core.py::_release_for_panic`'s
+    own provenance trace for an internally-silenced stuck note -- see
+    `docs/phase5-capture.md` §2's origin table). A note silenced by a
+    live panic has NO `note_off` EVENT at all (the release is dispatched
+    directly to analyzer/page state, never through `Engine._handle`, so
+    it leaves no raw-capture trace of its own) -- without this, a note
+    panic already released BEFORE the window would still read "active" at
+    the boundary (its `note_on` seen, no `note_off` EVER seen) and get a
+    bogus synthetic boundary note_on, even though it was honestly silent
+    the whole time. **Index conversion, the same sharp edge `engine/
+    replay.py::_apply_panic_release_mark` documents for its own sibling
+    fix**: the mark's `"ch"` is 1-INDEXED, every `channel` field here is
+    0-INDEXED -- this scan converts via `channel = ch - 1` before
+    checking `active_before_window`, matching `_release_for_panic`'s own
+    conversion exactly; getting this backwards would silently clear the
+    WRONG channel's held note (no error, just wrong) rather than the one
+    panic actually released.
+
     Disclosed, deliberate scope limit: this fix covers `note_on`/
     `note_off` sustain ONLY (the reviewer's own reproduction, and the
     ONE stateful MIDI condition every current replay consumer -- voices/
@@ -576,6 +596,36 @@ def trim_session(capture_dir: str, session_id: str, from_s: float, to_s: float, 
                     active_before_window[(line.get("channel"), line.get("data1"))] = line
                 elif note_type == "note_off":
                     active_before_window.pop((line.get("channel"), line.get("data1")), None)
+            elif line.get("kind") == "action" and line.get("name") == "panic.release":
+                # Phase 9 close-out fix wave (reviewer-verified regression):
+                # `Engine._release_for_panic` (engine/core.py) silences a
+                # held note internally (`_dispatch_to_state`, no `kind=
+                # "event"` line -- see docs/phase5-capture.md §2's own
+                # "internal action, not a fake wire event" framing) and
+                # records ONLY this mark. Without consuming it here, a note
+                # panic already released BEFORE the window still looked
+                # "active" at the boundary (a real note_on seen, no note_off
+                # EVENT ever seen) -- trim would synthesize a bogus boundary
+                # note_on for a note that was honestly silent. INDEX
+                # CONVERSION (the reviewer's own explicitly-flagged trap):
+                # the mark's own `"ch"` is 1-INDEXED (`Engine._maybe_panic`'s
+                # own `alert["ch"]` convention), while every event/synthesis
+                # `channel` field here is 0-INDEXED -- `_release_for_panic`
+                # itself converts via `channel=ch - 1` when building ITS OWN
+                # synthetic release event, and this scan must perform the
+                # IDENTICAL conversion or every released note gets checked
+                # against the WRONG channel's ledger (silently correct-
+                # looking, since nothing raises -- just wrong; see replay.py's
+                # own `_apply_panic_release_mark` for the sibling fix and the
+                # same conversion, applied at replay time instead of trim
+                # time).
+                args = line.get("args") or {}
+                ch = args.get("ch")
+                notes = args.get("notes")
+                if isinstance(ch, int) and isinstance(notes, list):
+                    channel = ch - 1
+                    for note in notes:
+                        active_before_window.pop((channel, note), None)
             continue
         if ts > abs_end:
             continue

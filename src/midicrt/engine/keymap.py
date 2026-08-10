@@ -286,10 +286,14 @@ def _default_v1_id_goto_bindings() -> dict[str, dict[str, Any]]:
     Every `PAGE_IDS` entry gets a binding UNCONDITIONALLY, regardless of
     whether its page is in any particular build's roster -- `page.goto`'s
     own graceful no-op (`engine/core.py::Engine._page_goto`, this task's
-    own addition) is what makes a v1-mapped-but-roster-absent page (e.g.
-    "tuner" on the stock default roster) harmless rather than a dispatch
-    error, the same "ordinary, expected situation" category `page.jump`'s
-    own out-of-range no-op already established -- just reached through
+    own addition) is what makes a v1-mapped-but-roster-absent page (any
+    `PAGE_IDS` entry excluded by a narrowed/custom `config.pages` roster
+    -- the STOCK default roster, as of Phase 9 Task 3, 96b1c12 "feat:
+    live tuner", currently includes every `PAGE_IDS`-mapped page, "tuner"
+    incl., so this scenario is only reachable via a hand-edited roster
+    today, not out of the box) harmless rather than a dispatch error, the
+    same "ordinary, expected situation" category `page.jump`'s own
+    out-of-range no-op already established -- just reached through
     `page.goto`'s own handler instead of a new one.
 
     Raises `ValueError` at IMPORT time (never at some later dispatch) if a

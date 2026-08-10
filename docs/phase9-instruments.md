@@ -238,24 +238,43 @@ extraction) — don't conflate them when grepping capture files.
 
 ## Chrome priority chain (final state, `clients/chrome.py::secondary_status_text`)
 
-The shared second chrome row picks the MOST urgent of, in order:
+The shared second chrome row picks the MOST urgent of, in order — **as
+re-ranked in the Phase 9 close-out fix wave, controller ruling** (a
+DIMMED, already-resolved historical relic must never mask live, urgent
+info; this superseded an earlier draft where "stuck alerts" was one
+combined rung covering BOTH the live and lingering cases, letting a
+resolved-and-dimmed relic outrank a live poly-limit flash or an active
+sysex confirmation):
 
-1. **Stuck alerts** (live or lingering-cleared) — v1's original tenant of
-   this row.
+1. **Live stuck alerts** (`STUCK WARN`/`STUCK CRIT`, currently active) —
+   v1's original tenant of this row. Unconditional rung 1, no exceptions.
 2. **Poly-limit flash** (Task 2, v2-native — v1 has no chrome home for
-   this data at all) — same "something is wrong right now" tier as
-   alerts, but alerts win when both are simultaneously true.
+   this data at all) — same "something is wrong right now" tier as a
+   live alert, but a live alert wins when both are simultaneously true.
 3. **Sysex-status text** (Task 5, v1 parity item — v1 showed this on a
    DIFFERENT row entirely, the loopprogress bar's row; v2 deliberately
    consolidates it onto this shared row instead of reserving a new one,
    following the same precedent `timesig_text` already established).
-   Informational/confirmatory, never as urgent as alerts/poly-limit, but
-   more timely than the routine fallback.
-4. **Timesig text** — routine fallback, wins only when nothing above is
+   Informational/confirmatory, never as urgent as a live alert/poly-limit,
+   but more timely than either the lingering-cleared relic below it or
+   the routine fallback.
+4. **Lingering-cleared stuck-note message** (`STUCK CLEARED: ...`, DIMMED
+   — `config.stuck_hold_after`) — a resolved, historical fact, not a live
+   one. Ranked BELOW poly-limit/sysex (both real, live, actionable RIGHT
+   NOW) but still ABOVE the routine timesig fallback (a recently-cleared
+   stuck note is more noteworthy than the always-present baseline).
+5. **Timesig text** — routine fallback, wins only when nothing above is
    active.
 
 `polylimit_vm`/`sysex_vm` are both optional args (default "not active") so
 every pre-Phase-9 call site with only 2–3 args keeps working unchanged.
+`secondary_status_dim()` (the renderer's "should this row be dimmed" cue)
+takes the SAME two optional args now, for the identical reason: it must
+agree with `secondary_status_text()` about which rung actually won, or
+the row could render full-brightness poly-limit/sysex text while still
+being told to paint the dimmed background underneath it (a real bug this
+same fix closed, `clients/chrome.py::secondary_status_dim`'s own
+docstring has the full incident).
 
 ## Known limitations
 
@@ -317,3 +336,22 @@ parallel `midicrt status` probe (26 samples, 0 failures, 0.69–0.91s
 latency, no spike). Full before/after JSON + probe log:
 `~/projects/pivisualizer/docs/evidence-phase9-smoke/` (ops repo,
 motherbase).
+
+**Follow-up run, Phase 9 close-out fix wave** (same day, after Task 6's
+own three review rounds — index.json locking, panic-release replay
+parity, chrome re-rank, etc. — and one more deliberate production
+restart to deploy them): `midicrt sessions repair-index` run a SECOND
+time, this time genuinely idempotent-clean rather than a real adoption --
+**0 adopted, 0 dropped, 51 kept** (every one of T7's own 51 finished
+sessions, verbatim), and the store's THEN-current live session correctly
+skipped. Store grew to 52 total by the time of this run (one more
+finished session landed from the fix wave's own live verification
+activity, cleanly indexed at `capture.stop` time, never orphaned) — **the
+store's steady-state orphan count is 0 both before and after this
+entire fix wave**, not the "a fresh orphan is expected" the coordinator's
+own instructions predicted going in: every `capture.stop`/`capture.start`
+cycle exercised during this round's own live checks (§10/§11 of `task-6-
+report.md`, plus this wave's own final-wave-report.md) completed cleanly
+(including through a real, deliberate production restart), so nothing
+was left to adopt. Disclosed as the honest result, not silently
+adjusted to match the prediction.

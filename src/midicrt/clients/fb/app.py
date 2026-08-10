@@ -1321,33 +1321,46 @@ def _draw_secondary(surface: Surface, alerts_vm: dict, timesig_vm: dict, font,
     `secondary_status_text()`.
 
     Phase 9 Task 2 (stuck-linger): the strip's FILL drops from `HEADER_BG`
-    (bright) to `LUM_DIM` whenever `secondary_status_dim(alerts_vm)`
-    reports the row is showing the lingering "STUCK CLEARED" message
-    (`config.stuck_hold_after`) instead of a live alert or the routine
-    time-signature line -- monochrome mandate: "dim" is a lower luminance
-    ramp tier, not a separate hue or a blink. Text stays `BG` either way
-    (unchanged reverse-video convention); only the background tier moves.
+    (bright) to `LUM_DIM` whenever `secondary_status_dim(alerts_vm,
+    polylimit_vm, sysex_vm)` reports the row is ACTUALLY showing the
+    lingering "STUCK CLEARED" message (`config.stuck_hold_after`) --
+    monochrome mandate: "dim" is a lower luminance ramp tier, not a
+    separate hue or a blink. Text stays `BG` either way (unchanged
+    reverse-video convention); only the background tier moves.
 
     Phase 9 Task 2 (poly-limit chrome flash): `polylimit_vm` (OPTIONAL,
     defaults to "not flashing" -- every pre-existing call site keeps
-    rendering byte-identically) is threaded straight into
-    `secondary_status_text()`'s own 3rd param -- see that function's
-    docstring for the alerts > polylimit-flash > timesig priority chain.
-    The flash does NOT dim the strip (full brightness -- it's urgent, like
-    a live alert, unlike the stuck-linger case above).
+    rendering byte-identically) is threaded into BOTH `secondary_status_
+    dim()`'s and `secondary_status_text()`'s own params -- see the latter's
+    docstring for the FULL priority chain (Phase 9 close-out, controller
+    ruling: live alert > polylimit-flash > sysex-status > lingering-
+    cleared > timesig). The flash does NOT dim the strip (full brightness
+    -- it's urgent, like a live alert, unlike the lingering-cleared case).
 
     Phase 9 Task 5 (SysEx manager): `sysex_vm` (`overlay.sysex`, OPTIONAL,
     same "new keyword-only, defaults to unchanged rendering" convention as
-    `polylimit_vm`) forwards straight into `secondary_status_text()`'s own
-    4th param -- see that function's own docstring for the alerts >
-    polylimit-flash > sysex-status > timesig priority chain. Also does NOT
-    dim the strip -- a loopprogress-style status confirmation, shown at
-    full brightness for its `SYSEX_DISPLAY_SECS` window then gone, never a
-    lingering/fading state the way the stuck-linger case is.
+    `polylimit_vm`) forwards into BOTH functions the same way. Also does
+    NOT dim the strip -- a loopprogress-style status confirmation, shown
+    at full brightness for its `SYSEX_DISPLAY_SECS` window then gone,
+    never a lingering/fading state the way the stuck-linger case is.
+
+    Phase 9 close-out (controller ruling): `secondary_status_dim` used to
+    take `alerts_vm` ALONE, computing dim-ness independently of whether
+    poly-limit/sysex would actually outrank the lingering message in
+    `secondary_status_text`'s own chain -- a real mismatch bug (this row
+    could render poly-limit's/sysex's full-brightness text while still
+    being told to dim the background under it). Now both functions share
+    the identical priority chain, so they can never disagree.
     """
     strip_h = _secondary_strip_height(font)
     y = surface.height - _reserved_chrome_height(font)
-    fill = LUM_DIM if chrome.secondary_status_dim(alerts_vm) else HEADER_BG
+    # Phase 9 close-out (controller ruling, chrome re-rank): `polylimit_vm`/
+    # `sysex_vm` now thread into `secondary_status_dim` too, not just
+    # `secondary_status_text` -- see that function's own docstring for the
+    # bug this closes (the dim decision could disagree with what text was
+    # actually rendered once poly-limit/sysex could outrank the lingering
+    # message).
+    fill = LUM_DIM if chrome.secondary_status_dim(alerts_vm, polylimit_vm, sysex_vm) else HEADER_BG
     surface.rect(0, y, surface.width, strip_h, fill)
     text = chrome.secondary_status_text(alerts_vm, timesig_vm, polylimit_vm, sysex_vm)
     draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, text, BG, font)

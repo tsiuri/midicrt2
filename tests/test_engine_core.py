@@ -731,6 +731,79 @@ def test_panic_release_does_not_record_a_raw_wire_event_for_the_synthetic_releas
     assert events_after == events_before   # no new raw event line
 
 
+# -- panic-release REPLAY parity (Phase 9 close-out fix wave, reviewer-
+# verified regression) -------------------------------------------------------
+#
+# `_release_for_panic` routes synthetic releases through `_dispatch_to_
+# state` only -- no `kind="event"` line, just the `panic.release` mark
+# (proven above). `engine/replay.py::stream_session` used to COUNT every
+# action mark (the generic, deliberate "never re-executed" safety rule) but
+# never APPLY `panic.release` specifically -- meaning a captured panic cycle
+# replayed with the panicked note STILL showing held, even though the LIVE
+# session had already released it. Fixed: replay now applies `panic.release`
+# as a direct state mutation, the SAME "state change with zero MIDI trace"
+# category `page_changed` marks already are (see replay.py's own "Mark
+# application semantics" docstring section).
+
+def test_replay_applies_a_captured_panic_release_so_voices_total_reaches_zero(tmp_path):
+    """The reviewer's own reproduction, automated: capture a real note_on
+    then a real panic release (via `_maybe_panic`, so the mark's `args`
+    shape is genuine, not hand-rolled), stop, and replay the file -- the
+    panicked note must NOT still show held."""
+    eng = Engine(Config(panic_on_crit=True, capture_dir=str(tmp_path)))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._capture_start_action()
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=1.0))   # ch5 (1-based)
+    eng._maybe_panic({"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}, 2.0)
+    # Confirm the LIVE state really did clear (the baseline this replay must reproduce).
+    assert eng.pages["voices"].view_model()["rows"][4]["active"] == 0
+    result = eng._capture_stop_action()
+    path = eng._capture.session_path(result["session_id"])
+
+    from midicrt.engine.replay import replay_session
+    summary = replay_session(path, instant=True)
+    assert summary["marks_by_kind"].get("action", 0) >= 1
+    assert summary["final_state"]["voices"]["total"] == 0
+
+
+def test_replay_without_the_panic_release_fix_would_show_the_note_still_held(tmp_path):
+    """Negative control, pinning the BUG this fix closes: replaying ONLY
+    the note_on (no panic.release mark at all, e.g. a session captured
+    before a panic ever fired) correctly shows the note STILL held --
+    proving the zero-total result above comes from actually APPLYING the
+    release mark, not from some unrelated reason total always reads 0."""
+    eng = Engine(Config(capture_dir=str(tmp_path)))
+    eng._capture_start_action()
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=1.0))
+    result = eng._capture_stop_action()
+    path = eng._capture.session_path(result["session_id"])
+
+    from midicrt.engine.replay import replay_session
+    summary = replay_session(path, instant=True)
+    assert summary["final_state"]["voices"]["total"] == 1   # still held, no release mark present
+
+
+def test_replay_ignores_a_malformed_panic_release_mark_instead_of_crashing(tmp_path, caplog):
+    eng = Engine(Config(capture_dir=str(tmp_path)))
+    eng._capture_start_action()
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=1.0))
+    # Hand-inject a malformed mark directly into the buffer (missing "ch")
+    # -- record_action itself always produces a well-formed one live, so
+    # this simulates a hand-edited/corrupted file, not a reachable live
+    # shape.
+    eng._capture._buffer.append({"kind": "action", "ts": 1.5, "name": "panic.release",
+                                 "args": {"notes": [60]}, "origin": "alert"})
+    result = eng._capture_stop_action()
+    path = eng._capture.session_path(result["session_id"])
+
+    from midicrt.engine.replay import replay_session
+    with caplog.at_level("WARNING"):
+        summary = replay_session(path, instant=True)
+    assert summary["final_state"]["voices"]["total"] == 1   # malformed mark skipped, not applied
+    assert any("panic.release" in r.message for r in caplog.records)
+
+
 def test_panic_release_is_gated_by_the_same_cooldown_as_the_cc_send():
     eng = Engine(Config(panic_on_crit=True))
     fake = _FakeMidiOut()
@@ -4159,6 +4232,45 @@ async def test_engine_stop_completes_and_flushes_notes_when_shutdown_capture_sto
     # And capture itself ended up cleanly disabled, not stuck "recording".
     assert eng._capture.is_recording is False
     assert eng.analyzers["status"].view_model()["rec"] is False
+
+
+async def test_engine_stop_completes_when_shutdown_capture_stop_raises_a_bare_value_error(
+        monkeypatch):
+    """Phase 9 close-out fix wave (controller ruling): `Engine.stop()`'s
+    own `suppress` widened from `(ActionError,)` to `(ActionError,
+    ValueError, OSError)` -- a concurrent `capture.stop` DISPATCH (async,
+    `asyncio.to_thread`-offloaded, Task 6 second review round) racing this
+    SIGTERM-driven direct call reaches the SAME `CaptureSink.stop()` body;
+    a race there could in principle raise something `_capture_stop_
+    action`'s own narrow `except OSError` never catches at all (unlike
+    the pre-existing OSError-only containment test right above this
+    file's own `test_engine_stop_completes_and_flushes_notes_when_
+    shutdown_capture_stop_fails`) -- a bare `ValueError` escapes THAT
+    method's try/except entirely and used to escape `Engine.stop()` too.
+    Simulated directly (CaptureSink.stop monkeypatched to raise
+    ValueError) since forcing a genuine two-thread race to land on this
+    EXACT exception type deterministically isn't practical; the actual
+    concurrency proof is test_capture.py's own `test_concurrent_capture_
+    stop_calls_are_serialized_by_the_lifecycle_lock`."""
+    eng = Engine(Config())
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    await eng.actions.dispatch("capture.start", {})
+    await eng.actions.dispatch("sendnotes.key", {"key": "z"})   # gates a real note
+    assert eng._capture.is_recording is True
+
+    def broken_stop():
+        raise ValueError("I/O operation on closed file.")
+
+    monkeypatch.setattr(eng._capture, "stop", broken_stop)
+
+    eng.stop()   # must NOT raise -- the widened suppress catches it
+
+    # Shutdown ordering completed past the failed capture-stop: the gated
+    # note got its note_off, and midi_out was closed -- identical proof to
+    # the OSError-specific test above, now for a ValueError too.
+    assert fake.note_off_calls == [(60, 1)]
+    assert fake.closed is True
 
 
 async def test_capture_status_action_reports_live_recording_state():

@@ -189,7 +189,7 @@ whether that page is in any particular build's roster:
 | v1 ID | key | page | v1 ID | key | page |
 |---|---|---|---|---|---|
 | 0 | `0` | help | 9 | `9` | spectrum |
-| 1 | `1` | harmony | 10 | `)` | tuner *(not in default roster)* |
+| 1 | `1` | harmony | 10 | `)` | tuner |
 | 2 | `2` | sendnotes | 11 | `!` | chordkey |
 | 4 | `4` | ccmonitor | 13 | `#` | voices |
 | 5 | `5` | ccdashboard | 14 | `$` | config |
@@ -199,6 +199,11 @@ whether that page is in any particular build's roster:
 
 (v1 IDs 3, 12, 15, 16, 18, 19 have no current page — those keys/shift-keys
 are simply absent from `DEFAULT_KEYMAP`, not bound to a no-op.)
+
+(Stale-claim fix, Phase 9 close-out: this table used to annotate ID 10
+("tuner") *(not in default roster)* — Phase 9 Task 3, 96b1c12 "feat: live
+tuner", added it to the default roster, so that annotation is no longer
+true; every page in this table is currently reachable on a stock build.)
 
 **Formula** (verified against v1's own real keymap, `docs/visual-audit.md`'s
 "Global page-switch keymap" audit row, not re-derived): unshifted digit
