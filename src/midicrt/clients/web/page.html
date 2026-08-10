@@ -578,6 +578,13 @@ function tuningMeterText(cents, width) {
 }
 
 function renderTuner(vm) {
+  // Fix round (review finding 2): device-in-title-line, same convention
+  // renderSpectrum's own `deviceLine` already established -- v1's status
+  // line (pages/tuner.py:172-174) ported following spectrum's v2 idiom,
+  // same as clients/fb/app.py::_tuner_header_text/clients/tui.py's
+  // identical fix.
+  const deviceLine = vm.available
+    ? `(device: ${escapeHtml(vm.device || "default")})` : "";
   if (!vm.available) {
     bodyEl.innerHTML =
       `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
@@ -586,14 +593,14 @@ function renderTuner(vm) {
   }
   if (!vm.has_signal) {
     bodyEl.innerHTML =
-      `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+      `<div><strong>${escapeHtml(vm.title)}</strong> ${deviceLine}</div>` +
       `<div>Listening...  Conf:${vm.confidence.toFixed(2)}  Level:${vm.db.toFixed(1)} dB</div>`;
     return;
   }
   const centsText = `${vm.cents >= 0 ? "+" : ""}${vm.cents.toFixed(1)}`;
   const meter = tuningMeterText(vm.cents, 40);
   bodyEl.innerHTML =
-    `<div><strong>${escapeHtml(vm.title)}</strong></div>` +
+    `<div><strong>${escapeHtml(vm.title)}</strong> ${deviceLine}</div>` +
     `<div>Note:${escapeHtml(vm.note)}  Pitch:${vm.hz.toFixed(2)} Hz  ` +
     `Cents:${centsText}  Conf:${vm.confidence.toFixed(2)}  Level:${vm.db.toFixed(1)} dB</div>` +
     `<pre class="ascii-grid">Tuning: ${escapeHtml(meter)}</pre>`;

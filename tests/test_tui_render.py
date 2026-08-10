@@ -657,15 +657,17 @@ TUNER_LOCKED_VM = {"title": "TUNER", "note": "A4", "cents": -3.2, "hz": 439.2,
 # Frozen against an actual run of render_tuner_lines(TUNER_LOCKED_VM, 60, 5)
 # and render_tuner_lines(TUNER_IDLE_VM, 60, 5) -- same "freeze from a real
 # run" discipline as GOLDEN_VOICES_FRAME/GOLDEN_HARMONY_FRAME above.
+# Re-frozen, fix round (review finding 2): header now carries v1's status
+# line (device), see _tuner_header_text's own docstring above.
 GOLDEN_TUNER_LOCKED_FRAME = [
-    "TUNER  [n]ext page [q]uit                                   ",
+    "TUNER  (device: default)  [n]ext page [q]uit                ",
     "Note:A4    Pitch: 439.20 Hz  Cents:  -3.2  Conf:0.82  Level:",
     "Tuning: -------------------^|-------------------            ",
     "                                                            ",
     "                                                            ",
 ]
 GOLDEN_TUNER_IDLE_FRAME = [
-    "TUNER  [n]ext page [q]uit                                   ",
+    "TUNER  (device: default)  [n]ext page [q]uit                ",
     "Listening...  Conf:0.00  Level:-120.0 dB                    ",
     "                                                            ",
     "                                                            ",

@@ -308,20 +308,26 @@ def render_harmony_lines(vm: dict, width: int, height: int) -> list[str]:
     return [header] + body
 
 
-# -- tuner page (phase-3 task 6) ----------------------------------------------
+# -- tuner page (phase-3 task 6; live-wired + status line Phase 9 Task 3) ----
 #
-# Layout mirrors v1's `pages/tuner.py::draw()` text rows: a status line
-# ("Input:.../Dev:.../SR:..." in v1 -- adapted here to "Listening... Conf:
-# .../Level:... dB" since this page has no live audio-device readout of its
-# own to report yet, see pages/tuner.py's/analyzers/tuner.py's module
-# docstrings), then either "Note:.../Pitch:.../Cents:.../Conf:.../Level:..."
-# + a "Tuning: <meter>" row (signal locked) or a second blank row (idle --
-# the state this page shows in production today, see those same
-# docstrings). `tuning_meter` is reused from analyzers/tuner.py, not
-# duplicated, same "shared pure function" convention as
-# `analyzers.theory.NOTE_NAMES` in the harmony renderers.
+# Layout mirrors v1's `pages/tuner.py::draw()` text rows: v1's own status
+# line ("Input:OK/… Dev:<device> SR:<sr>", `pages/tuner.py:172-174`, its
+# own separate body row in every state) is ported into the HEADER here
+# instead (fix round, review finding 2) -- following `_spectrum_header_
+# text`'s own already-established v2 convention (device-in-header,
+# conditional on `available`) rather than v1's literal separate-row/
+# three-field layout, keeping both audio pages visually consistent. Body
+# rows: "no audio input" (no device open, mirrors `render_spectrum_lines`'
+# identical `available` gate) / "Listening... Conf:.../Level:... dB" (device
+# open, no pitch locked) / "Note:.../Pitch:.../Cents:.../Conf:.../Level:..."
+# + a "Tuning: <meter>" row (signal locked). `tuning_meter` is reused from
+# analyzers/tuner.py, not duplicated, same "shared pure function"
+# convention as `analyzers.theory.NOTE_NAMES` in the harmony renderers.
 def _tuner_header_text(vm: dict) -> str:
-    return f"{vm['title']}  [n]ext page [q]uit"
+    if not vm.get("available", True):
+        return f"{vm['title']}  [n]ext page [q]uit"
+    device = vm.get("device") or "default"
+    return f"{vm['title']}  (device: {device})  [n]ext page [q]uit"
 
 
 def _tuner_body_lines(vm: dict) -> list[str]:

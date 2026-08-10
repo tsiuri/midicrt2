@@ -86,6 +86,35 @@ class _FakeTickingPage:
         return {}
 
 
+class _FakeCapturePage:
+    """Page double for `_tick_audio_gate` tests (fix round, review finding
+    1) -- exposes `start_capture`/`stop_capture` (the two NEW optional
+    `PageHooks` fields `_discover_page_hooks` looks for via `hasattr`,
+    same discovery mechanism `tick`/`drain_outputs`/`bind_info` already
+    use) with call counts/order instrumented instead of touching any real
+    `AudioCapture`/hardware -- mirrors `tests/test_pages_spectrum.py`'s
+    own `test_start_capture_and_stop_capture_delegate_to_the_capture_object`
+    convention of swapping in instrumented callables, one level up (a
+    whole fake PAGE here, not a swapped method on a real one, since these
+    tests exercise the ENGINE's gating decision, not any one page's own
+    delegation)."""
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def handle(self, ev) -> bool:
+        return False
+
+    def view_model(self) -> dict:
+        return {}
+
+    def start_capture(self) -> None:
+        self.calls.append("start")
+
+    def stop_capture(self) -> None:
+        self.calls.append("stop")
+
+
 def test_eventlog_page_capacity_and_vm():
     eng = Engine(Config(eventlog_capacity=2))
     page = eng.pages["eventlog"]
@@ -2128,6 +2157,233 @@ def test_snapshot_now_is_never_gated_by_the_refcount_provider():
     eng.set_topic_refcount_provider(lambda topic: 0)
     snap = eng.snapshot_now("page.eventlog")
     assert snap is not None
+
+
+# -- topic_refcount() public accessor (fix round, review finding 1) ---------
+#
+# New public wrapper around `_topic_refcount_provider` for consumers that
+# only need the net "is anyone plausibly listening" signal and are fine
+# treating "unwired" the same as "wired but zero" -- unlike `_flush_dirty`'s
+# own internal `is not None` check (which must NOT skip when unwired, see
+# that method's own docstring), `_tick_audio_gate` below (the audio-capture
+# demand gate) wants the SAFE-for-an-expensive-resource default: unwired
+# means "assume no subscribers", not "assume subscribed".
+
+def test_topic_refcount_is_zero_when_unwired():
+    eng = Engine(Config())
+    assert eng.topic_refcount("page.tuner") == 0
+
+
+def test_topic_refcount_reflects_the_wired_provider():
+    eng = Engine(Config())
+    eng.set_topic_refcount_provider(lambda topic: 3 if topic == "page.tuner" else 0)
+    assert eng.topic_refcount("page.tuner") == 3
+    assert eng.topic_refcount("page.spectrum") == 0
+
+
+# -- audio-capture demand gate (fix round, review finding 1: "Audio        --
+# -- capture is unconditional for daemon lifetime") --------------------------
+#
+# Root cause (live-measured by the reviewer): daemon.py started spectrum's
+# AND tuner's AudioCapture unconditionally at boot and never stopped either
+# until shutdown -- identical ~39-40% of one core whether the current page
+# was screensaver or tuner. Fix: `Engine._tick_audio_gate(now)` (called
+# from `run()` every tick, alongside `_tick_pages`/`_tick_analyzers`) starts
+# a page's capture only while it's `current_page` OR its `page.<name>`
+# topic has subscribers (`topic_refcount()` above), and stops it after
+# `_AUDIO_CAPTURE_STOP_DEBOUNCE_S` of neither holding -- so ordinary
+# page-flipping/pagecycle rotation doesn't thrash capture threads open and
+# closed. Applies to ANY page with `start_capture`/`stop_capture` hooks
+# (discovered the same `hasattr`-at-construction way `tick`/`drain_outputs`/
+# `bind_info` already are, see `PageHooks`'s own docstring) -- today that's
+# both "spectrum" and "tuner", gated by the exact same mechanism, not two
+# separate ones.
+
+def test_audio_gate_does_not_start_capture_when_page_not_current_and_no_subscribers():
+    eng = Engine(Config())
+    cap = _FakeCapturePage()
+    eng.register_page("capture_test", cap)
+    eng.current_page = "eventlog"   # NOT "capture_test"
+    eng._tick_audio_gate(0.0)
+    assert cap.calls == []
+
+
+def test_audio_gate_starts_capture_when_page_becomes_current():
+    eng = Engine(Config())
+    cap = _FakeCapturePage()
+    eng.register_page("capture_test", cap)
+    eng.current_page = "capture_test"
+    eng._tick_audio_gate(0.0)
+    assert cap.calls == ["start"]
+
+
+def test_audio_gate_start_is_idempotent_while_page_stays_current():
+    eng = Engine(Config())
+    cap = _FakeCapturePage()
+    eng.register_page("capture_test", cap)
+    eng.current_page = "capture_test"
+    eng._tick_audio_gate(0.0)
+    eng._tick_audio_gate(0.1)
+    eng._tick_audio_gate(0.2)
+    assert cap.calls == ["start"]   # never re-started
+
+
+def test_audio_gate_stops_capture_after_debounce_once_page_leaves_and_no_subscribers():
+    eng = Engine(Config())
+    cap = _FakeCapturePage()
+    eng.register_page("capture_test", cap)
+    eng.current_page = "capture_test"
+    eng._tick_audio_gate(0.0)
+    assert cap.calls == ["start"]
+
+    eng.current_page = "eventlog"   # left the page -- unwanted-since = 1.0
+    eng._tick_audio_gate(1.0)       # well within the debounce window
+    assert cap.calls == ["start"]   # not stopped yet
+    eng._tick_audio_gate(5.9)
+    assert cap.calls == ["start"]   # still not stopped (< 1.0+5.0s since unwanted)
+    eng._tick_audio_gate(6.1)       # debounce elapsed (>= 1.0+5.0)
+    assert cap.calls == ["start", "stop"]
+
+
+def test_audio_gate_debounce_resets_if_page_becomes_current_again_before_elapsing():
+    # Thrash protection -- the whole point of the debounce: ordinary
+    # page-flipping back and forth must never toggle the capture thread.
+    eng = Engine(Config())
+    cap = _FakeCapturePage()
+    eng.register_page("capture_test", cap)
+    eng.current_page = "capture_test"
+    eng._tick_audio_gate(0.0)
+    assert cap.calls == ["start"]
+
+    eng.current_page = "eventlog"
+    eng._tick_audio_gate(1.0)       # unwanted-since = 1.0
+    eng.current_page = "capture_test"
+    eng._tick_audio_gate(2.0)       # wanted again, well before 1.0+5.0
+    assert cap.calls == ["start"]   # still just the one start, no stop ever fired
+
+    eng.current_page = "eventlog"
+    eng._tick_audio_gate(7.0)       # a FRESH unwanted-since = 7.0, not 1.0
+    eng._tick_audio_gate(11.9)      # < 7.0+5.0 -- must not have stopped yet
+    assert cap.calls == ["start"]
+    eng._tick_audio_gate(12.1)      # >= 7.0+5.0 -- now it stops
+    assert cap.calls == ["start", "stop"]
+
+
+def test_audio_gate_topic_subscription_alone_keeps_capture_alive():
+    # Not the current page at all, ever -- only a subscriber (e.g. the web
+    # client rendering it in a background tab) -- capture still runs, and
+    # never gets debounce-stopped while the subscription holds.
+    eng = Engine(Config())
+    cap = _FakeCapturePage()
+    eng.register_page("capture_test", cap)
+    eng.current_page = "eventlog"
+    eng.set_topic_refcount_provider(lambda topic: 1 if topic == "page.capture_test" else 0)
+    eng._tick_audio_gate(0.0)
+    assert cap.calls == ["start"]
+    eng._tick_audio_gate(100.0)   # long past any debounce window
+    assert cap.calls == ["start"]   # never stopped -- the subscription alone holds it
+
+
+def test_audio_gate_stops_once_subscriber_refcount_drops_and_debounce_elapses():
+    eng = Engine(Config())
+    cap = _FakeCapturePage()
+    eng.register_page("capture_test", cap)
+    eng.current_page = "eventlog"
+    refcount = {"page.capture_test": 1}
+    eng.set_topic_refcount_provider(lambda topic: refcount.get(topic, 0))
+    eng._tick_audio_gate(0.0)
+    assert cap.calls == ["start"]
+
+    refcount["page.capture_test"] = 0
+    eng._tick_audio_gate(1.0)
+    assert cap.calls == ["start"]
+    eng._tick_audio_gate(6.1)
+    assert cap.calls == ["start", "stop"]
+
+
+def test_audio_gate_disabled_never_starts_capture_even_when_page_is_current():
+    # Mirrors the `--no-audio` opt-out -- daemon.py calls
+    # set_audio_capture_enabled(False) once, before run() ever ticks.
+    eng = Engine(Config())
+    cap = _FakeCapturePage()
+    eng.register_page("capture_test", cap)
+    eng.current_page = "capture_test"
+    eng.set_audio_capture_enabled(False)
+    eng._tick_audio_gate(0.0)
+    assert cap.calls == []
+
+
+def test_audio_gate_applies_independently_per_page():
+    eng = Engine(Config())
+    cap_a = _FakeCapturePage()
+    cap_b = _FakeCapturePage()
+    eng.register_page("capture_a", cap_a)
+    eng.register_page("capture_b", cap_b)
+    eng.current_page = "capture_a"
+    eng._tick_audio_gate(0.0)
+    assert cap_a.calls == ["start"]
+    assert cap_b.calls == []
+
+
+def test_audio_gate_ignores_pages_with_no_capture_hooks():
+    # A page with no start_capture/stop_capture (e.g. "eventlog") must
+    # never raise or be touched by the gate at all.
+    eng = Engine(Config())
+    eng.current_page = "eventlog"
+    eng._tick_audio_gate(0.0)   # must not raise
+
+
+# -- the real default-roster spectrum/tuner pages, not just fakes -----------
+
+def test_audio_gate_wires_the_real_spectrum_and_tuner_pages():
+    eng = Engine(Config())   # default roster includes both
+    spectrum_calls: list[str] = []
+    tuner_calls: list[str] = []
+    eng.pages["spectrum"].start_capture = lambda: spectrum_calls.append("start")
+    eng.pages["spectrum"].stop_capture = lambda: spectrum_calls.append("stop")
+    eng.pages["tuner"].start_capture = lambda: tuner_calls.append("start")
+    eng.pages["tuner"].stop_capture = lambda: tuner_calls.append("stop")
+    # Re-discover hooks so the gate picks up the swapped-in instrumented
+    # methods above -- PageHooks binds the callables at discovery time
+    # (Engine.__init__), before this test ever gets a chance to monkeypatch
+    # the page instances it already built.
+    eng._discover_page_hooks("spectrum", eng.pages["spectrum"])
+    eng._discover_page_hooks("tuner", eng.pages["tuner"])
+
+    eng.current_page = "eventlog"
+    eng._tick_audio_gate(0.0)
+    assert spectrum_calls == []
+    assert tuner_calls == []
+
+    eng.current_page = "tuner"
+    eng._tick_audio_gate(0.1)
+    assert tuner_calls == ["start"]
+    assert spectrum_calls == []
+
+    eng.current_page = "spectrum"
+    eng._tick_audio_gate(0.2)
+    assert spectrum_calls == ["start"]
+    # tuner is no longer current and has no subscriber -- still within the
+    # debounce window at t=0.2 (unwanted-since=0.2), so not stopped yet.
+    assert tuner_calls == ["start"]
+
+    eng._tick_audio_gate(5.3)   # past tuner's debounce (0.2 + 5.0)
+    assert tuner_calls == ["start", "stop"]
+    assert spectrum_calls == ["start"]   # spectrum still current, untouched
+
+
+async def test_audio_gate_starts_capture_via_a_real_page_goto_dispatch():
+    # End-to-end through the real action-dispatch path (not a direct
+    # current_page assignment) -- the brief's own named regression case
+    # ("started on page.goto to tuner").
+    eng = Engine(Config())
+    calls: list[str] = []
+    eng.pages["tuner"].start_capture = lambda: calls.append("start")
+    eng.pages["tuner"].stop_capture = lambda: calls.append("stop")
+    eng._discover_page_hooks("tuner", eng.pages["tuner"])
+    await eng.actions.dispatch("page.goto", {"name": "tuner"})
+    eng._tick_audio_gate(0.0)
+    assert calls == ["start"]
 
 
 # -- harmony/chordkey shared HarmonyAnalyzer (Important, finding 2b,

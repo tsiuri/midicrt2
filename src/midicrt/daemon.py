@@ -133,29 +133,26 @@ async def run(cfg, socket_path: str, use_midi: bool, use_audio: bool = True,
     await server.start()
     if midi:
         midi.start(asyncio.get_running_loop())
-    # Phase-3 task 8: start the spectrum page's audio-capture thread the
-    # same way midi.start() is wired above -- constructed unconditionally
-    # by Engine (it's in the default roster, config.py), started here only
-    # when both `use_audio` (the `--no-audio` opt-out, mirroring
-    # `--no-midi`) is true AND the page actually exists in this build's
-    # roster (a `config.pages` override could drop "spectrum" entirely,
-    # same guard shape as engine/core.py's pianoroll-actions registration).
+    # Phase 9 Task 3 fix round (review finding 1, "Audio capture is
+    # unconditional for daemon lifetime"): audio pages' capture threads
+    # are NO LONGER started here unconditionally at boot -- that was the
+    # bug (live-measured ~39-40% of one core paid in full whether the
+    # current page was screensaver or tuner, i.e. regardless of whether
+    # anyone could possibly see the result). `Engine._tick_audio_gate`
+    # (engine/core.py) now demand-starts/stops each audio page's capture
+    # (today: "spectrum" and "tuner") every tick, based on `current_page`/
+    # topic-subscriber state, with a debounce so ordinary page-flipping
+    # doesn't thrash the thread. This call is the ONLY wiring `run()`
+    # still owns for that: the `--no-audio` all-or-nothing opt-out
+    # (mirrors `--no-midi`'s own "never construct the I/O object at all"
+    # shape one level up) -- `set_audio_capture_enabled(False)` short-
+    # circuits `_tick_audio_gate` before it ever calls `start_capture()`
+    # on anything, for the whole process lifetime.
+    engine.set_audio_capture_enabled(use_audio)
     spectrum_page = engine.pages.get("spectrum")
-    audio_active = use_audio and spectrum_page is not None
-    if audio_active:
-        spectrum_page.start_capture()
-    # Phase 9 Task 3: identical wiring for the tuner page's OWN independent
-    # audio-capture thread -- see pages/tuner.py's module docstring for why
-    # this is a second, separate `AudioCapture` rather than sharing
-    # spectrum's (a disclosed architecture decision, not an oversight).
-    # Same `--no-audio` opt-out covers both -- there is one physical audio
-    # input either page might be reading from, so one flag stops both.
     tuner_page = engine.pages.get("tuner")
-    tuner_audio_active = use_audio and tuner_page is not None
-    if tuner_audio_active:
-        tuner_page.start_capture()
-    _LOG.info("midicrtd up on %s (midi=%s, audio=%s, tuner_audio=%s)",
-             socket_path, bool(midi), audio_active, tuner_audio_active)
+    _LOG.info("midicrtd up on %s (midi=%s, audio_capture_enabled=%s)",
+             socket_path, bool(midi), use_audio)
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     # Phase 9 Task 2b (shutdown-hang fix): NOT `loop.add_signal_handler`
@@ -169,9 +166,16 @@ async def run(cfg, socket_path: str, use_midi: bool, use_audio: bool = True,
     _LOG.info("shutting down")
     if midi:
         midi.stop()
-    if audio_active:
+    # Unconditional stop_capture() calls regardless of whether the demand
+    # gate ever actually started either page's capture this run --
+    # `AudioCapture.stop()` is a safe no-op when `.start()` was never
+    # called (`self._thread is None`), so this guarantees clean teardown
+    # of whatever IS running (mid-debounce-armed or actively capturing)
+    # without `run()` needing to track the gate's own started/stopped
+    # state a second time.
+    if spectrum_page is not None:
         spectrum_page.stop_capture()
-    if tuner_audio_active:
+    if tuner_page is not None:
         tuner_page.stop_capture()
     engine.stop()
     with contextlib.suppress(Exception):

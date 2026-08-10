@@ -414,7 +414,25 @@ def render_harmony_frame(vm: dict, surface: Surface, marquee_text: str | None = 
 
 
 def _tuner_header_text(vm: dict) -> str:
-    return f"{vm['title']}"
+    """Fix round (review finding 2): v1's tuner status line
+    (`pages/tuner.py:172-174`, `Input:OK/… Dev:<device> SR:<sr>`, its own
+    separate body row in every state) was ported for `available`/`device`
+    into the analyzer's `view_model()` but never actually SHOWN by any
+    renderer. Ported here following `_spectrum_header_text`'s own v2
+    convention (device-in-header, conditional on `available`) rather than
+    v1's literal separate-row/three-field layout -- v2's spectrum ALREADY
+    simplified that exact same v1 status-line shape down to just
+    "(device: ...)" in the header when a device is open, nothing extra
+    when it isn't; this keeps both audio pages visually/architecturally
+    consistent instead of reintroducing v1's row for tuner alone.
+    `vm.get("available", True)` (not spectrum's bare `.get("available")`)
+    to keep pre-Task-3-fix-round VM fixtures (`TUNER_IDLE_VM`/
+    `TUNER_LOCKED_VM`, no "available" key at all) on the SAME branch as
+    the body renderer's own identical default, below."""
+    if not vm.get("available", True):
+        return f"{vm['title']}"
+    device = vm.get("device") or "default"
+    return f"{vm['title']}  (device: {device})"
 
 
 def render_tuner_frame(vm: dict, surface: Surface, marquee_text: str | None = None) -> None:

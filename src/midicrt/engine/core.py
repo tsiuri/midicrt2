@@ -218,6 +218,23 @@ _PANIC_COOLDOWN_S = 3.0
 # `run()`'s own comment on `_tick_capture_flush` below).
 _MAX_BURST_PER_TICK = 500
 
+# Phase 9 Task 3 fix round (review finding 1, "Audio capture is
+# unconditional for daemon lifetime"): `_tick_audio_gate`'s stop-side
+# debounce -- once a page with `start_capture`/`stop_capture` hooks is
+# neither `current_page` nor has any `page.<name>` topic subscriber, its
+# capture thread keeps running for this many MORE seconds before actually
+# being stopped, so ordinary page-flipping (`page.next`/`page.prev`) or a
+# brief subscribe/unsubscribe blip doesn't thrash the thread open and
+# closed. Deliberately NOT anywhere near pagecycle's own 300s rotation
+# interval (`pagecycle_interval` default, config.py) -- surviving a full
+# rotation gap on debounce alone would defeat the whole point of gating
+# (capture would just never stop). Instead, a page rotating back IN after
+# being fully stopped pays a brief real re-open latency (native PortAudio
+# open, typically well under a second) during which it correctly shows its
+# existing "no audio input"/idle state until the first real block arrives
+# -- a disclosed, sane tradeoff, not a bug.
+_AUDIO_CAPTURE_STOP_DEBOUNCE_S = 5.0
+
 # Phase 8 Task 5 (behaviors/pagecycle.py's own "notify_page_action" +
 # "Origin ruling" docstring sections): every action name that moves
 # `current_page` -- `_on_action_dispatched` (below) and the two sysex
@@ -318,10 +335,22 @@ class PageHooks:
       this exact name, unchanged). The other two pages keep their own
       real, directly-tested methods and add a thin `bind_info` delegate
       (see each page's own docstring) for this generic discovery to find.
+    - `start_capture()`/`stop_capture() -> None` (Phase 9 Task 3 fix
+      round, review finding 1): the SAME generic discovery now also picks
+      up these two, whichever page names happen to implement them --
+      today "spectrum" and "tuner", both wrapping an
+      `analyzers.spectrum.AudioCapture` instance (see each page's own
+      module docstring). `_tick_audio_gate` (below) is the one consumer,
+      demand-starting/stopping a page's capture thread based on
+      `current_page`/topic-subscriber state instead of daemon.py starting
+      it unconditionally for the whole process lifetime (the bug this
+      fix round found and fixed).
     """
     tick: Callable[[float], bool] | None
     drain_outputs: Callable[[float], list[tuple[int, int]]] | None
     bind_info: Callable[[Callable[[], dict]], None] | None
+    start_capture: Callable[[], None] | None
+    stop_capture: Callable[[], None] | None
 
 
 class Page(Protocol):
@@ -752,6 +781,16 @@ class Engine:
         # Important perf fix (2026-08-07 fix wave, finding 1): see
         # set_topic_refcount_provider's own docstring and _flush_dirty's.
         self._topic_refcount_provider: Callable[[str], int] | None = None
+        # Phase 9 Task 3 fix round (review finding 1): `_tick_audio_gate`'s
+        # own per-page state -- see that method's own docstring. Lazily
+        # populated (`.get(name, ...)` at read time, never pre-seeded for
+        # the initial roster) so a page registered later via
+        # `register_page` with capture hooks is picked up with no extra
+        # wiring, the same "no staleness to manage" property `_page_hooks`
+        # itself already has.
+        self._capture_started: dict[str, bool] = {}
+        self._capture_unwanted_since: dict[str, float | None] = {}
+        self._audio_capture_enabled = True
         # Phase 5 Task 3 (bind.list port_present, docs/phase5-notes.md's
         # bundled cheap-wins list, Minor #2 from the phase-4 final review):
         # same PULL-seam shape as `_topic_refcount_provider` right above --
@@ -1887,6 +1926,8 @@ class Engine:
             tick=getattr(page, "tick", None),
             drain_outputs=getattr(page, "drain_outputs", None),
             bind_info=getattr(page, "bind_info", None),
+            start_capture=getattr(page, "start_capture", None),
+            stop_capture=getattr(page, "stop_capture", None),
         )
         self._page_hooks[name] = hooks
         provider = self._page_info_providers.get(name)
@@ -2114,6 +2155,34 @@ class Engine:
         see test_engine_core.py::
         test_snapshot_now_is_never_gated_by_the_refcount_provider."""
         self._topic_refcount_provider = provider
+
+    def topic_refcount(self, topic: str) -> int:
+        """Public accessor for whatever `set_topic_refcount_provider`'s
+        callback reports for `topic` -- 0 when unwired. Deliberately a
+        DIFFERENT default than `_flush_dirty`'s own internal `is not None`
+        check (which must NOT skip when unwired -- "nobody told me who's
+        subscribed" isn't the same claim as "nobody is subscribed", see
+        that setter's own docstring): this accessor is for consumers that
+        only care about the net "is anyone plausibly listening" signal and
+        want the SAFE-for-an-expensive-resource default when unwired --
+        today, only `_tick_audio_gate` (Phase 9 Task 3 fix round), which
+        must not keep a capture thread alive forever just because nothing
+        happened to wire a refcount provider (e.g. `--no-midi`-style bare
+        `Engine()` construction in a test, or a build with no
+        `ProtocolServer` attached at all)."""
+        if self._topic_refcount_provider is None:
+            return 0
+        return self._topic_refcount_provider(topic)
+
+    def set_audio_capture_enabled(self, enabled: bool) -> None:
+        """The `--no-audio` seam for `_tick_audio_gate` (Phase 9 Task 3 fix
+        round) -- `daemon.py::run()` calls this once, before `run()` ever
+        ticks, mirroring the all-or-nothing shape `--no-midi` already has
+        one level up (never constructing a `MidiInput` at all). Defaults
+        `True` (the gate runs normally) so every existing test that never
+        calls this -- i.e. nearly all of them -- is unaffected; production
+        code only ever calls this with `False`, and only once."""
+        self._audio_capture_enabled = enabled
 
     def set_open_ports_provider(self, provider: Callable[[], list[str]]) -> None:
         """Engine<->`MidiInput` seam (Phase 5 Task 3, docs/phase5-notes.md
@@ -2778,6 +2847,57 @@ class Engine:
                     self._dirty.add(f"page.{name}")
                     self._midi_out.note_off(note, ch)
 
+    def _tick_audio_gate(self, now: float) -> None:
+        """Demand-gates AudioCapture lifecycle for every page with
+        `start_capture`/`stop_capture` hooks (`PageHooks`, discovered via
+        `_discover_page_hooks` -- today "spectrum" and "tuner") -- Phase 9
+        Task 3 fix round, review finding 1 ("Audio capture is
+        unconditional for daemon lifetime"). Before this method existed,
+        `daemon.py::run()` called `start_capture()` unconditionally at
+        boot and never stopped it until shutdown -- live-measured by the
+        reviewer at ~39-40% of one core whether the current page was
+        screensaver or tuner, i.e. paid in full regardless of whether
+        anyone could possibly see the result.
+
+        A page's capture runs while it's `self.current_page` OR its
+        `page.<name>` topic has a live subscriber (`self.topic_refcount`)
+        -- either condition alone is enough (a client watching the page
+        in a background browser tab, not currently displayed on the CRT,
+        still needs real data; the CRT's own current page always needs
+        it regardless of whether any remote client is subscribed at
+        all). Once NEITHER holds, capture keeps running for
+        `_AUDIO_CAPTURE_STOP_DEBOUNCE_S` more seconds (that constant's
+        own docstring covers why this value, and why it does NOT try to
+        survive a full pagecycle rotation gap) before actually stopping
+        -- ordinary page-flipping must never thrash the capture thread.
+
+        Called every `run()` tick, same cadence as `_tick_pages`/
+        `_tick_analyzers` -- `--no-audio` (`set_audio_capture_enabled
+        (False)`) short-circuits the whole method before touching
+        anything, matching `--no-midi`'s own "never construct the I/O
+        object at all" shape one level up.
+        """
+        if not self._audio_capture_enabled:
+            return
+        for name, hooks in self._page_hooks.items():
+            if hooks.start_capture is None or hooks.stop_capture is None:
+                continue
+            wanted = self.current_page == name or self.topic_refcount(f"page.{name}") > 0
+            started = self._capture_started.get(name, False)
+            if wanted:
+                self._capture_unwanted_since[name] = None
+                if not started:
+                    hooks.start_capture()
+                    self._capture_started[name] = True
+            elif started:
+                since = self._capture_unwanted_since.get(name)
+                if since is None:
+                    self._capture_unwanted_since[name] = now
+                elif now - since >= _AUDIO_CAPTURE_STOP_DEBOUNCE_S:
+                    hooks.stop_capture()
+                    self._capture_started[name] = False
+                    self._capture_unwanted_since[name] = None
+
     async def _tick_behaviors(self, now: float) -> None:
         """Give each behavior (phase-3 task 9) a chance to act, and
         dispatch any action intent it returns -- see the module docstring's
@@ -2863,6 +2983,13 @@ class Engine:
             self._tick_analyzers(now)
             self._tick_pages(now)
             await self._tick_behaviors(now)
+            # Phase 9 Task 3 fix round (review finding 1): placed AFTER
+            # `_tick_behaviors` (not before) so a pagecycle rotation that
+            # just changed `current_page` THIS tick is already reflected
+            # -- minimizes the "brief warmup" gap `_tick_audio_gate`'s own
+            # docstring discloses to at most one tick's worth of latency
+            # rather than two.
+            self._tick_audio_gate(now)
             # Phase 4 Task 3 (DAW-style MIDI learn): auto-cancel an armed
             # learn slot past its timeout -- see `_tick_learn`'s own
             # docstring. Placed after `_tick_behaviors` (an armed learn has
