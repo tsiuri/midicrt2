@@ -8,6 +8,13 @@ is covered in test_engine_sysex_store.py instead -- mirrors test_capture.py's
 own "pure logic here, registry-aware engine wiring there" split (see that
 file's own module comment).
 
+Review fix (controller ruling): `status_text`/`status_active` are now
+driven EXCLUSIVELY by `record_command_status` (the CMD-dispatch subsystem's
+outcomes, `engine/sysex.py::build_status_text`, v1 parity) -- NEVER by
+`record_received`/`save`/`play`/`delete` (generic frame-receipt/browser-
+manager activity, whose only home is the ring/library, not chrome). See
+`test_record_received_does_not_touch_status_text` and its siblings below.
+
 Distinct from test_engine_sysex.py/test_engine_sysex_dispatch.py, which
 cover the PRE-EXISTING, unrelated `engine/sysex.py` Cirklon remote-control
 COMMAND protocol (F0 7D 6D 63 <cmd> ... F7) -- this module is the NEW
@@ -86,6 +93,19 @@ def test_sanitize_name_rejects_traversal_and_garbage(name):
         sanitize_name(name)
 
 
+def test_sanitize_name_length_boundary_is_a_single_source_of_truth():
+    # Review fix (Minor): `_MAX_NAME_LEN` used to be dead code (a separate
+    # `len() > _MAX_NAME_LEN` check that could never fire before the regex
+    # itself already rejected anything past its own, independently-coded
+    # bound). Now the regex is BUILT from `_MAX_NAME_LEN`, so the two can
+    # never drift again -- pinned at exactly the boundary, live-confirmed
+    # 63 accepted / 64 rejected.
+    from midicrt.engine.sysex_store import _MAX_NAME_LEN
+    assert sanitize_name("a" * _MAX_NAME_LEN) == "a" * _MAX_NAME_LEN
+    with pytest.raises(ValueError):
+        sanitize_name("a" * (_MAX_NAME_LEN + 1))
+
+
 # -- ring: record_received -------------------------------------------------
 
 def test_record_received_appends_to_recent_newest_first(tmp_path):
@@ -131,13 +151,43 @@ def test_oversized_frame_is_not_kept_in_memory_but_still_visible(tmp_path):
         store.save("too-big", index=0)
 
 
-def test_status_text_and_active_decay(tmp_path):
+def test_record_received_does_not_touch_status_text(tmp_path):
+    """Review fix (controller ruling): v1's `sysex_status` (`plugins/
+    loopprogress.py:43-46`, `plugins/sysex.py:55-57`) is set ONLY by the
+    CMD-dispatch subsystem's own outcomes -- NEVER by generic frame
+    receipt. With real foreign-device chatter (a Cirklon rig) on the
+    wire, `record_received` firing constantly would make the chrome row
+    noise v1 deliberately never had. Generic frame-received activity's
+    only home is the ring/library (`recent()`/web panel) -- it must never
+    touch `status_text`/`status_active`, whatever the frame's content."""
+    store = SysexStore(library_dir=str(tmp_path))
+    assert store.status_text is None
+    store.record_received(make_event(ts=100.0, data=(0x7D, 0x6D, 0x63, 0x01, 0x00)))  # even a real midicrt-prefixed frame
+    assert store.status_text is None
+    assert store.status_active(100.0) is False
+
+
+def test_record_command_status_sets_status_text_and_decays(tmp_path):
+    """The ONLY way `status_text`/`status_active` ever change now -- fed by
+    `Engine._handle_sysex` via `engine/sysex.py::build_status_text`'s
+    v1-style `"sx:legacy cmd=0x01 ok page->voices"` text (see that
+    function's own docstring)."""
     store = SysexStore(library_dir=str(tmp_path), display_secs=5.0)
-    store.record_received(make_event(ts=100.0, data=(0x7D,)))
-    assert store.status_text
+    store.record_command_status("sx:legacy cmd=0x01 ok page->voices", 100.0)
+    assert store.status_text == "sx:legacy cmd=0x01 ok page->voices"
     assert store.status_active(100.0) is True
     assert store.status_active(104.9) is True
     assert store.status_active(105.1) is False
+
+
+def test_record_command_status_overwrites_the_previous_text(tmp_path):
+    store = SysexStore(library_dir=str(tmp_path))
+    store.record_command_status("sx:legacy cmd=0x01 ok page->voices", 100.0)
+    store.record_command_status("sx:legacy cmd=0x02 ok screen-on", 101.0)
+    assert store.status_text == "sx:legacy cmd=0x02 ok screen-on"
+    assert store.status_active(101.0) is True
+    assert store.status_active(105.9) is True   # decays from the SECOND call's own ts
+    assert store.status_active(106.1) is False
 
 
 def test_status_active_false_before_any_activity(tmp_path):
@@ -197,12 +247,16 @@ def test_save_rejects_traversal_name_and_writes_nothing_outside_dir(tmp_path):
     assert not lib.exists() or list(lib.iterdir()) == []
 
 
-def test_save_updates_status_text(tmp_path):
+def test_save_does_not_touch_status_text(tmp_path):
+    # Review fix: only CMD-dispatch outcomes (record_command_status) drive
+    # the chrome row now -- a browser-triggered save/play/delete is a
+    # DIFFERENT, deliberately silent-on-chrome concern (its home is the
+    # web panel's own library list, not the CRT).
     store = SysexStore(library_dir=str(tmp_path))
     store.record_received(make_event())
     store.save("x", now=50.0)
-    assert "x" in store.status_text
-    assert store.status_active(50.0) is True
+    assert store.status_text is None
+    assert store.status_active(50.0) is False
 
 
 # -- library: list_library ---------------------------------------------------
@@ -249,10 +303,13 @@ def test_play_sends_via_midi_out_and_reports_size(tmp_path):
     store.record_received(make_event(data=(0x7D, 0x01, 0x02)))
     store.save("x")
     out = _FakeMidiOut()
-    result = store.play("x", out, now=10.0)
+    result = store.play("x", out)
     assert result == {"sent": True, "size": 3}
     assert out.sent == [(0x7D, 0x01, 0x02)]
-    assert store.status_active(10.0) is True
+    # Review fix: play() no longer touches the chrome status text either --
+    # see test_save_does_not_touch_status_text's own comment.
+    assert store.status_text is None
+    assert store.status_active(10.0) is False
 
 
 def test_play_unknown_name_raises_value_error(tmp_path):
@@ -311,6 +368,15 @@ def test_delete_rejects_traversal_name(tmp_path):
     store = SysexStore(library_dir=str(tmp_path))
     with pytest.raises(ValueError):
         store.delete("../../etc/passwd")
+
+
+def test_delete_does_not_touch_status_text(tmp_path):
+    store = SysexStore(library_dir=str(tmp_path))
+    store.record_received(make_event(data=(0x01,)))
+    store.save("x")
+    store.delete("x")
+    assert store.status_text is None
+    assert store.status_active(50.0) is False
 
 
 def test_delete_twice_does_not_raise_second_time_overwrites_trash(tmp_path):

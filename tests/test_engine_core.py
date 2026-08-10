@@ -1525,7 +1525,7 @@ async def test_pagecycle_sysex_page_switch_does_not_pause_rotation():
                         screensaver_enabled=False))
     eng._last_activity_ts = 0.0
     await eng._tick_behaviors(0.0)   # bootstrap
-    eng._sysex_switch_page(version=None, args=(13,))   # page id 13 = "voices"
+    eng._sysex_switch_page(version=None, args=(13,), ts=0.0)   # page id 13 = "voices"
     assert eng.current_page == "voices"
     await eng._tick_behaviors(5.0)   # interval elapsed -- rotation proceeds, unpaused
     assert eng.current_page == "harmony"
@@ -4273,7 +4273,7 @@ async def test_capture_records_provenance_for_all_four_dispatch_origins(tmp_path
 
     # 4. sysex origin -- CMD_SWITCH_PAGE to page id 13 ("voices"), version
     # None so no real MIDI reply send is attempted.
-    eng._sysex_switch_page(version=None, args=(13,))
+    eng._sysex_switch_page(version=None, args=(13,), ts=0.0)
 
     result = eng._capture_stop_action()
     lines = _read_session_lines(eng, result["session_id"])

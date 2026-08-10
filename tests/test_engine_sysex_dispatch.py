@@ -338,8 +338,162 @@ def test_unknown_command_legacy_has_no_reply_channel():
 # -- guard: no sysex_data at all (defensive) ------------------------------------
 
 def test_sysex_event_with_no_sysex_data_is_a_safe_no_op():
-    eng, fake = engine_with_fake_out()
+    eng, _fake = engine_with_fake_out()
     ev = MidiEvent(ts=0.0, source="x", type="sysex", channel=None,
                     data1=None, data2=None, summary="sysex (0 bytes)", sysex_data=None)
     eng._handle(ev)   # must not raise
+
+
+# -- chrome status text (Phase 9 Task 5 review fix, controller ruling) --------
+#
+# `Engine._sysex_store.status_text` (the loopprogress-style chrome text) is
+# now set ONLY by real CMD-dispatch outcomes -- v1 parity, re-derived from
+# `~/codex/midicrt/plugins/sysex.py`'s own `_log(_format_status(...))` call
+# sites. Every scenario below pairs the SAME byte sequences the reply-shape
+# tests above already exercise with an assertion on the resulting status
+# text, so a status-text regression can never hide behind a passing reply
+# test (or vice versa).
+
+def test_status_text_switch_page_ok():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x01, 0x08), ts=5.0))   # v1, switch to page 8
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x01 ok page->pianoroll"
+    assert eng._sysex_store.status_active(5.0) is True
+
+
+def test_status_text_switch_page_invalid_id():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x01, 0x03)))   # page 3 -- no v2 home
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x01 err invalid-page 3"
+
+
+def test_status_text_switch_page_mapped_but_not_in_roster():
+    eng, _fake = engine_with_fake_out(pages=["eventlog"])
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x01, 0x0A)))   # tuner, id 10
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x01 err invalid-page 10"
+
+
+def test_status_text_switch_page_missing_args():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x01)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x01 err missing-page"
+
+
+def test_status_text_screensaver_force_on_says_screen_off():
+    # v1's own wording describes the DISPLAY state, not the screensaver
+    # flag: forcing the screensaver ON means the screen goes OFF/dark.
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x02, 0x01)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x02 ok screen-off"
+
+
+def test_status_text_screensaver_wake_says_screen_on():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x02, 0x00)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x02 ok screen-on"
+
+
+def test_status_text_screensaver_missing_args():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x02)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x02 err missing-arg"
+
+
+def test_status_text_page_cycle_disable():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x03, 0x00)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x03 ok cycle-off"
+
+
+def test_status_text_page_cycle_enable():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x03, 0x01)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x03 ok cycle-on"
+
+
+def test_status_text_page_cycle_missing_args():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x03)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x03 err missing-arg"
+
+
+def test_status_text_capture_recent_versioned():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x04, 0x02)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x04 err capture-fail"
+
+
+def test_status_text_capture_recent_legacy_still_records_status_despite_no_reply():
+    # v1 logs regardless of version -- only the REPLY channel is gated.
+    eng, fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x04, 0x02)))
+    assert fake.sent == []
+    assert eng._sysex_store.status_text == "sx:legacy cmd=0x04 err capture-fail"
+
+
+def test_status_text_capabilities_ok_caps_sent():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x40, 0x10)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x10 ok caps-sent"
+
+
+def test_status_text_capabilities_legacy_requires_versioned_frame():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x10)))
+    assert eng._sysex_store.status_text == "sx:legacy cmd=0x10 err requires-versioned-frame"
+
+
+def test_status_text_unsupported_version():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x49, 0x01, 0x08)))   # requests version 9
+    assert eng._sysex_store.status_text == "sx:v9 cmd=0x01 err unsupported-version"
+
+
+def test_status_text_missing_cmd_byte_replicates_v1s_v0_quirk():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41)))
+    assert eng._sysex_store.status_text == "sx:v0 cmd=0x00 err missing-cmd"
+
+
+def test_status_text_unknown_command_versioned():
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x41, 0x7F)))
+    assert eng._sysex_store.status_text == "sx:v1 cmd=0x7F err unknown-cmd"
+
+
+def test_status_text_unknown_command_legacy_still_records_status_despite_no_reply():
+    # 0x05: a legacy cmd byte (< VERSION_BASE=0x40, so the marker IS the
+    # cmd byte, unlike 0x7F which -- being >= VERSION_BASE -- would parse
+    # as a VERSIONED marker with a missing cmd byte instead, a different
+    # scenario entirely (see test_status_text_missing_cmd_byte_replicates_
+    # v1s_v0_quirk above).
+    eng, fake = engine_with_fake_out()
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x05)))
+    assert fake.sent == []
+    assert eng._sysex_store.status_text == "sx:legacy cmd=0x05 err unknown-cmd"
+
+
+def test_status_text_untouched_by_non_midicrt_traffic():
+    # THE mandatory proof (controller ruling): real foreign-device sysex
+    # chatter (a Cirklon rig's own non-midicrt traffic) must never touch
+    # the chrome status text -- see engine/sysex_store.py's own module
+    # docstring for the full v1-evidence writeup of why the earlier draft
+    # (record_received setting status_text) was wrong.
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev(load_syx("non-midicrt-frame.syx"), ts=100.0))
+    assert eng._sysex_store.status_text is None
+    assert eng._sysex_store.status_active(100.0) is False
+
+
+def test_status_text_survives_multiple_foreign_frames_then_updates_on_a_real_command():
+    # A burst of foreign chatter followed by one real command: status must
+    # stay blank through the whole burst, then reflect ONLY the real one.
+    # Legacy frame (no version marker) so there's no reply-channel noise
+    # to account for -- this test's own subject is status_text, not replies.
+    eng, fake = engine_with_fake_out()
+    for _ in range(5):
+        eng._handle(sysex_ev(load_syx("non-midicrt-frame.syx"), ts=100.0))
+    assert eng._sysex_store.status_text is None
+    eng._handle(sysex_ev((0x7D, 0x6D, 0x63, 0x03, 0x01), ts=101.0))
+    assert eng._sysex_store.status_text == "sx:legacy cmd=0x03 ok cycle-on"
     assert fake.sent == []

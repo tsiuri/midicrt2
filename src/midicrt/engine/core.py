@@ -595,16 +595,17 @@ class _SysexStatusOverlay:
     topic/view_model convention every other chrome-row data source uses.
 
     `handle()` is always a no-op (`False`, never marks `overlay.sysex`
-    dirty from raw event handling) -- `Engine._handle` already calls
-    `self._sysex_store.record_received(ev)` DIRECTLY, outside the normal
-    analyzer fan-out (see that method's own comment at the call site,
-    mirroring `self._capture.record_event(ev)`'s identical placement),
-    because `SysexStore` needs the RAW event (in particular `ev.sysex_data`
-    with its original F0/F7-stripped byte tuple) regardless of which
-    analyzers exist in a given build's roster -- unlike every other
-    analyzer, whose whole job IS to react to `handle(ev)`. Only `tick(now)`
-    does real work here: it asks the store whether its status text is
-    still within `SYSEX_DISPLAY_SECS` of the last activity and reports a
+    dirty from raw event handling) -- neither `Engine._handle`'s own
+    `self._sysex_store.record_received(ev)` call (the ring, fed for EVERY
+    incoming sysex frame) NOR `_handle_sysex`'s `record_command_status`
+    calls (the ONLY thing that actually updates `status_text` -- review
+    fix, controller ruling: see `engine/sysex_store.py`'s own module
+    docstring's "Chrome status text" section for why generic frame receipt
+    must NOT reach this overlay) go through the normal analyzer `handle(ev)`
+    fan-out at all -- both are called directly by `Engine._handle`/
+    `_handle_sysex`, outside this wrapper. Only `tick(now)` does real work
+    here: it asks the store whether its status text is still within
+    `SYSEX_DISPLAY_SECS` of the last CMD-dispatch OUTCOME and reports a
     dirty TRANSITION (active flips true/false), the same "binary signal,
     transition-only dirty" shape `_PolyLimitOverlay`'s own shared instance
     uses for its flash."""
@@ -2486,6 +2487,18 @@ class Engine:
     # calls into. Every method below is a thin, testable wrapper: parse ->
     # (maybe) mutate engine state through the SAME methods a normal client
     # action would use -> (maybe) send a reply through self._midi_out.
+    #
+    # Phase 9 Task 5 review fix (controller ruling): every branch below
+    # that v1's own `plugins/sysex.py::_dispatch()`/`handle()` called
+    # `_log(_format_status(...))` from now ALSO calls `self._sysex_store.
+    # record_command_status(sysex_mod.build_status_text(...), ts)` --
+    # `ts` is threaded down from `_handle_sysex`'s own `ev.ts` (never a
+    # live clock read, same "engine injects the clock" discipline as
+    # `_tick_analyzers(now)`, and correct under replay -- see engine/
+    # sysex_store.py's own module docstring's "Chrome status text"
+    # section for the full v1-parity mapping and why generic frame
+    # receipt/the browser save/play/delete manager deliberately do NOT
+    # reach this at all).
 
     def _handle_sysex(self, ev: MidiEvent) -> None:
         if ev.sysex_data is None:
@@ -2516,8 +2529,16 @@ class Engine:
             "args": list(parsed["args"]), "error": parsed["error"],
         })
         if parsed["error"] == "missing-cmd":
+            # v1's own literal quirk, replicated exactly (plugins/sysex.py:
+            # 170): version=0 (an int, NOT None -- renders "v0", not
+            # "legacy") and cmd=0x00 (there IS no real cmd byte to report).
+            self._sysex_store.record_command_status(
+                sysex_mod.build_status_text(0, 0x00, "err", "missing-cmd"), ev.ts)
             return   # no cmd byte to reply about -- matches v1 (logs, no reply)
         if parsed["error"] == "unsupported-version":
+            self._sysex_store.record_command_status(
+                sysex_mod.build_status_text(parsed["version"], parsed["cmd"], "err",
+                                            "unsupported-version"), ev.ts)
             # v1's own reply quirk, preserved: the REPLY's version byte is
             # the highest SUPPORTED version, not the (unsupported) one that
             # was requested.
@@ -2526,29 +2547,45 @@ class Engine:
                 sysex_mod.SUPPORTED_PROTOCOL_VERSIONS)
             self._midi_out.send_sysex(reply)
             return
-        self._dispatch_sysex_command(parsed["version"], parsed["cmd"], parsed["args"])
+        self._dispatch_sysex_command(parsed["version"], parsed["cmd"], parsed["args"], ev.ts)
 
-    def _dispatch_sysex_command(self, version: int | None, cmd: int, args: tuple[int, ...]) -> None:
+    def _dispatch_sysex_command(self, version: int | None, cmd: int, args: tuple[int, ...],
+                                ts: float) -> None:
         if cmd == sysex_mod.CMD_SWITCH_PAGE:
-            self._sysex_switch_page(version, args)
+            self._sysex_switch_page(version, args, ts)
         elif cmd == sysex_mod.CMD_SCREENSAVER:
-            self._sysex_screensaver(version, args)
+            self._sysex_screensaver(version, args, ts)
         elif cmd == sysex_mod.CMD_PAGE_CYCLE:
-            self._sysex_page_cycle(version, args)
+            self._sysex_page_cycle(version, args, ts)
         elif cmd == sysex_mod.CMD_CAPTURE_RECENT:
-            self._sysex_capture_recent(version)
+            self._sysex_capture_recent(version, ts)
         elif cmd == sysex_mod.CMD_CAPABILITIES:
-            self._sysex_capabilities(version)
-        elif version is not None:
-            self._midi_out.send_sysex(sysex_mod.build_reply(version, cmd, 0x01))
+            self._sysex_capabilities(version, ts)
+        else:
+            # v1's own trailing `else` in `_dispatch()`: logs regardless of
+            # version (a legacy frame has no reply channel, but v1 still
+            # reports the status), replies only when versioned.
+            self._sysex_store.record_command_status(
+                sysex_mod.build_status_text(version, cmd, "err", "unknown-cmd"), ts)
+            if version is not None:
+                self._midi_out.send_sysex(sysex_mod.build_reply(version, cmd, 0x01))
 
-    def _sysex_switch_page(self, version: int | None, args: tuple[int, ...]) -> None:
+    def _sysex_switch_page(self, version: int | None, args: tuple[int, ...], ts: float) -> None:
         """CMD_SWITCH_PAGE (`01 <page>`): v1 numeric page ID -> v2 page
         name via `_SYSEX_PAGE_ID_MAP`, dispatched through the SAME
         `_page_goto` a normal `page.goto` action uses (so it emits the
         same `page_changed` event, marks the same dirty topic -- no
-        parallel page-switch code path)."""
+        parallel page-switch code path). Status text: v1 logged its own
+        resolved NUMERIC page id (`f"page->{resolved}"`) -- this reports
+        the v2 page NAME instead (`f"page->{name}"`), a disclosed,
+        deliberately richer adaptation (v2's own chrome/nav vocabulary is
+        already page-name-based everywhere else; a bare numeric id would
+        be less legible here than it was to a v1 operator with the id
+        table memorized)."""
         if not args:
+            self._sysex_store.record_command_status(
+                sysex_mod.build_status_text(version, sysex_mod.CMD_SWITCH_PAGE, "err",
+                                            "missing-page"), ts)
             if version is not None:
                 self._midi_out.send_sysex(
                     sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x01))
@@ -2556,6 +2593,9 @@ class Engine:
         page_id = args[0]
         name = _SYSEX_PAGE_ID_MAP.get(page_id)
         if name is None or name not in self.pages:
+            self._sysex_store.record_command_status(
+                sysex_mod.build_status_text(version, sysex_mod.CMD_SWITCH_PAGE, "err",
+                                            f"invalid-page {page_id}"), ts)
             if version is not None:
                 self._midi_out.send_sysex(
                     sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x01, (page_id,)))
@@ -2570,6 +2610,9 @@ class Engine:
         # with the equivalent action name/args a `page.goto` action call
         # would have carried.
         self._capture.record_action("page.goto", {"name": name}, "sysex")
+        self._sysex_store.record_command_status(
+            sysex_mod.build_status_text(version, sysex_mod.CMD_SWITCH_PAGE, "ok",
+                                        f"page->{name}"), ts)
         # Phase 8 Task 5 (fix round 1, reviewer-found reversal): deliberately
         # does NOT call `PageCycleBehavior.notify_page_action` here -- v1's
         # own `plugins/sysex.py::_dispatch()` CMD_SWITCH_PAGE branch calls
@@ -2584,7 +2627,7 @@ class Engine:
             self._midi_out.send_sysex(
                 sysex_mod.build_reply(version, sysex_mod.CMD_SWITCH_PAGE, 0x00, (page_id,)))
 
-    def _sysex_screensaver(self, version: int | None, args: tuple[int, ...]) -> None:
+    def _sysex_screensaver(self, version: int | None, args: tuple[int, ...], ts: float) -> None:
         """CMD_SCREENSAVER (`02 <0|1>`): `0`=wake, `1`=force on immediately.
 
         "Wake" needs no code here at all -- `_handle_sysex`'s own
@@ -2605,9 +2648,18 @@ class Engine:
         normally. Fixing that general interaction is out of this task's
         scope (porting sysex control, not auditing every existing
         `page.goto screensaver` call site); v1 has no equivalent case at
-        all (no page concept to leave "unrestored").
+        all (no page concept to leave "unrestored"). Status text: v1's own
+        "screen-on"/"screen-off" describes the DISPLAY state (deactivating
+        the screensaver = the screen is ON), not the screensaver's own
+        active/inactive flag -- ported literally, including for the
+        `"screensaver" not in self.pages` edge case (the reply already
+        unconditionally claims success there too, an existing, unrelated
+        quirk this fix doesn't change).
         """
         if not args:
+            self._sysex_store.record_command_status(
+                sysex_mod.build_status_text(version, sysex_mod.CMD_SCREENSAVER, "err",
+                                            "missing-arg"), ts)
             if version is not None:
                 self._midi_out.send_sysex(
                     sysex_mod.build_reply(version, sysex_mod.CMD_SCREENSAVER, 0x01))
@@ -2621,15 +2673,21 @@ class Engine:
             # Phase 8 Task 5 (fix round 1): same origin-ruling reasoning as
             # `_sysex_switch_page` -- no `notify_page_action` call here
             # either, v1's own SysEx dispatch never pauses the page cycler.
+        self._sysex_store.record_command_status(
+            sysex_mod.build_status_text(version, sysex_mod.CMD_SCREENSAVER, "ok",
+                                        "screen-on" if args[0] == 0 else "screen-off"), ts)
         if version is not None:
             self._midi_out.send_sysex(sysex_mod.build_reply(
                 version, sysex_mod.CMD_SCREENSAVER, 0x00, (int(args[0] != 0),)))
 
-    def _sysex_page_cycle(self, version: int | None, args: tuple[int, ...]) -> None:
+    def _sysex_page_cycle(self, version: int | None, args: tuple[int, ...], ts: float) -> None:
         """CMD_PAGE_CYCLE (`03 <0|1>`): dispatches through the SAME
         `_pagecycle_enable` the `pagecycle.enable` action uses (see its own
         registration comment)."""
         if not args:
+            self._sysex_store.record_command_status(
+                sysex_mod.build_status_text(version, sysex_mod.CMD_PAGE_CYCLE, "err",
+                                            "missing-arg"), ts)
             if version is not None:
                 self._midi_out.send_sysex(
                     sysex_mod.build_reply(version, sysex_mod.CMD_PAGE_CYCLE, 0x01))
@@ -2639,29 +2697,51 @@ class Engine:
         # "sysex bypasses the dispatch hook, call the primitive directly"
         # reasoning.
         self._capture.record_action("pagecycle.enable", {"enabled": bool(args[0])}, "sysex")
+        self._sysex_store.record_command_status(
+            sysex_mod.build_status_text(version, sysex_mod.CMD_PAGE_CYCLE, "ok",
+                                        f"cycle-{'on' if args[0] else 'off'}"), ts)
         if version is not None:
             self._midi_out.send_sysex(sysex_mod.build_reply(
                 version, sysex_mod.CMD_PAGE_CYCLE, 0x00, (int(bool(args[0])),)))
 
-    def _sysex_capture_recent(self, version: int | None) -> None:
+    def _sysex_capture_recent(self, version: int | None, ts: float) -> None:
         """CMD_CAPTURE_RECENT (`04 [bars]`): NOT ported -- capture/replay
         is Phase 5, unbuilt (docs/phase3-parity.md's sign-off section).
         A versioned frame gets an honest error reply (status 0x01) rather
         than silently claiming success; a legacy frame has no reply
-        channel at all, matching v1 exactly."""
+        channel at all, matching v1 exactly. Status text uses v1's own
+        "capture-fail" wording (v1's closest existing vocabulary for "this
+        didn't work") rather than inventing a new label -- disclosed as an
+        honest adaptation for a command v2 never implemented at all, not a
+        literal v1 outcome (v1's OWN "capture-fail" meant a real capture
+        attempt failed; here nothing was ever attempted)."""
+        self._sysex_store.record_command_status(
+            sysex_mod.build_status_text(version, sysex_mod.CMD_CAPTURE_RECENT, "err",
+                                        "capture-fail"), ts)
         if version is not None:
             self._midi_out.send_sysex(
                 sysex_mod.build_reply(version, sysex_mod.CMD_CAPTURE_RECENT, 0x01))
 
-    def _sysex_capabilities(self, version: int | None) -> None:
+    def _sysex_capabilities(self, version: int | None, ts: float) -> None:
         """CMD_CAPABILITIES (`10`, versioned-only -- matches v1's own
-        "requires-versioned-frame" rule; a legacy frame has no reply
-        channel to answer on regardless)."""
+        "requires-versioned-frame" rule). v1 logs BOTH outcomes
+        (`plugins/sysex.py`'s `CMD_CAPABILITIES` branch): the `version is
+        None` error immediately, and -- for a real versioned request -- an
+        "ok" status distinguishing whether the reply actually SENT
+        (`"caps-sent"`) from a locally-computed-but-unsent reply
+        (`"caps-local-only"`, `MidiOutput.send_sysex`'s own `bool` return,
+        e.g. no MIDI output port available). Ported identically below."""
         if version is None:
+            self._sysex_store.record_command_status(
+                sysex_mod.build_status_text(version, sysex_mod.CMD_CAPABILITIES, "err",
+                                            "requires-versioned-frame"), ts)
             return
         payload = self._sysex_capabilities_payload(version)
-        self._midi_out.send_sysex(
+        sent = self._midi_out.send_sysex(
             sysex_mod.build_reply(version, sysex_mod.CMD_CAPABILITIES, 0x00, payload))
+        self._sysex_store.record_command_status(
+            sysex_mod.build_status_text(version, sysex_mod.CMD_CAPABILITIES, "ok",
+                                        "caps-sent" if sent else "caps-local-only"), ts)
 
     def _sysex_capabilities_payload(self, version: int) -> tuple[int, ...]:
         """Adapted from v1's `_capabilities_payload` -- v1's `profile`/
@@ -2731,7 +2811,7 @@ class Engine:
 
     def _sysex_play_action(self, name: str) -> dict:
         try:
-            return self._sysex_store.play(name, self._midi_out, now=self._clock())
+            return self._sysex_store.play(name, self._midi_out)
         except ValueError as exc:
             raise ActionError(str(exc)) from exc
         except OSError as exc:
@@ -2739,7 +2819,7 @@ class Engine:
 
     def _sysex_delete_action(self, name: str) -> dict:
         try:
-            return self._sysex_store.delete(name, now=self._clock())
+            return self._sysex_store.delete(name)
         except ValueError as exc:
             raise ActionError(str(exc)) from exc
         except OSError as exc:

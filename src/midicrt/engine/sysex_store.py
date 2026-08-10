@@ -43,6 +43,41 @@ entirely: its metadata (timestamp/source/size/manufacturer) still lands in
 something large arrived; only its raw bytes are discarded, so it can never
 be `save()`d (a clear `ValueError`, not a silent no-op).
 
+Chrome status text: CMD-dispatch outcomes ONLY, never generic traffic
+(review fix, controller ruling)
+---------------------------------------------------------------------------
+`status_text`/`status_active()` -- the loopprogress-style text `engine/
+core.py::_SysexStatusOverlay` exposes to chrome -- are driven EXCLUSIVELY
+by `record_command_status()`, called by `Engine._handle_sysex` with a v1-
+style `engine/sysex.py::build_status_text(...)` string
+(`"sx:legacy cmd=0x01 ok page->voices"`) whenever the PRE-EXISTING midicrt
+CMD-dispatch subsystem (`engine/sysex.py` + `Engine._handle_sysex`, see
+"Distinct from" above) actually resolves an outcome. `record_received()`
+(this module's OWN ring, fed from EVERY incoming frame regardless of
+content) and `save()`/`play()`/`delete()` (the browser-facing library
+CRUD) deliberately do NOT touch `status_text` at all, even though an
+earlier draft of this module had `record_received()` do exactly that.
+
+Why the earlier draft was wrong (v1 extraction re-checked under review):
+v1's own `midicrt.sysex_status` (`plugins/sysex.py:55-57`, read by
+`plugins/loopprogress.py:42-46`) is set ONLY inside `plugins/sysex.py::
+_dispatch()`'s own per-command branches -- NEVER by the unconditional
+`_log_sysex`/`_split_sysex` file-logging that already runs for every
+sysex frame regardless of content (v1's own `SYSEX_LOG_ALL = True`). A
+real Cirklon rig on the wire produces a steady stream of non-midicrt
+sysex traffic (MMC-style transport messages, etc.) that v1's chrome row
+NEVER lit up for -- only an actual midicrt REMOTE-CONTROL command did.
+Making `record_received()` set `status_text` reproduced the file-logging
+half of v1's behavior (which has no v2 chrome analog at all) instead of
+the actual `sysex_status` half -- under real foreign-device chatter this
+would have lit the chrome row constantly, exactly the noise v1
+deliberately never had, while ALSO giving a real midicrt command LESS
+information than v1's own rich `"sx:legacy cmd=0x01 ok page->3"` text
+(a bare `"sx: rx 5B Non-Commercial"` says nothing about which command,
+or whether it even succeeded). Generic frame-received activity's only
+home now is `recent()` (the ring itself, surfaced in the web panel's
+recent-received list) -- never the chrome row.
+
 Library: named, on-disk, atomic writes, ENOSPC-safe, stage-don't-delete
 ---------------------------------------------------------------------------
 `save()`/`play()`/`delete()` are cold-path, human-rate operations (a
@@ -142,14 +177,26 @@ TRASH_SUBDIR = "trash"
 RING_SIZE = 20
 MAX_FRAME_BYTES = 65536   # 64 KiB per-frame ceiling on what the ring KEEPS
 
-# v1's `plugins/loopprogress.py::SYSEX_DISPLAY_SECS` -- ported verbatim
-# (see docs task-5-report.md's v1-extraction section): how long the
-# chrome-row status text stays visible after the last sysex activity
-# (received / saved / played / deleted) before reverting to blank.
+# v1's `plugins/loopprogress.py::SYSEX_DISPLAY_SECS` (line 13) -- ported
+# verbatim (see docs task-5-report.md's v1-extraction section): how long
+# the chrome-row status text stays visible after the last CMD-dispatch
+# OUTCOME (record_command_status -- see module docstring's "Chrome status
+# text" section for why generic frame receipt/save/play/delete never
+# reach this at all) before reverting to blank.
 SYSEX_DISPLAY_SECS = 5.0
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9 _.-]{0,62}$")
-_MAX_NAME_LEN = 64
+# Review fix (Minor): `_MAX_NAME_LEN` is now the SINGLE source of truth for
+# the name-length bound -- `_NAME_RE` is BUILT from it (below), so the two
+# can never silently drift apart again. Previously the regex hardcoded its
+# own independent `{0,62}` bound (63 chars max, 1 first char + 62 more) and
+# a SEPARATE `len(stripped) > _MAX_NAME_LEN == 64` check sat in front of it
+# -- dead code: nothing 64 chars long could ever reach the length check's
+# own rejection, since the regex already refused anything past 63 first
+# (a name of length 64 is NOT `> 64`, so it sailed past the length check
+# and was rejected by the regex instead -- the length check never actually
+# blocked anything the regex wasn't already blocking on its own).
+_MAX_NAME_LEN = 63
+_NAME_RE = re.compile(rf"^[A-Za-z0-9_-][A-Za-z0-9 _.-]{{0,{_MAX_NAME_LEN - 1}}}$")
 
 _MANUFACTURER_NAMES = {
     0x7D: "Non-Commercial",
@@ -185,7 +232,7 @@ def sanitize_name(name: Any) -> str:
     if not isinstance(name, str):
         raise ValueError(f"sysex name must be a string, got {name!r}")  # noqa: TRY004
     stripped = name.strip()
-    if not stripped or len(stripped) > _MAX_NAME_LEN or not _NAME_RE.match(stripped):
+    if not stripped or not _NAME_RE.match(stripped):
         raise ValueError(f"invalid sysex name: {name!r}")
     return stripped
 
@@ -247,10 +294,12 @@ class SysexStore:
         self._max_frame_bytes = max(0, int(max_frame_bytes))
         self._display_secs = max(0.0, float(display_secs))
         self._ring: deque[_RingFrame] = deque(maxlen=self._ring_size)
-        # Loopprogress-style chrome status (module docstring) -- `None`
-        # until the very first activity of any kind (received/saved/
-        # played/deleted). `status_active(now)` is what `_SysexStatusOverlay.
-        # tick()` (engine/core.py) consults every engine tick.
+        # Loopprogress-style chrome status (module docstring's "Chrome
+        # status text" section) -- `None` until the very first CMD-dispatch
+        # OUTCOME (`record_command_status`, called by `Engine._handle_sysex`
+        # ONLY -- never by `record_received`/`save`/`play`/`delete`).
+        # `status_active(now)` is what `_SysexStatusOverlay.tick()`
+        # (engine/core.py) consults every engine tick.
         self.status_text: str | None = None
         self._status_ts: float = 0.0
 
@@ -263,13 +312,15 @@ class SysexStore:
     def record_received(self, ev) -> None:
         """Called from `Engine._handle` for EVERY `type == "sysex"` event,
         regardless of whether it also parses as a midicrt command (see
-        module docstring) -- must never touch disk. `ev.ts` (not a live
-        clock read) stamps the status text, keeping this store on the SAME
-        clock domain as the event itself (also correct, harmlessly, when
-        this fires during a session replay -- see docs/phase5-capture.md
-        §6's "SysEx is the one exception" precedent this module's ring
-        recording extends: a pure in-memory append, no real I/O, safe to
-        replay exactly like `_handle_sysex`'s own page-switch dispatch)."""
+        module docstring) -- must never touch disk, and (review fix,
+        controller ruling) must NEVER touch `status_text` either: that is
+        exclusively `record_command_status`'s job, fed only by real
+        CMD-dispatch outcomes -- see module docstring's "Chrome status
+        text" section for why generic frame receipt used to (wrongly) set
+        it and what v1 evidence proved that wrong. Safe to replay exactly
+        like `_handle_sysex`'s own page-switch dispatch -- a pure
+        in-memory append, no real I/O (docs/phase5-capture.md §6's "SysEx
+        is the one exception" precedent)."""
         data = tuple(ev.sysex_data or ())
         size = len(data)
         manufacturer = _decode_manufacturer(data)
@@ -277,17 +328,26 @@ class SysexStore:
         self._ring.appendleft(_RingFrame(
             ts=ev.ts, source=ev.source or "", size=size,
             manufacturer=manufacturer, data=keep))
-        if keep is None:
-            self.status_text = f"sx: rx {size}B dropped (too large)"
-        else:
-            self.status_text = f"sx: rx {size}B {manufacturer}"
-        self._status_ts = ev.ts
+
+    def record_command_status(self, text: str, ts: float) -> None:
+        """The ONLY way `status_text`/`status_active()` ever change (review
+        fix, controller ruling) -- called by `Engine._handle_sysex` with a
+        v1-style `engine/sysex.py::build_status_text(...)` string for every
+        CMD-dispatch outcome (a matched-prefix midicrt command that
+        resolved to SOME result, success or failure -- see that method's
+        own call sites for the full v1-parity mapping). `ts` is the
+        triggering `MidiEvent.ts` (not a live clock read), the same
+        "engine injects the clock, this store never reads one itself"
+        discipline `record_received` already followed."""
+        self.status_text = text
+        self._status_ts = ts
 
     def status_active(self, now: float) -> bool:
-        """`True` iff there has been SOME sysex activity (received / saved
-        / played / deleted) within the last `display_secs` seconds of
-        `now` -- the loopprogress-style decay window (module docstring),
-        matching v1's own `SYSEX_DISPLAY_SECS` gate exactly."""
+        """`True` iff a CMD-dispatch outcome (`record_command_status` --
+        NEVER generic frame receipt or a browser save/play/delete, see
+        module docstring) landed within the last `display_secs` seconds of
+        `now` -- the loopprogress-style decay window, matching v1's own
+        `SYSEX_DISPLAY_SECS` gate exactly."""
         return self.status_text is not None and (now - self._status_ts) < self._display_secs
 
     def recent(self) -> list[dict]:
@@ -335,7 +395,10 @@ class SysexStore:
         (ENOSPC etc.), deliberately NOT caught here (module docstring's
         "ENOSPC must not kill the engine loop" section: the ENGINE-level
         caller converts it to `ActionError`, this store stays a thin,
-        honest wrapper around the filesystem)."""
+        honest wrapper around the filesystem). `now` stamps the persisted
+        `saved_ts` field only (review fix: no longer touches chrome's
+        `status_text` -- see module docstring's "Chrome status text"
+        section)."""
         safe = sanitize_name(name)
         frame = self._ring_frame(index)
         if frame.data is None:
@@ -349,8 +412,6 @@ class SysexStore:
             "data": list(frame.data),
         }
         _atomic_write_json(self._library_path(safe), payload)
-        self.status_text = f"sx: saved '{safe}' ({frame.size}B)"
-        self._status_ts = saved_ts
         return {"name": safe, "size": frame.size}
 
     def list_library(self) -> list[dict]:
@@ -384,7 +445,7 @@ class SysexStore:
                 _LOG.warning("sysex: skipping unreadable library entry %s: %s", path, exc)
         return rows
 
-    def play(self, name: str, midi_out, *, now: float | None = None) -> dict:
+    def play(self, name: str, midi_out) -> dict:
         """Loads `name`'s saved frame and sends it via `midi_out.
         send_sysex(data)` (the SAME shared, self-subscription-guarded
         `MidiOutput` every other real send in this engine uses -- see
@@ -392,7 +453,10 @@ class SysexStore:
         for an unknown/invalid name or a corrupt library file (never lets
         a bad on-disk entry crash the caller); `midi_out.send_sysex`'s own
         `bool` return (never raises, per that class's contract) becomes
-        this method's `"sent"` field."""
+        this method's `"sent"` field. Review fix: no longer touches
+        chrome's `status_text` (dropped its own `now` param entirely, it
+        had no other use) -- a browser-triggered play is a silent-on-chrome
+        action now, see module docstring's "Chrome status text" section."""
         safe = sanitize_name(name)
         path = self._library_path(safe)
         try:
@@ -404,21 +468,19 @@ class SysexStore:
             raise ValueError(f"sysex library entry {safe!r} is unreadable/corrupt: {exc}") from exc
         data = tuple(doc.get("data") or ())
         sent = midi_out.send_sysex(data)
-        play_ts = now if now is not None else time.time()
-        self.status_text = (f"sx: play '{safe}' ({len(data)}B)" if sent
-                            else f"sx: play '{safe}' failed")
-        self._status_ts = play_ts
         return {"sent": sent, "size": len(data)}
 
-    def delete(self, name: str, *, now: float | None = None) -> dict:
+    def delete(self, name: str) -> dict:
         """Stages `name` to `library_dir/trash/` (an `os.replace` move,
         NOT a real delete -- stage-don't-delete) rather than removing it.
         Raises `ValueError` for an unknown/invalid name; can also raise a
         real `OSError` (same containment contract as `save()`, see that
         method's own docstring). A second delete of the same name
         overwrites whatever was previously in `trash/` under that name --
-        `trash/` is a "moved aside" landing spot, not a versioned
-        archive."""
+        `trash/` is a "moved aside" landing spot, not a versioned archive.
+        Review fix: no longer touches chrome's `status_text` (dropped its
+        own `now` param entirely, it had no other use) -- see module
+        docstring's "Chrome status text" section."""
         safe = sanitize_name(name)
         src = self._library_path(safe)
         if not os.path.isfile(src):
@@ -426,6 +488,4 @@ class SysexStore:
         dest = self._trash_path(safe)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         os.replace(src, dest)
-        self.status_text = f"sx: deleted '{safe}'"
-        self._status_ts = now if now is not None else time.time()
         return {"deleted": True}

@@ -107,3 +107,35 @@ def test_build_reply_no_payload():
 def test_build_reply_version_byte_is_version_base_plus_version():
     frame = sysex.build_reply(1, 0x02, 0x00, payload=(1,))
     assert frame[3] == sysex.VERSION_BASE + 1
+
+
+# -- build_status_text (Phase 9 Task 5 review fix -- v1's _format_status,
+# plugins/sysex.py:92-95, the loopprogress-status text format) --------------
+
+def test_build_status_text_legacy_frame_says_legacy():
+    assert sysex.build_status_text(None, 0x01, "ok", "page->voices") == \
+        "sx:legacy cmd=0x01 ok page->voices"
+
+
+def test_build_status_text_versioned_frame_shows_v_prefixed_version():
+    assert sysex.build_status_text(1, 0x10, "ok", "caps-sent") == \
+        "sx:v1 cmd=0x10 ok caps-sent"
+
+
+def test_build_status_text_no_detail_has_no_trailing_space():
+    assert sysex.build_status_text(1, 0x03, "err") == "sx:v1 cmd=0x03 err"
+    assert sysex.build_status_text(None, 0x02, "err", "") == "sx:legacy cmd=0x02 err"
+
+
+def test_build_status_text_cmd_byte_is_uppercase_hex_zero_padded():
+    assert sysex.build_status_text(1, 0x01, "ok") == "sx:v1 cmd=0x01 ok"
+    assert sysex.build_status_text(1, 0x10, "ok") == "sx:v1 cmd=0x10 ok"
+
+
+def test_build_status_text_replicates_v1s_own_missing_cmd_literal_quirk():
+    # v1's handle() (plugins/sysex.py:170) hardcodes version=0 (an int, NOT
+    # None) for this ONE case -- a versioned marker byte with no cmd byte
+    # to actually report on. Renders "v0", not "legacy" -- a faithfully
+    # replicated v1 quirk, not a v2 bug.
+    assert sysex.build_status_text(0, 0x00, "err", "missing-cmd") == \
+        "sx:v0 cmd=0x00 err missing-cmd"

@@ -94,6 +94,22 @@ def parse_command(data: tuple[int, ...]) -> dict | None:
     return {"version": version, "cmd": cmd, "args": args, "error": None}
 
 
+def build_status_text(version: int | None, cmd: int, status: str, detail: str = "") -> str:
+    """Pure port of v1's `_format_status` (`plugins/sysex.py:92-95`) --
+    the loopprogress-status TEXT format for a CMD-dispatch outcome (v1's
+    `midicrt.sysex_status`, read by `plugins/loopprogress.py:43-46`, see
+    `engine/sysex_store.py::SysexStore.record_command_status`'s own
+    docstring for the v2 wiring). `"sx:legacy cmd=0x01 ok page->3"`-style:
+    `version=None` renders `"legacy"` (a legacy F0 7D 6D 63 <cmd> frame),
+    otherwise `f"v{version}"`; `detail` is appended (space-separated,
+    stripped) only when non-empty, matching v1's own `f"{base} {detail}".
+    strip()` exactly -- an empty `detail` (v1's own default) leaves `base`
+    untouched rather than a trailing space."""
+    vtxt = "legacy" if version is None else f"v{version}"
+    base = f"sx:{vtxt} cmd=0x{cmd:02X} {status}"
+    return f"{base} {detail}".strip()
+
+
 def build_reply(version: int, cmd: int, status: int, payload: tuple[int, ...] = ()) -> tuple[int, ...]:
     """Pure port of v1's `_send_reply`'s frame construction (the byte
     layout only -- the actual MIDI send is `engine/midi_out.py::

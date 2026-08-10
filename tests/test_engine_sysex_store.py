@@ -243,19 +243,24 @@ async def test_delete_unknown_name_raises_action_error():
 # -- overlay.sysex: chrome data source, tick-driven decay ---------------------
 
 def test_overlay_sysex_view_model_becomes_active_on_receipt_and_marks_dirty():
+    # Review fix: overlay.sysex only activates for a REAL CMD-dispatch
+    # outcome now -- a generic/malformed frame (e.g. a too-short one that
+    # never even matches the midicrt PREFIX) must NOT activate it. Use a
+    # real captured command fixture, matching this file's own load_syx
+    # convention.
     eng, _fake = engine_with_fake_out()
-    eng._handle(sysex_ev((0x7D, 0x01), ts=100.0))
+    eng._handle(sysex_ev(load_syx("legacy-switch-page-0.syx"), ts=100.0))
     eng._dirty.clear()
     eng._tick_analyzers(100.0)
     assert "overlay.sysex" in eng._dirty
     vm = eng.analyzers["sysex"].view_model()
     assert vm["active"] is True
-    assert "rx" in vm["text"]
+    assert vm["text"] == "sx:legacy cmd=0x01 ok page->help"   # page_id 0 -> "help"
 
 
 def test_overlay_sysex_decays_after_display_window_and_marks_dirty_once():
     eng, _fake = engine_with_fake_out()
-    eng._handle(sysex_ev((0x7D, 0x01), ts=100.0))
+    eng._handle(sysex_ev(load_syx("legacy-switch-page-0.syx"), ts=100.0))
     eng._tick_analyzers(100.0)   # transition to active -- dirty
     eng._dirty.clear()
     eng._tick_analyzers(102.0)   # still within SYSEX_DISPLAY_SECS -- no re-dirty
@@ -263,6 +268,16 @@ def test_overlay_sysex_decays_after_display_window_and_marks_dirty_once():
     eng._tick_analyzers(106.0)   # past the 5s window -- transition to inactive
     assert "overlay.sysex" in eng._dirty
     assert eng.analyzers["sysex"].view_model()["active"] is False
+
+
+def test_overlay_sysex_stays_inactive_for_generic_non_command_traffic():
+    # The MANDATORY foreign-frame-does-NOT-set-status proof, at the chrome
+    # overlay level (see test_sysex_store.py's own store-level pin for the
+    # same fact against SysexStore directly).
+    eng, _fake = engine_with_fake_out()
+    eng._handle(sysex_ev(load_syx("non-midicrt-frame.syx"), ts=100.0))
+    eng._tick_analyzers(100.0)
+    assert eng.analyzers["sysex"].view_model() == {"text": "", "active": False}
 
 
 def test_overlay_sysex_default_view_model_before_any_activity():

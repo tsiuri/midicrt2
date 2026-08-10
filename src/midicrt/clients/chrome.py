@@ -273,11 +273,25 @@ def secondary_status_text(alerts_vm: dict, timesig_vm: dict, polylimit_vm: dict 
        itself has "no v1 chrome row of its own" and shares this exact
        row for the identical reason, see the module-level comment above
        `alerts_text`) -- sysex-status joins for the same reason: it is
-       informational/confirmatory ("your remote-control command fired",
-       "your saved patch played"), never as urgent as a stuck note or an
+       informational/confirmatory ("your remote-control command fired and
+       here's what it did"), never as urgent as a stuck note or an
        exceeded polyphony limit, but still more timely than the
        always-present routine timesig baseline, so it wins that
-       tie-break.
+       tie-break. Review fix (controller ruling, re-checking the v1
+       extraction under review): `sysex_vm["text"]` is fed EXCLUSIVELY by
+       the pre-existing midicrt CMD-dispatch subsystem's own outcomes
+       (`engine/sysex.py::build_status_text`, `Engine._handle_sysex`) --
+       NOT by generic incoming sysex traffic, and NOT by the browser-
+       facing sysex MANAGER's own save/play/delete actions (`engine/
+       sysex_store.py`'s ring/library CRUD) either. v1's real
+       `sysex_status` only ever lit up for an actual midicrt remote-
+       control command outcome (`plugins/sysex.py:55-57`, called only
+       from `_dispatch()`'s own branches) -- a real Cirklon rig's other,
+       non-midicrt sysex chatter never touched it, and this row must not
+       either, or real foreign-device traffic would light this row
+       constantly (noise v1 deliberately never had). See engine/
+       sysex_store.py's own module docstring for the full v1-evidence
+       writeup.
     4. `timesig_text()` -- the routine fallback, wins only when nothing
        above is active.
 
