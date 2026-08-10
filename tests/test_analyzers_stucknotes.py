@@ -236,6 +236,77 @@ def test_multiple_stuck_notes_sorted_worst_first():
     assert vm["alerts"][1]["level"] == "warn"
 
 
+# -- held_notes() (Phase 9 Task 2 review fix: panic-release parity) --------
+#
+# v1 evidence: `~/codex/midicrt/plugins/zstucknotes.py:221-225` -- on a CRIT
+# transition, v1 calls `eng.request_release(ch - 1)` IN ADDITION TO the
+# CC123 send, because "the engine ignores CC123" (v1's own comment) and a
+# lossy MIDI loopback under overload can strand phantom held notes even
+# after the external device silences. `request_release` (`~/codex/midicrt/
+# engine/core.py:410-433`) synthesizes a real `note_off` for EVERY note the
+# engine's OWN active-notes ledger believes is held on that channel (not
+# just the one note that triggered CRIT), and re-ingests each through the
+# SAME path real MIDI takes, so every module/plugin (not just zstucknotes
+# itself) clears its own tracking. v2 has no separate engine-level active-
+# notes ledger; `held_notes()` exposes THIS analyzer's own per-channel
+# active set (the same shape of state v1's ledger held, driven by the
+# same event stream) as the source `Engine._maybe_panic` synthesizes
+# releases from -- see engine/core.py's own docstring for the full wiring.
+
+def test_held_notes_is_empty_for_an_untouched_channel():
+    a = StuckNotesAnalyzer()
+    assert a.held_notes(1) == []
+
+
+def test_held_notes_returns_active_notes_on_that_channel_sorted():
+    a = StuckNotesAnalyzer()
+    a.handle(note_on(0, 64, ts=0.0))
+    a.handle(note_on(0, 60, ts=0.0))
+    assert a.held_notes(1) == [60, 64]
+
+
+def test_held_notes_includes_notes_below_warn_after_too():
+    # v1's channel-wide release doesn't discriminate "stuck" from
+    # "just pressed" -- CC123 (and request_release) silences EVERYTHING
+    # on the channel, matching what a real device receiving that CC would
+    # do. held_notes() must reflect that: any currently-active note on the
+    # channel, alerting or not.
+    a = StuckNotesAnalyzer()
+    a.handle(note_on(0, 60, ts=0.0))   # never ticked past WARN_AFTER
+    assert a.held_notes(1) == [60]
+
+
+def test_held_notes_ignores_other_channels():
+    a = StuckNotesAnalyzer()
+    a.handle(note_on(1, 62, ts=0.0))   # channel 2
+    assert a.held_notes(1) == []
+    assert a.held_notes(2) == [62]
+
+
+def test_held_notes_reflects_note_off():
+    a = StuckNotesAnalyzer()
+    a.handle(note_on(0, 60, ts=0.0))
+    a.handle(note_off(0, 60, ts=0.1))
+    assert a.held_notes(1) == []
+
+
+def test_held_notes_reflects_cc123_clear():
+    a = StuckNotesAnalyzer()
+    a.handle(note_on(0, 60, ts=0.0))
+    a.handle(cc(0, 123, 0, ts=0.1))
+    assert a.held_notes(1) == []
+
+
+def test_held_notes_an_overlapping_retrigger_stays_held_until_both_offs():
+    a = StuckNotesAnalyzer()
+    a.handle(note_on(0, 60, ts=0.0))
+    a.handle(note_on(0, 60, ts=0.0))   # overlapping retrigger, count=2
+    a.handle(note_off(0, 60, ts=0.1))
+    assert a.held_notes(1) == [60]   # one voice remains
+    a.handle(note_off(0, 60, ts=0.2))
+    assert a.held_notes(1) == []
+
+
 def test_tick_never_reads_a_clock_or_does_io():
     # Structural guard, mirrors test_analyzers_transport.py's own
     # `test_handle_never_reads_a_clock_or_does_io`: an analyzer must only

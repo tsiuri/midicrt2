@@ -2245,6 +2245,21 @@ class Engine:
         # matching the activity-stamp's own placement).
         if ev.type == "sysex":
             self._handle_sysex(ev)
+        self._dispatch_to_state(ev)
+
+    def _dispatch_to_state(self, ev: MidiEvent) -> None:
+        """Fan `ev` out to every analyzer's then every page's own `handle
+        (ev)`, marking `overlay.<name>`/`page.<name>` dirty for each one
+        that reports a real change -- extracted from `_handle`'s own tail
+        (Phase 9 Task 2 review fix) so a SECOND caller, `_maybe_panic`'s
+        synthetic-release path below, can update every analyzer/page's
+        held-note state exactly as a real event would, WITHOUT also
+        re-running `_handle`'s wire-level bookkeeping (the self-output
+        filter, `record_event`/raw capture, `events_total`, the activity
+        timestamp, binding-dispatch collection, sysex parsing) -- a
+        synthetic release is an honest, separately-provenanced internal
+        action (see `_maybe_panic`'s own docstring), not a second fake
+        wire event."""
         for name, analyzer in self.analyzers.items():
             if analyzer.handle(ev):
                 self._dirty.add(f"overlay.{name}")
@@ -2553,28 +2568,66 @@ class Engine:
     def _maybe_panic(self, alert: dict, now: float) -> None:
         """`config.panic_on_crit` side effect (default False -- see
         config.py's own docstring for the deliberate v1-default posture
-        change): v1's `zstucknotes.py::draw()` sends a channel-scoped "All
-        Notes Off" CC the instant a note's level transitions to "crit"
-        (zstucknotes.py:209-216), gated by a per-channel `PANIC_COOLDOWN`
-        (3.0s, `_PANIC_COOLDOWN_S` above) -- ported here as REAL I/O
-        (`self._midi_out.all_notes_off`), the one place in this whole
-        method that touches MIDI output, mirroring `_tick_pages`'s own
-        "pure module reports, engine acts" split for its sendnotes
-        auto-off drain.
+        change): v1's `zstucknotes.py::draw()` does TWO things the instant
+        a note's level transitions to "crit" (zstucknotes.py:209-225),
+        both gated by the SAME per-channel `PANIC_COOLDOWN` (3.0s,
+        `_PANIC_COOLDOWN_S` above):
 
-        v1 sends `_send_all_notes_off(channel=ch)` -- despite that function
-        NAME, it is a single channel-mode CC (control=123, value=0) for
-        `PANIC_SCOPE="channel"` (v1's own default, read from
-        `~/codex/midicrt/plugins/zstucknotes.py:24` -- NOT v1's
-        `PANIC_SCOPE="all"` alternative, and NOT a per-note note-off
-        despite the brief's own initial "targeted note-off" wording; see
-        the task report for the full read-the-source evidence). v1's other
-        panic knobs (`PANIC_SCOPE`, `PANIC_OUTPUT_NAME`, `PANIC_AUTOCONNECT`,
-        `PANIC_DST_HINTS`) are v1's own ALSA-port-discovery plumbing for a
-        SEPARATE named output port -- this engine already has exactly one
-        shared, self-subscription-guarded `MidiOutput` (see that module's
-        own docstring), so none of that plumbing is ported; only the
-        channel-scoped send itself.
+        1. Sends a channel-scoped "All Notes Off" CC externally
+           (`self._midi_out.all_notes_off`, the one place in this whole
+           method that touches real MIDI output, mirroring `_tick_pages`'s
+           own "pure module reports, engine acts" split for its sendnotes
+           auto-off drain). v1 sends `_send_all_notes_off(channel=ch)` --
+           despite that function NAME, it is a single channel-mode CC
+           (control=123, value=0) for `PANIC_SCOPE="channel"` (v1's own
+           default, `~/codex/midicrt/plugins/zstucknotes.py:24` -- NOT
+           v1's `PANIC_SCOPE="all"` alternative, and NOT a per-note
+           note-off despite the brief's own initial "targeted note-off"
+           wording; see the task report for the full read-the-source
+           evidence). v1's other panic knobs (`PANIC_SCOPE`,
+           `PANIC_OUTPUT_NAME`, `PANIC_AUTOCONNECT`, `PANIC_DST_HINTS`) are
+           v1's own ALSA-port-discovery plumbing for a SEPARATE named
+           output port -- this engine already has exactly one shared,
+           self-subscription-guarded `MidiOutput` (see that module's own
+           docstring), so none of that plumbing is ported; only the
+           channel-scoped send itself.
+
+        2. **Review fix (Critical, v1 parity gap)**: v1 ALSO calls `eng.
+           request_release(ch - 1)` (zstucknotes.py:221-225), with its own
+           comment explaining why: "the engine ignores CC123" and a lossy
+           MIDI loopback under exactly the overload conditions that cause
+           a stuck note can ALSO drop the real note-off, so the external
+           CC123 alone can leave the engine's OWN tracked state pinned at
+           "crit" forever even though the physical device already went
+           silent. v1's `request_release` (`~/codex/midicrt/engine/
+           core.py:410-433`) synthesizes a real `note_off` for EVERY note
+           the engine's OWN active-notes ledger believes is held on that
+           channel (not just the one note that triggered CRIT -- the same
+           whole-channel scope the CC123 itself has) and re-ingests each
+           one through the exact path real MIDI takes, so every plugin --
+           not just zstucknotes -- clears its own tracking. v2 has no
+           separate engine-level active-notes ledger; this method's
+           analog is `held_notes(ch)` on WHATEVER analyzer drained this
+           alert's `"ch"` (in practice always `self.analyzers["alerts"]`,
+           `StuckNotesAnalyzer`'s own per-channel active set -- the same
+           shape of state v1's ledger held, driven by the same event
+           stream). Each synthesized note-off is routed through
+           `_dispatch_to_state` -- the SAME analyzer/page fan-out
+           `_handle()` itself uses, so `page.voices`/pianoroll/harmony/etc
+           all clear too, exactly as a real note-off would -- but NOT
+           through `_handle()` itself: `_dispatch_to_state` skips the
+           self-output filter, `record_event` (raw capture),
+           `events_total`, the activity timestamp, and binding-dispatch
+           collection, because a synthetic release is an honest, INTERNAL
+           action, not a second fake wire event arriving from outside
+           (review's own wording: "they must land in capture with honest
+           provenance ... not fake wire events"). Instead, ONE
+           `panic.release` action mark (`origin="alert"`, same new origin
+           `panic.notes_off` below already introduced -- see
+           `docs/phase5-capture.md`'s origin table) records exactly which
+           notes were released, only when there was something to release
+           (mirrors v1's own conditional: `request_release` is a genuine
+           no-op when the ledger has nothing for that channel).
 
         A drained alert with no `"ch"` (shouldn't occur for
         `StuckNotesAnalyzer`'s own `{"ch", "note", "level", "held_s"}`
@@ -2582,16 +2635,21 @@ class Engine:
         drained alerts, see `_tick_analyzers`'s own docstring) is a safe
         no-op rather than a crash.
 
-        No-feedback-loop note (brief's own CRITICAL callout): this call
-        only ever reaches `self._midi_out.all_notes_off(...)`, the SAME
-        shared, self-subscription-guarded output every other real send
-        (sendnotes note-on, sysex replies) already uses -- it never
+        No-feedback-loop note (brief's own CRITICAL callout): the CC123
+        send only ever reaches `self._midi_out.all_notes_off(...)`, the
+        SAME shared, self-subscription-guarded output every other real
+        send (sendnotes note-on, sysex replies) already uses -- it never
         constructs or queues a `MidiEvent`, so it cannot itself become a
         new inbound event regardless of the two existing self-subscription
         defense layers (`engine/midi_in.py::MidiInput`'s `exclude_names`,
-        `Engine._handle`'s own source filter) -- see
+        `Engine._handle`'s own source filter). The internal release
+        (point 2 above) is a DIFFERENT kind of "never reaches `_handle`"
+        guarantee: it is dispatched via `_dispatch_to_state` directly, so
+        it never passes through `_handle`'s self-output filter (or
+        `events_total`) AT ALL -- there is no path back into `_handle`
+        for either effect to loop through. See
         test_panic_send_never_synthesizes_a_new_inbound_event in
-        test_engine_core.py for the pinning proof."""
+        test_engine_core.py for the CC123-side pinning proof."""
         ch = alert.get("ch")
         if ch is None:
             return
@@ -2607,6 +2665,31 @@ class Engine:
         self._panic_last[ch] = now
         self._midi_out.all_notes_off(ch)
         self._capture.record_action("panic.notes_off", {"ch": ch}, "alert")
+        self._release_for_panic(ch, now)
+
+    def _release_for_panic(self, ch: int, now: float) -> None:
+        """The internal-release half of `_maybe_panic` (point 2 in its own
+        docstring) -- isolated into its own method for readability. Reads
+        `held_notes(ch)` off `self.analyzers.get("alerts")` (duck-typed,
+        `getattr(..., "held_notes", None)`, so this stays a safe no-op for
+        any custom roster/test double that doesn't expose it -- mirrors
+        this whole module's existing `getattr(analyzer, "tick"/
+        "drain_alerts", None)` convention rather than a hard `isinstance`
+        check)."""
+        alerts_analyzer = self.analyzers.get("alerts")
+        held_notes = getattr(alerts_analyzer, "held_notes", None)
+        if held_notes is None:
+            return
+        notes = held_notes(ch)
+        if not notes:
+            return
+        for note in notes:
+            self._dispatch_to_state(MidiEvent(
+                ts=now, source="panic:release", type="note_off",
+                channel=ch - 1, data1=note, data2=0,
+                summary=f"panic release ch{ch} n{note}",
+            ))
+        self._capture.record_action("panic.release", {"ch": ch, "notes": notes}, "alert")
 
     def _tick_pages(self, now: float) -> None:
         """Mirrors `_tick_analyzers` above but for PAGES (phase-3 task 7):

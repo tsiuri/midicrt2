@@ -350,6 +350,20 @@ class StuckNotesAnalyzer:
         drained, self._pending_alerts = self._pending_alerts, []
         return drained
 
+    def held_notes(self, ch: int) -> list[int]:
+        """Phase 9 Task 2 review fix (panic-release parity): every note
+        number currently tracked as ACTIVE (held) on `ch`, sorted --
+        `Engine._maybe_panic`'s source for synthesizing internal releases,
+        mirroring what v1's `request_release(ch-1)` reads from the
+        engine's own `active_notes` ledger (`~/codex/midicrt/engine/
+        core.py:410-433`). Deliberately unfiltered by alert level: a note
+        that hasn't reached WARN_AFTER yet is still included, matching
+        v1's channel-wide "release everything on this channel" semantics
+        (the same scope CC123/`_send_all_notes_off` already has -- see
+        module docstring's panic-send section) rather than "release only
+        the note that triggered CRIT"."""
+        return sorted(note for (c, note) in self._active if c == ch)
+
     # -- view model -----------------------------------------------------------
 
     def _alerts_list(self) -> list[dict]:

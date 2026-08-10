@@ -589,6 +589,172 @@ def test_panic_on_crit_records_a_provenance_marked_action():
     assert marks[0]["args"] == {"ch": 5}
 
 
+# -- panic RELEASE (review fix, Critical): v1 parity requires clearing
+# engine-tracked state, not just sending the external CC123 -----------------
+#
+# v1 evidence: `~/codex/midicrt/plugins/zstucknotes.py:209-225` -- v1's OWN
+# comment explains why: "the engine ignores CC123" and a lossy MIDI
+# loopback under overload can strand phantom held notes even after the
+# external device silences. v1 additionally calls `eng.request_release
+# (ch - 1)`, which synthesizes a real note_off for EVERY note the engine's
+# ledger believes is held on that channel and re-ingests each one through
+# the SAME path real MIDI takes (`~/codex/midicrt/engine/core.py:410-433`),
+# so every module -- not just zstucknotes -- clears its own tracking.
+# `Engine._maybe_panic` mirrors this: after the CC123 send, it synthesizes
+# note_off `MidiEvent`s for `self.analyzers["alerts"].held_notes(ch)` and
+# routes each through the SAME analyzer/page fan-out `_handle()` uses
+# (`_dispatch_to_state`), NOT through `_handle()` itself -- these are
+# honestly-provenanced synthetic releases (a `panic.release` action mark,
+# origin="alert"), not fake wire events (no `record_event`/`events_total`
+# bump, matching docs/phase5-capture.md's "action marks record what
+# fired... not a replacement for the raw trace" contract).
+
+def test_panic_release_clears_the_real_alerts_analyzers_held_note():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=0.0))   # ch5 (1-based)
+    assert eng.analyzers["alerts"].held_notes(5) == [60]
+    eng._maybe_panic({"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}, 1.0)
+    assert fake.control_change_calls == [(123, 0, 5)]
+    assert eng.analyzers["alerts"].held_notes(5) == []
+
+
+def test_panic_release_clears_every_held_note_on_the_channel_not_just_the_crit_one():
+    # v1's channel-wide release scope (§ module docstring) -- a SECOND,
+    # not-yet-alerting note on the same channel must ALSO clear, matching
+    # what a real device receiving CC123 on that channel would do.
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=0.0))
+    eng._handle(ev(type="note_on", channel=4, data1=64, data2=100, ts=0.9))   # fresh, not alerting
+    assert eng.analyzers["alerts"].held_notes(5) == [60, 64]
+    eng._maybe_panic({"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}, 1.0)
+    assert eng.analyzers["alerts"].held_notes(5) == []
+
+
+def test_panic_release_also_clears_the_voices_pages_own_active_count():
+    # The release must reach EVERY analyzer/page that tracks held notes,
+    # not just the one that triggered the alert -- proven here against the
+    # REAL "voices" page (a genuinely different analyzer instance,
+    # VoiceMonitorAnalyzer, not StuckNotesAnalyzer).
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=0.0))
+    assert eng.pages["voices"].view_model()["rows"][4]["active"] == 1
+    eng._maybe_panic({"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}, 1.0)
+    assert eng.pages["voices"].view_model()["rows"][4]["active"] == 0
+
+
+def test_panic_release_is_a_noop_when_nothing_is_held_on_that_channel():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    before_total = eng.events_total
+    eng._maybe_panic({"ch": 3, "note": 60, "level": "crit", "held_s": 11.0}, 1.0)
+    assert fake.control_change_calls == [(123, 0, 3)]   # CC still sent
+    marks = [line for line in eng._capture._buffer if line.get("name") == "panic.release"]
+    assert marks == []   # nothing to release -- no mark, matches v1's own no-op
+    assert eng.events_total == before_total
+
+
+def test_panic_release_records_a_provenance_marked_action():
+    eng = Engine(Config(panic_on_crit=True, capture_dir=None))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._capture_start_action()
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=0.0))
+    eng._maybe_panic({"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}, 1.0)
+    marks = [line for line in eng._capture._buffer
+             if line.get("kind") == "action" and line.get("name") == "panic.release"]
+    assert len(marks) == 1
+    assert marks[0]["origin"] == "alert"
+    assert marks[0]["args"] == {"ch": 5, "notes": [60]}
+
+
+def test_panic_release_does_not_record_a_raw_wire_event_for_the_synthetic_release():
+    # "not fake wire events" (review's own wording): the synthetic release
+    # must NOT show up as a kind="event" capture line (which would make it
+    # indistinguishable from real incoming MIDI) -- only the kind="action"
+    # mark above represents it.
+    eng = Engine(Config(panic_on_crit=True, capture_dir=None))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._capture_start_action()
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=0.0))
+    events_before = [line for line in eng._capture._buffer if line.get("kind") == "event"]
+    eng._maybe_panic({"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}, 1.0)
+    events_after = [line for line in eng._capture._buffer if line.get("kind") == "event"]
+    assert events_after == events_before   # no new raw event line
+
+
+def test_panic_release_is_gated_by_the_same_cooldown_as_the_cc_send():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=0.0))
+    eng._maybe_panic({"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}, 1.0)
+    assert eng.analyzers["alerts"].held_notes(5) == []
+    eng._handle(ev(type="note_on", channel=4, data1=62, data2=100, ts=1.1))   # new note, same ch
+    eng._maybe_panic({"ch": 5, "note": 62, "level": "crit", "held_s": 11.0}, 1.1)   # within cooldown
+    assert fake.control_change_calls == [(123, 0, 5)]   # still just the one send
+    assert eng.analyzers["alerts"].held_notes(5) == [62]   # NOT released -- cooldown blocked it too
+
+
+def test_panic_release_dispatch_marks_the_affected_topics_dirty():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._handle(ev(type="note_on", channel=4, data1=60, data2=100, ts=0.0))
+    eng._dirty.clear()
+    eng._maybe_panic({"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}, 1.0)
+    assert "overlay.alerts" in eng._dirty
+    assert "page.voices" in eng._dirty
+
+
+async def test_panic_release_clears_the_alert_end_to_end_then_lingers_then_expires():
+    # The REQUIRED integration test (review's Important finding): real
+    # StuckNotesAnalyzer + real Engine, no _FakeTickingAnalyzer -- proves
+    # the release actually reaches the escalation path that created the
+    # alert in the first place, not just a directly-invoked _maybe_panic.
+    import midicrt.analyzers.stucknotes as stucknotes_mod
+
+    eng = Engine(Config(panic_on_crit=True, stuck_hold_after=1.0, capture_dir=None))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._capture_start_action()
+
+    eng._handle(ev(type="note_on", channel=0, data1=60, data2=100, ts=0.0))
+    assert eng.pages["voices"].view_model()["rows"][0]["active"] == 1
+
+    crit_after = stucknotes_mod.CRIT_AFTER
+    eng._tick_analyzers(crit_after + 0.1)   # escalates to crit -- panic fires + release synthesized
+
+    assert fake.control_change_calls == [(123, 0, 1)]
+    # Handle()-time-equivalent clear already visible: the release was
+    # dispatched synchronously inside THIS SAME _tick_analyzers call.
+    assert eng.analyzers["alerts"].view_model()["alerts"] == []
+    assert eng.pages["voices"].view_model()["rows"][0]["active"] == 0
+
+    # Next tick arms the stuck-linger window (tick()-time bookkeeping,
+    # analyzers/stucknotes.py's own documented one-tick gap).
+    eng._tick_analyzers(crit_after + 0.2)
+    cleared = eng.analyzers["alerts"].view_model()["cleared"]
+    assert cleared and cleared[0]["note"] == 60
+
+    # After stuck_hold_after (1.0s here) elapses, the linger expires.
+    eng._tick_analyzers(crit_after + 0.2 + 1.0 + 0.1)
+    assert eng.analyzers["alerts"].view_model()["cleared"] == []
+
+    release_marks = [line for line in eng._capture._buffer
+                     if line.get("kind") == "action" and line.get("name") == "panic.release"]
+    assert len(release_marks) == 1
+    assert release_marks[0]["origin"] == "alert"
+    assert release_marks[0]["args"] == {"ch": 1, "notes": [60]}
+
+
 # -- panic-send must never feed back as a new inbound event (CRITICAL,
 # brief's own callout -- the P3 self-subscription runaway is the ancestor
 # bug here) -----------------------------------------------------------------
