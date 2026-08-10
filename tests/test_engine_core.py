@@ -755,6 +755,48 @@ async def test_panic_release_clears_the_alert_end_to_end_then_lingers_then_expir
     assert release_marks[0]["args"] == {"ch": 1, "notes": [60]}
 
 
+async def test_panic_on_crit_re_arms_after_cooldown_for_a_genuinely_new_stuck_note():
+    """T2b warm-up (re-review follow-up 1): pins the cooldown RE-ARM case
+    with a real analyzer/engine round trip, not a directly-invoked
+    `_maybe_panic` (every cooldown test above already covers that
+    shortcut). Reviewer verified live that a first stuck note escalating
+    to crit, being released, and THEN a genuinely new stuck note on the
+    SAME channel escalating again well outside the 3.0s PANIC_COOLDOWN
+    window fires panic a second time -- two real sends on channel 3,
+    `[3, 3]` -- but nothing pinned it with an injected clock, so a future
+    regression (e.g. cooldown keyed wrong, or never reset) could slip
+    through silently. Mirrors
+    test_panic_release_clears_the_alert_end_to_end_then_lingers_then_expires's
+    real-StuckNotesAnalyzer shape above, just carried one note further."""
+    import midicrt.analyzers.stucknotes as stucknotes_mod
+
+    eng = Engine(Config(panic_on_crit=True, capture_dir=None))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    crit_after = stucknotes_mod.CRIT_AFTER
+
+    # First stuck note on channel 3 (1-based; channel=2 is 0-based) --
+    # held past CRIT_AFTER escalates to crit and fires panic (CC123 +
+    # internal release, clearing the analyzer's own held-note state).
+    eng._handle(ev(type="note_on", channel=2, data1=60, data2=100, ts=0.0))
+    first_fire_at = crit_after + 0.1
+    eng._tick_analyzers(first_fire_at)
+    assert [c[2] for c in fake.control_change_calls] == [3]
+    assert eng.analyzers["alerts"].held_notes(3) == []
+
+    # A genuinely NEW stuck note (different pitch, fresh hold) on the SAME
+    # channel, started well after the first release and escalating to
+    # crit well outside the 3.0s cooldown measured from the first panic.
+    second_note_start = first_fire_at + 1.0
+    eng._handle(ev(type="note_on", channel=2, data1=64, data2=100, ts=second_note_start))
+    second_fire_at = second_note_start + crit_after + 0.1
+    assert second_fire_at - first_fire_at > 3.0   # sanity: genuinely past cooldown
+    eng._tick_analyzers(second_fire_at)
+
+    assert [c[2] for c in fake.control_change_calls] == [3, 3]   # panic fired AGAIN
+    assert eng.analyzers["alerts"].held_notes(3) == []   # released again
+
+
 # -- panic-send must never feed back as a new inbound event (CRITICAL,
 # brief's own callout -- the P3 self-subscription runaway is the ancestor
 # bug here) -----------------------------------------------------------------

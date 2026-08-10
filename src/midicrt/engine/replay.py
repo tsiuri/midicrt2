@@ -217,6 +217,18 @@ class _OfflineMidiOutput:
     def note_off(self, note: int, channel: int) -> None:
         pass
 
+    def all_notes_off(self, channel: int) -> None:
+        """Defense-in-depth no-op (T2b warm-up item 2, re-review follow-up):
+        `Engine._maybe_panic` (Phase 9 Task 2, panic-send) is the one
+        caller of `MidiOutput.all_notes_off` and only ever fires from
+        `_tick_analyzers`, which nothing in this module calls (replay
+        drives `_handle` directly, never `run()`/analyzer ticks -- see this
+        module's own docstring's "tick-driven replay is future work"
+        note), so this is currently unreachable. Added anyway, matching
+        `note_on`/`note_off`/`send_sysex` above's own "every method is an
+        unconditional no-op" contract, so a future tick-driven replay mode
+        hits an inert stub here instead of an `AttributeError`."""
+
     def send_sysex(self, data: tuple[int, ...]) -> bool:
         return False
 

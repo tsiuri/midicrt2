@@ -79,6 +79,15 @@ def test_build_offline_engine_midi_output_sends_are_inert_no_ops():
     eng._midi_out.note_on(60, 100, 1)   # must not raise, must not touch mido
     eng._midi_out.note_off(60, 1)
     assert eng._midi_out.send_sysex((0x7D, 0x6D, 0x63, 0x10)) is False
+    # T2b warm-up item 2: defense-in-depth stub -- panic-send's
+    # `all_notes_off` (Phase 9 Task 2) is currently unreachable during
+    # replay (`Engine._maybe_panic` only ever fires from `_tick_analyzers`,
+    # and replay never calls `run()`/ticks analyzers -- see this module's
+    # own "tick-driven replay is future work" docstring note), but a
+    # future tick-driven replay mode would call it on this SAME stub, so
+    # it must be a real, inert no-op now rather than an AttributeError
+    # waiting to happen.
+    eng._midi_out.all_notes_off(1)   # must not raise, must not touch mido
 
 
 def test_build_offline_engine_accepts_a_bindings_path(tmp_path):
