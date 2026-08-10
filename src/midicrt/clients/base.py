@@ -5,7 +5,42 @@ Both `cli.py` (one-shot request/response) and `tui.py` (persistent
 subscription + interactive actions) used to hand-roll this handshake; see
 docs/phase2-notes.md for the wire-protocol facts this depends on and the
 deferred hardening items this extraction absorbs.
+
+Malformed peer data == connection lost (Phase 9 Task 4 review fix)
+--------------------------------------------------------------------------
+`proto.LineDecoder.feed()` calls `json.loads()` per line and raises the
+stdlib `json.JSONDecodeError` on garbage -- both read paths below
+(`_read_next_sync`, used by `connect()`'s hello read and every pre-reader
+sync `request()`; `_reader_loop`, the background thread `start_reader()`
+spawns) used to let that propagate UNCAUGHT. For `_read_next_sync` that
+meant a corrupt/stale-socket/version-skew byte during the CONNECT
+handshake crashed the caller with a raw `JSONDecodeError` instead of the
+uniform `ClientError` every other connect failure raises -- and for
+`Bridge`'s reconnect loop (`clients/web/bridge.py`) specifically, an
+uncaught exception there kills the pump thread outright, silently ending
+reconnection forever: the exact "frozen forever" symptom that loop exists
+to fix, reborn through a narrower trigger. For `_reader_loop` it was worse
+-- an uncaught exception on a background `threading.Thread` just prints a
+traceback and ends the thread with NO sentinel ever pushed, so every
+consumer waiting on `start_reader()`'s queue (`drain_latest`,
+`wait_first_snapshot`, and through them `tui.py`/`fb/app.py`) would block
+forever instead of ever seeing "connection lost".
+
+Both paths now catch `json.JSONDecodeError` and treat it EXACTLY like an
+empty `recv()` (an ordinary EOF) -- `_read_next_sync` returns `None`,
+`_reader_loop` calls `self._on_eof()` and returns. This is the SAME
+policy `engine/server.py::ProtocolServer._handle` already applies to a
+malformed line arriving from a CLIENT (catches `json.JSONDecodeError`
+around its own `conn.decoder.feed(data)` call and drops that connection,
+see `test_malformed_json_drops_only_that_client`) -- this fix brings the
+client side up to the same standing convention: a peer that sends garbage
+is indistinguishable from a peer that hung up. Every downstream consumer
+of the `None`/`ClientError` contract (`connect()`, `request()`,
+`drain_latest`, `wait_first_snapshot`, and everything built on top --
+`switch_topic`, `tui.py`, `fb/app.py`, `cli.py`, `Bridge`) already treats
+that uniformly as "lost connection" and needed NO changes at all.
 """
+import json
 import queue
 import socket
 import threading
@@ -178,7 +213,17 @@ class EngineClient:
                 if not data:
                     self._on_eof()
                     return
-                for decoded in self._decoder.feed(data):
+                try:
+                    decoded_msgs = self._decoder.feed(data)
+                except json.JSONDecodeError:
+                    # Corrupt peer -- see module docstring "Malformed peer
+                    # data == connection lost": treat exactly like an
+                    # ordinary EOF (a raw recv() returning b""), not an
+                    # uncaught exception that would silently kill this
+                    # thread with no sentinel ever reaching a waiter.
+                    self._on_eof()
+                    return
+                for decoded in decoded_msgs:
                     self._route(decoded)
                 continue
             self._route(msg)
@@ -222,7 +267,15 @@ class EngineClient:
                 data = b""
             if not data:
                 return None
-            self._sync_buf.extend(self._decoder.feed(data))
+            try:
+                self._sync_buf.extend(self._decoder.feed(data))
+            except json.JSONDecodeError:
+                # Corrupt peer during the pre-reader sync path (most
+                # notably connect()'s own hello read) -- see module
+                # docstring: treat exactly like an ordinary EOF so every
+                # caller (connect(), the pre-reader request() path) raises
+                # its usual ClientError instead of a raw JSONDecodeError.
+                return None
         return self._sync_buf.pop(0)
 
     def _read_until_sync(self, target_id: int) -> dict | None:

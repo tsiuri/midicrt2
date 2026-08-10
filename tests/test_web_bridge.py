@@ -785,6 +785,104 @@ def test_reconnect_loop_backoff_doubles_and_caps_with_jitter(monkeypatch):
     loop.close()
 
 
+# -- Review fix (Important): the retry loop's "retry forever" contract was
+# -- narrower than advertised -- only `ClientError` was caught around each
+# -- attempt. A malformed line during the reconnect handshake (protocol-
+# -- version skew, a stale-socket race, a corrupted peer) raised a bare
+# -- `json.JSONDecodeError` straight through `_connect_client()`, killing
+# -- the pump thread and permanently ending reconnection -- the exact
+# -- frozen-forever symptom this whole feature exists to fix, reborn via a
+# -- narrower trigger. Fixed two ways: (1) `clients/base.py`'s own read
+# -- paths now convert `JSONDecodeError` into the ordinary EOF/`ClientError`
+# -- contract every other disconnect already uses (see that module's own
+# -- docstring + tests/test_client_base.py's matching tests) -- the first
+# -- test below proves `_reconnect_loop` survives that specific, realistic
+# -- trigger. (2) belt-and-suspenders: `_reconnect_loop` now also catches
+# -- bare `Exception` around each attempt (logged at WARNING), so no FUTURE
+# -- exception class -- not just this one -- can ever kill the loop again;
+# -- the second test below proves that generic catch-all independently of
+# -- the JSON-specific fix.
+
+async def test_reconnect_loop_survives_a_malformed_peer_line_and_keeps_retrying(tmp_path):
+    """A REAL raw listener at the bridge's socket path serves garbage
+    instead of a valid hello for the first stretch of retry attempts (a
+    realistic reproduction of the review's own scenario: a corrupt/stale
+    peer during the handshake, not a mocked exception), then gets torn
+    down and replaced by a real engine+server at the SAME path -- proving
+    the reconnect loop survived every garbage attempt in between and kept
+    retrying, exactly like an ordinary connection-refused attempt would."""
+    sock_path = str(tmp_path / "ctl.sock")
+
+    async def garbage_handle(reader, writer):
+        writer.write(b"not-json-at-all\n")
+        try:
+            await writer.drain()
+        except (ConnectionError, OSError):
+            pass
+        writer.close()
+
+    garbage_server = await asyncio.start_unix_server(garbage_handle, path=sock_path)
+    bridge = Bridge(EngineClient(sock_path), **_FAST_RECONNECT)
+    loop = asyncio.get_running_loop()
+    bridge.loop = loop
+
+    reconnect_task = asyncio.create_task(asyncio.to_thread(bridge._reconnect_loop))
+    # Let several garbage-serving attempts happen (fast retry: 20-100ms
+    # apart) before swapping in the real server -- proves survival across
+    # MULTIPLE consecutive malformed attempts, not just tolerance of one.
+    await asyncio.sleep(0.3)
+    assert not reconnect_task.done(), "reconnect loop died instead of retrying past garbage"
+    garbage_server.close()
+    await garbage_server.wait_closed()
+
+    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    result = await asyncio.wait_for(reconnect_task, timeout=5.0)
+    assert result is True
+    assert bridge.state["page"] == "eventlog"
+
+    await asyncio.to_thread(bridge.client.close)
+    eng.stop(); await task; await srv.close()
+
+
+async def test_reconnect_loop_survives_an_unexpected_exception_and_keeps_retrying(
+        tmp_path, monkeypatch, caplog):
+    """Belt-and-suspenders `except Exception` in `_reconnect_loop`,
+    independent of the JSON-specific fix above: an arbitrary, never-
+    special-cased exception class raised from `_connect_client` (something
+    genuinely unanticipated, not `ClientError`) must not kill the loop
+    either -- structurally guaranteeing "retry forever" rather than
+    relying on having enumerated every failure mode a connect attempt
+    could ever raise. Also pins that this path is LOGGED (WARNING), not
+    silently swallowed."""
+    eng, srv, task = await make(tmp_path, tick_hz=100.0)
+    bridge = Bridge(EngineClient(srv.socket_path), **_FAST_RECONNECT)
+    loop = asyncio.get_running_loop()
+    bridge.loop = loop
+
+    real_connect = EngineClient.connect
+    calls = {"n": 0}
+
+    def flaky_connect(self):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            raise RuntimeError(f"exotic failure #{calls['n']}")
+        return real_connect(self)
+
+    monkeypatch.setattr(EngineClient, "connect", flaky_connect)
+
+    import logging
+    with caplog.at_level(logging.WARNING, logger="midicrt.clients.web.bridge"):
+        result = await asyncio.to_thread(bridge._reconnect_loop)
+
+    assert result is True
+    assert calls["n"] == 4  # 3 RuntimeErrors, then the real connect succeeded
+    assert any("unexpected exception" in r.message.lower() or "runtimeerror" in r.message.lower()
+              for r in caplog.records), "no WARNING logged for the swallowed exotic exception"
+
+    await asyncio.to_thread(bridge.client.close)
+    eng.stop(); await task; await srv.close()
+
+
 async def test_bridge_page_goto_action_arms_pagecycle_user_pause(tmp_path):
     """Phase 9 Task 4 (tab-click navigation, user ruling: dispatches
     page.goto as origin=client "exactly like any other binding surface").

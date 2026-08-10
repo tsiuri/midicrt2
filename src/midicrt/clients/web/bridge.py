@@ -170,8 +170,34 @@ for the two-line addition this required. `hello_message()` also grew a
 `"status"` field so a websocket that connects (or reconnects) while the
 bridge itself is mid-outage sees this honestly from its very first frame,
 not just from a live event it might have connected too late to catch.
+
+Review fix: "retry forever" made structurally true, not just usually true
+--------------------------------------------------------------------------
+The first landed version only caught `ClientError` around each connect
+attempt in `_reconnect_loop` -- but `clients/base.py`'s read paths used to
+let a malformed/corrupt line from the peer raise a bare, uncaught
+`json.JSONDecodeError` (protocol-version skew, a stale-socket race, a
+genuinely corrupt peer during the reconnect handshake specifically), which
+killed the pump thread and ended reconnection forever: the exact
+frozen-forever bug this whole feature exists to fix, reborn through a
+narrower trigger than the original "midicrtd just isn't up yet" case.
+Fixed two ways, both required: (1) `clients/base.py` now converts
+`JSONDecodeError` into the SAME EOF/`ClientError` contract every other
+disconnect already uses (see that module's own docstring -- this also
+brings the client side up to the exact policy `engine/server.py`'s
+`ProtocolServer._handle` already applies to a malformed line from a
+CLIENT, dropping that connection rather than crashing); (2)
+`_reconnect_loop` also catches a bare `Exception` around each attempt now
+(logged at WARNING with a traceback, then retried) as belt-and-suspenders
+on top of fix (1) -- structurally guaranteeing no exception class, known
+or future, can ever escape this loop, rather than relying on having
+enumerated every failure mode a connect attempt could raise. Each attempt
+also explicitly `.close()`s the `EngineClient` it just tried (whether it
+failed or is being replaced by a successful one) instead of relying on
+garbage collection to eventually release the socket fd.
 """
 import asyncio
+import logging
 import queue
 import random
 import threading
@@ -184,6 +210,8 @@ from midicrt.clients.base import (
     current_page_topic,
     switch_topic,
 )
+
+_LOG = logging.getLogger(__name__)
 
 # Web spec (docs/phase6-notes.md item 6): 5/s, not the 10/s this branch
 # shipped with pre-merge -- a browser tab is a slower consumer than a
@@ -520,7 +548,21 @@ class Bridge:
         in place, ready for `_pump_loop` to resume reading), False if
         `stop()` won the race (the pump thread should exit, matching the
         pre-reconnect EOF-then-exit shape).
-        """
+
+        Structurally retry-forever (review fix): `_connect_client()` can
+        fail two ways -- an ordinary `ClientError` (connection refused, a
+        rejected hello, or -- since `clients/base.py`'s own fix -- a
+        malformed/corrupt line from the peer, now folded into the same
+        EOF/`ClientError` contract every other disconnect uses), or, in
+        principle, something genuinely unanticipated. Both are caught here
+        so NO exception raised while attempting to (re)connect can ever
+        kill this loop -- the bare `except Exception` is deliberate
+        belt-and-suspenders on top of the `ClientError`-specific fix, not
+        a substitute for it (an unexpected exception class is logged at
+        WARNING with a traceback, since silently swallowing an ACTUALLY
+        novel bug class would be its own hazard -- this loop must never
+        crash, but a crash-worthy bug elsewhere should still be visible
+        somewhere)."""
         if self._stopping.is_set() or self.loop.is_closed():
             return False
         self.loop.call_soon_threadsafe(self._on_disconnected)
@@ -528,21 +570,36 @@ class Bridge:
         while True:
             if self._stopping.is_set():
                 return False
+            # A brand-new EngineClient every attempt -- reusing the dead
+            # one is a trap, see the module docstring. Constructed OUTSIDE
+            # the try/except below (bare attribute assignment, cannot
+            # itself raise ClientError or anything else worth guarding)
+            # so both failure branches can unconditionally close it.
+            client = EngineClient(self._socket_path)
             try:
-                # A brand-new EngineClient every attempt -- reusing the dead
-                # one is a trap, see the module docstring.
-                client = EngineClient(self._socket_path)
                 hello, page, topic, inbox = self._connect_client(client)
             except ClientError:
-                if self._stopping.wait(self._jittered_delay(delay)):
-                    return False  # stop() fired during the backoff sleep
-                delay = min(delay * 2.0, self._reconnect_max_delay)
-                continue
-            self.client = client
-            self._inbox = inbox
-            if not self.loop.is_closed():
-                self.loop.call_soon_threadsafe(self._on_reconnected, hello, page, topic)
-            return True
+                client.close()  # release the partially-opened socket, no GC-timing reliance
+            except Exception:  # noqa: BLE001 -- deliberate belt-and-suspenders, see docstring
+                # above: this loop's contract is retry-forever, so no exception class may
+                # ever escape it -- logged at WARNING (not silently swallowed) precisely
+                # because a blind catch here trades "might mask a real bug" for "must never
+                # freeze the bridge again," a trade worth making explicitly, not implicitly.
+                client.close()
+                _LOG.warning(
+                    "Bridge reconnect attempt raised an unexpected exception (not "
+                    "ClientError) -- treating it as a failed attempt and retrying, per "
+                    "this loop's retry-forever contract", exc_info=True)
+            else:
+                self.client.close()  # the client this attempt is replacing -- explicit, no GC-timing reliance
+                self.client = client
+                self._inbox = inbox
+                if not self.loop.is_closed():
+                    self.loop.call_soon_threadsafe(self._on_reconnected, hello, page, topic)
+                return True
+            if self._stopping.wait(self._jittered_delay(delay)):
+                return False  # stop() fired during the backoff sleep
+            delay = min(delay * 2.0, self._reconnect_max_delay)
 
     def _jittered_delay(self, delay: float) -> float:
         """+/- `self._reconnect_jitter` fraction of `delay`, never negative

@@ -354,6 +354,86 @@ async def test_malformed_json_drops_only_that_client(tmp_path):
     eng.stop(); await task; await srv.close()
 
 
+# -- Phase 9 Task 4 review fix: malformed peer data == connection lost -----
+#
+# `test_malformed_json_drops_only_that_client` above proves the SERVER
+# already treats a malformed line from a CLIENT as "drop the connection"
+# (`engine/server.py::ProtocolServer._handle` catches `json.JSONDecodeError`
+# around its own `conn.decoder.feed(data)` call). These two are the CLIENT
+# side of the identical policy, for the two places `EngineClient` calls
+# `proto.LineDecoder.feed()`: the pre-reader sync path (`_read_next_sync`,
+# used by `connect()`'s own hello read) and the background reader thread
+# (`_reader_loop`). Before this fix, both let `json.JSONDecodeError`
+# propagate UNCAUGHT -- `clients/web/bridge.py`'s reconnect loop specifically
+# treated that as fatal (an uncaught exception killing the pump thread ends
+# reconnection forever, reproducing the "frozen forever" bug this whole
+# feature exists to fix, via a narrower trigger: a corrupt/stale-socket/
+# version-skew byte during the connect handshake instead of a clean EOF).
+
+async def test_connect_treats_a_malformed_hello_line_as_connection_lost(tmp_path):
+    """A peer that sends garbage instead of a valid hello line must raise
+    the SAME `ClientError` connect() already raises for a refused/dropped
+    connection -- not a raw `json.JSONDecodeError` leaking `proto.py`'s
+    own implementation detail past the client boundary."""
+    sock_path = str(tmp_path / "garbage-hello.sock")
+
+    async def handle(reader, writer):
+        writer.write(b"not-json-at-all\n")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(handle, path=sock_path)
+    async with server:
+        client = EngineClient(sock_path)
+        with pytest.raises(ClientError):
+            await asyncio.to_thread(client.connect)
+        await asyncio.to_thread(client.close)
+
+
+async def test_reader_loop_treats_a_malformed_async_line_as_eof_not_a_silent_thread_death(
+        tmp_path):
+    """Mid-stream corruption AFTER a clean connect: the fake server sends a
+    valid hello, answers `connect()`'s own hello handshake normally, then
+    sends garbage instead of a real snapshot/event. Before this fix, an
+    uncaught `JSONDecodeError` on `_reader_loop`'s background thread just
+    prints a traceback and ends the thread with NO sentinel ever pushed --
+    every consumer of `start_reader()`'s queue (`drain_latest`, `wait_
+    first_snapshot`, and everything built on those: tui.py, fb/app.py)
+    would then block forever instead of ever seeing "connection lost".
+    Proving the queue actually yields the `None` EOF sentinel is proving
+    those consumers get the "same as any disconnect" treatment for free,
+    with no changes needed at their own call sites."""
+    sock_path = str(tmp_path / "garbage-midstream.sock")
+
+    async def handle(reader, writer):
+        writer.write(proto.encode(proto.hello()))
+        await writer.drain()
+        line = await reader.readline()
+        msg = json.loads(line)
+        writer.write(proto.encode(proto.response(msg["id"], {"ok": "hello"})))
+        await writer.drain()
+        writer.write(b"not-json-at-all\n")  # garbage instead of a real async message
+        await writer.drain()
+
+    server = await asyncio.start_unix_server(handle, path=sock_path)
+    async with server:
+        client = EngineClient(sock_path)
+        await asyncio.to_thread(client.connect)
+        inbox = client.start_reader()
+        # `queue.Queue.get(timeout=...)` (NOT `asyncio.wait_for` wrapping a
+        # bare `inbox.get()`): against the unfixed code this reader thread
+        # dies silently and NOTHING is ever pushed, so a bare `.get()`
+        # blocks forever -- `asyncio.wait_for` can only cancel the AWAITING
+        # coroutine, not the underlying `asyncio.to_thread` worker thread
+        # actually stuck inside `.get()`, which would leak a thread and can
+        # hang the whole test process at interpreter shutdown. `Queue.get`'s
+        # own `timeout` makes the blocking call itself finite either way.
+        msg = await asyncio.to_thread(inbox.get, timeout=5.0)
+        assert msg is None  # the EOF sentinel -- not a hang, not a raised exception
+        await asyncio.to_thread(client.close)
+
+
 # -- review fixes: request-id lock, event-aware startup wait, live topic ----
 # -- filter (all dormant under today's single-page config; the moment a    --
 # -- second page ships, fb's main thread (switch_topic via on_event) and   --

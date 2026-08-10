@@ -406,13 +406,20 @@ scratch socket/config/capture directory were removed; production's
 33 tests total, part of the full suite's 1354/1354 passing at this doc's
 HEAD (`15876a0`). `ruff check src tests`: clean.
 
-**Updated 2026-08-10 (Phase 9 Task 4):** `tests/test_web_bridge.py` (31
-tests, +11: the reconnect loop, backoff shape, `bridge_status`/`hello`
-status field, and the web-action-arms-pagecycle-pause integration test) +
+**Updated 2026-08-10 (Phase 9 Task 4, including its own review-fix
+round):** `tests/test_web_bridge.py` (33 tests, +13: the reconnect loop,
+backoff shape, `bridge_status`/`hello` status field, the
+web-action-arms-pagecycle-pause integration test, and — review fix — the
+malformed-peer-line and unexpected-exception reconnect-survival tests) +
 `tests/test_web_app.py` (17 tests, +4: the `bridge_status` JS content pin
-and the `--read-only` CLI flag semantics) — 48 tests total, part of the
-full suite's 1775/1775 passing at this task's own HEAD. `ruff check src
-tests`: clean. Full test list and design rationale: `task-4-report.md`.
+and the `--read-only` CLI flag semantics) + `tests/test_client_base.py`
+(39 tests, +2: review fix — `EngineClient`'s own read paths treating a
+malformed line as connection-lost, not an uncaught `JSONDecodeError`) —
+**89 tests across the three files, 19 new/changed overall**, part of the
+full suite's **1783/1783** passing at this task's own final HEAD (grown
+from the 1779 first landed, per the review's own fix round). `ruff check
+src tests`: clean. Full test list and design rationale: `task-4-report.md`
+(including its "Review response" section).
 
 ## 10. Engine-restart reconnect (Phase 9 Task 4)
 
