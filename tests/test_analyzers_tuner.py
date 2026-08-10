@@ -290,6 +290,79 @@ def test_detect_pitch_uses_the_documented_default_range():
     assert 0.0 < YIN_THRESHOLD < 1.0
 
 
+# -- octave-error resistance (fix round, review finding 3) -------------------
+#
+# `detect_pitch`'s "first dip below threshold, scanning tau small-to-large"
+# strategy (i.e. HIGH frequency toward LOW frequency) is what YIN's own
+# design uses to avoid octave errors -- a real musical tone (fundamental +
+# harmonics) is periodic at its fundamental's period T0 (harmonics are
+# integer multiples of f0, so the WHOLE waveform repeats every T0), but
+# generally NOT at T0/2 (the 2nd harmonic's own shorter period) UNLESS the
+# fundamental's own contribution is negligible -- so the fundamental's tau
+# is normally the SMALLEST lag that shows a clean CMNDF dip, correctly
+# winning the small-to-large scan even though a harmonic's shorter lag is
+# examined first. This section pins that behavior with real multi-
+# harmonic synthetic content so a future change to the dip-selection logic
+# can't silently regress it.
+#
+# Empirically-found boundary (disclosed, not fixed): this resistance holds
+# up to roughly a 3:1 harmonic:fundamental amplitude ratio (verified below
+# across four fundamentals and five random phase offsets) but breaks down
+# at more extreme ratios -- a fundamental amplitude sweep against a fixed
+# 0.5-amplitude 2nd harmonic (not shipped as a test, verified via a
+# throwaway prototype) flips from correctly reporting the fundamental to
+# reporting the 2nd harmonic somewhere between a 0.15 and 0.10 fundamental
+# amplitude (roughly 3.3:1 to 5:1). Once the fundamental's own periodicity
+# signature becomes THAT weak relative to the harmonic, the harmonic's own
+# shorter-lag dip becomes the cleaner one and correctly wins per the same
+# algorithm -- a known limitation of the YIN family generally at extreme
+# harmonic dominance, not something this task's fix round changes.
+
+def _harmonic_series(f0: float, amps: list[float], sr: int = SR, n: int = BLOCK_N) -> np.ndarray:
+    t = np.arange(n) / sr
+    x = np.zeros(n)
+    for k, amp in enumerate(amps, start=1):
+        x += amp * np.sin(2 * np.pi * f0 * k * t)
+    return x.astype(np.float32)
+
+
+def test_detect_pitch_fundamental_plus_realistic_harmonic_series_no_octave_error():
+    # A realistic, dominant-fundamental instrument-like spectrum (each
+    # harmonic weaker than the last) -- the ordinary, non-adversarial case.
+    x = _harmonic_series(220.0, [0.5, 0.3, 0.15, 0.08])
+    hz, confidence = detect_pitch(x, SR)
+    assert hz == pytest.approx(220.0, abs=1.0)
+    assert confidence >= MIN_CONF
+
+
+@pytest.mark.parametrize("f0", [110.0, 146.83, 220.0, 330.0])
+def test_detect_pitch_weak_fundamental_strong_second_harmonic_still_picks_fundamental(f0):
+    # The adversarial case the brief's own fix-round review named
+    # explicitly: a WEAK fundamental (0.2) against a STRONGER 2nd harmonic
+    # (0.6, a 3:1 ratio) -- naive autocorrelation-style pitch detection is
+    # prone to reporting the harmonic here (an "octave error", one octave
+    # too high); this asserts the fundamental still wins, not `f0*2`.
+    x = _harmonic_series(f0, [0.2, 0.6])
+    hz, confidence = detect_pitch(x, SR)
+    assert hz == pytest.approx(f0, abs=3.0)
+    assert abs(hz - f0 * 2) > 3.0   # sanity: genuinely not the harmonic, not a loose tolerance overlap
+    assert confidence >= MIN_CONF
+
+
+def test_detect_pitch_weak_fundamental_strong_harmonic_resists_octave_error_across_phase():
+    # Real signals aren't phase-locked between fundamental and harmonic --
+    # proves the resistance above isn't a phase-alignment artifact.
+    rng = np.random.default_rng(0)
+    for _ in range(5):
+        phase = rng.uniform(0, 2 * np.pi)
+        t = np.arange(BLOCK_N) / SR
+        x = (0.2 * np.sin(2 * np.pi * 220.0 * t)
+             + 0.6 * np.sin(2 * np.pi * 440.0 * t + phase)).astype(np.float32)
+        hz, confidence = detect_pitch(x, SR)
+        assert hz == pytest.approx(220.0, abs=3.0)
+        assert confidence >= MIN_CONF
+
+
 # -- on_audio_block: the real production wiring (Phase 9 Task 3) -------------
 #
 # `on_audio_block(block, sr)` is what `AudioCapture`'s callback thread

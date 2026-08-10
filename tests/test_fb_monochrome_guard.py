@@ -158,11 +158,30 @@ _PIANOROLL_VM_WITH_TINT_AND_FLASH = {
                         "ch": 5, "vel": 0.9}],
 }
 
+def _draw_tuner_and_check_no_audio_state(surf: Surface) -> None:
+    """Fix round (review finding 4): also exercises the "no audio input"
+    state's own pixels, not just the locked state below -- checked HERE,
+    inline, rather than as a SECOND top-level `_PAGE_CASES` entry, since
+    this dict's keys are page NAMES (`test_page_cases_cover_every_
+    registered_renderer` asserts a 1:1 match against `app.RENDERERS`) and
+    a page can only have ONE renderer entry; a mutually-exclusive VM
+    STATE (available=False vs. locked) can't be merged additively onto
+    one VM the way pianoroll's row-tint/overlap-flash extras were
+    (`_PIANOROLL_VM_WITH_TINT_AND_FLASH` above), since `render_tuner_
+    frame` branches on `available`/`has_signal` and only ever draws ONE
+    branch per call."""
+    no_audio_surf = Surface(*fbr.TUNER_SURFACE_SIZE)
+    app.render_tuner_frame(fbr.TUNER_NO_AUDIO_VM, no_audio_surf)
+    violations = _find_pixel_violations(no_audio_surf)
+    assert not violations, f"non-green pixel(s) in tuner's no-audio-input state: {violations}"
+    app.render_tuner_frame(fbr.TUNER_LOCKED_VM, surf)
+
+
 _PAGE_CASES: dict[str, tuple[tuple[int, int], object]] = {
     "eventlog": (fbr.GOLDEN_SURFACE_SIZE, lambda s: app.render_frame(fbr.VM, s)),
     "voices": (fbr.VOICES_SURFACE_SIZE, lambda s: app.render_voices_frame(fbr.VOICES_VM, s)),
     "harmony": (fbr.HARMONY_SURFACE_SIZE, lambda s: app.render_harmony_frame(fbr.HARMONY_VM, s)),
-    "tuner": (fbr.TUNER_SURFACE_SIZE, lambda s: app.render_tuner_frame(fbr.TUNER_LOCKED_VM, s)),
+    "tuner": (fbr.TUNER_SURFACE_SIZE, _draw_tuner_and_check_no_audio_state),
     "pianoroll": (fbr.PIANOROLL_SURFACE_SIZE,
                   lambda s: app.render_pianoroll_frame(_PIANOROLL_VM_WITH_TINT_AND_FLASH, s)),
     "spectrum": (fbr.SPECTRUM_SURFACE_SIZE, lambda s: app.render_spectrum_frame(fbr.SPECTRUM_VM, s)),
