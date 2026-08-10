@@ -60,6 +60,14 @@ def engine_with_fake_out(**cfg) -> tuple[Engine, _FakeMidiOut]:
 # -- real captured fixtures ----------------------------------------------------
 
 def test_real_capture_non_midicrt_frame_is_ignored_entirely():
+    """The CMD-dispatch half (`_handle_sysex`, this file's own subject)
+    stays a true no-op for a non-midicrt-prefixed frame -- no page change,
+    no reply, no `sysex_command` event. Phase 9 Task 5's UNRELATED sysex
+    MANAGER (`engine/sysex_store.py`) now records every incoming sysex
+    frame regardless of content, and fires its own `sysex_received` event
+    for the web panel's live refresh (see `Engine._handle`'s own comment
+    at the call site) -- that event is intentional new behavior from a
+    different subsystem, not a regression of this test's own subject."""
     eng, fake = engine_with_fake_out()
     events = []
     eng.add_listener(lambda m: events.append(m) if m.get("kind") == "event" else None)
@@ -67,7 +75,8 @@ def test_real_capture_non_midicrt_frame_is_ignored_entirely():
     eng._handle(sysex_ev(load_syx("non-midicrt-frame.syx")))
     assert eng.current_page == before_page
     assert fake.sent == []
-    assert events == []   # no sysex_command event for non-matching traffic
+    assert events == [{"kind": "event", "name": "sysex_received", "data": {"size": 5}}]
+    assert eng._sysex_store.recent()[0]["size"] == 5   # the manager DID record it
 
 
 # -- self-subscription feedback-loop fix (live-reproduced Critical) --------

@@ -298,6 +298,70 @@ def test_secondary_status_dim_is_false_while_the_polylimit_flash_is_showing():
     assert secondary_status_dim(DEFAULT_ALERTS_VM) is False
 
 
+# -- sysex-status text (Phase 9 Task 5, SysEx manager): v1 parity item --
+# `plugins/loopprogress.py`'s own left-of-bar sysex status string, ported
+# now that `engine/sysex_store.py` finally gives it a v2 data source. Joins
+# the SAME shared second chrome row, one tier BELOW alerts/poly-limit
+# (both mean "something urgent right now") and ABOVE the routine timesig
+# line -- see secondary_status_text's own docstring for the full,
+# disclosed row-placement writeup (this is a v2-native row-SHARING
+# decision, not a literal replay of v1's own row layout). ------------------
+
+def test_overlay_sysex_topic_matches_engine_convention():
+    from midicrt.clients.chrome import OVERLAY_SYSEX_TOPIC
+
+    assert OVERLAY_SYSEX_TOPIC == "overlay.sysex"
+
+
+def test_default_sysex_vm_matches_analyzer_initial_view_model():
+    from midicrt.clients.chrome import DEFAULT_SYSEX_VM
+    from midicrt.engine.core import _SysexStatusOverlay
+    from midicrt.engine.sysex_store import SysexStore
+
+    assert DEFAULT_SYSEX_VM == _SysexStatusOverlay(SysexStore(library_dir="/nonexistent")).view_model()
+
+
+def test_secondary_status_text_shows_sysex_status_when_active_and_no_alerts_or_polylimit():
+    text = secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, None,
+                                 {"text": "sx: rx 4B Roland", "active": True})
+    assert text == "sx: rx 4B Roland"
+
+
+def test_secondary_status_text_falls_back_to_timesig_when_sysex_inactive():
+    text = secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, None,
+                                 {"text": "sx: rx 4B Roland", "active": False})
+    assert text == "Time Signature: (no lock)"
+
+
+def test_secondary_status_text_sysex_param_is_optional_backward_compatible():
+    # Every pre-existing 2- and 3-arg call site keeps working unchanged --
+    # the 4th param defaults to "not active".
+    assert secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM) == "Time Signature: (no lock)"
+    assert secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM,
+                                 {"flashing": False}) == "Time Signature: (no lock)"
+
+
+def test_secondary_status_text_stuck_alerts_win_over_sysex_status():
+    alerts_vm = {"alerts": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}], "cleared": []}
+    text = secondary_status_text(alerts_vm, DEFAULT_TIMESIG_VM, None,
+                                 {"text": "sx: rx 4B", "active": True})
+    assert text.startswith("STUCK WARN:")
+
+
+def test_secondary_status_text_polylimit_flash_wins_over_sysex_status():
+    text = secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, {"flashing": True},
+                                 {"text": "sx: rx 4B", "active": True})
+    assert text == "POLY LIMIT EXCEEDED"
+
+
+def test_secondary_status_text_sysex_status_wins_over_timesig():
+    timesig_vm = {"labels": ["4/4"], "confidence": 0.9, "events": 10,
+                  "events_window": 10, "events_total": 10, "pending": None}
+    text = secondary_status_text(DEFAULT_ALERTS_VM, timesig_vm, None,
+                                 {"text": "sx: play 'x' (4B)", "active": True})
+    assert text == "sx: play 'x' (4B)"
+
+
 # -- beatflash + loopprogress (phase-3 task 9) --------------------------------
 
 def test_overlay_beatflash_and_loopprogress_topics_match_engine_convention():

@@ -102,12 +102,15 @@ async def test_hello_and_describe(tmp_path):
     # comment for the full default-roster ordering. Phase 8 Task 4 added
     # "marquee" (the header page-title scrolling marquee). Phase 9 Task 2
     # added "polylimit" (poly-limit chrome flash), registered post-hoc last.
+    # Phase 9 Task 5 added "sysex" (_SysexStatusOverlay), registered even
+    # later still (right after self._midi_out is built) -- lands last.
     assert d["data"]["topics"] == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
         "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes", "page.tuner",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress", "overlay.marquee", "overlay.polylimit",
+        "overlay.sysex",
     ]
     # Phase 4 Task 1 (docs/phase4-notes.md): "keymap" used to be a reserved
     # `{}` placeholder -- now the engine's real (default, no keymap.toml on

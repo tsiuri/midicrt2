@@ -127,7 +127,7 @@ def render_status_row(vm: dict, width: int) -> str:
 
 
 def render_secondary_row(alerts_vm: dict, timesig_vm: dict, width: int,
-                         polylimit_vm: dict | None = None) -> str:
+                         polylimit_vm: dict | None = None, sysex_vm: dict | None = None) -> str:
     """TUI's presentation of the shared second chrome row (phase-3 task 6:
     stuck-note alerts when any are active, else the time-signature
     estimate -- see clients/chrome.py's `secondary_status_text()`). Same
@@ -149,8 +149,12 @@ def render_secondary_row(alerts_vm: dict, timesig_vm: dict, width: int,
     3rd param. Unlike the DIM treatment above, the flash is plain TEXT
     (`"POLY LIMIT EXCEEDED"`) with no luminance concern at all, so it IS
     shown here identically to the fb client -- nothing about it needs the
-    dimming primitive the TUI lacks."""
-    return _fit(chrome.secondary_status_text(alerts_vm, timesig_vm, polylimit_vm), width)
+    dimming primitive the TUI lacks.
+
+    Phase 9 Task 5 (SysEx manager): `sysex_vm` (OPTIONAL, same convention)
+    forwards straight into `secondary_status_text()`'s own 4th param --
+    plain text here too, shown identically to the fb client."""
+    return _fit(chrome.secondary_status_text(alerts_vm, timesig_vm, polylimit_vm, sysex_vm), width)
 
 
 def render_beatprogress_row(beatflash_vm: dict, loopprogress_vm: dict, width: int) -> str:
@@ -1007,7 +1011,8 @@ def run_tui(socket_path: str) -> int:
     client = EngineClient(socket_path)
     overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
                        chrome.OVERLAY_TIMESIG_TOPIC, chrome.OVERLAY_BEATFLASH_TOPIC,
-                       chrome.OVERLAY_LOOPPROGRESS_TOPIC, chrome.OVERLAY_POLYLIMIT_TOPIC]
+                       chrome.OVERLAY_LOOPPROGRESS_TOPIC, chrome.OVERLAY_POLYLIMIT_TOPIC,
+                       chrome.OVERLAY_SYSEX_TOPIC]
     try:
         client.connect()
         page, topic = current_page_topic(client)
@@ -1032,6 +1037,7 @@ def run_tui(socket_path: str) -> int:
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
              "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM),
              "polylimit_vm": dict(chrome.DEFAULT_POLYLIMIT_VM),
+             "sysex_vm": dict(chrome.DEFAULT_SYSEX_VM),
              "learn_armed": False}
 
     def on_event(msg: dict) -> None:
@@ -1106,6 +1112,9 @@ def run_tui(socket_path: str) -> int:
                     dirty = True
                 if chrome.OVERLAY_POLYLIMIT_TOPIC in drained:
                     state["polylimit_vm"] = drained[chrome.OVERLAY_POLYLIMIT_TOPIC]
+                    dirty = True
+                if chrome.OVERLAY_SYSEX_TOPIC in drained:
+                    state["sysex_vm"] = drained[chrome.OVERLAY_SYSEX_TOPIC]
                     dirty = True
                 if chrome.OVERLAY_BEATFLASH_TOPIC in drained:
                     state["beatflash_vm"] = drained[chrome.OVERLAY_BEATFLASH_TOPIC]
@@ -1189,7 +1198,7 @@ def run_tui(socket_path: str) -> int:
                             status_line = _fit("LEARN: waiting for MIDI...", term.width)
                         secondary_line = render_secondary_row(
                             state["alerts_vm"], state["timesig_vm"], term.width,
-                            polylimit_vm=state["polylimit_vm"])
+                            polylimit_vm=state["polylimit_vm"], sysex_vm=state["sysex_vm"])
                         beatprogress_line = render_beatprogress_row(
                             state["beatflash_vm"], state["loopprogress_vm"], term.width)
                         # Accent (bold) highlighting reaches back into the

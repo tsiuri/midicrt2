@@ -236,22 +236,61 @@ DEFAULT_POLYLIMIT_VM = {"flashing": False}
 POLYLIMIT_FLASH_TEXT = "POLY LIMIT EXCEEDED"
 
 
-def secondary_status_text(alerts_vm: dict, timesig_vm: dict, polylimit_vm: dict | None = None) -> str:
-    """The shared second chrome row's text: `alerts_text()` (stuck alerts,
-    live or lingering-cleared) when present, else the poly-limit chrome
-    flash (Phase 9 Task 2, `config.poly_limit_global`/`poly_limit_ch` --
-    disclosed v2-native addition, v1's `zvoicemonitor.py` has no chrome
-    home of its own, see `analyzers/voices.py`'s module docstring) when
-    `polylimit_vm["flashing"]`, else `timesig_text()` -- see the
-    module-level comment above `alerts_text` for why the routine
-    time-signature line only ever wins when nothing more urgent is
-    active. `polylimit_vm` is OPTIONAL (defaults to "not flashing") so
-    every pre-existing 2-arg call site keeps working unchanged."""
+OVERLAY_SYSEX_TOPIC = "overlay.sysex"
+DEFAULT_SYSEX_VM = {"text": "", "active": False}
+
+
+def secondary_status_text(alerts_vm: dict, timesig_vm: dict, polylimit_vm: dict | None = None,
+                          sysex_vm: dict | None = None) -> str:
+    """The shared second chrome row's text -- priority chain (most urgent
+    wins, routine timesig only shows when NOTHING more urgent is active):
+
+    1. `alerts_text()` (stuck alerts, live or lingering-cleared) -- v1's
+       own `zstucknotes.py` CRIT reverse-video urgency, this row's
+       original tenant.
+    2. The poly-limit chrome flash (Phase 9 Task 2, `polylimit_vm[
+       "flashing"]` -- disclosed v2-native addition, v1's
+       `zvoicemonitor.py` has no chrome home of its own, see
+       `analyzers/voices.py`'s module docstring) -- also an urgent,
+       device-malfunction-adjacent condition, same tier as alerts in
+       spirit (both mean "something is wrong RIGHT NOW"), but alerts win
+       when both are simultaneously true (a stuck note is the more
+       actionable of the two).
+    3. The sysex-status text (Phase 9 Task 5, `sysex_vm["active"]` --
+       v1 parity item, `plugins/loopprogress.py`'s own left-of-bar
+       scheduler/sysex status string, ported now that `engine/
+       sysex_store.py` finally gives it a v2 data source; see
+       `engine/core.py::_SysexStatusOverlay`'s own docstring and
+       docs/task-5-report.md's v1-extraction section). Deliberately
+       ranked BELOW alerts/poly-limit and ABOVE timesig: this is a
+       disclosed, v2-native ROW-PLACEMENT decision, not a literal replay
+       of v1's own layout -- v1 showed this text on a COMPLETELY
+       DIFFERENT row (the loopprogress bar's row, not the stuck-notes
+       row this function builds), with nothing else ever competing for
+       that space. v2 already established the precedent of consolidating
+       cheap/glanceable, non-alert diagnostic text onto this SAME shared
+       row rather than reserving a new one per widget (`timesig_text`
+       itself has "no v1 chrome row of its own" and shares this exact
+       row for the identical reason, see the module-level comment above
+       `alerts_text`) -- sysex-status joins for the same reason: it is
+       informational/confirmatory ("your remote-control command fired",
+       "your saved patch played"), never as urgent as a stuck note or an
+       exceeded polyphony limit, but still more timely than the
+       always-present routine timesig baseline, so it wins that
+       tie-break.
+    4. `timesig_text()` -- the routine fallback, wins only when nothing
+       above is active.
+
+    `polylimit_vm`/`sysex_vm` are both OPTIONAL (default `None`/"not
+    active") so every pre-existing 2- and 3-arg call site keeps working
+    unchanged."""
     text = alerts_text(alerts_vm)
     if text:
         return text
     if polylimit_vm and polylimit_vm.get("flashing"):
         return POLYLIMIT_FLASH_TEXT
+    if sysex_vm and sysex_vm.get("active") and sysex_vm.get("text"):
+        return sysex_vm["text"]
     return timesig_text(timesig_vm)
 
 

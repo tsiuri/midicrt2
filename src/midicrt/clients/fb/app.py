@@ -1315,7 +1315,7 @@ def _reserved_chrome_height(font) -> int:
 
 
 def _draw_secondary(surface: Surface, alerts_vm: dict, timesig_vm: dict, font,
-                    polylimit_vm: dict | None = None) -> None:
+                    polylimit_vm: dict | None = None, sysex_vm: dict | None = None) -> None:
     """Paint the second reserved strip, directly ABOVE the status strip --
     same reverse-video convention, showing `clients/chrome.py`'s
     `secondary_status_text()`.
@@ -1335,12 +1335,21 @@ def _draw_secondary(surface: Surface, alerts_vm: dict, timesig_vm: dict, font,
     docstring for the alerts > polylimit-flash > timesig priority chain.
     The flash does NOT dim the strip (full brightness -- it's urgent, like
     a live alert, unlike the stuck-linger case above).
+
+    Phase 9 Task 5 (SysEx manager): `sysex_vm` (`overlay.sysex`, OPTIONAL,
+    same "new keyword-only, defaults to unchanged rendering" convention as
+    `polylimit_vm`) forwards straight into `secondary_status_text()`'s own
+    4th param -- see that function's own docstring for the alerts >
+    polylimit-flash > sysex-status > timesig priority chain. Also does NOT
+    dim the strip -- a loopprogress-style status confirmation, shown at
+    full brightness for its `SYSEX_DISPLAY_SECS` window then gone, never a
+    lingering/fading state the way the stuck-linger case is.
     """
     strip_h = _secondary_strip_height(font)
     y = surface.height - _reserved_chrome_height(font)
     fill = LUM_DIM if chrome.secondary_status_dim(alerts_vm) else HEADER_BG
     surface.rect(0, y, surface.width, strip_h, fill)
-    text = chrome.secondary_status_text(alerts_vm, timesig_vm, polylimit_vm)
+    text = chrome.secondary_status_text(alerts_vm, timesig_vm, polylimit_vm, sysex_vm)
     draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, text, BG, font)
 
 
@@ -1395,7 +1404,8 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
                   loopprogress_vm: dict, marquee_vm: dict, *,
                   page_keymap: dict | None = None, keymap_hints_enabled: bool = True,
                   overlay_active: bool = False, keymap_global: dict | None = None,
-                  roster: list[str] | None = None, polylimit_vm: dict | None = None) -> None:
+                  roster: list[str] | None = None, polylimit_vm: dict | None = None,
+                  sysex_vm: dict | None = None) -> None:
     """Render `page`'s body, then all THREE chrome strips -- UNLESS `page`
     is the screensaver page (Important fix, task-9 review), in which case
     NO chrome is painted at all, matching v1's true full-screen blank --
@@ -1437,7 +1447,11 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
     "new keyword-only, defaults to unchanged rendering" convention as the
     keymap params above) forwards straight into `_draw_secondary` -- see
     that function's own docstring for the poly-limit chrome-flash
-    priority chain."""
+    priority chain.
+
+    Phase 9 Task 5: `sysex_vm` (`overlay.sysex`, OPTIONAL, same convention)
+    forwards straight into `_draw_secondary` too -- see that function's own
+    docstring for the sysex-status chrome text."""
     renderer = RENDERERS.get(page, _render_unknown)
     capacity = _header_char_capacity(surface, font)
     # `hint_budget` is reserved BEFORE computing the hint text (not the
@@ -1461,7 +1475,8 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
         if overlay_active:
             _draw_help_overlay(surface, font, keymap_global or {}, page_keymap or {}, page, roster)
         return
-    _draw_secondary(surface, alerts_vm, timesig_vm, font, polylimit_vm=polylimit_vm)
+    _draw_secondary(surface, alerts_vm, timesig_vm, font, polylimit_vm=polylimit_vm,
+                    sysex_vm=sysex_vm)
     _draw_status(surface, status_vm, font)
     _draw_beatprogress(surface, beatflash_vm, loopprogress_vm, font)
     if overlay_active:
@@ -1833,7 +1848,10 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
              # Phase 9 Task 2 (poly-limit chrome flash): shares the SAME
              # second chrome row as alerts_vm/timesig_vm -- see the
              # `secondary_updated` gate below.
-             "polylimit_vm": dict(chrome.DEFAULT_POLYLIMIT_VM)}
+             "polylimit_vm": dict(chrome.DEFAULT_POLYLIMIT_VM),
+             # Phase 9 Task 5 (SysEx manager): shares the SAME second
+             # chrome row too -- see the `secondary_updated` gate below.
+             "sysex_vm": dict(chrome.DEFAULT_SYSEX_VM)}
     on_event = _make_page_switcher(client, state, fps)
     # Phase 8 Task 6 (help overlay): shared with `_input_loop`'s background
     # thread the SAME way `state["keymap"]` is -- see `_dispatch_evdev_key`'s
@@ -1870,7 +1888,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
                      page_keymap=state["keymap_page"],
                      keymap_hints_enabled=state["keymap_hints_enabled"],
                      overlay_active=overlay_state["active"], keymap_global=state["keymap_global"],
-                     roster=state["roster"], polylimit_vm=state["polylimit_vm"])
+                     roster=state["roster"], polylimit_vm=state["polylimit_vm"],
+                     sysex_vm=state["sysex_vm"])
         surface.write_to_mmap(fb_mm, stride=stride)
         # Phase 8 Task 6: the overlay's on/off state changes on the INPUT
         # thread (a keypress), not through any of the drained topics below
@@ -1895,7 +1914,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
                 inbox, lambda: {state["topic"], chrome.OVERLAY_STATUS_TOPIC,
                                 chrome.OVERLAY_ALERTS_TOPIC, chrome.OVERLAY_TIMESIG_TOPIC,
                                 chrome.OVERLAY_BEATFLASH_TOPIC, chrome.OVERLAY_LOOPPROGRESS_TOPIC,
-                                chrome.OVERLAY_MARQUEE_TOPIC, chrome.OVERLAY_POLYLIMIT_TOPIC},
+                                chrome.OVERLAY_MARQUEE_TOPIC, chrome.OVERLAY_POLYLIMIT_TOPIC,
+                                chrome.OVERLAY_SYSEX_TOPIC},
                 on_event=on_event)
             page_updated = state["topic"] in drained
             if page_updated:
@@ -1913,6 +1933,9 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
                 secondary_updated = True
             if chrome.OVERLAY_POLYLIMIT_TOPIC in drained:
                 state["polylimit_vm"] = drained[chrome.OVERLAY_POLYLIMIT_TOPIC]
+                secondary_updated = True
+            if chrome.OVERLAY_SYSEX_TOPIC in drained:
+                state["sysex_vm"] = drained[chrome.OVERLAY_SYSEX_TOPIC]
                 secondary_updated = True
             beatprogress_updated = False
             if chrome.OVERLAY_BEATFLASH_TOPIC in drained:
@@ -1966,7 +1989,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
                              page_keymap=state["keymap_page"],
                              keymap_hints_enabled=state["keymap_hints_enabled"],
                              overlay_active=overlay_now, keymap_global=state["keymap_global"],
-                             roster=state["roster"], polylimit_vm=state["polylimit_vm"])
+                             roster=state["roster"], polylimit_vm=state["polylimit_vm"],
+                             sysex_vm=state["sysex_vm"])
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
     finally:
@@ -1980,7 +2004,7 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
     overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
                        chrome.OVERLAY_TIMESIG_TOPIC, chrome.OVERLAY_BEATFLASH_TOPIC,
                        chrome.OVERLAY_LOOPPROGRESS_TOPIC, chrome.OVERLAY_MARQUEE_TOPIC,
-                       chrome.OVERLAY_POLYLIMIT_TOPIC]
+                       chrome.OVERLAY_POLYLIMIT_TOPIC, chrome.OVERLAY_SYSEX_TOPIC]
     try:
         client.connect()
         page, topic = current_page_topic(client)
@@ -2006,7 +2030,8 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
             # yet by the time the page snapshot does.
             secondary = {"alerts_vm": dict(chrome.DEFAULT_ALERTS_VM),
                         "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
-                        "polylimit_vm": dict(chrome.DEFAULT_POLYLIMIT_VM)}
+                        "polylimit_vm": dict(chrome.DEFAULT_POLYLIMIT_VM),
+                        "sysex_vm": dict(chrome.DEFAULT_SYSEX_VM)}
             status = {"vm": dict(chrome.DEFAULT_STATUS_VM)}
             beatprogress = {"beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
                             "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM)}
@@ -2023,6 +2048,8 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
                     secondary["timesig_vm"] = msg["data"]
                 elif msg.get("topic") == chrome.OVERLAY_POLYLIMIT_TOPIC:
                     secondary["polylimit_vm"] = msg["data"]
+                elif msg.get("topic") == chrome.OVERLAY_SYSEX_TOPIC:
+                    secondary["sysex_vm"] = msg["data"]
                 elif msg.get("topic") == chrome.OVERLAY_BEATFLASH_TOPIC:
                     beatprogress["beatflash_vm"] = msg["data"]
                 elif msg.get("topic") == chrome.OVERLAY_LOOPPROGRESS_TOPIC:
@@ -2049,7 +2076,8 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
                          keymap_hints_enabled=keymap_bundle.get("hints_enabled", True),
                          overlay_active=show_overlay, keymap_global=keymap_bundle["global"],
                          roster=keymap_bundle.get("roster", []),
-                         polylimit_vm=secondary["polylimit_vm"])
+                         polylimit_vm=secondary["polylimit_vm"],
+                         sysex_vm=secondary["sysex_vm"])
             surface.save_png(out_path)
             return 0
         keymap_bundle = fetch_keymap_sections(client)

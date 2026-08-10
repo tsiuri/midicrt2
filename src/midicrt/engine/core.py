@@ -153,6 +153,7 @@ from midicrt.engine import bindings as bindings_mod
 from midicrt.engine import capture as capture_mod
 from midicrt.engine import keymap as keymap_mod
 from midicrt.engine import sysex as sysex_mod
+from midicrt.engine import sysex_store as sysex_store_mod
 from midicrt.engine.actions import ActionError, ActionRegistry
 from midicrt.engine.midi_out import MidiOutput
 from midicrt.pages.ccdashboard import CCDashboardPage
@@ -575,6 +576,56 @@ class _PolyLimitOverlay:
         return self._shared.flash_view_model()
 
 
+class _SysexStatusOverlay:
+    """Phase 9 Task 5 (SysEx manager, engine/sysex_store.py): a thin
+    `overlay.sysex` analyzer-shaped WRAPPER around `Engine._sysex_store`,
+    the chrome data source for the loopprogress-style sysex-status text (v1
+    parity item -- v1's `plugins/loopprogress.py` showed a left-of-bar
+    scheduler/sysex status string that Phase 8's `analyzers/loopprogress.py`
+    port explicitly could NOT reproduce for lack of any v2 sysex-activity
+    data source at all; `SysexStore` now finally IS one -- see that
+    module's own docstring and docs task-5-report.md's v1-extraction
+    section for the exact text/timing this ports).
+
+    Mirrors `_PolyLimitOverlay` right above: `SysexStore` is engine-owned
+    (like `CaptureSink`), not itself Analyzer-shaped, since its OTHER job
+    (the ring + on-disk library CRUD behind `sysex.list/save/play/delete`)
+    has nothing to do with per-event `handle()` dispatch -- this wrapper is
+    the seam that lets chrome read its state through the SAME `overlay.*`
+    topic/view_model convention every other chrome-row data source uses.
+
+    `handle()` is always a no-op (`False`, never marks `overlay.sysex`
+    dirty from raw event handling) -- `Engine._handle` already calls
+    `self._sysex_store.record_received(ev)` DIRECTLY, outside the normal
+    analyzer fan-out (see that method's own comment at the call site,
+    mirroring `self._capture.record_event(ev)`'s identical placement),
+    because `SysexStore` needs the RAW event (in particular `ev.sysex_data`
+    with its original F0/F7-stripped byte tuple) regardless of which
+    analyzers exist in a given build's roster -- unlike every other
+    analyzer, whose whole job IS to react to `handle(ev)`. Only `tick(now)`
+    does real work here: it asks the store whether its status text is
+    still within `SYSEX_DISPLAY_SECS` of the last activity and reports a
+    dirty TRANSITION (active flips true/false), the same "binary signal,
+    transition-only dirty" shape `_PolyLimitOverlay`'s own shared instance
+    uses for its flash."""
+
+    def __init__(self, store: sysex_store_mod.SysexStore) -> None:
+        self._store = store
+        self._active = False
+
+    def handle(self, ev: MidiEvent) -> bool:
+        return False
+
+    def tick(self, now: float) -> bool:
+        active = self._store.status_active(now)
+        changed = active != self._active
+        self._active = active
+        return changed
+
+    def view_model(self) -> dict:
+        return {"text": self._store.status_text or "", "active": self._active}
+
+
 @dataclass
 class _LearnArm:
     """Phase 4 Task 3 (DAW-style MIDI learn, docs/phase4-notes.md): the
@@ -737,6 +788,36 @@ class Engine:
         # actually CALLED later -- the bound-method reference itself
         # doesn't need `self._midi_out` to exist yet, just `self`.
         self._midi_out = MidiOutput()
+        # Phase 9 Task 5 (SysEx manager, engine/sysex_store.py -- user-
+        # requested: "record, save, and play sysex at will from the
+        # browser"): engine-owned, like `self._capture` below -- constructed
+        # here (right after `self._midi_out`, which `sysex.play`'s handler
+        # needs) so the ring is live for the very first incoming MIDI event.
+        # `_SysexStatusOverlay` (module-level class above) is a thin
+        # `overlay.sysex` analyzer-shaped WRAPPER around it, mirroring
+        # `_PolyLimitOverlay`'s own "wrap a shared, non-analyzer object's
+        # state into a small view model" shape -- registered here rather
+        # than left out of the analyzer roster because chrome's loopprogress-
+        # style sysex-status text (docs task-5-report.md) needs a `tick(now)`
+        # to decay, and `_tick_analyzers` only ever ticks registered
+        # analyzers.
+        self._sysex_store = sysex_store_mod.SysexStore(library_dir=config.sysex_dir)
+        self.register_analyzer("sysex", _SysexStatusOverlay(self._sysex_store))
+        self.actions.register("sysex.list", self._sysex_list_action,
+                              description="List recently-received sysex frames and the "
+                                          "saved library")
+        self.actions.register("sysex.save", self._sysex_save_action,
+                              description="Save a recently-received sysex frame (0 = most "
+                                          "recent) into the named library",
+                              args={"name": "str", "index": "int"}, defaults={"index": 0})
+        self.actions.register("sysex.play", self._sysex_play_action,
+                              description="Play a saved sysex library entry out the MIDI "
+                                          "output",
+                              args={"name": "str"})
+        self.actions.register("sysex.delete", self._sysex_delete_action,
+                              description="Delete (stage to trash) a saved sysex library "
+                                          "entry",
+                              args={"name": "str"})
         # Phase 9 Task 2 (panic-send): per-channel "last real panic send"
         # timestamp, mirroring v1's own `_panic_last` dict
         # (zstucknotes.py:89) -- see `_maybe_panic`'s own docstring.
@@ -2349,6 +2430,32 @@ class Engine:
         # keeps engine-level side effects grouped at the top of _handle,
         # matching the activity-stamp's own placement).
         if ev.type == "sysex":
+            # Phase 9 Task 5 (SysEx manager): recorded into the ring BEFORE
+            # `_handle_sysex`'s own midicrt-command parse/dispatch, and
+            # UNCONDITIONALLY -- unlike `_handle_sysex` (a true no-op for
+            # any frame not addressed to midicrt, `engine/sysex.py::
+            # parse_command` returning `None`), the sysex MANAGER records
+            # every incoming frame regardless of content: the user-
+            # requested feature is "record, save, and play sysex at will",
+            # not just midicrt's own command channel (see engine/
+            # sysex_store.py's own module docstring for the full "distinct
+            # from engine/sysex.py" writeup). Pure in-memory ring append
+            # (no I/O) -- safe under replay for the identical reason
+            # `_handle_sysex` itself already is (docs/phase5-capture.md
+            # §6's "SysEx is the one exception" precedent).
+            self._sysex_store.record_received(ev)
+            # Web panel live-refresh (Phase 9 Task 5): a named event, NOT a
+            # new subscribable snapshot topic -- `clients/web/page.html`'s
+            # sysex panel (behind control) reacts to this the same way it
+            # already reacts to `capture_started`/`capture_stopped`
+            # (`refreshCaptureStatus()`'s own precedent): re-poll `sysex.
+            # list` for a fresh `recent`/`library` view rather than
+            # threading the whole ring through the snapshot/subscribe
+            # machinery for a browser feature that's open far less often
+            # than a page is. fb/tui never subscribe to this (their own
+            # sysex-status text comes from `overlay.sysex`'s snapshot
+            # topic, not this event).
+            self.emit_event("sysex_received", {"size": len(ev.sysex_data or ())})
             self._handle_sysex(ev)
         self._dispatch_to_state(ev)
 
@@ -2588,6 +2695,55 @@ class Engine:
     def _pagecycle_enable(self, enabled: bool) -> dict:
         self._pagecycle_behavior.enabled = enabled
         return {"enabled": enabled}
+
+    # -- sysex.list / .save / .play / .delete (Phase 9 Task 5, the SysEx
+    # MANAGER -- unrelated to the CMD dispatch handlers right above; see
+    # engine/sysex_store.py's own module docstring for the split). All four
+    # are ordinary client-dispatchable actions (registered in `__init__`
+    # right after `self._sysex_store` is constructed) -- provenance is
+    # therefore whatever `ActionRegistry`'s normal post-dispatch hook
+    # already stamps for any action (`client`/`binding:<id>`/`behavior`,
+    # docs/phase5-capture.md's origin table), no new origin needed, unlike
+    # the sysex CMD handlers above (which bypass the registry entirely).
+    # `save`/`play`/`delete` all do real disk/MIDI I/O through
+    # `SysexStore`, which deliberately does NOT catch `OSError` itself
+    # (see that module's docstring) -- caught HERE and converted to a clean
+    # `ActionError`, the SAME "ENOSPC must not kill the engine loop, nor
+    # tear down the requesting client connection" pattern `_capture_start_
+    # action`/`_capture_stop_action` already established for capture's own
+    # disk writes. `ValueError` (an invalid/traversal name, an unknown
+    # library entry, an out-of-range ring index, a too-large-to-save
+    # frame, a corrupt library file) is likewise translated to
+    # `ActionError` -- a genuine caller error, same "unknown named
+    # resource" precedent `bind.remove`/`capture.pin` already use, never a
+    # raw exception escaping `ActionRegistry.dispatch`.
+
+    def _sysex_list_action(self) -> dict:
+        return {"recent": self._sysex_store.recent(), "library": self._sysex_store.list_library()}
+
+    def _sysex_save_action(self, name: str, index: int) -> dict:
+        try:
+            return self._sysex_store.save(name, index, now=self._clock())
+        except ValueError as exc:
+            raise ActionError(str(exc)) from exc
+        except OSError as exc:
+            raise ActionError(f"sysex save failed: {exc}") from exc
+
+    def _sysex_play_action(self, name: str) -> dict:
+        try:
+            return self._sysex_store.play(name, self._midi_out, now=self._clock())
+        except ValueError as exc:
+            raise ActionError(str(exc)) from exc
+        except OSError as exc:
+            raise ActionError(f"sysex play failed: {exc}") from exc
+
+    def _sysex_delete_action(self, name: str) -> dict:
+        try:
+            return self._sysex_store.delete(name, now=self._clock())
+        except ValueError as exc:
+            raise ActionError(str(exc)) from exc
+        except OSError as exc:
+            raise ActionError(f"sysex delete failed: {exc}") from exc
 
     def stop(self) -> None:
         self._running = False

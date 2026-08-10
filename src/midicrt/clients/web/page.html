@@ -57,6 +57,15 @@
   #capture-panel { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   #rec-toggle.recording { background: #4a1f1f; border-color: #7a2b2b; color: #ff8a8a; }
   #last-session { font-size: 0.85em; opacity: 0.85; }
+  /* -- SysEx manager panel (Phase 9 Task 5, --allow-control only) --------- */
+  #sysex-panel { display: flex; flex-direction: column; gap: 6px; font-size: 0.85em; }
+  #sysex-panel .sysex-col { display: flex; flex-direction: column; gap: 4px; }
+  #sysex-panel .sysex-row {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 2px 0;
+  }
+  #sysex-panel input[type=text] { width: 10em; }
+  #sysex-panel .sysex-empty { opacity: 0.6; }
   /* -- alert banners (phase6-notes item 4): dismissable, `level`-colored -- */
   #alerts { padding: 0 12px; }
   .alert-banner {
@@ -106,6 +115,17 @@
     <button id="rec-toggle" type="button">● start REC</button>
     <span id="last-session">last session: (none yet)</span>
   </div>
+  <div id="sysex-panel">
+    <strong>SysEx</strong>
+    <div class="sysex-col">
+      <div>Recently received:</div>
+      <div id="sysex-recent" class="sysex-empty">(none yet)</div>
+    </div>
+    <div class="sysex-col">
+      <div>Library:</div>
+      <div id="sysex-library" class="sysex-empty">(empty)</div>
+    </div>
+  </div>
   <form id="action-form">
     <select id="action-select"></select>
     <span id="action-args"></span>
@@ -130,6 +150,9 @@ const alertsEl = document.getElementById("alerts");
 const toastContainerEl = document.getElementById("toast-container");
 const recToggleEl = document.getElementById("rec-toggle");
 const lastSessionEl = document.getElementById("last-session");
+const sysexPanelEl = document.getElementById("sysex-panel");
+const sysexRecentEl = document.getElementById("sysex-recent");
+const sysexLibraryEl = document.getElementById("sysex-library");
 
 let describeCache = null;
 let currentPage = null;
@@ -250,6 +273,61 @@ async function refreshCaptureStatus() {
     updateRecToggle();
     renderLastSession(data.last_session);
   } catch (e) { /* best-effort -- overlay.status will catch up recording state anyway */ }
+}
+
+// -- SysEx manager panel (Phase 9 Task 5, --allow-control only): recent-
+// received list (timestamp/size/manufacturer, save-with-name) + saved
+// library list (play/delete) -- both come from ONE `sysex.list` action
+// (no dedicated snapshot topic; a browser feature that's open far less
+// often than a page is, same reasoning `capture.status` above already
+// established for the REC panel: poll on demand rather than thread the
+// whole ring through the subscribe/snapshot machinery). Refreshed on
+// control-enable (below) and whenever the engine emits a `sysex_received`
+// event (a new frame arrived -- see handleMessage) or after this panel's
+// own save/play/delete actions succeed.
+function formatSysexRecentRow(row) {
+  const truncNote = row.truncated
+    ? ` <em>(too large to save -- dropped from memory)</em>` : "";
+  const disabled = row.truncated ? "disabled" : "";
+  return `<div class="sysex-row">` +
+    `<span>#${row.index} ${escapeHtml(row.manufacturer)} ${row.size}B${truncNote}</span>` +
+    `<input type="text" placeholder="name to save as" data-sysex-name-for="${row.index}" ${disabled}>` +
+    `<button data-sysex-save="${row.index}" ${disabled}>save</button>` +
+    `</div>`;
+}
+
+function formatSysexLibraryRow(row) {
+  const when = row.saved_ts ? new Date(row.saved_ts * 1000).toLocaleTimeString() : "?";
+  return `<div class="sysex-row">` +
+    `<span>${escapeHtml(row.name)} -- ${row.size}B ${escapeHtml(row.manufacturer)} (saved ${when})</span>` +
+    `<button data-sysex-play="${escapeHtml(row.name)}">play</button>` +
+    `<button data-sysex-delete="${escapeHtml(row.name)}">delete</button>` +
+    `</div>`;
+}
+
+function renderSysexPanel(data) {
+  if (!sysexPanelEl) return;
+  const recent = data.recent || [];
+  const library = data.library || [];
+  sysexRecentEl.className = recent.length ? "" : "sysex-empty";
+  sysexRecentEl.innerHTML = recent.length
+    ? recent.map(formatSysexRecentRow).join("") : "(none yet)";
+  sysexLibraryEl.className = library.length ? "" : "sysex-empty";
+  sysexLibraryEl.innerHTML = library.length
+    ? library.map(formatSysexLibraryRow).join("") : "(empty)";
+}
+
+async function refreshSysexPanel() {
+  if (!ALLOW_CONTROL) return;
+  try {
+    const res = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "sysex.list", args: {} }),
+    });
+    if (!res.ok) return;
+    renderSysexPanel(await res.json());
+  } catch (e) { /* best-effort -- panel just stays as it was */ }
 }
 
 // -- nav roster: describe's `topics` (page.* entries, roster/cycle order)
@@ -714,6 +792,12 @@ function handleMessage(msg) {
     showToast(`learn cancelled (${(msg.data && msg.data.reason) || "?"})`);
   } else if (msg.name === "capture_started" || msg.name === "capture_stopped") {
     refreshCaptureStatus();  // authoritative source: capture.status, not the event payload alone
+  } else if (msg.name === "sysex_received") {
+    // Phase 9 Task 5: a new frame landed in the ring -- re-poll sysex.list
+    // for a fresh recent/library view, same "event just means refresh,
+    // don't trust the event payload as the data itself" precedent as the
+    // capture_started/capture_stopped branch right above.
+    refreshSysexPanel();
   }
 }
 
@@ -787,7 +871,40 @@ if (ALLOW_CONTROL) {
   recToggleEl.addEventListener("click", () => {
     postAction(recording ? "capture.stop" : "capture.start", {});
   });
+  // -- SysEx manager panel clicks (Phase 9 Task 5): ONE delegated listener
+  // on the panel container, not per-row listeners -- rows are rebuilt
+  // wholesale on every refreshSysexPanel() call (innerHTML replace, same
+  // "drop-and-replace, never merge into stale DOM" convention every page
+  // renderer here already follows), so per-row listeners would need to be
+  // re-attached every refresh anyway; delegation avoids that entirely.
+  sysexPanelEl.addEventListener("click", async (ev) => {
+    const el = ev.target;
+    if (!el || !el.dataset) return;
+    if (el.dataset.sysexSave !== undefined) {
+      const index = Number(el.dataset.sysexSave);
+      const input = sysexRecentEl.querySelector(`input[data-sysex-name-for="${index}"]`);
+      const name = input ? input.value.trim() : "";
+      if (!name) { actionResultEl.textContent = "error: enter a name before saving"; return; }
+      await postAction("sysex.save", { name, index });
+      refreshSysexPanel();
+    } else if (el.dataset.sysexPlay !== undefined) {
+      await postAction("sysex.play", { name: el.dataset.sysexPlay });
+    } else if (el.dataset.sysexDelete !== undefined) {
+      const name = el.dataset.sysexDelete;
+      // Confirm affordance (task brief: "Delete gets a confirm affordance
+      // in the UI") -- a real browser confirm() dialog, same as any other
+      // irreversible-from-the-USER'S-perspective action would use (the
+      // engine itself still only STAGES to trash, never truly deletes --
+      // see engine/sysex_store.py's own docstring -- but the browser UI
+      // has no "undo from trash" affordance, so this still needs to read
+      // as a real confirmation to the person clicking it).
+      if (!confirm(`Delete saved SysEx '${name}'?`)) return;
+      await postAction("sysex.delete", { name });
+      refreshSysexPanel();
+    }
+  });
   refreshCaptureStatus();  // seed the REC toggle label + last_session panel on load
+  refreshSysexPanel();     // seed the SysEx recent/library lists on load
 }
 
 // -- websocket connection with auto-reconnect + exponential backoff -------

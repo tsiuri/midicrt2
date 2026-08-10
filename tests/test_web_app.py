@@ -340,6 +340,122 @@ def test_read_only_flag_defaults_to_control_on():
     assert args.read_only is False  # i.e. `main()`'s allow_control = not args.read_only -> True
 
 
+# -- SysEx manager panel (Phase 9 Task 5) ------------------------------------
+#
+# The panel reaches the engine through the SAME generic `/api/action`
+# endpoint every other action already uses (`sysex.list/save/play/delete`
+# are ordinary registered actions, engine/core.py's own `Engine.__init__`)
+# -- no dedicated web route was added. These tests cover (1) the served
+# page's static markup/JS actually wires the panel up (same content-pin
+# discipline `test_index_page_renderer_registry_covers_full_default_
+# roster` already uses -- no browser/JS harness in this suite) and (2) a
+# REAL end-to-end round trip through the actual HTTP layer + bridge +
+# engine, proving the whole chain works over `/api/action`, not just at
+# the bare-Engine level (already covered directly in
+# test_engine_sysex_store.py).
+
+async def test_index_page_has_sysex_manager_panel_markup_and_wiring(tmp_path):
+    eng, srv, task, client = await _client_for(tmp_path)
+    resp = await client.get("/")
+    body = await resp.text()
+    assert 'id="sysex-panel"' in body
+    assert 'id="sysex-recent"' in body
+    assert 'id="sysex-library"' in body
+    assert "sysex.list" in body
+    assert "sysex.save" in body
+    assert "sysex.play" in body
+    assert "sysex.delete" in body
+    assert "sysex_received" in body    # live-refresh event hookup
+    assert "confirm(" in body          # delete confirm affordance (task brief)
+
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
+class _FakeMidiOut:
+    """Same "never touch a real ALSA port from a plain unit/integration
+    test" discipline test_engine_core.py's own `_FakeMidiOut` already
+    establishes -- this suite's other server-level tests never exercise
+    `sendnotes.key`/real `MidiOutput` either, for the identical reason."""
+    port_name = "fake"
+
+    def __init__(self):
+        self.sent: list[tuple[int, ...]] = []
+
+    def send_sysex(self, data):
+        self.sent.append(data)
+        return True
+
+    def note_on(self, *a, **kw):
+        pass
+
+    def note_off(self, *a, **kw):
+        pass
+
+    def close(self):
+        pass
+
+
+async def test_sysex_save_play_delete_round_trip_via_api_action(tmp_path):
+    from midicrt.engine.core import MidiEvent
+
+    eng, srv, task, client = await _client_for(tmp_path, allow_control=True)
+    fake_out = _FakeMidiOut()
+    eng._midi_out = fake_out
+
+    await eng.queue.put(MidiEvent(
+        ts=1.0, source="t", type="sysex", channel=None, data1=None, data2=None,
+        summary="sysex (3 bytes)", sysex_data=(0x7D, 0x01, 0x02)))
+    await asyncio.sleep(0.2)   # fixture tick_hz=100 -- plenty of drain time
+
+    listing = await client.post("/api/action", json={"name": "sysex.list", "args": {}})
+    assert listing.status == 200
+    listing_data = await listing.json()
+    assert listing_data["recent"][0]["size"] == 3
+
+    save = await client.post("/api/action",
+                             json={"name": "sysex.save", "args": {"name": "web patch"}})
+    assert save.status == 200
+    assert (await save.json())["size"] == 3
+
+    listing2 = await client.post("/api/action", json={"name": "sysex.list", "args": {}})
+    assert [row["name"] for row in (await listing2.json())["library"]] == ["web patch"]
+
+    play = await client.post("/api/action",
+                             json={"name": "sysex.play", "args": {"name": "web patch"}})
+    assert play.status == 200
+    assert (await play.json())["sent"] is True
+    assert fake_out.sent == [(0x7D, 0x01, 0x02)]
+
+    delete = await client.post("/api/action",
+                               json={"name": "sysex.delete", "args": {"name": "web patch"}})
+    assert delete.status == 200
+    assert (await delete.json())["deleted"] is True
+
+    listing3 = await client.post("/api/action", json={"name": "sysex.list", "args": {}})
+    assert (await listing3.json())["library"] == []
+
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
+async def test_sysex_save_traversal_name_via_api_action_returns_400(tmp_path):
+    from midicrt.engine.core import MidiEvent
+
+    eng, srv, task, client = await _client_for(tmp_path, allow_control=True)
+    await eng.queue.put(MidiEvent(
+        ts=1.0, source="t", type="sysex", channel=None, data1=None, data2=None,
+        summary="sysex (1 bytes)", sysex_data=(0x01,)))
+    await asyncio.sleep(0.2)
+
+    resp = await client.post(
+        "/api/action", json={"name": "sysex.save", "args": {"name": "../../etc/passwd"}})
+    assert resp.status == 400   # ActionError -> _handle_action's 400 path, not a 500 crash
+
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
 def test_read_only_flag_disables_control_when_passed():
     args = _build_arg_parser().parse_args(["--read-only"])
     assert args.read_only is True

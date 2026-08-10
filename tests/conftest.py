@@ -72,6 +72,7 @@ import pytest
 from midicrt.engine import bindings as bindings_mod
 from midicrt.engine import capture as capture_mod
 from midicrt.engine import keymap as keymap_mod
+from midicrt.engine import sysex_store as sysex_store_mod
 
 
 @pytest.fixture(autouse=True)
@@ -82,3 +83,15 @@ def _isolate_default_midicrt_config_paths(tmp_path, monkeypatch):
     monkeypatch.setattr(capture_mod, "DEFAULT_STATE_DIR", str(fake_dir / "sessions"))
     monkeypatch.setattr(capture_mod, "DEV_FALLBACK_STATE_DIR",
                         str(fake_dir / "sessions-dev-fallback"))
+    # Phase 9 Task 5 (SysEx manager, engine/sysex_store.py): the SAME
+    # contamination risk capture_mod's own two constants above exist to
+    # close, one level further -- an unconfigured `SysexStore` (any bare
+    # `Engine(Config())` in this suite) would otherwise resolve its
+    # library directory via `resolve_sysex_dir()`'s real production/dev-
+    # fallback logic, which on this exact live Pi (daemon + repo share a
+    # home directory) could point at a REAL `/var/lib/midicrt/sysex` or
+    # `~/.local/state/midicrt/sysex` -- do NOT write real test noise
+    # there (binding constraint, task-5-brief.md).
+    monkeypatch.setattr(sysex_store_mod, "DEFAULT_SYSEX_DIR", str(fake_dir / "sysex"))
+    monkeypatch.setattr(sysex_store_mod, "DEV_FALLBACK_SYSEX_DIR",
+                        str(fake_dir / "sysex-dev-fallback"))

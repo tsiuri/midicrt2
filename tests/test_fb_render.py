@@ -738,6 +738,75 @@ def test_paint_frame_polylimit_vm_defaults_to_not_flashing_byte_identical():
     assert surf_default.image.tobytes() == surf_explicit.image.tobytes()
 
 
+# -- sysex-status chrome text (Phase 9 Task 5) -------------------------------
+
+def test_draw_secondary_renders_different_text_when_sysex_status_is_active():
+    # Same indirect-proof shape as the polylimit test above -- the strip's
+    # rendered bytes must differ between active/inactive, proving `sysex_vm`
+    # actually reached `chrome.secondary_status_text()` (exact string
+    # already unit-tested in test_chrome.py).
+    font = load_font()
+    surf_off = Surface(*GOLDEN_SURFACE_SIZE)
+    app._draw_secondary(surf_off, chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM, font,
+                        sysex_vm={"text": "sx: rx 4B Roland", "active": False})
+    surf_on = Surface(*GOLDEN_SURFACE_SIZE)
+    app._draw_secondary(surf_on, chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM, font,
+                        sysex_vm={"text": "sx: rx 4B Roland", "active": True})
+    assert surf_off.image.tobytes() != surf_on.image.tobytes()
+
+
+def test_draw_secondary_sysex_status_does_not_dim_the_strip():
+    # Loopprogress-style confirmation, shown at full brightness -- never the
+    # dimmed stuck-linger treatment.
+    font = load_font()
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    app._draw_secondary(surf, chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM, font,
+                        sysex_vm={"text": "sx: rx 4B Roland", "active": True})
+    y = surf.height - app._reserved_chrome_height(font)
+    assert surf.image.load()[surf.width - 1, y] == app.HEADER_BG
+
+
+def test_draw_secondary_sysex_vm_defaults_to_not_active():
+    # Every pre-existing call site (no sysex_vm at all) keeps rendering
+    # byte-identical output.
+    font = load_font()
+    surf_default = Surface(*GOLDEN_SURFACE_SIZE)
+    app._draw_secondary(surf_default, chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM, font)
+    surf_explicit = Surface(*GOLDEN_SURFACE_SIZE)
+    app._draw_secondary(surf_explicit, chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM, font,
+                        sysex_vm=dict(chrome.DEFAULT_SYSEX_VM))
+    assert surf_default.image.tobytes() == surf_explicit.image.tobytes()
+
+
+def test_paint_frame_forwards_sysex_vm_to_draw_secondary():
+    font = load_font()
+    surf_off = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf_off, "eventlog", VM, font, chrome.DEFAULT_STATUS_VM,
+                     chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM,
+                     DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, DEFAULT_MARQUEE_VM,
+                     sysex_vm={"text": "sx: rx 4B", "active": False})
+    surf_on = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf_on, "eventlog", VM, font, chrome.DEFAULT_STATUS_VM,
+                     chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM,
+                     DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, DEFAULT_MARQUEE_VM,
+                     sysex_vm={"text": "sx: rx 4B", "active": True})
+    assert surf_off.image.tobytes() != surf_on.image.tobytes()
+
+
+def test_paint_frame_sysex_vm_defaults_to_not_active_byte_identical():
+    font = load_font()
+    surf_default = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf_default, "eventlog", VM, font, chrome.DEFAULT_STATUS_VM,
+                     chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM,
+                     DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, DEFAULT_MARQUEE_VM)
+    surf_explicit = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf_explicit, "eventlog", VM, font, chrome.DEFAULT_STATUS_VM,
+                     chrome.DEFAULT_ALERTS_VM, GOLDEN_TIMESIG_VM,
+                     DEFAULT_BEATFLASH_VM, DEFAULT_LOOPPROGRESS_VM, DEFAULT_MARQUEE_VM,
+                     sysex_vm=dict(chrome.DEFAULT_SYSEX_VM))
+    assert surf_default.image.tobytes() == surf_explicit.image.tobytes()
+
+
 def test_render_frame_golden_matches_frozen_fixture():
     # Phase-3 task 3: the golden now composes BOTH renderers, page body
     # (render_frame) + chrome status strip (_draw_status), the same way the

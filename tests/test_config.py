@@ -73,3 +73,18 @@ def test_load_overrides_panic_linger_polylimit_settings(tmp_path):
     assert cfg.stuck_hold_after == 5.0
     assert cfg.poly_limit_global == 4
     assert cfg.poly_limit_ch == 2
+
+
+# -- SysEx manager (Phase 9 Task 5) -----------------------------------------
+
+def test_sysex_dir_defaults_to_none_letting_resolve_sysex_dir_decide():
+    cfg = Config()
+    assert cfg.sysex_dir is None
+
+
+def test_load_overrides_sysex_dir(tmp_path):
+    p = tmp_path / "config.toml"
+    override = str(tmp_path / "my-sysex-lib")
+    p.write_text(f'sysex_dir = "{override}"\n')
+    cfg = load(str(p))
+    assert cfg.sysex_dir == override

@@ -217,6 +217,16 @@ class Config:
     stuck_hold_after: float = 15.0
     poly_limit_global: int = 16
     poly_limit_ch: int = 8
+    # Phase 9 Task 5 (SysEx manager, engine/sysex_store.py): explicit
+    # override for `SysexStore`'s on-disk library directory, mirroring
+    # `capture_dir` above exactly (`resolve_sysex_dir`'s own StateDirectory-
+    # vs-dev-fallback resolution is skipped whenever this is set). `None`
+    # (the default) lets `SysexStore` resolve `/var/lib/midicrt/sysex`
+    # (production, a StateDirectory=midicrt SIBLING of `capture_dir`'s own
+    # `sessions/` leaf) or `~/.local/state/midicrt/sysex` (dev fallback) --
+    # no new v1 knob to port here (v1 has no equivalent named-library
+    # feature at all, see engine/sysex_store.py's own module docstring).
+    sysex_dir: str | None = None
 
 
 def load(path: str | None = None) -> Config:

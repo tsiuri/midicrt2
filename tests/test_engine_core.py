@@ -220,11 +220,12 @@ def test_engine_topics_reflects_roster_order():
         "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress", "overlay.marquee",
-        # Phase 9 Task 2: "polylimit" is registered LAST (post-hoc, right
-        # after "voices" is built -- see Engine.__init__'s own comment),
-        # so it lands after every OTHER analyzer here, same insertion-order
-        # convention every topic list in this file already follows.
+        # Phase 9 Task 2: "polylimit" is registered post-hoc, right after
+        # "voices" is built -- see Engine.__init__'s own comment.
         "overlay.polylimit",
+        # Phase 9 Task 5: "sysex" (_SysexStatusOverlay) is registered even
+        # later, right after `self._midi_out` is constructed -- lands last.
+        "overlay.sysex",
     ]
 
 
@@ -322,10 +323,13 @@ def test_default_analyzer_roster_is_status_alerts_timesig():
     # page-title scrolling marquee, v1's own primary anti-burn-in device.
     eng = Engine(Config())
     assert list(eng.analyzers) == [
-        # Phase 9 Task 2: "polylimit" lands LAST -- registered post-hoc
-        # (Engine.__init__, right after "voices" is built), not via
+        # Phase 9 Task 2: "polylimit" -- registered post-hoc (Engine.
+        # __init__, right after "voices" is built), not via
         # _ANALYZER_FACTORIES like the other five.
+        # Phase 9 Task 5: "sysex" (_SysexStatusOverlay) lands LAST --
+        # registered even later, right after `self._midi_out` is built.
         "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee", "polylimit",
+        "sysex",
     ]
 
 
@@ -334,7 +338,8 @@ def test_register_analyzer_appends_to_live_roster():
     fake = _FakePage()  # same handle()/view_model() shape as an Analyzer
     eng.register_analyzer("second", fake)
     assert list(eng.analyzers) == [
-        "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee", "polylimit", "second",
+        "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee", "polylimit",
+        "sysex", "second",
     ]
     assert eng.analyzers["second"] is fake
 
@@ -347,6 +352,7 @@ def test_topics_include_overlay_after_page_topics():
         "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes", "page.tuner",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress", "overlay.marquee", "overlay.polylimit",
+        "overlay.sysex",
     ]
 
 

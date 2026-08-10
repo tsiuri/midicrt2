@@ -411,6 +411,17 @@ def test_render_secondary_row_polylimit_param_is_optional_backward_compatible():
     assert row.strip() == "Time Signature: (no lock)"
 
 
+def test_render_secondary_row_shows_sysex_status_when_active_and_no_alerts_or_polylimit():
+    row = render_secondary_row(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, width=60,
+                               sysex_vm={"text": "sx: rx 4B Roland", "active": True})
+    assert row.strip() == "sx: rx 4B Roland"
+
+
+def test_render_secondary_row_sysex_param_is_optional_backward_compatible():
+    row = render_secondary_row(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, width=60)
+    assert row.strip() == "Time Signature: (no lock)"
+
+
 # -- third chrome row: beatflash/loopprogress (phase-3 task 9) ---------------
 
 def test_render_beatprogress_row_is_exactly_width_wide():
