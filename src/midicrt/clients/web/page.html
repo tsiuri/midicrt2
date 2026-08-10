@@ -66,6 +66,17 @@
   }
   #sysex-panel input[type=text] { width: 10em; }
   #sysex-panel .sysex-empty { opacity: 0.6; }
+  /* -- sessions panel (Phase 9 Task 6, capture editor -- READ-ONLY: list +
+     summaries only, no trim/delete from the browser this pass) ---------- */
+  #sessions-panel { display: flex; flex-direction: column; gap: 4px; font-size: 0.85em; }
+  #sessions-panel .session-row {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    padding: 2px 0;
+  }
+  #sessions-panel .session-empty { opacity: 0.6; }
+  #sessions-panel .session-status { opacity: 0.75; }
+  #sessions-panel .session-status.recording { color: #ff8a8a; }
+  #sessions-panel pre.json { max-width: 100%; }
   /* -- alert banners (phase6-notes item 4): dismissable, `level`-colored -- */
   #alerts { padding: 0 12px; }
   .alert-banner {
@@ -126,6 +137,10 @@
       <div id="sysex-library" class="sysex-empty">(empty)</div>
     </div>
   </div>
+  <div id="sessions-panel">
+    <strong>Capture sessions</strong>
+    <div id="sessions-list" class="session-empty">(none yet)</div>
+  </div>
   <form id="action-form">
     <select id="action-select"></select>
     <span id="action-args"></span>
@@ -153,6 +168,8 @@ const lastSessionEl = document.getElementById("last-session");
 const sysexPanelEl = document.getElementById("sysex-panel");
 const sysexRecentEl = document.getElementById("sysex-recent");
 const sysexLibraryEl = document.getElementById("sysex-library");
+const sessionsPanelEl = document.getElementById("sessions-panel");
+const sessionsListEl = document.getElementById("sessions-list");
 
 let describeCache = null;
 let currentPage = null;
@@ -327,6 +344,54 @@ async function refreshSysexPanel() {
     });
     if (!res.ok) return;
     renderSysexPanel(await res.json());
+  } catch (e) { /* best-effort -- panel just stays as it was */ }
+}
+
+// -- capture sessions panel (Phase 9 Task 6, capture editor -- READ-ONLY:
+// list + summaries only, gated the SAME way as every other panel here
+// (`--allow-control` on, POSTing through the ONE shared `/api/action`
+// endpoint -- see app.py's `_handle_action` 403 gate) -- v1 of this panel
+// ships NO trim/delete affordance from the browser (task brief), only
+// `capture.sessions_list` (this refresh) + `capture.sessions_show` (a
+// per-row "show" button, fetched on demand rather than eagerly for every
+// row -- a summary build replays the whole session through an offline
+// engine, engine/sessions.py's own docstring -- so this panel only pays
+// that cost for a session someone actually clicked into). Refreshed on
+// control-enable (below) and whenever a `capture_started`/
+// `capture_stopped` event arrives (same branch that already refreshes the
+// REC toggle -- a new session starting/finishing changes what this list
+// should show).
+function formatSessionsRow(row) {
+  const started = row.started_ts ? new Date(row.started_ts * 1000).toLocaleTimeString() : "?";
+  const pinned = row.pinned ? " 📌" : "";
+  const statusCls = row.status === "recording" ? "session-status recording" : "session-status";
+  const sizeText = row.size == null ? "?" : `${row.size}B`;
+  return `<div class="session-row" data-session-id="${escapeHtml(row.id)}">` +
+    `<span>${escapeHtml(row.id)}${pinned}</span>` +
+    `<span class="${statusCls}">${escapeHtml(row.status)}</span>` +
+    `<span>started ${started}, ${sizeText}</span>` +
+    `<button data-session-show="${escapeHtml(row.id)}">show</button>` +
+    `<div class="session-detail" data-session-detail-for="${escapeHtml(row.id)}"></div>` +
+    `</div>`;
+}
+
+function renderSessionsPanel(data) {
+  if (!sessionsPanelEl) return;
+  const rows = data.sessions || [];
+  sessionsListEl.className = rows.length ? "" : "session-empty";
+  sessionsListEl.innerHTML = rows.length ? rows.map(formatSessionsRow).join("") : "(none yet)";
+}
+
+async function refreshSessionsPanel() {
+  if (!ALLOW_CONTROL) return;
+  try {
+    const res = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "capture.sessions_list", args: {} }),
+    });
+    if (!res.ok) return;
+    renderSessionsPanel(await res.json());
   } catch (e) { /* best-effort -- panel just stays as it was */ }
 }
 
@@ -792,6 +857,7 @@ function handleMessage(msg) {
     showToast(`learn cancelled (${(msg.data && msg.data.reason) || "?"})`);
   } else if (msg.name === "capture_started" || msg.name === "capture_stopped") {
     refreshCaptureStatus();  // authoritative source: capture.status, not the event payload alone
+    refreshSessionsPanel();  // a session starting/finishing changes this list's own contents
   } else if (msg.name === "sysex_received") {
     // Phase 9 Task 5: a new frame landed in the ring -- re-poll sysex.list
     // for a fresh recent/library view, same "event just means refresh,
@@ -857,6 +923,24 @@ async function postAction(name, args) {
   }
 }
 
+// Same POST /api/action call `postAction` makes, but returns `{ok, data}`
+// instead of writing into the shared `#action-result` bar -- for a caller
+// (the sessions panel's own "show" button, below) that wants to render the
+// response somewhere ELSE inline, without clobbering that shared element.
+async function postActionSilent(name, args) {
+  try {
+    const res = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name, args: args || {} }),
+    });
+    const data = await res.json();
+    return { ok: res.ok, data };
+  } catch (e) {
+    return { ok: false, data: { error: String(e) } };
+  }
+}
+
 if (ALLOW_CONTROL) {
   controlsEl.classList.add("enabled");
   controlsEl.querySelectorAll("button[data-action]").forEach((btn) => {
@@ -903,8 +987,34 @@ if (ALLOW_CONTROL) {
       refreshSysexPanel();
     }
   });
+  // -- sessions panel clicks (Phase 9 Task 6): the ONE interactive
+  // affordance this READ-ONLY v1 panel has -- "show" fetches and toggles
+  // a JSON summary inline under its own row (delegated listener, same
+  // "rows are rebuilt wholesale on refresh" reasoning as the SysEx panel
+  // above). A second click on an ALREADY-fetched row's "show" button just
+  // toggles visibility rather than re-fetching (cheap: this panel's own
+  // refresh already rebuilds the whole list from scratch whenever the
+  // underlying data could have changed, see refreshSessionsPanel's own
+  // comment) -- no trim/delete button exists here at all (task brief).
+  sessionsPanelEl.addEventListener("click", async (ev) => {
+    const el = ev.target;
+    if (!el || !el.dataset || el.dataset.sessionShow === undefined) return;
+    const id = el.dataset.sessionShow;
+    const detailEl = sessionsListEl.querySelector(`[data-session-detail-for="${id}"]`);
+    if (!detailEl) return;
+    if (detailEl.dataset.loaded === "1") {
+      detailEl.style.display = detailEl.style.display === "none" ? "" : "none";
+      return;
+    }
+    const res = await postActionSilent("capture.sessions_show", { id });
+    detailEl.innerHTML = res.ok
+      ? `<pre class="json">${escapeHtml(JSON.stringify(res.data, null, 2))}</pre>`
+      : `error: ${escapeHtml(res.data && res.data.error)}`;
+    detailEl.dataset.loaded = "1";
+  });
   refreshCaptureStatus();  // seed the REC toggle label + last_session panel on load
   refreshSysexPanel();     // seed the SysEx recent/library lists on load
+  refreshSessionsPanel();  // seed the capture sessions list on load
 }
 
 // -- websocket connection with auto-reconnect + exponential backoff -------

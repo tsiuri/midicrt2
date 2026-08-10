@@ -152,6 +152,7 @@ from midicrt.config import Config, ConfigError
 from midicrt.engine import bindings as bindings_mod
 from midicrt.engine import capture as capture_mod
 from midicrt.engine import keymap as keymap_mod
+from midicrt.engine import sessions as sessions_mod
 from midicrt.engine import sysex as sysex_mod
 from midicrt.engine import sysex_store as sysex_store_mod
 from midicrt.engine.actions import ActionError, ActionRegistry
@@ -1121,6 +1122,27 @@ class Engine:
                               description="Pin a stopped capture session so retention "
                                           "never deletes it",
                               args={"id": "str"})
+        # Phase 9 Task 6 (capture editor): two READ-ONLY actions backing
+        # the web sessions panel -- engine/sessions.py's own pure
+        # `list_sessions`/`show_session` functions, the SAME ones `midicrt
+        # sessions list`/`show` call directly against the store on disk
+        # (clients/cli.py). Registered here (not e.g. only reachable via
+        # a bespoke HTTP route in clients/web/app.py) so the web panel
+        # reuses the EXACT SAME `/api/action` + `ALLOW_CONTROL` gate every
+        # other panel (bind.list, sysex.list) already goes through --
+        # zero new plumbing needed in app.py itself, just page.html/JS
+        # (see that file's own "sessions panel" section). `self._capture.
+        # dir`/`.is_recording`/`.session_id` give these handlers the live-
+        # session id for free (no socket round-trip -- this IS the live
+        # engine), unlike clients/cli.py's own `_live_recording_session_
+        # id`, which has to ask over the wire.
+        self.actions.register("capture.sessions_list", self._capture_sessions_list_action,
+                              description="List sessions in the capture store (drift-healed "
+                                          "view, no writes)")
+        self.actions.register("capture.sessions_show", self._capture_sessions_show_action,
+                              description="Summarize one session via the replay engine's "
+                                          "summarizer",
+                              args={"id": "str"})
         # Fix-wave fix (2026-08-07, Important finding, replay isolation):
         # `and not self._replay` -- an offline `engine/replay.py::
         # build_offline_engine()` engine has no real I/O of its own, but
@@ -1714,6 +1736,33 @@ class Engine:
         error" precedent `_bind_remove` already sets."""
         try:
             return self._capture.pin(id)
+        except ValueError as exc:
+            raise ActionError(str(exc)) from exc
+
+    def _live_capture_session_id(self) -> str | None:
+        """Shared by both `capture.sessions_*` handlers below -- `None`
+        unless a session is ACTIVELY recording right now (mirrors
+        `clients/cli.py::_live_recording_session_id`'s own "no live
+        session" contract, just read directly off `self._capture.status()`
+        instead of over a socket -- `CaptureSink` has no public
+        `session_id` property of its own, only `status()`'s dict, see
+        that method's own docstring)."""
+        status = self._capture.status()
+        return status["session_id"] if status["recording"] else None
+
+    def _capture_sessions_list_action(self) -> dict:
+        return sessions_mod.list_sessions(self._capture.dir,
+                                          live_session_id=self._live_capture_session_id())
+
+    def _capture_sessions_show_action(self, id: str) -> dict:
+        """`capture.sessions_show {id}` -- translates engine/sessions.py's
+        `UnknownSessionError` (a `ValueError` subclass, see that module's
+        own docstring) into `ActionError`, same "unknown named resource is
+        a genuine caller error" precedent `_capture_pin_action` above
+        already sets."""
+        try:
+            return sessions_mod.show_session(self._capture.dir, id,
+                                             live_session_id=self._live_capture_session_id())
         except ValueError as exc:
             raise ActionError(str(exc)) from exc
 

@@ -161,6 +161,7 @@ own `DEFAULT_PATH` isolation convention (see tests/conftest.py).
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -223,6 +224,62 @@ def _atomic_write_json(path: str, payload: Any) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
+_INDEX_LOCK_FILE = ".index.lock"
+
+
+@contextlib.contextmanager
+def _index_write_lock(capture_dir: str):
+    """Advisory `fcntl.flock` (exclusive) held for the ENTIRE read-modify-
+    write span of an `index.json` mutation -- Phase 9 Task 6 review-round
+    fix (Important finding, live-reproducible race): `_update_index_on_
+    stop`/`pin`/`fail`/`_sweep_retention` below each used to
+    `_load_index`/`_save_index` with NO lock at all -- meanwhile,
+    `engine/sessions.py`'s own `trim_session`/`delete_session`/
+    `repair_index` (the `midicrt sessions` CLI + the web sessions panel's
+    read actions) do their OWN independent read-modify-write against the
+    SAME `index.json`, from a SEPARATE process, whenever production has
+    `capture_auto_start` LIVE (the default) and an operator runs `midicrt
+    sessions ...` concurrently. Without a shared lock, two interleaved
+    read-then-write cycles can silently drop one side's edit (this
+    daemon reads rows A, `sessions.py` reads rows A, `sessions.py`
+    appends/removes and writes A', this daemon finishes its OWN edit and
+    writes A+new -- overwriting A' and losing whatever `sessions.py` just
+    did, or the symmetric loss the other way around) -- a real, silent
+    DATA-LOSS bug, not cosmetic.
+
+    `engine/sessions.py` carries an IDENTICAL copy of this exact context
+    manager (same name, same `.index.lock` filename, same
+    `<capture_dir>/.index.lock` convention) -- see this module's OWN
+    docstring's "Session index" section and `engine/sessions.py`'s own
+    module docstring for why duplicating a SMALL helper across the two
+    modules (rather than one importing the other's private API) is this
+    codebase's established convention; what matters for CORRECTNESS is
+    only that both copies lock the same file, which they do by
+    construction (both key off `capture_dir`/`self._dir`, the one value
+    every caller on both sides already agrees on). `fcntl.flock` (not a
+    separate lockfile-as-mutex library) because both lockers are always
+    on the same host, same LOCAL filesystem (this module's own "Storage
+    location" section -- `/var/lib/midicrt/sessions` or the dev fallback,
+    never network storage), where POSIX advisory locking is correct and
+    needs no extra dependency.
+
+    Read-only callers (`status()`, `_load_index()`'s own plain reads
+    where the caller doesn't go on to write) deliberately do NOT take
+    this lock -- `os.replace()`'s own atomicity (`_atomic_write_json`
+    above) already guarantees any concurrent reader sees either the
+    fully-old or fully-new document, never a torn/partial one; the lock
+    exists ONLY to serialize WRITER-vs-WRITER read-modify-write races."""
+    os.makedirs(capture_dir, exist_ok=True)
+    lock_path = os.path.join(capture_dir, _INDEX_LOCK_FILE)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 class CaptureSink:
@@ -416,7 +473,7 @@ class CaptureSink:
                 "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
                 "counts": counts, "error": error_text,
             }
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(Exception), _index_write_lock(self._dir):
                 rows = [r for r in self._load_index() if r.get("id") != session_id]
                 rows.append({
                     "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
@@ -432,13 +489,17 @@ class CaptureSink:
         no row to pin yet). Raises `ValueError` for an unknown id --
         `Engine._capture_pin` translates that into `ActionError`, matching
         `bind.remove`'s own "unknown named resource is a genuine caller
-        error" precedent."""
-        rows = self._load_index()
-        for row in rows:
-            if row.get("id") == session_id:
-                row["pinned"] = True
-                self._save_index(rows)
-                return {"pinned": True, "id": session_id}
+        error" precedent. Locked (see `_index_write_lock`'s own docstring)
+        across the read-modify-write span -- races against a concurrent
+        `midicrt sessions trim/delete/repair-index` (engine/sessions.py)
+        writing the SAME index.json from a separate process."""
+        with _index_write_lock(self._dir):
+            rows = self._load_index()
+            for row in rows:
+                if row.get("id") == session_id:
+                    row["pinned"] = True
+                    self._save_index(rows)
+                    return {"pinned": True, "id": session_id}
         raise ValueError(f"unknown capture session: {session_id!r}")
 
     # -- hot-path recording (no I/O) ------------------------------------------
@@ -594,12 +655,17 @@ class CaptureSink:
 
     def _update_index_on_stop(self, session_id: str, started_ts: float, ended_ts: float,
                               counts: dict) -> None:
-        rows = [r for r in self._load_index() if r.get("id") != session_id]
-        rows.append({
-            "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
-            "counts": counts, "pinned": False,
-        })
-        self._save_index(rows)
+        """Locked (see `_index_write_lock`'s own docstring) across the
+        read-modify-write span -- races against a concurrent `midicrt
+        sessions trim/delete/repair-index` (engine/sessions.py) writing
+        the SAME index.json from a separate process."""
+        with _index_write_lock(self._dir):
+            rows = [r for r in self._load_index() if r.get("id") != session_id]
+            rows.append({
+                "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
+                "counts": counts, "pinned": False,
+            })
+            self._save_index(rows)
 
     def _sweep_retention(self) -> None:
         """Called at the START of `start()`, BEFORE the new session this
@@ -617,19 +683,30 @@ class CaptureSink:
         `retention + 1` forever (this session always counted from its very
         next sweep onward, never from this one) -- caught live by
         test_capture.py::test_retention_sweep_never_deletes_a_pinned_session
-        expecting the unpinned count to settle at exactly `retention`."""
-        rows = self._load_index()
-        unpinned = sorted(
-            (r for r in rows if not r.get("pinned")),
-            key=lambda r: float(r.get("started_ts", 0.0)),
-        )
-        excess = len(unpinned) - max(0, self._retention - 1)
-        if excess <= 0:
-            return
-        victims = unpinned[:excess]
-        victim_ids = {v["id"] for v in victims}
-        for victim in victims:
-            with contextlib.suppress(OSError):
-                os.remove(self.session_path(victim["id"]))
-        rows = [r for r in rows if r.get("id") not in victim_ids]
-        self._save_index(rows)
+        expecting the unpinned count to settle at exactly `retention`.
+
+        Locked (see `_index_write_lock`'s own docstring) for the entire
+        read-decide-delete-write span -- same concurrent-writer race as
+        every other index-mutating method here, PLUS this one also
+        deletes `.jsonl` FILES, so holding the lock across the whole
+        operation also prevents a `midicrt sessions show/trim` (engine/
+        sessions.py) from being handed a session id this sweep is about
+        to remove out from under it mid-read (belt-and-suspenders; the
+        primary defense for that is still `list_sessions`/`show_session`'s
+        own honest missing-file/orphan reporting, not this lock)."""
+        with _index_write_lock(self._dir):
+            rows = self._load_index()
+            unpinned = sorted(
+                (r for r in rows if not r.get("pinned")),
+                key=lambda r: float(r.get("started_ts", 0.0)),
+            )
+            excess = len(unpinned) - max(0, self._retention - 1)
+            if excess <= 0:
+                return
+            victims = unpinned[:excess]
+            victim_ids = {v["id"] for v in victims}
+            for victim in victims:
+                with contextlib.suppress(OSError):
+                    os.remove(self.session_path(victim["id"]))
+            rows = [r for r in rows if r.get("id") not in victim_ids]
+            self._save_index(rows)
