@@ -21,6 +21,7 @@ from midicrt.engine.bindings import (
     BindingsFile,
     glob_port_pattern,
     is_learnable_event,
+    strip_alsa_port_suffix,
     validate_binding,
 )
 from midicrt.engine.core import MidiEvent
@@ -83,6 +84,48 @@ def test_port_pattern_fnmatch_on_source():
     d = BindingDispatcher([b])
     assert d.handle(ev(source="Midi Through:Midi Through Port-0 14:0")) == [("page.next", {})]
     assert d.handle(ev(source="USB MIDI Interface 20:0")) == []
+
+
+# -- device identity (Phase 9 Task 1): primary when present, port_pattern -----
+# untouched otherwise -- see BindingMatch's own docstring for the chosen
+# precedence.
+
+def test_device_present_matches_by_device_id_regardless_of_port_pattern():
+    """A deliberately WRONG port_pattern (would never fnmatch this
+    source) must not matter at all once `device` is set -- proves device
+    is not ANDed with port_pattern."""
+    b = trigger_binding(match={"type": "note_on", "number": 60,
+                               "port_pattern": "this pattern matches nothing*",
+                               "device": "usb:1234:5678:SN1"})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(device_id="usb:1234:5678:SN1", source="anything at all")) == [
+        ("page.next", {})]
+
+
+def test_device_present_does_not_fall_back_to_port_pattern_on_mismatch():
+    """Proves device is not ORed with port_pattern either: a port_pattern
+    that WOULD match is still ignored once `device` disagrees."""
+    b = trigger_binding(match={"type": "note_on", "number": 60,
+                               "port_pattern": "Midi Through*",
+                               "device": "usb:1234:5678:SN1"})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(device_id="usb:1234:5678:SN2",
+                       source="Midi Through:Midi Through Port-0 14:0")) == []
+
+
+def test_device_none_falls_back_to_port_pattern_exactly_as_before():
+    """Migration: a binding with no `device` at all (every binding
+    persisted before this task) must keep matching purely on port_pattern
+    -- even against an event that itself DOES carry a resolved
+    `device_id` (a real, fully-upgraded engine populates it on every
+    event; the OLD binding simply never asked for it)."""
+    b = trigger_binding(match={"type": "note_on", "number": 60,
+                               "port_pattern": "Midi Through*", "device": None})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(device_id="usb:1234:5678:SN1",
+                       source="Midi Through:Midi Through Port-0 14:0")) == [
+        ("page.next", {})]
+    assert d.handle(ev(device_id="usb:1234:5678:SN1", source="USB MIDI Interface 20:0")) == []
 
 
 # -- trigger: note_on (velocity > 0 only) --------------------------------------
@@ -254,6 +297,7 @@ def test_binding_match_defaults_channel_and_port_pattern_to_none():
     m = BindingMatch(type="note_on", number=60)
     assert m.channel is None
     assert m.port_pattern is None
+    assert m.device is None
 
 
 def test_binding_defaults_mode_trigger_threshold_64():
@@ -622,6 +666,55 @@ def test_bindingsfile_roundtrip_continuous_binding_with_fill_marker(tmp_path):
     assert reloaded.bindings == [original]
 
 
+def test_bindingsfile_roundtrip_binding_with_device_identity(tmp_path):
+    p = tmp_path / "bindings.toml"
+    original = trigger_binding(
+        match={"type": "note_on", "number": 60, "port_pattern": "Midi Through*",
+              "device": "usb:1234:5678:SN1"})
+    bf = BindingsFile([original], path=str(p))
+    bf.save()
+    assert 'device = "usb:1234:5678:SN1"' in p.read_text()
+    reloaded = BindingsFile.load(str(p))
+    assert reloaded.bindings == [original]
+    assert reloaded.bindings[0].match.device == "usb:1234:5678:SN1"
+
+
+def test_bindingsfile_load_tolerates_a_file_with_no_device_key_at_all(tmp_path):
+    """Migration in the OTHER direction: every bindings.toml written
+    before this task simply has no `device` key -- must load exactly as
+    it always did, `match.device` defaulting to None."""
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.b1]\n'
+        'action = "page.next"\n'
+        '\n'
+        '[bindings.b1.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+        'port_pattern = "Midi Through*"\n'
+    )
+    bf = BindingsFile.load(str(p))
+    assert bf.bindings[0].match.device is None
+    assert bf.bindings[0].match.port_pattern == "Midi Through*"
+
+
+def test_bindingsfile_load_skips_entry_with_a_non_string_device(tmp_path, caplog):
+    p = tmp_path / "bindings.toml"
+    p.write_text(
+        '[bindings.b1]\n'
+        'action = "page.next"\n'
+        '\n'
+        '[bindings.b1.match]\n'
+        'type = "note_on"\n'
+        'number = 60\n'
+        'device = 5\n'
+    )
+    with caplog.at_level(logging.WARNING):
+        bf = BindingsFile.load(str(p))
+    assert bf.bindings == []
+    assert "match.device" in caplog.text
+
+
 def test_bindingsfile_roundtrip_multiple_bindings_preserves_all(tmp_path):
     p = tmp_path / "bindings.toml"
     b1 = trigger_binding(id="b1")
@@ -806,6 +899,20 @@ def test_glob_port_pattern_with_no_alsa_suffix_falls_back_to_an_exact_pattern():
     # function can't assume every future source string has the suffix).
     assert glob_port_pattern("Midi Through:0") == "Midi Through:0"
     assert glob_port_pattern("A") == "A"
+
+
+def test_strip_alsa_port_suffix_removes_the_trailing_client_port_numbering():
+    # Phase 9 Task 1: extracted from glob_port_pattern's own suffix-
+    # stripping so engine/midi_identity.py's virt: fallback can reuse the
+    # exact same rule -- verified directly here, not just indirectly via
+    # glob_port_pattern's own tests.
+    assert (strip_alsa_port_suffix("Midi Through:Midi Through Port-0 14:0")
+            == "Midi Through:Midi Through Port-0")
+
+
+def test_strip_alsa_port_suffix_with_no_suffix_returns_unchanged():
+    assert strip_alsa_port_suffix("Midi Through:0") == "Midi Through:0"
+    assert strip_alsa_port_suffix("A") == "A"
 
 
 def test_glob_port_pattern_escapes_fnmatch_specials_in_the_port_name():

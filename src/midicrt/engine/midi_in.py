@@ -80,6 +80,23 @@ that an exact-match check would silently miss entirely, which is exactly
 how this bug slipped through code review and unit tests the first time:
 nothing had ever exercised what `get_input_names()` ACTUALLY returns for
 a self-opened virtual port on real hardware.
+
+Device identity (Phase 9 Task 1, device-identity bindings)
+------------------------------------------------------------
+Every port this class opens also gets a resolved, stable `device_id`
+(`engine/midi_identity.py::IdentityResolver` -- see that module's own
+docstring for the full `usb:<vendor>:<product>[:<serial>]` / `virt:<name>`
+resolution ladder) -- resolved exactly ONCE, right when `_watch()` opens
+the port, and cached in `self._device_ids` for as long as that port stays
+open. This is deliberately NOT re-resolved per incoming MIDI message: the
+real resolver does actual I/O (a subprocess call plus a handful of
+/proc and /sys reads), and a port's identity cannot change while it stays
+the same open ALSA port anyway. `_enqueue` looks the cached value up by
+`source` name and threads it onto every `MidiEvent` (via `translate()`'s
+new `device_id` parameter) it queues for that port, including the
+synthesized `clock_tick` aggregate. `BindingMatch.device` (engine/
+bindings.py) is what actually consumes this at match time -- see that
+module's own docstring for the full precedence rule.
 """
 import fnmatch
 import logging
@@ -87,6 +104,7 @@ import threading
 import time
 
 from midicrt.engine.core import MidiEvent
+from midicrt.engine.midi_identity import IdentityResolver
 
 _LOG = logging.getLogger(__name__)
 # mido's real type string is "active_sensing" (verified via
@@ -115,7 +133,15 @@ def _is_own_output(port_name: str, exclude_names) -> bool:
     return any(name and name in port_name for name in exclude_names)
 
 
-def translate(msg, source: str, ts: float) -> MidiEvent | None:
+def translate(msg, source: str, ts: float, device_id: str | None = None) -> MidiEvent | None:
+    """`device_id` (Phase 9 Task 1, device-identity bindings): the stable
+    identity `MidiInput` already resolved for `source` at port-open time
+    (see that class's own docstring) -- threaded straight onto the
+    returned `MidiEvent`, no resolution happens HERE (this function stays
+    a pure, backend-agnostic message translator, same charter as before).
+    Defaults to `None` so every existing direct call site (tests, tools)
+    that doesn't know about device identity at all keeps working
+    unchanged."""
     if msg.type in _IGNORED_TYPES:
         return None
     channel = getattr(msg, "channel", None)
@@ -152,17 +178,20 @@ def translate(msg, source: str, ts: float) -> MidiEvent | None:
         sysex_data = tuple(msg.data)
         summary = f"sysex ({len(sysex_data)} bytes)"
         return MidiEvent(ts=ts, source=source, type=msg.type, channel=channel,
-                         data1=None, data2=None, summary=summary, sysex_data=sysex_data)
+                         data1=None, data2=None, summary=summary, sysex_data=sysex_data,
+                         device_id=device_id)
     elif channel is not None:
         summary = f"{msg.type} ch{channel + 1}"
     else:
         summary = msg.type
     return MidiEvent(ts=ts, source=source, type=msg.type,
-                     channel=channel, data1=data1, data2=data2, summary=summary)
+                     channel=channel, data1=data1, data2=data2, summary=summary,
+                     device_id=device_id)
 
 
 class MidiInput:
-    def __init__(self, patterns, queue, poll_interval=3.0, backend=None, exclude_names=()):
+    def __init__(self, patterns, queue, poll_interval=3.0, backend=None, exclude_names=(),
+                 identity_resolver=None):
         if backend is None:
             import mido as backend
         self._backend = backend
@@ -182,10 +211,34 @@ class MidiInput:
         # name`.
         self._exclude_names = tuple(exclude_names)
         self._excluded_warned: set[str] = set()   # log each skipped name once, not every poll
+        # Phase 9 Task 1 (device-identity bindings): `IdentityResolver`
+        # (engine/midi_identity.py) does real I/O (a subprocess call, a
+        # handful of /proc and /sys reads) -- resolved ONCE per newly-
+        # OPENED port name, in `_watch()` below, and cached here for the
+        # port's whole open lifetime rather than re-resolved on every
+        # incoming MIDI message (`_enqueue` just looks this dict up, an
+        # O(1) string hash, matching the task brief's own "MidiEvent gains
+        # device_id ... cheap string" requirement). Injectable for tests,
+        # same "constructor seam, real default" shape as `backend` above.
+        self._identity = identity_resolver or IdentityResolver()
+        self._device_ids: dict[str, str] = {}   # name -> resolved device_id
 
     @property
     def open_ports(self) -> list[str]:
         return sorted(self._ports)
+
+    @property
+    def open_device_ids(self) -> list[str]:
+        """Phase 9 Task 1: the DEDUPED set of `device_id`s currently
+        resolved across every open port -- feeds `Engine._device_present`
+        via `daemon.py`'s `set_open_device_ids_provider` wiring, exactly
+        mirroring `open_ports`/`set_open_ports_provider`'s own shape.
+        Deduped (not one entry per port) because two ports CAN legitimately
+        share a device_id -- the documented no-serial collision case (see
+        engine/midi_identity.py's own docstring) -- and `_device_present`
+        only ever asks "is this id present at all", never "how many
+        ports"."""
+        return sorted(set(self._device_ids.values()))
 
     def start(self, loop) -> None:
         self._loop = loop
@@ -200,20 +253,22 @@ class MidiInput:
         for port in self._ports.values():
             port.close()
         self._ports.clear()
+        self._device_ids.clear()
 
     def _enqueue(self, msg, source: str) -> None:
+        device_id = self._device_ids.get(source)
         if msg.type == "clock":
-            self._on_clock(source)
+            self._on_clock(source, device_id)
             return
         if msg.type in _CLOCK_BOUNDARY_RESET_TYPES:
             self._clock_batch_start = None
         if msg.type in _CLOCK_FULL_RESET_TYPES:
             self._clock_count = 0
-        ev = translate(msg, source, time.time())
+        ev = translate(msg, source, time.time(), device_id)
         if ev is not None:
             self._loop.call_soon_threadsafe(self._queue.put_nowait, ev)
 
-    def _on_clock(self, source: str) -> None:
+    def _on_clock(self, source: str, device_id: str | None = None) -> None:
         """Count one raw clock pulse; emit an aggregated `clock_tick`
         MidiEvent every `_CLOCK_BATCH_SIZE` pulses -- see module docstring."""
         now = time.time()
@@ -222,7 +277,7 @@ class MidiInput:
             return
         ev = MidiEvent(ts=now, source=source, type="clock_tick", channel=None,
                        data1=_CLOCK_BATCH_SIZE, data2=None, summary="clock_tick",
-                       clock_batch_start=self._clock_batch_start)
+                       clock_batch_start=self._clock_batch_start, device_id=device_id)
         self._clock_batch_start = now
         self._clock_count = 0
         self._loop.call_soon_threadsafe(self._queue.put_nowait, ev)
@@ -248,11 +303,24 @@ class MidiInput:
                 try:
                     self._ports[name] = self._backend.open_input(
                         name, callback=lambda m, n=name: self._enqueue(m, n))
-                    _LOG.info("opened MIDI input: %s", name)
+                    # Phase 9 Task 1: resolve device identity ONCE, right
+                    # here at open time -- see this class's own docstring
+                    # comment on `self._identity` for why this must not
+                    # happen per-message. A resolver failure (real I/O:
+                    # subprocess/proc/sysfs) must not prevent the port
+                    # itself from opening -- caught the same way `open_
+                    # input` failures right below are, never propagated.
+                    try:
+                        self._device_ids[name] = self._identity.resolve(name)
+                    except Exception as exc:  # noqa: BLE001 — identity resolution is best-effort
+                        _LOG.warning("device-identity resolution failed for %s: %s", name, exc)
+                    _LOG.info("opened MIDI input: %s (device=%s)",
+                             name, self._device_ids.get(name))
                 except Exception as exc:  # noqa: BLE001 — same: one bad port must not kill the loop
                     _LOG.warning("open failed for %s: %s", name, exc)
             for name in list(self._ports):
                 if name not in available:
                     _LOG.info("MIDI input vanished: %s", name)
                     self._ports.pop(name).close()
+                    self._device_ids.pop(name, None)
             time.sleep(self._poll)

@@ -141,6 +141,26 @@ def is_learnable_event(ev) -> bool:
 _ALSA_PORT_SUFFIX_RE = re.compile(r"\s\d+:\d+$")
 
 
+def strip_alsa_port_suffix(source: str) -> str:
+    """Return `source` with its trailing volatile ALSA `" <client>:<port>"`
+    numbering suffix removed (see `_ALSA_PORT_SUFFIX_RE`'s own comment
+    right above) -- or `source` UNCHANGED if it has no such suffix at all.
+
+    Extracted from `glob_port_pattern` (Phase 9 Task 1, device-identity
+    bindings, .superpowers/sdd/2026-08-09-midicrt2-phase9-instruments/
+    task-1-brief.md) as a standalone, glob-agnostic helper: `engine/
+    midi_identity.py`'s `virt:<name>` device-identity fallback needs the
+    bare stripped string (compared with plain `==`, never `fnmatch`), not
+    a glob-escaped pattern with a trailing `"*"` appended -- reusing this
+    function keeps "what counts as the volatile ALSA suffix" defined in
+    exactly ONE place rather than risking two independently-drifting
+    regexes for what is definitionally the same ALSA fact. `glob_port_
+    pattern` below is a pure extraction onto this helper -- its own
+    behavior (and every existing test of it) is unchanged."""
+    match = _ALSA_PORT_SUFFIX_RE.search(source)
+    return source[: match.start()] if match else source
+
+
 def glob_port_pattern(source: str) -> str:
     """Turn a raw `MidiEvent.source` string into a DURABLE `bind.learn`
     `port_pattern`: strip the trailing volatile " <client>:<port>" ALSA
@@ -179,7 +199,7 @@ def glob_port_pattern(source: str) -> str:
     match = _ALSA_PORT_SUFFIX_RE.search(source)
     if match is None:
         return glob.escape(source)
-    return glob.escape(source[: match.start()]) + "*"
+    return glob.escape(strip_alsa_port_suffix(source)) + "*"
 
 
 # TOML has no null literal, so a continuous binding's "this arg gets filled
@@ -221,11 +241,40 @@ class BindingMatch:
     midi_in.py::translate()`'s `summary` strings use (`ch{channel + 1}`).
     `number` is the note number for `type == "note_on"`, the controller
     number for `type == "control_change"` -- `MidiEvent.data1` in both
-    cases (see `engine/midi_in.py::translate()`)."""
+    cases (see `engine/midi_in.py::translate()`).
+
+    `device` (Phase 9 Task 1, device-identity bindings, .superpowers/sdd/
+    2026-08-09-midicrt2-phase9-instruments/task-1-brief.md): an OPTIONAL
+    stable device-identity string (`engine/midi_identity.py::
+    IdentityResolver`'s own `usb:<vendor>:<product>[:<serial>]` /
+    `virt:<name>` shapes -- see that module's docstring for the full
+    resolution ladder). When present, `BindingDispatcher._matches` treats
+    `device` as the SOLE port-identity check and does NOT consult
+    `port_pattern` at all -- exact string equality against `MidiEvent.
+    device_id`, never `fnmatch` (a device_id is already a fully-resolved
+    identity, not a glob). `None` (the default, and every binding ever
+    persisted before this task) means "no device constraint" -- matching
+    falls through entirely to the pre-existing `port_pattern` check,
+    completely unchanged, so every bindings.toml written before this task
+    keeps working exactly as it always did.
+
+    `bind.learn` captures (`Engine._capture_learn`, engine/core.py) always
+    populate BOTH fields going forward -- `device` from the capturing
+    event's own `MidiEvent.device_id`, `port_pattern` from the pre-existing
+    `glob_port_pattern(ev.source)` -- so `port_pattern` is never lost, it
+    just becomes an inert, documented fallback the moment `device` is also
+    present: hand-deleting a learned binding's `device` line from
+    `bindings.toml` reverts that one binding to pure pattern-based
+    matching, no code change required. See `docs/phase4-bindings.md`'s
+    `port_pattern` row and docs/phase5-capture.md §7 for the full,
+    updated "identical-device collision" disclosure this supersedes for
+    serial-bearing USB devices (still applies, disclosed, for a
+    serial-less device -- see `IdentityResolver`'s own docstring)."""
     type: str
     number: int
     channel: int | None = None
     port_pattern: str | None = None
+    device: str | None = None
 
 
 @dataclass
@@ -336,6 +385,17 @@ class BindingDispatcher:
             return False
         if m.channel is not None and ev.channel != m.channel:
             return False
+        if m.device is not None:
+            # Phase 9 Task 1 (device-identity bindings): device identity is
+            # the PRIMARY -- and, when present, the ONLY -- port-identity
+            # check. `port_pattern` is deliberately NOT also consulted here
+            # (not an AND, not an OR) -- see `BindingMatch`'s own docstring
+            # for why this is the chosen precedence, and why port_pattern
+            # is still written to disk anyway (an inert, hand-editable
+            # fallback). Exact string equality, never `fnmatch` -- a
+            # `device_id` is already a fully-resolved stable identity, not
+            # a glob pattern.
+            return ev.device_id == m.device
         return m.port_pattern is None or fnmatch.fnmatch(ev.source or "", m.port_pattern)
 
     def _evaluate(self, binding: Binding, ev) -> tuple[str, dict] | None:
@@ -535,8 +595,23 @@ def _parse_match(binding_id: str, raw: Any) -> BindingMatch | None:
         _LOG.warning("bindings: %r has a malformed match.port_pattern (must be a string "
                      "or absent), got %r, skipping", binding_id, port_pattern)
         return None
+    # Phase 9 Task 1 (device-identity bindings): additive field, same
+    # shape/validation as port_pattern right above -- absent (the ONLY
+    # shape any bindings.toml written before this task can have) means
+    # `None`, matching `BindingMatch.device`'s own default and preserving
+    # pure pattern-based matching for every pre-existing binding
+    # untouched. An OLDER version of this loader encountering this key in
+    # a bindings.toml a NEWER daemon wrote simply ignores it (see
+    # `BindingsFile.load`'s own "tolerant of unknown keys at every level"
+    # docstring) -- this addition requires no migration in either
+    # direction.
+    device = raw.get("device")
+    if device is not None and not isinstance(device, str):
+        _LOG.warning("bindings: %r has a malformed match.device (must be a string or "
+                     "absent), got %r, skipping", binding_id, device)
+        return None
     return BindingMatch(type=match_type, number=number, channel=channel,
-                        port_pattern=port_pattern)
+                        port_pattern=port_pattern, device=device)
 
 
 def _parse_binding_entry(binding_id: str, raw: Any) -> Binding | None:
@@ -787,6 +862,8 @@ def _binding_to_raw(binding: Binding) -> str:
         lines.append(f"channel = {binding.match.channel}")
     if binding.match.port_pattern is not None:
         lines.append(f"port_pattern = {_toml_string(binding.match.port_pattern)}")
+    if binding.match.device is not None:
+        lines.append(f"device = {_toml_string(binding.match.device)}")
     return "\n".join(lines) + "\n"
 
 

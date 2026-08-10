@@ -2340,6 +2340,164 @@ async def test_bind_list_port_present_true_when_provider_itself_raises():
     assert result["bindings"][0]["port_present"] is True
 
 
+# -- bind.list device_present (Phase 9 Task 1, device-identity bindings) -----
+# Mirrors the port_present suite right above exactly -- same PULL-seam
+# shape (`set_open_device_ids_provider`), same "unknown means present,
+# only a genuine known-absent reports False" precedent.
+
+async def test_bind_list_device_present_true_with_no_provider_wired():
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, device="usb:1234:5678:SN1"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["device_present"] is True
+
+
+async def test_bind_list_device_present_true_when_device_is_none():
+    """No device identity at all -- trivially "present", same "no
+    constraint to be missing" reasoning as port_pattern=None."""
+    eng = Engine(Config())
+    eng.set_open_device_ids_provider(list)
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(type="note_on", number=60, device=None),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["device_present"] is True
+
+
+async def test_bind_list_device_present_true_when_an_open_device_matches():
+    eng = Engine(Config())
+    eng.set_open_device_ids_provider(lambda: ["usb:1234:5678:SN1", "virt:Midi Through"])
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, device="usb:1234:5678:SN1"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["device_present"] is True
+
+
+async def test_bind_list_device_present_false_when_no_open_device_matches():
+    eng = Engine(Config())
+    eng.set_open_device_ids_provider(lambda: ["virt:Midi Through"])
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, device="usb:1234:5678:SN1"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["device_present"] is False
+
+
+async def test_bind_list_device_present_true_when_provider_itself_raises():
+    def _boom():
+        raise RuntimeError("boom")
+
+    eng = Engine(Config())
+    eng.set_open_device_ids_provider(_boom)
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, device="usb:1234:5678:SN1"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["device_present"] is True
+
+
+async def test_bind_list_serializes_the_device_field_in_match():
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, device="usb:1234:5678:SN1"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    result = await eng.actions.dispatch("bind.list", {})
+    assert result["bindings"][0]["match"]["device"] == "usb:1234:5678:SN1"
+
+
+# -- device identity is PRIMARY over port_pattern at real dispatch time -------
+# (Phase 9 Task 1) -- the actual "differentiate different devices, recognize
+# the same device even in a different port" capability, proven at the full
+# Engine._handle/_dispatch_bindings level (test_bindings.py already proves
+# the pure BindingDispatcher._matches unit in isolation).
+
+async def test_same_device_different_port_still_fires():
+    """The headline capability: a binding learned/bound against one
+    device_id fires for an event carrying an entirely DIFFERENT `source`
+    string (simulating the same physical device replugged into a
+    different USB port) as long as the resolved device_id is unchanged."""
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern="Port A*",
+            device="usb:1234:5678:SN1"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    eng._handle(ev(type="note_on", data1=60, data2=100,
+                   source="Port B:Totally Different Name 30:1",
+                   device_id="usb:1234:5678:SN1"))
+    await eng._dispatch_bindings()
+    assert eng.current_page == "voices"
+
+
+async def test_distinct_serials_do_not_cross_fire():
+    """Two identical-model devices WITH serials must stay disambiguated
+    -- an event from the second device must not fire a binding learned
+    against the first, even though both would match the same
+    port_pattern."""
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern="USB Midi*",
+            device="usb:1234:5678:SN1"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    eng._handle(ev(type="note_on", data1=60, data2=100,
+                   source="USB Midi:USB Midi MIDI 1 21:0",
+                   device_id="usb:1234:5678:SN2"))
+    await eng._dispatch_bindings()
+    assert eng.current_page == "eventlog"   # did NOT fire
+
+
+async def test_no_serial_same_model_still_cross_fires_documented_honestly():
+    """Pinned, not silently fixed (docs/phase4-bindings.md /
+    docs/phase5-capture.md §7): two serial-less units of the same model
+    resolve to the identical device_id, so a binding learned against one
+    STILL fires for the other."""
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, device="usb:1234:5678"),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    eng._handle(ev(type="note_on", data1=60, data2=100, source="second unit, different port",
+                   device_id="usb:1234:5678"))
+    await eng._dispatch_bindings()
+    assert eng.current_page == "voices"   # collided, as documented
+
+
+async def test_migration_pattern_only_binding_still_fires_via_port_pattern():
+    """A binding with `device=None` (every binding persisted before this
+    task) must keep matching purely on port_pattern -- even against a
+    real, fully-upgraded event that itself DOES carry a resolved
+    device_id (the old binding simply never asked for one)."""
+    eng = Engine(Config())
+    eng._bindings_file.add(_binding_module().Binding(
+        id="b1", match=_binding_module().BindingMatch(
+            type="note_on", number=60, port_pattern="Midi Through*", device=None),
+        action="page.next"))
+    eng._binding_dispatcher.set_bindings(eng._bindings_file.bindings)
+    eng._handle(ev(type="note_on", data1=60, data2=100,
+                   source="Midi Through:Midi Through Port-0 14:0",
+                   device_id="virt:Midi Through:Midi Through Port-0"))
+    await eng._dispatch_bindings()
+    assert eng.current_page == "voices"
+
+
 async def test_bind_remove_drops_the_binding_and_persists_atomically(tmp_path):
     p = tmp_path / "bindings.toml"
     _write_trigger_binding(p, action="page.next")
@@ -2732,6 +2890,49 @@ async def test_learn_capture_still_fires_after_the_port_re_enumerates(tmp_path):
     eng.stop()
     await task
     assert eng.current_page == "voices"   # fired despite the renumbered suffix
+
+
+async def test_learn_capture_records_the_capturing_events_device_id(tmp_path):
+    """Phase 9 Task 1 (device-identity bindings): `_capture_learn` must
+    stamp `match.device` from the capturing event's own `MidiEvent.
+    device_id` -- `port_pattern` is STILL populated too (documented
+    fallback, see BindingMatch's own docstring), not replaced."""
+    p = tmp_path / "bindings.toml"
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100,
+                           source="USB Midi:USB Midi MIDI 1 20:0",
+                           device_id="usb:1234:5678:SN1"))
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+
+    b = eng._bindings_file.bindings[0]
+    assert b.match.device == "usb:1234:5678:SN1"
+    assert b.match.port_pattern == "USB Midi:USB Midi MIDI 1*"
+
+    from midicrt.engine.bindings import BindingsFile
+    reloaded = BindingsFile.load(str(p)).bindings[0]
+    assert reloaded.match.device == "usb:1234:5678:SN1"   # persisted, round-trips
+
+
+async def test_learn_capture_with_no_device_id_leaves_match_device_none(tmp_path):
+    """Backward-compat: a capturing event with no resolved identity at
+    all (`device_id=None` -- the default for every MidiEvent built
+    without an identity resolver behind it, matching this whole test
+    suite's overwhelming default) must not invent a device string."""
+    p = tmp_path / "bindings.toml"
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100))   # device_id defaults to None
+    await asyncio.sleep(0.1)
+    eng.stop()
+    await task
+    assert eng._bindings_file.bindings[0].match.device is None
 
 
 async def test_learn_capture_control_change_builds_a_cc_binding(tmp_path):

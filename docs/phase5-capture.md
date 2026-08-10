@@ -387,7 +387,7 @@ binding as port-missing just because nothing ever told the engine what's
 open. Never gates whether a binding actually fires — `BindingDispatcher`
 is completely untouched by this field.
 
-### Disclosed limitation: identical-device collision (the tradeoff this fix accepts)
+### Disclosed limitation: identical-device collision (the tradeoff this fix accepts) — **fixed for serial-bearing devices, Phase 9 Task 1**
 
 Stripping the trailing `<client>:<port>` suffix buys durability across a
 reboot/replug/rtpmidid restart (§7 above) at a real cost: it also strips
@@ -403,26 +403,50 @@ list`'s `port_present: true` does not catch this either: it only checks
 whether SOME open port matches, not whether EXACTLY one does, so a
 collision reads as perfectly healthy.
 
-This is a deliberate, accepted tradeoff, not an oversight: the failure
-mode this task fixed (every learned binding going permanently dead on the
-very next reboot) is both more common and worse than the failure mode
-this section discloses (a binding firing from an unintended second
-identical-model device, which requires two units of the exact same
-hardware connected at once to even be POSSIBLE). Net positive, but it
-must be written down, not silently traded away. If you rely on multiple
-identical-model MIDI interfaces plugged in simultaneously, hand-edit the
-affected binding's `port_pattern` in `bindings.toml` back to an exact
-string (or a pattern that also encodes something ALSA exposes besides the
-name + numbering, if your hardware provides one) — see
-`docs/phase4-bindings.md`'s own port_pattern row for the hand-edit
-convention.
+This was a deliberate, accepted tradeoff, not an oversight, when this
+section was first written: the failure mode this task fixed (every
+learned binding going permanently dead on the very next reboot) was both
+more common and worse than the failure mode disclosed here (a binding
+firing from an unintended second identical-model device, which requires
+two units of the exact same hardware connected at once to even be
+POSSIBLE). It has since been **closed for the common case**: see
+`engine/midi_identity.py` (Phase 9 Task 1, .superpowers/sdd/
+2026-08-09-midicrt2-phase9-instruments/task-1-brief.md) and
+`docs/phase4-bindings.md`'s `device` field row. In short — `bind.learn`
+now ALSO resolves and captures a stable `usb:<vendor>:<product>:<serial>`
+/ `virt:<name>` device identity (`BindingMatch.device`), which becomes the
+SOLE match key whenever present (port_pattern is retained on disk as an
+inert fallback, not consulted). For any USB MIDI interface that exposes a
+hardware serial number, this fully resolves the collision this section
+originally disclosed: two distinct-serial units of the same model no
+longer cross-fire each other's bindings, and a binding correctly follows
+its device across a port move.
+
+**What's still open, disclosed honestly rather than silently traded
+away:** a USB MIDI interface with NO hardware serial number (confirmed to
+exist on real, cheap hardware — this Pi's own attached USB Audio Device
+has no `serial` sysfs attribute at all; see `IdentityResolver`'s own
+module docstring for the live probe) resolves to `usb:<vendor>:<product>`
+with no distinguishing third segment — two simultaneously-connected units
+of that exact serial-less model are STILL indistinguishable and will
+still cross-fire, exactly as before this task. `bind.list`'s
+`device_present: true` has the identical "checks *some* match, not
+*exactly one*" limitation `port_present` always had. If you rely on
+multiple identical-model, serial-less MIDI interfaces plugged in
+simultaneously, hand-edit the affected binding's `port_pattern` (or
+`device`) in `bindings.toml` back to something that disambiguates them —
+see `docs/phase4-bindings.md`'s own `device`/`port_pattern` rows for the
+hand-edit convention. The "Phase-7 follow-up idea" below (a match COUNT,
+not just a boolean) remains unbuilt and would help here too, now for
+`device_present` as much as `port_present`.
 
 **Phase-7 follow-up idea** (not built, flagged for later): `bind.list`
-could additionally report how MANY currently-open ports match a
-binding's `port_pattern` (not just whether ≥1 does), so a human
+could additionally report how MANY currently-open ports/devices match a
+binding's `port_pattern`/`device` (not just whether ≥1 does), so a human
 diagnosing "why is my binding firing from the wrong device" could see a
 count of 2+ and immediately suspect this exact collision, rather than
-`port_present: true` reading as unconditionally reassuring.
+`port_present`/`device_present: true` reading as unconditionally
+reassuring.
 
 ---
 

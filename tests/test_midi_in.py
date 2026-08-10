@@ -52,6 +52,27 @@ def test_translate_non_sysex_events_have_no_sysex_data():
     assert ev.sysex_data is None
 
 
+# -- device identity (Phase 9 Task 1) ----------------------------------------
+
+def test_translate_device_id_defaults_to_none():
+    # Every pre-existing direct translate() call site (this whole test
+    # file included) doesn't pass device_id at all -- must not regress.
+    ev = translate(mido.Message("note_on", channel=0, note=60, velocity=100), "USB", 1.0)
+    assert ev.device_id is None
+
+
+def test_translate_threads_device_id_onto_the_event():
+    ev = translate(mido.Message("note_on", channel=0, note=60, velocity=100), "USB", 1.0,
+                   "usb:1234:5678:SN1")
+    assert ev.device_id == "usb:1234:5678:SN1"
+
+
+def test_translate_threads_device_id_onto_a_sysex_event_too():
+    msg = mido.Message("sysex", data=(0x7D,))
+    ev = translate(msg, "USB", 1.0, "virt:Midi Through:Midi Through Port-0")
+    assert ev.device_id == "virt:Midi Through:Midi Through Port-0"
+
+
 def test_matches():
     assert matches("NetMIDI:Network 128:0", ["NetMIDI*"])
     assert not matches("Midi Through:0", ["NetMIDI*", "USB*"])
@@ -159,6 +180,95 @@ async def test_midi_input_never_opens_its_own_daemons_output_port():
     assert mi.open_ports == ["USB MIDI 20:0"]
     assert "RtMidiOut Client:midicrt2 Output 142:0" not in backend.opened
     mi.stop()
+    mi.stop()
+
+
+class FakeIdentity:
+    """Minimal identity-resolver double for MidiInput wiring tests --
+    real resolution ladder mechanics are covered exhaustively in
+    test_midi_identity.py; these tests only need to prove MidiInput calls
+    `.resolve(name)` at open time, caches the result, and exposes/clears
+    it correctly, not re-derive the ladder itself."""
+
+    def __init__(self, mapping: dict[str, str]):
+        self.mapping = mapping
+        self.calls: list[str] = []
+
+    def resolve(self, name: str) -> str:
+        self.calls.append(name)
+        return self.mapping.get(name, f"virt:{name}")
+
+
+async def test_midi_input_resolves_and_caches_device_id_at_open_time():
+    backend = FakeBackend()
+    backend.names = ["NetMIDI 128:0"]
+    identity = FakeIdentity({"NetMIDI 128:0": "usb:1234:5678:SN1"})
+    queue = asyncio.Queue()
+    mi = MidiInput(["NetMIDI*"], queue, poll_interval=0.05, backend=backend,
+                    identity_resolver=identity)
+    mi.start(asyncio.get_running_loop())
+    for _ in range(50):
+        if mi.open_ports:
+            break
+        await asyncio.sleep(0.05)
+    assert mi.open_device_ids == ["usb:1234:5678:SN1"]
+
+    backend.opened["NetMIDI 128:0"](mido.Message("note_on", note=61, velocity=1))
+    ev = await asyncio.wait_for(queue.get(), timeout=2)
+    assert ev.device_id == "usb:1234:5678:SN1"
+
+    # Cached, not re-resolved per poll cycle.
+    await asyncio.sleep(0.2)
+    assert identity.calls == ["NetMIDI 128:0"]
+    mi.stop()
+
+
+async def test_midi_input_drops_device_id_when_its_port_vanishes():
+    backend = FakeBackend()
+    backend.names = ["NetMIDI 128:0"]
+    identity = FakeIdentity({"NetMIDI 128:0": "usb:1234:5678:SN1"})
+    queue = asyncio.Queue()
+    mi = MidiInput(["NetMIDI*"], queue, poll_interval=0.05, backend=backend,
+                    identity_resolver=identity)
+    mi.start(asyncio.get_running_loop())
+    for _ in range(50):
+        if mi.open_device_ids:
+            break
+        await asyncio.sleep(0.05)
+    assert mi.open_device_ids == ["usb:1234:5678:SN1"]
+
+    backend.names = []
+    for _ in range(50):
+        if not mi.open_ports:
+            break
+        await asyncio.sleep(0.05)
+    assert mi.open_device_ids == []
+
+
+async def test_midi_input_defaults_to_a_real_identity_resolver_when_none_given():
+    # Regression: the daemon's real production wiring never passes
+    # identity_resolver explicitly -- must not crash/require one.
+    mi = MidiInput(["*"], asyncio.Queue())
+    from midicrt.engine.midi_identity import IdentityResolver
+    assert isinstance(mi._identity, IdentityResolver)
+
+
+async def test_midi_input_two_ports_with_the_same_device_id_dedupe_in_open_device_ids():
+    """The documented no-serial collision case, one layer up: MidiInput
+    itself must not report a device_id twice just because two open ports
+    happen to resolve to the identical identity."""
+    backend = FakeBackend()
+    backend.names = ["NetMIDI 128:0", "Midi Through 14:0"]
+    identity = FakeIdentity({"NetMIDI 128:0": "usb:1234:5678",
+                            "Midi Through 14:0": "usb:1234:5678"})
+    queue = asyncio.Queue()
+    mi = MidiInput(["*"], queue, poll_interval=0.05, backend=backend, identity_resolver=identity)
+    mi.start(asyncio.get_running_loop())
+    for _ in range(50):
+        if len(mi.open_ports) == 2:
+            break
+        await asyncio.sleep(0.05)
+    assert mi.open_device_ids == ["usb:1234:5678"]
     mi.stop()
 
 
@@ -328,6 +438,26 @@ async def test_continue_mid_batch_resumes_the_partial_pulse_tally():
     analyzer.handle(ev)
     after = analyzer.view_model()
     assert after["bar"] == 0 and after["beat"] == 2   # advanced by exactly one beat
+
+
+async def test_enqueue_threads_the_cached_device_id_onto_queued_events():
+    """`_enqueue` looks up the port's cached device_id (populated by
+    `_watch()` at open time in production; set directly here since this
+    helper bypasses `_watch()` entirely, matching this section's own
+    "no thread, no backend" unit-test style) and threads it onto BOTH a
+    regular translated event and a synthesized clock_tick."""
+    q = asyncio.Queue()
+    mi = _clockless_input(q)
+    mi._device_ids["USB"] = "usb:1234:5678:SN1"
+
+    mi._enqueue(mido.Message("note_on", channel=0, note=60, velocity=100), "USB")
+    await asyncio.sleep(0)
+    assert q.get_nowait().device_id == "usb:1234:5678:SN1"
+
+    for _ in range(24):
+        mi._enqueue(mido.Message("clock"), "USB")
+    await asyncio.sleep(0)
+    assert q.get_nowait().device_id == "usb:1234:5678:SN1"
 
 
 async def test_translate_still_ignores_clock_when_called_directly():

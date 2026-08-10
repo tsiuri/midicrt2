@@ -250,6 +250,7 @@ type = "note_on"
 number = 60
 channel = 0
 port_pattern = "Midi Through:Midi Through Port-0*"   # suffix-globbed, see §2's port_pattern row
+device = "virt:Midi Through:Midi Through Port-0"     # PRIMARY when present -- see §2's device row
 
 [bindings.cc_swell]
 action = "pianoroll.zoom_level"
@@ -289,29 +290,39 @@ de-duplicate.
 | `type` | string | *(required)* | `"note_on"` or `"control_change"` — the only two MIDI message shapes a binding can watch (mirrors what `bind.learn` can ever capture, §3). |
 | `number` | int, 0–127 | *(required)* | Note number (`type = "note_on"`) or controller number (`type = "control_change"`) — `MidiEvent.data1` either way. |
 | `channel` | int, 0–15, or absent | `None` (any channel) | **0-indexed**, matching `MidiEvent.channel` directly — NOT the human 1-indexed display the event-log's `summary` strings use. Absent means "any channel." |
-| `port_pattern` | string, or absent | `None` (any port) | `fnmatch`-style glob matched against the MIDI event's source port name (e.g. `"Midi Through*"` matches any port whose name starts with that string). **Updated, Phase 5 Task 3 (docs/phase5-capture.md):** a `bind.learn` capture no longer writes the exact, verbatim source string — it strips the trailing volatile ALSA `<client>:<port>` numbering suffix and appends `*` (`engine/bindings.py::glob_port_pattern`), so a learned binding survives that suffix renumbering across a reboot/replug/rtpmidid session restart instead of silently going dead. See docs/phase5-capture.md's "Learned-binding port durability" section for the full rationale and the exact transform. |
+| `port_pattern` | string, or absent | `None` (any port) | `fnmatch`-style glob matched against the MIDI event's source port name (e.g. `"Midi Through*"` matches any port whose name starts with that string). **Updated, Phase 5 Task 3 (docs/phase5-capture.md):** a `bind.learn` capture no longer writes the exact, verbatim source string — it strips the trailing volatile ALSA `<client>:<port>` numbering suffix and appends `*` (`engine/bindings.py::glob_port_pattern`), so a learned binding survives that suffix renumbering across a reboot/replug/rtpmidid session restart instead of silently going dead. See docs/phase5-capture.md's "Learned-binding port durability" section for the full rationale and the exact transform. **Superseded as the primary match key, Phase 9 Task 1 (docs/phase5-capture.md §7):** ignored entirely once `device` (below) is also present on the same binding — see that row. |
+| `device` | string, or absent | `None` (no device constraint) | **Added, Phase 9 Task 1** (device-identity bindings). A stable device-identity string from `engine/midi_identity.py::IdentityResolver`'s resolution ladder — `usb:<vendor>:<product>:<serial>` for a USB MIDI interface that exposes a serial number, `usb:<vendor>:<product>` (no serial — see the collision note below) or `virt:<client:port name, suffix-stripped>` otherwise (kernel virtual ports like `Midi Through`, rtpmidid's network-export ports, or any non-USB kernel card). **When present, `device` is the SOLE port-identity check — `port_pattern` is not also consulted (not ANDed, not ORed).** `bind.learn` always writes BOTH fields going forward: `device` from the capturing event's resolved identity, `port_pattern` from the pre-existing suffix-globbing — so `port_pattern` survives on disk as an inert, hand-editable fallback (delete the `device` line to revert one binding to pure pattern matching). A bindings.toml with no `device` key at all (every file written before this task) is unaffected — matching falls straight through to `port_pattern`, exactly as it always has. |
 
-**Disclosed limitation: identical-device collision.** Stripping the
-`<client>:<port>` suffix buys reboot/replug durability at a real cost —
-it also strips the ONE thing that could distinguish two DIFFERENT
-physical ports ALSA happens to enumerate under the SAME name, most
-commonly two simultaneously-connected units of the same USB MIDI
-interface model. A binding learned against "device A" globs to a pattern
-that ALSO matches "device B" — a control on the second, physically
-distinct unit will silently ALSO fire that binding, with no error. `bind
-list`'s `port_present: true` does not catch this either (it only checks
-whether *some* open port matches, not whether *exactly one* does — a
-collision reads as perfectly healthy). This is a deliberate, accepted
-tradeoff, not an oversight — the failure mode this task fixed (every
-learned binding going permanently dead on the very next reboot) is both
-more common and worse — but it's a real one if you run multiple
-identical-model MIDI interfaces at once: hand-edit the affected binding's
-`port_pattern` back to an exact string in that case. **Phase-7 follow-up
-idea** (not built): `bind list` could report how many currently-open
-ports match a binding's pattern (not just whether ≥1 does), so a count of
-2+ immediately flags this exact collision instead of `port_present: true`
-reading as unconditionally reassuring. Full writeup:
-docs/phase5-capture.md §7.
+**Disclosed limitation: identical-device collision — fixed for
+serial-bearing devices, Phase 9 Task 1.** Stripping the `<client>:<port>`
+suffix (Phase 5 Task 3) bought reboot/replug durability for `port_pattern`
+at a real cost: it also stripped the ONE thing that could distinguish two
+DIFFERENT physical ports ALSA happens to enumerate under the SAME name,
+most commonly two simultaneously-connected units of the same USB MIDI
+interface model. **Phase 9 Task 1's `device` field (above) closes this
+gap for any USB MIDI interface that exposes a hardware serial number** —
+`bind.learn` now captures the device's own `usb:<vendor>:<product>:<serial>`
+identity, which is unique per physical unit regardless of which USB port
+it's plugged into, so a binding fires for the correct device even after a
+replug, and two distinct-serial units of the same model no longer
+cross-fire each other's bindings.
+
+**The gap that remains, disclosed, not silently traded away:** a USB MIDI
+interface that does NOT expose a serial number (`IdentityResolver`
+resolves it to `usb:<vendor>:<product>` with no third segment — a real,
+live-probed case: this Pi's own attached USB Audio Device has no `serial`
+sysfs attribute at all) is still indistinguishable from a second unit of
+the exact same serial-less model — both resolve to the identical
+`device_id`, so a binding still cross-fires between them, exactly as it
+did under the old pattern-only scheme. `bind list`'s `device_present:
+true` does not catch this either (same "checks *some* match, not *exactly
+one*" limitation `port_present` always had). If you run multiple
+identical-model, serial-less MIDI interfaces at once, hand-edit the
+affected binding's `port_pattern` back to an exact string (or `device` to
+something else entirely) — see docs/phase5-capture.md §7 for the full,
+updated writeup and `engine/midi_identity.py`'s own module docstring for
+exactly why a serial can't be invented where the hardware doesn't provide
+one.
 
 ### The fill sentinel (`args` ↔ TOML translation)
 
@@ -458,6 +469,13 @@ midicrt bind cancel
   fires; `BindingDispatcher._matches` is untouched) for exactly the
   "double check ... `port_pattern` ... against the real incoming event"
   troubleshooting step §6 already tells a human to do by eyeball.
+  **Added, Phase 9 Task 1:** `device: str | None` (the binding's own
+  `match.device`, or `null`) and `device_present: bool` -- the exact same
+  "any open port resolve to this?" check, against `MidiInput.
+  open_device_ids` this time (`Engine.set_open_device_ids_provider`).
+  Same `True`-means-"unknown-or-unconstrained" precedent as
+  `port_present`; `False` only when a device identity is genuinely known
+  and genuinely not currently open.
 - **`bind remove <id>`**: drops a binding by id (from `bind list`'s own
   output), persists, and disarms the live dispatcher immediately — a
   removed binding cannot fire again even for a MIDI event already in

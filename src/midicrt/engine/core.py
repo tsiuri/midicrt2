@@ -226,6 +226,20 @@ class MidiEvent:
     # engine/sysex.py's module docstring for the frame format this feeds
     # (`Engine._handle_sysex`'s own parse/dispatch).
     sysex_data: tuple[int, ...] | None = None
+    # Phase 9 Task 1 (device-identity bindings, .superpowers/sdd/
+    # 2026-08-09-midicrt2-phase9-instruments/task-1-brief.md): the stable
+    # device identity `engine/midi_identity.py::IdentityResolver` resolved
+    # for `source` at the moment its port was OPENED (see `MidiInput`'s
+    # own docstring for why this is a cache lookup, not a fresh resolve
+    # per message) -- `usb:<vendor>:<product>[:<serial>]` or
+    # `virt:<name>`. `None` for every MidiEvent built by a test/tool that
+    # constructs one directly without threading a resolved identity
+    # through (the overwhelming majority of this test suite, and any
+    # `--no-midi` engine) -- `BindingDispatcher._matches` only ever
+    # consults this when a binding's own `BindingMatch.device` is itself
+    # non-None, so a bare `None` here never falsely fails to match an
+    # old, device-less binding.
+    device_id: str | None = None
 
 
 @dataclass
@@ -651,6 +665,10 @@ class Engine:
         # without the engine owning MIDI I/O itself. See
         # `set_open_ports_provider`'s own docstring for the full contract.
         self._open_ports_provider: Callable[[], list[str]] | None = None
+        # Phase 9 Task 1 (device-identity bindings): sibling of
+        # `_open_ports_provider` right above -- see `set_open_device_ids_
+        # provider`'s own docstring for the full contract.
+        self._open_device_ids_provider: Callable[[], list[str]] | None = None
         # Phase-3 task 9: seeded to "now", NOT epoch 0 -- see the module
         # docstring's "Behaviors + activity tracking" section for why a
         # freshly booted engine must not look infinitely idle on its very
@@ -1111,7 +1129,8 @@ class Engine:
         return {
             "id": b.id,
             "match": {"type": b.match.type, "number": b.match.number,
-                     "channel": b.match.channel, "port_pattern": b.match.port_pattern},
+                     "channel": b.match.channel, "port_pattern": b.match.port_pattern,
+                     "device": b.match.device},
             "action": b.action,
             "args": dict(b.args),
             "mode": b.mode,
@@ -1120,6 +1139,7 @@ class Engine:
             "valid": error is None,
             "error": error,
             "port_present": self._port_present(b.match.port_pattern),
+            "device_present": self._device_present(b.match.device),
         }
 
     def _port_present(self, port_pattern: str | None) -> bool:
@@ -1152,6 +1172,29 @@ class Engine:
         except Exception:  # noqa: BLE001 -- diagnostic-only; never let this crash bind.list
             return True
         return any(fnmatch.fnmatch(p, port_pattern) for p in open_ports)
+
+    def _device_present(self, device: str | None) -> bool:
+        """Phase 9 Task 1 (device-identity bindings) sibling of
+        `_port_present` right above -- same "pure diagnostic sugar, never
+        gates real dispatch" contract, applied to `BindingMatch.device`
+        instead of `port_pattern`: is `device` currently resolved by ANY
+        open MIDI input port? Exact string containment (`in`), never
+        `fnmatch` -- a `device_id` is already a fully-resolved identity,
+        not a glob. `device is None` ("this binding has no device
+        identity at all -- either pre-this-task, or a virtual/
+        unidentifiable capture that fell back to pattern-only") is
+        trivially always `True`, same "no constraint to be missing"
+        reasoning as `_port_present`'s own `port_pattern is None` case.
+        No provider wired, or a provider call that itself raises
+        (defensive only), also reports `True` -- "unknown" is never
+        reported as "absent"."""
+        if device is None or self._open_device_ids_provider is None:
+            return True
+        try:
+            open_device_ids = self._open_device_ids_provider()
+        except Exception:  # noqa: BLE001 -- diagnostic-only; never let this crash bind.list
+            return True
+        return device in open_device_ids
 
     def _bind_remove(self, id: str) -> dict:
         """`bind.remove` action handler: drops the binding by id, persists
@@ -1539,9 +1582,19 @@ class Engine:
         payload discloses whatever was replaced."""
         arm = self._learn_armed
         self._learn_armed = None
+        # Phase 9 Task 1 (device-identity bindings): capture BOTH the
+        # stable device identity (`ev.device_id`, resolved by `MidiInput`
+        # at port-open time -- `None` for a capturing event that never
+        # went through a real identity resolver, e.g. most of this test
+        # suite) AND the pre-existing globbed port_pattern -- see
+        # `BindingMatch`'s own docstring for why keeping both, rather than
+        # dropping port_pattern once device is known, is the deliberate
+        # choice (device is primary at match time; port_pattern survives
+        # as an inert, hand-editable fallback).
         match = bindings_mod.BindingMatch(
             type=ev.type, number=ev.data1, channel=ev.channel,
-            port_pattern=bindings_mod.glob_port_pattern(ev.source))
+            port_pattern=bindings_mod.glob_port_pattern(ev.source),
+            device=ev.device_id)
         replaced = self._replace_bindings_with_exact_match(match)
         binding = bindings_mod.Binding(
             id=self._new_binding_id(), match=match, action=arm.action,
@@ -1972,6 +2025,20 @@ class Engine:
         `_topic_refcount_provider`'s own "unwired means preserve prior
         behavior, don't guess a stricter answer" precedent."""
         self._open_ports_provider = provider
+
+    def set_open_device_ids_provider(self, provider: Callable[[], list[str]]) -> None:
+        """Phase 9 Task 1 (device-identity bindings) sibling of
+        `set_open_ports_provider` right above -- identical PULL-seam
+        shape and identical rationale, applied to `MidiInput.
+        open_device_ids` (the DEDUPED set of currently-resolved
+        `device_id` strings across every open port) instead of raw port
+        names. `daemon.py::build()` wires this once, right alongside the
+        pre-existing `set_open_ports_provider` call.
+        `_bind_list`/`_serialize_binding` are the only consumers,
+        computing each binding's `device_present` field. No provider
+        wired means "unknown", reported `True` -- same "don't guess a
+        stricter answer than the truth" precedent as `_port_present`."""
+        self._open_device_ids_provider = provider
 
     def snapshot_now(self, topic: str) -> dict | None:
         if topic.startswith("page."):

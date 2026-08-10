@@ -38,6 +38,11 @@ def build(cfg, socket_path: str, use_midi: bool, config_path: str | None = None)
         # not a value captured here) so a port vanishing/appearing between
         # `bind.list` calls is always reflected on the next one.
         engine.set_open_ports_provider(lambda: midi.open_ports)
+        # Phase 9 Task 1 (device-identity bindings): sibling wiring to the
+        # line right above -- see `Engine.set_open_device_ids_provider`'s
+        # own docstring for the full contract. Reads `midi.open_device_ids`
+        # LIVE on every call, same "not a snapshot" property as open_ports.
+        engine.set_open_device_ids_provider(lambda: midi.open_device_ids)
     return engine, server, midi
 
 
