@@ -1865,15 +1865,22 @@ class Engine:
         CURRENT roster order (`self._page_order()`, the same order `page.
         next`/`.prev` walk). Deliberately DIFFERENT failure behavior from
         `_page_goto` above: a `position` outside `[1, len(order)]` is an
-        ORDINARY, expected situation (`DEFAULT_KEYMAP`, engine/keymap.py,
-        always defines all 20 roster-jump keys regardless of how many
-        pages this build actually has -- pressing "0" on an 8-page roster
-        must not spam a client-visible error on every keypress) -- logged
-        once per occurrence and a plain no-op (`{}`, no `page_changed`/
-        `keymap_changed` emitted), NOT an `ActionError`. A typo'd `page.
-        goto` NAME, by contrast, is a genuine user mistake worth failing
-        loudly on -- that distinction is the whole reason this is a
-        separate action rather than a thin wrapper around `_page_goto`."""
+        ORDINARY, expected situation -- logged once per occurrence and a
+        plain no-op (`{}`, no `page_changed`/`keymap_changed` emitted), NOT
+        an `ActionError`. A typo'd `page.goto` NAME, by contrast, is a
+        genuine user mistake worth failing loudly on -- that distinction is
+        the whole reason this is a separate action rather than a thin
+        wrapper around `_page_goto`.
+
+        STALE-AS-OF Phase 9 Task 0 update: `DEFAULT_KEYMAP` (engine/
+        keymap.py) no longer binds any digit key to `page.jump` at all --
+        its digit/shifted-digit bindings are now `page.goto {name: ...}`
+        entries baked from `analyzers.marquee.PAGE_IDS` (see that module's
+        own docstring). `page.jump` itself, and this out-of-range no-op,
+        remain fully registered/dispatchable -- they matter now only for a
+        HAND-WRITTEN `keymap.toml` that explicitly binds a key to
+        `page.jump {position: N}` for roster-relative behavior no fixed-ID
+        scheme can express (docs/phase4-bindings.md §1b)."""
         order = self._page_order()
         if not 1 <= position <= len(order):
             _LOG.info("page.jump: position %d out of range (roster has %d pages) -- no-op",
