@@ -272,6 +272,106 @@ async def test_midi_input_two_ports_with_the_same_device_id_dedupe_in_open_devic
     mi.stop()
 
 
+# -- resolution retry-on-poll (Important review fix, Phase 9 Task 1 --------
+# follow-up): a transient IdentityResolver failure at open time used to
+# strand a port with no device_id for its whole open lifetime -- _watch()
+# now retries any open-but-unresolved name on every subsequent poll.
+
+class FlakyIdentity:
+    """Fails the first `fail_times` calls, then succeeds -- models a
+    transient aconnect/proc/sysfs hiccup that clears up on its own."""
+
+    def __init__(self, fail_times: int, value: str):
+        self.fail_times = fail_times
+        self.value = value
+        self.attempts = 0
+
+    def resolve(self, name: str) -> str:
+        self.attempts += 1
+        if self.attempts <= self.fail_times:
+            raise RuntimeError("transient device-identity resolution failure")
+        return self.value
+
+
+class AlwaysFailIdentity:
+    def resolve(self, name: str) -> str:
+        raise RuntimeError("permanent failure")
+
+
+async def test_midi_input_retries_a_failed_identity_resolution_on_subsequent_polls():
+    backend = FakeBackend()
+    backend.names = ["NetMIDI 128:0"]
+    identity = FlakyIdentity(fail_times=2, value="usb:1234:5678:SN1")
+    queue = asyncio.Queue()
+    mi = MidiInput(["NetMIDI*"], queue, poll_interval=0.03, backend=backend,
+                    identity_resolver=identity)
+    mi.start(asyncio.get_running_loop())
+    for _ in range(100):
+        if mi.open_device_ids:
+            break
+        await asyncio.sleep(0.03)
+    assert mi.open_device_ids == ["usb:1234:5678:SN1"]
+    assert identity.attempts >= 3   # 1 at open time + at least 2 retries before success
+    mi.stop()
+
+
+async def test_midi_input_events_carry_the_device_id_once_a_retry_succeeds():
+    """Not just open_device_ids -- newly queued MidiEvents for that port
+    must also start carrying the identity once a retry resolves it."""
+    backend = FakeBackend()
+    backend.names = ["NetMIDI 128:0"]
+    identity = FlakyIdentity(fail_times=1, value="usb:1234:5678:SN1")
+    queue = asyncio.Queue()
+    mi = MidiInput(["NetMIDI*"], queue, poll_interval=0.03, backend=backend,
+                    identity_resolver=identity)
+    mi.start(asyncio.get_running_loop())
+    for _ in range(100):
+        if mi.open_device_ids:
+            break
+        await asyncio.sleep(0.03)
+    backend.opened["NetMIDI 128:0"](mido.Message("note_on", note=61, velocity=1))
+    got = await asyncio.wait_for(queue.get(), timeout=2)
+    assert got.device_id == "usb:1234:5678:SN1"
+    mi.stop()
+
+
+async def test_midi_input_caps_the_unresolved_identity_warning_log_at_one_per_name(caplog):
+    backend = FakeBackend()
+    backend.names = ["NetMIDI 128:0"]
+    queue = asyncio.Queue()
+    mi = MidiInput(["NetMIDI*"], queue, poll_interval=0.02, backend=backend,
+                    identity_resolver=AlwaysFailIdentity())
+    with caplog.at_level("WARNING"):
+        mi.start(asyncio.get_running_loop())
+        await asyncio.sleep(0.3)   # several poll cycles -- would keep failing forever
+        mi.stop()
+    warnings = [r for r in caplog.records if "device-identity" in r.message]
+    assert len(warnings) == 1   # capped, not one per poll cycle
+
+
+async def test_midi_input_retry_warning_cap_resets_after_a_port_vanishes_and_reopens():
+    """The warned-name set is cleared on vanish (`_identity_retry_warned.
+    discard`) -- a REPLUGGED port (same name, brand new failure run) must
+    be able to warn again, not stay silently suppressed forever from a
+    previous, unrelated open."""
+    backend = FakeBackend()
+    backend.names = ["NetMIDI 128:0"]
+    queue = asyncio.Queue()
+    mi = MidiInput(["NetMIDI*"], queue, poll_interval=0.02, backend=backend,
+                    identity_resolver=AlwaysFailIdentity())
+    mi.start(asyncio.get_running_loop())
+    await asyncio.sleep(0.1)
+    assert "NetMIDI 128:0" in mi._identity_retry_warned
+
+    backend.names = []
+    for _ in range(50):
+        if not mi.open_ports:
+            break
+        await asyncio.sleep(0.02)
+    assert "NetMIDI 128:0" not in mi._identity_retry_warned   # cleared on vanish
+    mi.stop()
+
+
 # -- clock aggregation (phase-3 task 3) --------------------------------------
 #
 # `_enqueue` is called directly here (no `start()`/`_watch()` thread, no

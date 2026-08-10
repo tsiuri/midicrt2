@@ -291,7 +291,7 @@ de-duplicate.
 | `number` | int, 0–127 | *(required)* | Note number (`type = "note_on"`) or controller number (`type = "control_change"`) — `MidiEvent.data1` either way. |
 | `channel` | int, 0–15, or absent | `None` (any channel) | **0-indexed**, matching `MidiEvent.channel` directly — NOT the human 1-indexed display the event-log's `summary` strings use. Absent means "any channel." |
 | `port_pattern` | string, or absent | `None` (any port) | `fnmatch`-style glob matched against the MIDI event's source port name (e.g. `"Midi Through*"` matches any port whose name starts with that string). **Updated, Phase 5 Task 3 (docs/phase5-capture.md):** a `bind.learn` capture no longer writes the exact, verbatim source string — it strips the trailing volatile ALSA `<client>:<port>` numbering suffix and appends `*` (`engine/bindings.py::glob_port_pattern`), so a learned binding survives that suffix renumbering across a reboot/replug/rtpmidid session restart instead of silently going dead. See docs/phase5-capture.md's "Learned-binding port durability" section for the full rationale and the exact transform. **Superseded as the primary match key, Phase 9 Task 1 (docs/phase5-capture.md §7):** ignored entirely once `device` (below) is also present on the same binding — see that row. |
-| `device` | string, or absent | `None` (no device constraint) | **Added, Phase 9 Task 1** (device-identity bindings). A stable device-identity string from `engine/midi_identity.py::IdentityResolver`'s resolution ladder — `usb:<vendor>:<product>:<serial>` for a USB MIDI interface that exposes a serial number, `usb:<vendor>:<product>` (no serial — see the collision note below) or `virt:<client:port name, suffix-stripped>` otherwise (kernel virtual ports like `Midi Through`, rtpmidid's network-export ports, or any non-USB kernel card). **When present, `device` is the SOLE port-identity check — `port_pattern` is not also consulted (not ANDed, not ORed).** `bind.learn` always writes BOTH fields going forward: `device` from the capturing event's resolved identity, `port_pattern` from the pre-existing suffix-globbing — so `port_pattern` survives on disk as an inert, hand-editable fallback (delete the `device` line to revert one binding to pure pattern matching). A bindings.toml with no `device` key at all (every file written before this task) is unaffected — matching falls straight through to `port_pattern`, exactly as it always has. |
+| `device` | string, or absent | `None` (no device constraint) | **Added, Phase 9 Task 1** (device-identity bindings). A stable device-identity string from `engine/midi_identity.py::IdentityResolver`'s resolution ladder — `usb:<vendor>:<product>:<serial>` for a USB MIDI interface that exposes a serial number, `usb:<vendor>:<product>` (no serial — see the collision note below) or `virt:<client:port name, suffix-stripped>` otherwise (kernel virtual ports like `Midi Through`, rtpmidid's network-export ports, or any non-USB kernel card). **When present AND the incoming event itself carries a resolved identity, `device` is the SOLE port-identity check — `port_pattern` is not also consulted (not ANDed, not ORed).** `bind.learn` always writes BOTH fields going forward: `device` from the capturing event's resolved identity, `port_pattern` from the pre-existing suffix-globbing — so `port_pattern` survives on disk as an inert, hand-editable fallback (delete the `device` line to revert one binding to pure pattern matching) AND as a **rescue**: if the incoming event's own port never resolved an identity (a transient outage — see "Resolution retry and the pattern rescue" below), matching falls back to `port_pattern` for that one event. A bindings.toml with no `device` key at all (every file written before this task) is unaffected — matching falls straight through to `port_pattern`, exactly as it always has. |
 
 **Disclosed limitation: identical-device collision — fixed for
 serial-bearing devices, Phase 9 Task 1.** Stripping the `<client>:<port>`
@@ -323,6 +323,51 @@ something else entirely) — see docs/phase5-capture.md §7 for the full,
 updated writeup and `engine/midi_identity.py`'s own module docstring for
 exactly why a serial can't be invented where the hardware doesn't provide
 one.
+
+### Relearn dedup across the device-identity upgrade (review Critical fix)
+
+Replace-on-relearn (§4 below) used to compare a fresh capture's `match`
+against every persisted binding with plain `==`. The moment `BindingMatch`
+grew `device`, that broke silently for the single most common case: relearning
+any binding that predates device-identity capture (`device: null`, its
+`type`/`number`/`channel`/`port_pattern` otherwise unchanged) against a
+fresh capture that NOW resolves a real device — the two `match`es were no
+longer `==` (one has `device: null`, the other a real string), so the old
+binding was never removed, both stayed on disk, and both fired forever
+going forward. Fixed by `engine/bindings.py::should_replace_on_relearn`:
+same base requirement (`type`/`number`/`channel` must match — a relearn
+can only ever mean "replace whatever's on THIS control"), then replace
+when either the full match is `==` (unchanged rule, still correct for two
+device-stamped or two device-less captures) **or** the existing binding's
+`device` is `None` and its `port_pattern` equals the fresh one exactly —
+the "pre-device binding, same durable port_pattern" migration case. Still
+never touches a wildcard/overlapping-but-not-identical `port_pattern`
+(unchanged, string equality only). Deliberately **not** symmetric: a
+fresh capture that itself failed to resolve identity does not replace an
+already device-stamped existing binding — see the retry/rescue section
+right below for why that gap stays narrow in practice.
+
+### Resolution retry and the pattern rescue (review Important fix)
+
+Identity resolution is real I/O (`aconnect -l`, `/proc`, `/sys`) done
+once per port at open time — a transient hiccup used to leave that port
+permanently `device_id`-less for its whole open lifetime, silently going
+dead for every device-bound binding on it (no error, no rescue). Two
+fixes, both needed:
+
+- **Retry** (`engine/midi_in.py::MidiInput._watch`): any port that's
+  still open but missing a resolved `device_id` is retried on every
+  subsequent poll (capped failure log — one warning per name, not one per
+  `poll_interval` forever), not just once at open time.
+- **Rescue** (`engine/bindings.py::BindingDispatcher._matches`): while a
+  port's identity remains unresolved, an incoming event from it carries
+  `device_id: None` — a device-bound binding falls back to its stored
+  `port_pattern` for that one event rather than going dead. The moment
+  identity resolves (retry succeeds, or the very next event on an
+  already-resolved port), `device` resumes being the sole, authoritative
+  check. A device_id that resolves to something DIFFERENT from the
+  binding's `device` is never rescued — only a genuinely unresolved
+  (`None`) event identity falls back to pattern matching.
 
 ### The fill sentinel (`args` ↔ TOML translation)
 

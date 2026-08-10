@@ -224,3 +224,19 @@ def test_aconnect_client_with_no_card_annotation_falls_back_to_virt(bad_line):
     r = _fake_resolver(sysfs={}, aconnect=bad_line)
     assert (r.resolve("USB Midi:USB Midi MIDI 1 20:0")
             == "virt:USB Midi:USB Midi MIDI 1")
+
+
+# -- Minor review fix: an apostrophe embedded in a real client name --------
+
+def test_aconnect_client_name_containing_an_apostrophe_still_resolves_the_card():
+    """`aconnect -l` never escapes an apostrophe in a client's own name
+    (verbatim `'%s'` quoting) -- a device genuinely named e.g. "Roland's
+    SC-55" would break a naive `'[^']*'` character-class regex (stops at
+    the FIRST `'`, landing mid-name with no `[type=...` right after, so
+    the whole line fails to match and a real card-backed device silently
+    falls back to virt: instead). The lazy `'.*?'` pattern must expand
+    past the embedded apostrophe to reach the real closing one."""
+    transcript = "client 24: 'Roland's SC-55' [type=kernel,card=2]\n    0 'SC-55 MIDI 1'\n"
+    sysfs = _usb_sysfs(2, "0582", "0007", "/sys/devices/.../1-1.5", serial="SN99")
+    r = _fake_resolver(sysfs, aconnect=transcript)
+    assert r.resolve("Roland's SC-55:SC-55 MIDI 1 24:0") == "usb:0582:0007:SN99"

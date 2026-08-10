@@ -1527,20 +1527,31 @@ class Engine:
         control you already bound something to), so it's a correctness
         bug, not a cosmetic one.
 
-        Removes every currently-persisted binding whose `match` is
-        EXACTLY equal to `match` (`BindingMatch` is a plain dataclass, so
-        `==` already compares type/number/channel/port_pattern all
-        together) -- deliberately EXACT equality, not `BindingDispatcher.
-        _matches`'s own `fnmatch`-on-`port_pattern` semantics: a
-        pre-existing WILDCARD binding (e.g. `port_pattern="Midi
-        Through*"`) that would ALSO match the same physical event going
-        forward is left untouched here. This is a disclosed, honest
-        simplification -- exact-match relearn is unambiguous (there is
-        only ever at most one prior binding it could mean "this one,
-        specifically"), whereas removing every WILDCARD binding that
-        happens to overlap would be a much more aggressive, surprising
-        operation with no single obvious "the one being replaced" target
-        (see test_engine_core.py::
+        Removes every currently-persisted binding `bindings_mod.
+        should_replace_on_relearn(b.match, match)` says should be replaced
+        -- see that function's own docstring for the full predicate (base
+        `type`/`number`/`channel` identity always required, THEN either
+        full `BindingMatch` equality or the device-aware "pre-device
+        binding, same durable port_pattern" migration case).
+
+        Phase 9 Task 1 follow-up (review Critical, live-reproduced): this
+        used to be plain `b.match == match` -- correct before `BindingMatch`
+        grew a `device` field, but broken the moment it did: a fresh
+        capture now almost always carries a real, non-`None` `device`,
+        which plain dataclass `==` against an EXISTING pre-device binding
+        (`device=None`) would never equal, however identical the rest of
+        `match` is. Relearning any binding that predates device-identity
+        capture silently left BOTH the old and the freshly captured
+        binding on disk, both firing forever -- exactly the
+        accumulating-bindings bug this method exists to prevent, just
+        reopened by a different field. `should_replace_on_relearn` is the
+        fix, kept as an independently-testable pure function (bindings.py)
+        rather than inlined here.
+
+        Still never touches a WILDCARD/overlapping-but-not-identical
+        `port_pattern` -- STRING equality, not `fnmatch` overlap, unchanged
+        from the original Phase-4 disclosed simplification (see
+        test_engine_core.py::
         test_learn_capture_does_not_remove_an_overlapping_wildcard_port_binding).
 
         Returns the removed bindings (for the `learn_bound` event's own
@@ -1550,7 +1561,8 @@ class Engine:
         directly from "old binding present" to "new binding present" in a
         single atomic write, never through an intermediate state with
         neither on disk."""
-        to_remove = [b for b in self._bindings_file.bindings if b.match == match]
+        to_remove = [b for b in self._bindings_file.bindings
+                    if bindings_mod.should_replace_on_relearn(b.match, match)]
         for b in to_remove:
             self._bindings_file.remove(b.id)
         return to_remove

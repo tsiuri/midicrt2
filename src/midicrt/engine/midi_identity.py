@@ -144,8 +144,22 @@ _ALSA_CLIENT_PORT_RE = re.compile(r"\s(\d+):(\d+)$")
 #   client 24: 'USB Midi' [type=kernel,card=2]
 #   client 14: 'Midi Through' [type=kernel]              <- no card: virtual
 #   client 130: 'pivisualizer' [type=user,pid=339032]    <- no card: user/rtpmidid
+#
+# Minor review fix: `aconnect` never escapes an apostrophe embedded in a
+# client's own name (its `printf`-style quoting is just `'%s'`, verbatim)
+# -- a device genuinely named e.g. "Roland's SC-55" would break the
+# ORIGINAL `'[^']*'` character-class version of this pattern (it stops at
+# the FIRST `'`, landing mid-name with no `[type=...` immediately after,
+# so the whole line simply fails to match and that client's card, if any,
+# is silently never found -- falls all the way back to `virt:`, wrong for
+# a real card-backed device). The lazy `'.*?'` below instead expands past
+# an embedded apostrophe as needed to reach the actual `' [type=` that
+# closes the name -- `.` does not match `\n` here (no `re.DOTALL`), so
+# this still can't run past a single line even though it's not anchored
+# on `'` alone. See test_aconnect_client_name_containing_an_apostrophe_
+# still_resolves_the_card in test_midi_identity.py.
 _ACONNECT_CLIENT_RE = re.compile(
-    r"^client (\d+): '[^']*' \[type=\w+(?:,card=(\d+))?", re.MULTILINE)
+    r"^client (\d+): '.*?' \[type=\w+(?:,card=(\d+))?", re.MULTILINE)
 
 _USBID_RE = re.compile(r"^([0-9a-fA-F]{4}):([0-9a-fA-F]{4})\s*$")
 

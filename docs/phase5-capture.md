@@ -448,6 +448,24 @@ count of 2+ and immediately suspect this exact collision, rather than
 `port_present`/`device_present: true` reading as unconditionally
 reassuring.
 
+### Two review follow-up fixes, same task (Critical + Important, both live-reproduced)
+
+- **Relearn no longer duplicates across the device-identity upgrade.**
+  Replace-on-relearn's plain `match ==` comparison broke silently the
+  moment `device` joined `BindingMatch` — relearning ANY pre-device
+  binding (every binding persisted before this task) left both the old
+  and the freshly device-stamped capture on disk, both firing forever.
+  Fixed by `engine/bindings.py::should_replace_on_relearn` — full writeup
+  and the exact predicate: `docs/phase4-bindings.md`'s "Relearn dedup
+  across the device-identity upgrade" section.
+- **A transient identity-resolution failure no longer strands a
+  device-bound binding dead.** `MidiInput` retries an unresolved port's
+  identity on every poll instead of only once at open time, and
+  `BindingDispatcher._matches` falls back to `port_pattern` for any event
+  whose OWN port hasn't resolved an identity yet — full writeup:
+  `docs/phase4-bindings.md`'s "Resolution retry and the pattern rescue"
+  section.
+
 ---
 
 ## 8. Live smoke evidence (on-Pi, real production `midicrtd`, real hardware)

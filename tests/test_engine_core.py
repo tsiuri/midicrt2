@@ -3143,6 +3143,64 @@ async def test_learn_capture_relearning_the_same_exact_match_replaces_the_old_bi
     assert eng.current_page == "eventlog"
 
 
+async def test_learn_capture_relearning_a_pre_device_binding_replaces_it_not_duplicates(tmp_path):
+    """THE Critical review reproduction (live-reproduced): before the
+    `should_replace_on_relearn` fix, `BindingMatch.device` joining plain
+    dataclass `==` meant a fresh, device-stamped relearn capture could
+    NEVER equal an existing device=None binding on the identical physical
+    control -- both stayed on disk, both firing, silently accumulating
+    forever (exactly the bug class the ORIGINAL Phase-4 replace-on-relearn
+    fix eliminated, reopened by a different field). Proof mirrors
+    test_learn_capture_relearning_the_same_exact_match_replaces_the_old_
+    binding right above almost exactly -- the only difference is the
+    FIRST capture's event carries no device_id at all (simulating either
+    a binding learned before this task, or one captured during a
+    transient identity-resolution outage), while the SECOND (relearn)
+    capture's event DOES."""
+    p = tmp_path / "bindings.toml"
+    eng = Engine(Config(tick_hz=200.0), bindings_path=str(p))
+    got = []
+    eng.add_listener(got.append)
+    task = asyncio.create_task(eng.run())
+    note60_no_identity = ev(type="note_on", data1=60, data2=100, channel=0,
+                            source="Midi Through:Midi Through Port-0 14:0", device_id=None)
+    note60_with_identity = ev(type="note_on", data1=60, data2=100, channel=0,
+                              source="Midi Through:Midi Through Port-0 23:1",
+                              device_id="virt:Midi Through:Midi Through Port-0")
+
+    # First learn: captured with NO resolved device identity -- the
+    # "pre-device" (or transient-outage) binding.
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.next", "mode": "trigger", "args": {}})
+    await eng.queue.put(note60_no_identity)
+    await asyncio.sleep(0.05)
+    assert len(eng._bindings_file.bindings) == 1
+    assert eng._bindings_file.bindings[0].match.device is None
+
+    # Relearn the SAME physical control -- this time identity resolves.
+    await eng.actions.dispatch(
+        "bind.learn", {"action": "page.prev", "mode": "trigger", "args": {}})
+    await eng.queue.put(note60_with_identity)
+    await asyncio.sleep(0.05)
+    eng.stop()
+    await task
+
+    # Exactly ONE binding remains -- the new, device-stamped one.
+    assert len(eng._bindings_file.bindings) == 1
+    only = eng._bindings_file.bindings[0]
+    assert only.action == "page.prev"
+    assert only.match.device == "virt:Midi Through:Midi Through Port-0"
+
+    from midicrt.engine.bindings import BindingsFile
+    assert BindingsFile.load(str(p)).bindings == [only]   # persisted atomically, one binding
+
+    bound_events = [m for m in got if m.get("kind") == "event" and m.get("name") == "learn_bound"]
+    assert len(bound_events) == 2
+    assert bound_events[0]["data"]["replaced"] == []              # nothing to replace the first time
+    assert len(bound_events[1]["data"]["replaced"]) == 1          # the pre-device binding WAS replaced
+    assert bound_events[1]["data"]["replaced"][0]["action"] == "page.next"
+
+
 async def test_learn_capture_a_different_match_does_not_replace_unrelated_bindings(tmp_path):
     eng = Engine(Config(tick_hz=200.0), bindings_path=str(tmp_path / "bindings.toml"))
     task = asyncio.create_task(eng.run())

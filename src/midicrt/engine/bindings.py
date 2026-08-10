@@ -248,11 +248,18 @@ class BindingMatch:
     stable device-identity string (`engine/midi_identity.py::
     IdentityResolver`'s own `usb:<vendor>:<product>[:<serial>]` /
     `virt:<name>` shapes -- see that module's docstring for the full
-    resolution ladder). When present, `BindingDispatcher._matches` treats
+    resolution ladder). When present AND the incoming `MidiEvent` itself
+    carries a resolved `device_id`, `BindingDispatcher._matches` treats
     `device` as the SOLE port-identity check and does NOT consult
-    `port_pattern` at all -- exact string equality against `MidiEvent.
-    device_id`, never `fnmatch` (a device_id is already a fully-resolved
-    identity, not a glob). `None` (the default, and every binding ever
+    `port_pattern` at all -- exact string equality, never `fnmatch` (a
+    device_id is already a fully-resolved identity, not a glob).
+    **Rescue (Important review fix):** if the event's OWN port never got a
+    resolved identity (`ev.device_id is None` -- a transient
+    `IdentityResolver` failure at open time; see `MidiInput`'s own
+    retry-on-poll fix, which shrinks but cannot fully eliminate this
+    window), matching falls back to `port_pattern` for that one event --
+    the durably-stored pattern earns its keep exactly during a resolution
+    outage, never otherwise. `None` (the default, and every binding ever
     persisted before this task) means "no device constraint" -- matching
     falls through entirely to the pre-existing `port_pattern` check,
     completely unchanged, so every bindings.toml written before this task
@@ -301,6 +308,70 @@ class Binding:
     mode: str = "trigger"
     threshold: int = 64
     range: tuple[float, float] = (0.0, 1.0)
+
+
+def should_replace_on_relearn(existing: BindingMatch, fresh: BindingMatch) -> bool:
+    """Phase 9 Task 1 follow-up (review Critical, live-reproduced): is
+    `existing` the binding a fresh relearn capture's `match` (`fresh`)
+    should REPLACE? `Engine._replace_bindings_with_exact_match`
+    (engine/core.py) is the one production caller.
+
+    Physical-control identity -- `type`/`number`/`channel` -- must match
+    FIRST, always: a relearn can only ever mean "replace whatever was
+    bound to THIS EXACT note/CC+channel", never a different control
+    entirely, however similar its `device`/`port_pattern` might look.
+
+    Given that base identity matches, replace when EITHER:
+      (a) `existing == fresh` -- full dataclass equality, including
+          `port_pattern` AND `device`. The original Phase-4 "exact match"
+          rule, still correct for two device-stamped (or two device-less)
+          captures of the same control.
+      (b) `existing.device is None` and `existing.port_pattern ==
+          fresh.port_pattern` -- the migration case: `existing` predates
+          device-identity capture entirely (every binding persisted
+          before Phase 9 Task 1, or one captured during a transient
+          identity-resolution outage -- see `engine/midi_in.py`'s own
+          retry-on-poll fix) but is otherwise the SAME physical control,
+          durably identified the OLD way (the suffix-globbed
+          `port_pattern`, unchanged by this task).
+
+    Rule (b) exists because `BindingMatch.device` participating in plain
+    dataclass `==` means rule (a) ALONE would silently stop matching a
+    pre-device binding against any freshly captured match once device
+    identity starts resolving (a fresh capture almost always carries a
+    non-`None` `device` from this task onward) -- live-reproduced by
+    review: relearning a pre-device binding left BOTH the old and the new
+    binding on disk, both firing on every future trigger, exactly the
+    accumulating-bindings bug class the original Phase-4 Critical fix
+    (see `Engine._replace_bindings_with_exact_match`'s own docstring) was
+    built to eliminate.
+
+    Deliberately NOT symmetric: a fresh capture with `fresh.device is
+    None` (an identity-resolution outage happening to coincide with THIS
+    relearn) does not, by this rule alone, replace an EXISTING
+    device-stamped binding on the same control -- a disclosed, narrow,
+    accepted gap rather than silently downgrading an already-disambiguated
+    binding back to pattern-only on nothing more than a transient hiccup.
+    `MidiInput`'s retry-on-poll fix keeps this window small in practice;
+    `bind.list` remains the visible way to notice (two bindings on the
+    same control, one with `device: null`) and manually `bind.remove` the
+    stale entry in the rare case it actually happens.
+
+    Still never touches a WILDCARD/overlapping-but-not-identical
+    `port_pattern`: `existing.port_pattern == fresh.port_pattern` is
+    STRING equality, not `fnmatch` overlap, so a hand-written
+    `port_pattern = "Midi Through*"` binding is left alone by a relearn
+    that captures the narrower `"Midi Through:Midi Through Port-0*"` --
+    same disclosed "only byte-for-byte identical patterns are ever
+    auto-replaced" contract the original Phase-4 fix established (see
+    test_learn_capture_does_not_remove_an_overlapping_wildcard_port_binding
+    in test_engine_core.py, unchanged by this fix)."""
+    if (existing.type, existing.number, existing.channel) != (fresh.type, fresh.number,
+                                                              fresh.channel):
+        return False
+    if existing == fresh:
+        return True
+    return existing.device is None and existing.port_pattern == fresh.port_pattern
 
 
 def _lerp(value: int, lo: float, hi: float) -> float:
@@ -385,17 +456,37 @@ class BindingDispatcher:
             return False
         if m.channel is not None and ev.channel != m.channel:
             return False
-        if m.device is not None:
+        if m.device is not None and ev.device_id is not None:
             # Phase 9 Task 1 (device-identity bindings): device identity is
-            # the PRIMARY -- and, when present, the ONLY -- port-identity
-            # check. `port_pattern` is deliberately NOT also consulted here
-            # (not an AND, not an OR) -- see `BindingMatch`'s own docstring
-            # for why this is the chosen precedence, and why port_pattern
-            # is still written to disk anyway (an inert, hand-editable
-            # fallback). Exact string equality, never `fnmatch` -- a
-            # `device_id` is already a fully-resolved stable identity, not
-            # a glob pattern.
+            # the PRIMARY -- and, when both sides have one, the ONLY --
+            # port-identity check. `port_pattern` is deliberately NOT also
+            # consulted here (not an AND, not an OR) -- see `BindingMatch`'s
+            # own docstring for why this is the chosen precedence, and why
+            # port_pattern is still written to disk anyway (an inert,
+            # hand-editable fallback). Exact string equality, never
+            # `fnmatch` -- a `device_id` is already a fully-resolved stable
+            # identity, not a glob pattern. A DIFFERING device_id returns
+            # False here directly -- it never falls through to the
+            # port_pattern check below (see the `ev.device_id is None`
+            # rescue comment right below for the one case that DOES fall
+            # through).
             return ev.device_id == m.device
+        # Important review fix (Phase 9 Task 1 follow-up, live-reproduced
+        # risk): `ev.device_id is None` here means either (a) this binding
+        # has no device identity at all (`m.device is None` -- every
+        # binding persisted before this task, unaffected, falls straight
+        # through exactly as it always did), or (b) the event's OWN port
+        # never got a resolved identity -- a transient `IdentityResolver`
+        # failure at open time (see `engine/midi_in.py::MidiInput`'s own
+        # retry-on-poll fix, which shrinks but cannot fully eliminate this
+        # window). Without this fallback, EVERY device-bound binding on an
+        # unresolved port would silently stop firing for as long as the
+        # outage lasts, with the durably-stored `port_pattern` sitting
+        # there unused the whole time. Pattern rescues ONLY during a
+        # genuine resolution outage (or for a device-less binding, which
+        # never asked for anything else) -- the moment identity resolves
+        # again, device resumes being authoritative and exclusive per the
+        # branch above.
         return m.port_pattern is None or fnmatch.fnmatch(ev.source or "", m.port_pattern)
 
     def _evaluate(self, binding: Binding, ev) -> tuple[str, dict] | None:

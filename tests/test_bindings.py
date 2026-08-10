@@ -21,6 +21,7 @@ from midicrt.engine.bindings import (
     BindingsFile,
     glob_port_pattern,
     is_learnable_event,
+    should_replace_on_relearn,
     strip_alsa_port_suffix,
     validate_binding,
 )
@@ -111,6 +112,27 @@ def test_device_present_does_not_fall_back_to_port_pattern_on_mismatch():
     d = BindingDispatcher([b])
     assert d.handle(ev(device_id="usb:1234:5678:SN2",
                        source="Midi Through:Midi Through Port-0 14:0")) == []
+
+
+def test_device_bound_binding_fires_via_port_pattern_rescue_when_event_has_no_device_id():
+    """Important review fix: a transient identity-resolution outage on
+    the EVENT's own port (ev.device_id is None) must not strand a
+    device-bound binding dead -- it falls back to the pre-existing
+    port_pattern check for that one event."""
+    b = trigger_binding(match={"type": "note_on", "number": 60,
+                               "port_pattern": "Midi Through*",
+                               "device": "usb:1234:5678:SN1"})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(device_id=None, source="Midi Through:Midi Through Port-0 14:0")) == [
+        ("page.next", {})]
+
+
+def test_device_bound_binding_rescue_still_respects_a_non_matching_pattern():
+    b = trigger_binding(match={"type": "note_on", "number": 60,
+                               "port_pattern": "Midi Through*",
+                               "device": "usb:1234:5678:SN1"})
+    d = BindingDispatcher([b])
+    assert d.handle(ev(device_id=None, source="USB MIDI Interface 20:0")) == []
 
 
 def test_device_none_falls_back_to_port_pattern_exactly_as_before():
@@ -305,6 +327,72 @@ def test_binding_defaults_mode_trigger_threshold_64():
     assert b.mode == "trigger"
     assert b.threshold == 64
     assert b.args == {}
+
+
+# -- should_replace_on_relearn (Phase 9 Task 1 follow-up, review Critical, --
+# live-reproduced): the fix for `BindingMatch.device` breaking replace-on-
+# relearn's original plain `==` check the moment a fresh capture starts
+# carrying a real device_id against an old device=None binding.
+
+def test_should_replace_full_match_equal_including_device():
+    m1 = BindingMatch(type="note_on", number=60, channel=0,
+                      port_pattern="A*", device="usb:1:2:S")
+    m2 = BindingMatch(type="note_on", number=60, channel=0,
+                      port_pattern="A*", device="usb:1:2:S")
+    assert should_replace_on_relearn(m1, m2)
+
+
+def test_should_replace_pre_device_binding_against_a_freshly_device_stamped_capture():
+    """THE fix: an existing device=None binding, identical type/number/
+    channel/port_pattern to a fresh capture that NOW also carries a
+    resolved device -- must still be recognized as the same physical
+    control worth replacing, not silently kept alongside the new one."""
+    existing = BindingMatch(type="note_on", number=60, channel=0,
+                            port_pattern="Midi Through:Midi Through Port-0*", device=None)
+    fresh = BindingMatch(type="note_on", number=60, channel=0,
+                         port_pattern="Midi Through:Midi Through Port-0*",
+                         device="virt:Midi Through:Midi Through Port-0")
+    assert should_replace_on_relearn(existing, fresh)
+
+
+def test_should_not_replace_different_control_even_with_identical_port_pattern():
+    existing = BindingMatch(type="note_on", number=60, channel=0,
+                            port_pattern="A*", device=None)
+    fresh = BindingMatch(type="note_on", number=61, channel=0, port_pattern="A*", device="usb:1:2")
+    assert not should_replace_on_relearn(existing, fresh)
+
+
+def test_should_not_replace_when_existing_device_stamped_differently_even_if_pattern_matches():
+    """Full-equality rule (a) only -- a DIFFERENT device on an already
+    device-stamped existing binding is not the migration case (b) at
+    all (existing.device is not None), so it is left alone."""
+    existing = BindingMatch(type="note_on", number=60, channel=0,
+                            port_pattern="A*", device="usb:1:2:SN1")
+    fresh = BindingMatch(type="note_on", number=60, channel=0,
+                         port_pattern="A*", device="usb:1:2:SN2")
+    assert not should_replace_on_relearn(existing, fresh)
+
+
+def test_should_not_replace_wildcard_overlapping_but_not_identical_port_pattern():
+    """Unchanged Phase-4 disclosed contract: STRING equality, not
+    fnmatch overlap."""
+    existing = BindingMatch(type="note_on", number=60, channel=0,
+                            port_pattern="Midi Through*", device=None)
+    fresh = BindingMatch(type="note_on", number=60, channel=0,
+                         port_pattern="Midi Through:Midi Through Port-0*",
+                         device="virt:Midi Through:Midi Through Port-0")
+    assert not should_replace_on_relearn(existing, fresh)
+
+
+def test_should_not_replace_when_fresh_device_is_none_but_existing_is_device_stamped():
+    """Deliberately NOT symmetric (disclosed): a fresh capture that
+    itself failed to resolve identity (device=None) does not replace an
+    existing, already-disambiguated device-stamped binding just because
+    the port_pattern matches."""
+    existing = BindingMatch(type="note_on", number=60, channel=0,
+                            port_pattern="A*", device="usb:1:2:SN1")
+    fresh = BindingMatch(type="note_on", number=60, channel=0, port_pattern="A*", device=None)
+    assert not should_replace_on_relearn(existing, fresh)
 
 
 # -- BindingsFile: load ---------------------------------------------------------

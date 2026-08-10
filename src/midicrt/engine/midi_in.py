@@ -86,17 +86,30 @@ Device identity (Phase 9 Task 1, device-identity bindings)
 Every port this class opens also gets a resolved, stable `device_id`
 (`engine/midi_identity.py::IdentityResolver` -- see that module's own
 docstring for the full `usb:<vendor>:<product>[:<serial>]` / `virt:<name>`
-resolution ladder) -- resolved exactly ONCE, right when `_watch()` opens
-the port, and cached in `self._device_ids` for as long as that port stays
-open. This is deliberately NOT re-resolved per incoming MIDI message: the
-real resolver does actual I/O (a subprocess call plus a handful of
-/proc and /sys reads), and a port's identity cannot change while it stays
-the same open ALSA port anyway. `_enqueue` looks the cached value up by
-`source` name and threads it onto every `MidiEvent` (via `translate()`'s
-new `device_id` parameter) it queues for that port, including the
-synthesized `clock_tick` aggregate. `BindingMatch.device` (engine/
-bindings.py) is what actually consumes this at match time -- see that
-module's own docstring for the full precedence rule.
+resolution ladder) -- resolved right when `_watch()` opens the port, and
+cached in `self._device_ids` for as long as that port stays open. This is
+deliberately NOT re-resolved per incoming MIDI message: the real resolver
+does actual I/O (a subprocess call plus a handful of /proc and /sys
+reads), and a port's identity cannot change while it stays the same open
+ALSA port anyway. `_enqueue` looks the cached value up by `source` name
+and threads it onto every `MidiEvent` (via `translate()`'s new
+`device_id` parameter) it queues for that port, including the synthesized
+`clock_tick` aggregate. `BindingMatch.device` (engine/bindings.py) is
+what actually consumes this at match time -- see that module's own
+docstring for the full precedence rule.
+
+**Resolution retry (Important review fix):** the open-time resolve is
+best-effort, not guaranteed -- a transient failure (real I/O: `aconnect`,
+`/proc`, `/sys`) used to leave a port permanently absent from
+`self._device_ids` for its whole open lifetime, with no retry at all.
+`_watch()` now retries any name that's still open but missing a
+`device_id` on every subsequent poll (`_resolve_device_id`, shared with
+the open-time call site, caps its own failure log to once per name via
+`self._identity_retry_warned` rather than once per `poll_interval`
+forever). This narrows, but cannot fully close, the window during which
+an event from that port carries `device_id=None` --
+`BindingDispatcher._matches`'s own port_pattern rescue (see that method's
+docstring) is what covers events arriving during whatever window remains.
 """
 import fnmatch
 import logging
@@ -222,6 +235,19 @@ class MidiInput:
         # same "constructor seam, real default" shape as `backend` above.
         self._identity = identity_resolver or IdentityResolver()
         self._device_ids: dict[str, str] = {}   # name -> resolved device_id
+        # Important review fix (Phase 9 Task 1 follow-up): a transient
+        # `IdentityResolver` failure at open time used to strand that port
+        # with NO `_device_ids` entry for its entire open lifetime -- every
+        # device-bound binding on it would silently stop firing (well,
+        # rescue to port_pattern instead -- see `BindingDispatcher._matches`'
+        # own fix -- but never regain its device identity) until the next
+        # reboot/replug. `_watch()` now retries any open-but-unresolved
+        # name on every subsequent poll; this set caps the failure log to
+        # ONE line per name (cleared on success or when the port vanishes)
+        # instead of one every `poll_interval`, forever, on a persistent
+        # outage -- same "log each skipped name once" discipline
+        # `_excluded_warned` right above already established.
+        self._identity_retry_warned: set[str] = set()
 
     @property
     def open_ports(self) -> list[str]:
@@ -254,6 +280,28 @@ class MidiInput:
             port.close()
         self._ports.clear()
         self._device_ids.clear()
+        self._identity_retry_warned.clear()
+
+    def _resolve_device_id(self, name: str, *, context: str) -> None:
+        """Shared by the open-time resolve and the retry-on-poll pass
+        below (Important review fix, Phase 9 Task 1 follow-up) -- one
+        place that calls `IdentityResolver.resolve` and swallows its own
+        failure, so a hiccup never propagates past this class regardless
+        of which call site hit it. `context` is purely for the log
+        message ("opened"/"retry"); the caching/warn-capping behavior is
+        identical either way."""
+        try:
+            self._device_ids[name] = self._identity.resolve(name)
+        except Exception as exc:  # noqa: BLE001 — identity resolution is best-effort
+            if name not in self._identity_retry_warned:
+                _LOG.warning("device-identity resolution failed for %s (%s): %s",
+                            name, context, exc)
+                self._identity_retry_warned.add(name)
+            return
+        if context == "retry":
+            _LOG.info("device-identity resolved on retry for %s: %s", name,
+                     self._device_ids[name])
+        self._identity_retry_warned.discard(name)
 
     def _enqueue(self, msg, source: str) -> None:
         device_id = self._device_ids.get(source)
@@ -303,17 +351,15 @@ class MidiInput:
                 try:
                     self._ports[name] = self._backend.open_input(
                         name, callback=lambda m, n=name: self._enqueue(m, n))
-                    # Phase 9 Task 1: resolve device identity ONCE, right
-                    # here at open time -- see this class's own docstring
-                    # comment on `self._identity` for why this must not
-                    # happen per-message. A resolver failure (real I/O:
-                    # subprocess/proc/sysfs) must not prevent the port
-                    # itself from opening -- caught the same way `open_
-                    # input` failures right below are, never propagated.
-                    try:
-                        self._device_ids[name] = self._identity.resolve(name)
-                    except Exception as exc:  # noqa: BLE001 — identity resolution is best-effort
-                        _LOG.warning("device-identity resolution failed for %s: %s", name, exc)
+                    # Phase 9 Task 1: resolve device identity ONCE at open
+                    # time -- see this class's own docstring comment on
+                    # `self._identity` for why this must not happen
+                    # per-message. A resolver failure (real I/O: subprocess/
+                    # procfs/sysfs) must not prevent the port itself from
+                    # opening -- `_resolve_device_id` swallows its own
+                    # failure independently of `open_input`'s own try/except
+                    # right below.
+                    self._resolve_device_id(name, context="opened")
                     _LOG.info("opened MIDI input: %s (device=%s)",
                              name, self._device_ids.get(name))
                 except Exception as exc:  # noqa: BLE001 — same: one bad port must not kill the loop
@@ -323,4 +369,15 @@ class MidiInput:
                     _LOG.info("MIDI input vanished: %s", name)
                     self._ports.pop(name).close()
                     self._device_ids.pop(name, None)
+                    self._identity_retry_warned.discard(name)
+            # Important review fix (Phase 9 Task 1 follow-up): retry
+            # resolution for any port that's STILL open but never got a
+            # device_id -- a transient failure at open time (above) must
+            # not strand that port unresolved for its whole open lifetime.
+            # Skips ports that resolved fine (the overwhelming majority,
+            # every poll) and any port that just vanished in the loop right
+            # above (no longer in `self._ports` at all).
+            for name in list(self._ports):
+                if name not in self._device_ids:
+                    self._resolve_device_id(name, context="retry")
             time.sleep(self._poll)
