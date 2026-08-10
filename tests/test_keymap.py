@@ -12,7 +12,10 @@ import logging
 
 import pytest
 
+from midicrt.analyzers.marquee import PAGE_IDS
+from midicrt.config import Config
 from midicrt.engine.keymap import (
+    _SHIFT_OF,
     CLIENT_HELP_TOGGLE_ACTION,
     CLIENT_QUIT_ACTION,
     DEFAULT_KEYMAP,
@@ -27,12 +30,13 @@ from midicrt.engine.keymap import (
 def test_default_keymap_matches_documented_reality():
     # Verified against both clients' ACTUAL current key handling -- see
     # module docstring's own "Default-keymap reality check". Phase 8
-    # Task 6 (keymap revamp) added the help-overlay toggle and the 20
-    # roster-positional jump bindings on top of the original three real
-    # keys; neither client has ever bound "p" to anything at the GLOBAL
-    # level (pianoroll's own [keys.pianoroll] section does bind "p", see
-    # DEFAULT_PAGE_KEYMAPS below -- that's a page-scoped override, not a
-    # global default).
+    # Task 6 (keymap revamp) added the help-overlay toggle on top of the
+    # original three real keys; neither client has ever bound "p" to
+    # anything at the GLOBAL level (pianoroll's own [keys.pianoroll]
+    # section does bind "p", see DEFAULT_PAGE_KEYMAPS below -- that's a
+    # page-scoped override, not a global default). `PAGE_JUMP_ACTION`
+    # stays a valid action name even though Phase 9 Task 0 (below) no
+    # longer uses it to build DEFAULT_KEYMAP's own digit bindings.
     assert DEFAULT_KEYMAP["q"] == "client.quit"
     assert DEFAULT_KEYMAP["c"] == "eventlog.clear"
     assert DEFAULT_KEYMAP["n"] == "page.next"
@@ -42,20 +46,84 @@ def test_default_keymap_matches_documented_reality():
     assert PAGE_JUMP_ACTION == "page.jump"
 
 
-def test_default_keymap_has_the_four_named_keys_plus_twenty_jump_bindings():
+# -- digit navigation: v1 page-ID based (Phase 9 Task 0, docs/gui-phase-  --
+# -- decisions-2026-08-08.md's Phase-8-CLOSED reconciliation ruling)       --
+
+def test_default_keymap_has_the_four_named_keys_plus_one_binding_per_v1_page_id():
+    # One `page.goto` digit/shifted-digit binding per `marquee.PAGE_IDS`
+    # entry (14 today) -- NOT a fixed 20-slot scheme like the superseded
+    # roster-positional design, since there's no reason to reserve a key
+    # for a v1 ID no page currently claims.
     named = {"q", "c", "n", "?"}
-    assert set(DEFAULT_KEYMAP) - named == set("1234567890!@#$%^&*()")
-    assert len(DEFAULT_KEYMAP) == 24
+    assert len(DEFAULT_KEYMAP) == len(named) + len(PAGE_IDS)
+    assert set(DEFAULT_KEYMAP) - named <= set("1234567890!@#$%^&*()")
 
 
-def test_default_keymap_number_row_jumps_to_positions_one_through_ten():
-    for i, ch in enumerate("1234567890"):
-        assert DEFAULT_KEYMAP[ch] == {"action": PAGE_JUMP_ACTION, "args": {"position": i + 1}}
+def test_default_keymap_digit_bindings_regenerate_from_v1_page_ids():
+    # The formula itself (engine/keymap.py module docstring's "Digit <->
+    # v1-ID mapping formula" section): unshifted digit char == ID's ones
+    # digit for IDs 0-9; for IDs 10-19, the SHIFTED variant of that same
+    # ones-digit character.
+    for name, page_id in PAGE_IDS.items():
+        tens, ones = divmod(page_id, 10)
+        expected_key = str(ones) if tens == 0 else _SHIFT_OF[str(ones)]
+        assert DEFAULT_KEYMAP[expected_key] == {"action": "page.goto", "args": {"name": name}}
 
 
-def test_default_keymap_shifted_row_jumps_to_positions_eleven_through_twenty():
-    for i, ch in enumerate("!@#$%^&*()"):
-        assert DEFAULT_KEYMAP[ch] == {"action": PAGE_JUMP_ACTION, "args": {"position": i + 11}}
+def test_default_keymap_illustrative_v1_id_examples():
+    # The task brief's own worked examples, spelled out literally.
+    assert DEFAULT_KEYMAP["0"] == {"action": "page.goto", "args": {"name": "help"}}
+    assert DEFAULT_KEYMAP["1"] == {"action": "page.goto", "args": {"name": "harmony"}}
+    assert DEFAULT_KEYMAP["8"] == {"action": "page.goto", "args": {"name": "pianoroll"}}
+    # "!" is shift+1, but v1's own shifted-digit scheme (docs/visual-
+    # audit.md) starts counting at ID 11, not ID 1 -- "!" -> chordkey.
+    assert DEFAULT_KEYMAP["!"] == {"action": "page.goto", "args": {"name": "chordkey"}}
+    # ID 10 ("tuner") is the one disclosed deviation from v1 (which used a
+    # dedicated "t"/"T" letter key instead) -- this formula reaches it via
+    # shift+0 (")") like every other ID, with no letter-key exception.
+    assert DEFAULT_KEYMAP[")"] == {"action": "page.goto", "args": {"name": "tuner"}}
+
+
+def test_default_keymap_has_no_binding_for_a_v1_id_gap():
+    # No page claims v1 ID 3 (or 12/15/16/18/19 -- see PAGE_IDS) -- the
+    # digit/shifted key simply has no default binding at all, the same
+    # "genuinely absent" outcome as any other unmapped key, not a no-op
+    # binding that happens to do nothing.
+    assert "3" not in DEFAULT_KEYMAP
+    for ch in "@%^*(":
+        assert ch not in DEFAULT_KEYMAP
+
+
+def test_default_keymap_omits_the_one_roster_page_with_no_v1_id():
+    # "screensaver" is config.py's one default-roster page with no v1
+    # page-ID concept at all (analyzers/marquee.py's own docstring) -- no
+    # key in DEFAULT_KEYMAP names it via page.goto.
+    goto_targets = {entry["args"]["name"] for entry in DEFAULT_KEYMAP.values()
+                    if isinstance(entry, dict) and entry.get("action") == "page.goto"}
+    assert "screensaver" not in goto_targets
+    assert "screensaver" in Config().pages   # confirms it's a real roster member, not a typo
+
+
+def test_default_keymap_v1_id_bindings_cover_every_default_roster_page_with_an_id():
+    # Consistency test (task brief): every PAGE_IDS entry whose page IS in
+    # the default roster gets a reachable page.goto digit binding.
+    roster = set(Config().pages)
+    goto_targets = {entry["args"]["name"] for entry in DEFAULT_KEYMAP.values()
+                    if isinstance(entry, dict) and entry.get("action") == "page.goto"}
+    for name in PAGE_IDS:
+        if name in roster:
+            assert name in goto_targets
+
+
+def test_default_keymap_v1_id_bindings_also_cover_pages_outside_the_default_roster():
+    # "tuner" (v1 ID 10) has a binding even though it's excluded from the
+    # default roster -- "binding present" per the brief; see
+    # engine/core.py::Engine._page_goto's graceful no-op for what actually
+    # happens when it's pressed on a build that lacks it.
+    assert "tuner" not in Config().pages
+    goto_targets = {entry["args"]["name"] for entry in DEFAULT_KEYMAP.values()
+                    if isinstance(entry, dict) and entry.get("action") == "page.goto"}
+    assert "tuner" in goto_targets
 
 
 def test_default_page_keymaps_cover_the_pages_this_task_restored_keys_for():

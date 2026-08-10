@@ -33,13 +33,15 @@ produces exactly this shape: `[keys.pianoroll]` parses to
 discriminator field, no separate top-level table.
 
 Why `page.jump {position: int}`, not `page.goto {name: "..."}`, for number
-keys (design decision, brief's own framing)
+keys -- SUPERSEDED for `DEFAULT_KEYMAP` by Phase 9 Task 0, see the next
+section
 -------------------------------------------------------------------------
-The ruling asks for numeric keys to jump by ROSTER POSITION ("1st page",
-"5th page"), not by a fixed page NAME -- a deploy's `config.pages` order
-can differ (or change), so "5" must always mean "whatever page is 5th in
-THIS build's roster" rather than a name baked in at some other build's
-roster shape. Two designs were on the table:
+The original (Phase 8 Task 6) ruling asked for numeric keys to jump by
+ROSTER POSITION ("1st page", "5th page"), not by a fixed page NAME -- a
+deploy's `config.pages` order can differ (or change), so "5" must always
+mean "whatever page is 5th in THIS build's roster" rather than a name
+baked in at some other build's roster shape. Two designs were on the
+table:
   1. Bake `page.goto {name: "<resolved-name>"}` into `DEFAULT_KEYMAP` at
      `Engine.__init__` time, once the real roster is known -- rejected:
      `DEFAULT_KEYMAP` is a plain module-level constant read by
@@ -54,19 +56,92 @@ roster shape. Two designs were on the table:
 `page.jump`'s out-of-range behavior is deliberately DIFFERENT from
 `page.goto`'s: a typo'd `page.goto` NAME is a real user mistake and should
 raise loudly (`ActionError`, unchanged); a `page.jump` POSITION beyond the
-current roster's length is an ordinary, expected situation (`DEFAULT_
-KEYMAP` always defines all 20 positions -- 1-10 unshifted, 11-20 shifted --
-regardless of how many pages THIS build actually has) and is a silent,
-logged no-op instead (`engine/core.py::Engine._page_jump`'s own docstring).
+current roster's length is an ordinary, expected situation and is a
+silent, logged no-op instead (`engine/core.py::Engine._page_jump`'s own
+docstring).
 
-Roster-position key layout (both banks are DEFAULT bindings, always
-present -- a user's keymap.toml can still override/remove any of them like
-any other entry)
+`page.jump` itself is UNCHANGED and stays fully registered/dispatchable --
+this action's own docstring (still accurate) is preserved above/below for
+that reason. What Task 0 supersedes is only which action `DEFAULT_KEYMAP`
+itself bakes onto the digit keys -- a hand-written `keymap.toml` can still
+bind any key to `page.jump {position: N}` for genuinely roster-relative
+behavior no v1-ID scheme could ever express (v1 has no roster-relative
+concept at all -- every one of its own keys names a fixed, absolute page
+ID).
+
+Digit navigation: v1 page-ID based, not roster-positional (Phase 9 Task 0
+-- docs/gui-phase-decisions-2026-08-08.md "Phase 8 CLOSED" section)
 -------------------------------------------------------------------------
-  "1".."9", "0"        -> positions 1-10   (roster's first ten pages)
-  "!@#$%^&*()"          -> positions 11-20  (roster's next ten pages)
-(the shifted-row layout mirrors a standard US keyboard's shift-1..shift-0
-row: "!" is shift+1, ")" is shift+0, etc.)
+Phase 8 Task 6 shipped the roster-positional scheme above and its own
+`analyzers/marquee.py::MarqueeAnalyzer` (built the SAME task) exposed a
+clash neither task noticed at the time: the header marquee shows v1's OWN
+page-ID vocabulary (`[8:PIANOROLL]`, `PAGE_IDS`), but pressing "8" jumped
+to the 8th ROSTER position -- "config" on the stock default roster, a
+DIFFERENT page than the marquee's own "8" names. Phase 8's own closeout
+doc flagged this as an open, blocking ruling ("(a) marquee shows
+positions, or (b) digits map to v1 IDs -- user decides"). This task
+resolves it as (b), a controller ruling disclosed in that doc and this
+task's own report -- cleanly reversible, since `page.jump` (above) is
+untouched and a keymap.toml can restore roster-positional digits at any
+time by overriding each key back to a `page.jump` entry.
+
+The rejection reason for design #1 above (`DEFAULT_KEYMAP` can't depend on
+"the real roster" -- it doesn't exist at module-load time) does NOT apply
+here: `analyzers/marquee.py::PAGE_IDS` is a DIFFERENT table from "the real
+roster" -- v1's own FIXED page-ID vocabulary, a plain module-level
+constant that exists before any `Engine` does, no different in kind from
+`DIGIT_ROW`/`SHIFTED_DIGIT_ROW` below. `DEFAULT_KEYMAP`'s digit bindings
+are therefore baked directly FROM `PAGE_IDS` at THIS module's own
+load time (`_default_v1_id_goto_bindings` below), using `page.goto
+{name: "<the PAGE_IDS name>"}` entries -- reusing `page.goto` exactly as
+it already exists (no new action), per this task's own brief.
+
+Digit <-> v1-ID mapping formula (verified against v1's OWN real keymap --
+docs/visual-audit.md's "Global page-switch keymap" audit row, not
+re-derived from scratch)
+-------------------------------------------------------------------------
+That audit row reads v1's real keyboard dispatch as: unshifted `"0"`-`"9"`
+jump DIRECTLY to v1 page IDs 0-9; shifted `"!@#$%^&*"` (shift+1..shift+8)
+jump to IDs 11-17 SEQUENTIALLY (`!`->11, `@`->12, ..., `&`->17) -- "a
+deliberate non-literal mnemonic scheme" per that row, since shift+1
+landing on ID 11 (not ID 1) only makes sense once you know the shifted row
+starts counting at 11, not at the shifted key's own face value.
+`_default_v1_id_goto_bindings` below reproduces this exactly via ONE
+formula spanning the full 0-19 ID space (today's `PAGE_IDS` values top out
+at 17): the unshifted digit CHARACTER equals the ID's ones digit for IDs
+0-9; for IDs 10-19, the SAME ones-digit character is used, but its SHIFTED
+variant (`_SHIFT_OF`, the same `DIGIT_ROW`/`SHIFTED_DIGIT_ROW` pairing
+`clients/fb/app.py::_build_evdev_shifted_char_table` already keys off of)
+-- e.g. `id=11 -> ones=1 -> shift_of["1"] == "!"`, ..., `id=17 -> ones=7 ->
+shift_of["7"] == "&"`, reproducing v1's own table character-for-character
+with no second, hand-typed lookup.
+
+Disclosed deviation -- v1 page ID 10 ("tuner"): v1 does NOT reach page 10
+through this digit/shift scheme at all -- it binds a dedicated letter key
+(`t`/`T`) instead, an ad hoc exception to its own numbering (same audit
+row). This formula does NOT special-case it: `id=10 -> ones=0 ->
+shift_of["0"] == ")"` (shift+0), the same single rule every other ID
+follows. Deliberate, disclosed, for two reasons: (a) letters are reserved
+for PER-PAGE functions under this whole revamp's own ruling ("number keys
+... for page jumps; letters for per-page functions",
+docs/gui-phase-decisions-2026-08-08.md) -- baking one global letter-keyed
+page jump back in would itself be a smaller version of the exact
+inconsistency this task exists to remove; (b) "tuner" isn't in the default
+roster anyway (`config.py`), so whichever key reaches it hits
+`Engine._page_goto`'s graceful no-op (engine/core.py, this task's own
+addition) on a stock deploy regardless -- see that method's own docstring.
+A future config that DOES add "tuner" reaches it via shift+0 (`")"`), not
+`t`/`T`; changing that mapping later is a one-line `PAGE_IDS`-adjacent fix,
+not a redesign.
+
+Every `PAGE_IDS` entry gets a binding this way UNCONDITIONALLY, regardless
+of whether its page is in any particular build's roster -- see
+`_default_v1_id_goto_bindings`'s own docstring for why that's safe. A
+roster page with NO v1 ID at all (only "screensaver" today, see
+`analyzers/marquee.py`'s own docstring) gets no digit binding of any kind
+-- there is no ID to derive one from, and no key is reserved for it either
+(a hand-written keymap.toml remains free to bind any key to
+`page.goto {name: "screensaver"}` directly).
 
 Modifier handling is CLIENT-SPECIFIC, not engine-side (both clients read
 the very same keymap table; only how each one PRODUCES the string "!" for
@@ -160,6 +235,8 @@ import os
 import tomllib
 from typing import Any
 
+from midicrt.analyzers.marquee import PAGE_IDS as _V1_PAGE_IDS
+
 _LOG = logging.getLogger(__name__)
 
 DEFAULT_PATH = os.path.expanduser("~/.config/midicrt/keymap.toml")
@@ -177,41 +254,80 @@ CLIENT_HELP_TOGGLE_ACTION = "client.help_toggle"
 PAGE_JUMP_ACTION = "page.jump"
 
 # Standard US-keyboard shift-row layout: shift+1..shift+0 -> these symbols,
-# in the SAME left-to-right order as "1234567890". Used both to build the
-# second (11-20) bank of default jump bindings below AND by fb's evdev
-# shifted-char table (`clients/fb/app.py::_build_evdev_shifted_char_table`)
-# so the two stay derived from one source of truth, not two hand-typed
-# copies of the same layout.
+# in the SAME left-to-right order as "1234567890". Used both by the
+# v1-ID digit/shift formula below AND by fb's evdev shifted-char table
+# (`clients/fb/app.py::_build_evdev_shifted_char_table`) so the two stay
+# derived from one source of truth, not two hand-typed copies of the same
+# layout.
 DIGIT_ROW = "1234567890"
 SHIFTED_DIGIT_ROW = "!@#$%^&*()"
 
+# `_SHIFT_OF["3"] == "#"`, etc -- the SAME positional pairing DIGIT_ROW/
+# SHIFTED_DIGIT_ROW already encode (index i of one <-> index i of the
+# other), as a lookup instead of a linear scan. Used by
+# `_default_v1_id_goto_bindings` below to find "the shifted key that types
+# the same digit character" for any v1 ID >= 10 -- see module docstring's
+# "Digit <-> v1-ID mapping formula" section.
+_SHIFT_OF: dict[str, str] = dict(zip(DIGIT_ROW, SHIFTED_DIGIT_ROW, strict=True))
 
-def _jump_entry(position: int) -> dict[str, Any]:
-    return {"action": PAGE_JUMP_ACTION, "args": {"position": position}}
+
+def _goto_entry(name: str) -> dict[str, Any]:
+    return {"action": "page.goto", "args": {"name": name}}
 
 
-def _default_roster_jump_bindings() -> dict[str, dict[str, Any]]:
-    """The 20 default `page.jump` bindings: unshifted digit row -> positions
-    1-10, shifted digit row -> positions 11-20 -- see module docstring's
-    "Roster-position key layout" section."""
+def _default_v1_id_goto_bindings() -> dict[str, dict[str, Any]]:
+    """The v1-ID-based digit bindings (Phase 9 Task 0) -- one `page.goto`
+    entry per `marquee.PAGE_IDS` entry, keyed by the digit/shifted-digit
+    character the module docstring's "Digit <-> v1-ID mapping formula"
+    section derives from that page's own v1 ID (verified against v1's
+    real keymap, docs/visual-audit.md, including that section's one
+    disclosed deviation for ID 10/"tuner").
+
+    Every `PAGE_IDS` entry gets a binding UNCONDITIONALLY, regardless of
+    whether its page is in any particular build's roster -- `page.goto`'s
+    own graceful no-op (`engine/core.py::Engine._page_goto`, this task's
+    own addition) is what makes a v1-mapped-but-roster-absent page (e.g.
+    "tuner" on the stock default roster) harmless rather than a dispatch
+    error, the same "ordinary, expected situation" category `page.jump`'s
+    own out-of-range no-op already established -- just reached through
+    `page.goto`'s own handler instead of a new one.
+
+    Raises `ValueError` at IMPORT time (never at some later dispatch) if a
+    future `PAGE_IDS` edit ever introduces a v1 ID >= 20 (this formula's
+    two-bank 0-9/10-19 assumption) or two pages sharing one ID -- both
+    would otherwise silently collide two page names onto the same key, a
+    far worse failure mode than refusing to import."""
     bindings: dict[str, dict[str, Any]] = {}
-    for i, ch in enumerate(DIGIT_ROW):
-        bindings[ch] = _jump_entry(i + 1)
-    for i, ch in enumerate(SHIFTED_DIGIT_ROW):
-        bindings[ch] = _jump_entry(i + 11)
+    seen_ids: set[int] = set()
+    for name, page_id in _V1_PAGE_IDS.items():
+        if page_id in seen_ids:
+            raise ValueError(
+                f"marquee.PAGE_IDS: duplicate v1 ID {page_id} (page {name!r}) -- the "
+                "digit-nav formula (engine/keymap.py) requires unique IDs")
+        seen_ids.add(page_id)
+        tens, ones = divmod(page_id, 10)
+        if tens not in (0, 1):
+            raise ValueError(
+                f"marquee.PAGE_IDS: v1 ID {page_id} (page {name!r}) is outside the 0-19 "
+                "range the digit-nav formula (engine/keymap.py) supports -- add a third bank")
+        digit_char = str(ones)
+        key = digit_char if tens == 0 else _SHIFT_OF[digit_char]
+        bindings[key] = _goto_entry(name)
     return bindings
 
 
 # See module docstring's "Default-keymap reality check" -- the original
-# three real hardcoded keys (unchanged), plus Phase 8 Task 6's additions:
-# `?` opens/closes the help overlay, and the 20 roster-positional jump
-# bindings.
+# three real hardcoded keys (unchanged), plus Phase 8 Task 6's `?` help-
+# overlay toggle, plus Phase 9 Task 0's v1-ID-based digit/shifted-digit
+# `page.goto` bindings (superseding Phase 8 Task 6's own roster-positional
+# `page.jump` bindings for THIS table specifically -- see module
+# docstring's "Digit navigation: v1 page-ID based" section).
 DEFAULT_KEYMAP: dict[str, Any] = {
     "q": CLIENT_QUIT_ACTION,
     "c": "eventlog.clear",
     "n": "page.next",
     "?": CLIENT_HELP_TOGGLE_ACTION,
-    **_default_roster_jump_bindings(),
+    **_default_v1_id_goto_bindings(),
 }
 
 # Per-page default bindings (Phase 8 Task 6): v1's per-page retuning keys,

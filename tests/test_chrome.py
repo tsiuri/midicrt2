@@ -1,3 +1,4 @@
+from midicrt.analyzers.marquee import PAGE_IDS, PAGE_TITLES
 from midicrt.clients.chrome import (
     DEFAULT_ALERTS_VM,
     DEFAULT_BEATFLASH_VM,
@@ -27,6 +28,8 @@ from midicrt.clients.chrome import (
     status_text,
     timesig_text,
 )
+from midicrt.config import Config
+from midicrt.engine.keymap import DEFAULT_KEYMAP
 
 
 def test_overlay_status_topic_matches_engine_convention():
@@ -418,3 +421,54 @@ def test_overlay_lines_non_jump_entries_unaffected_by_roster():
     roster = ["eventlog", "voices"]
     lines = overlay_lines({"q": "client.quit"}, {}, "eventlog", roster)
     assert lines == ["GLOBAL", "  q  client.quit"]
+
+
+# -- page.goto v1-ID labels (Phase 9 Task 0, docs/gui-phase-decisions-      --
+# -- 2026-08-08.md digit-nav reconciliation) ---------------------------------
+
+def test_overlay_lines_resolves_page_goto_to_its_v1_id_and_title():
+    # "8 -> 8:PIANOROLL" -- matches the marquee's OWN [8:PIANOROLL] text
+    # for the same page (analyzers/marquee.py::PAGE_TITLES), the whole
+    # point of mapping digits to v1 IDs.
+    lines = overlay_lines({"8": {"action": "page.goto", "args": {"name": "pianoroll"}}}, {},
+                          "eventlog")
+    assert lines == ["GLOBAL", "  8  -> 8:PIANOROLL"]
+
+
+def test_overlay_lines_page_goto_v1_id_label_does_not_need_a_roster():
+    # Unlike page.jump, the v1 ID comes from the STATIC marquee.PAGE_IDS
+    # table, not the live cycle order -- resolves identically with or
+    # without a roster argument.
+    entry = {"1": {"action": "page.goto", "args": {"name": "harmony"}}}
+    assert overlay_lines(entry, {}, "eventlog") == overlay_lines(entry, {}, "eventlog", [])
+    assert overlay_lines(entry, {}, "eventlog") == ["GLOBAL", "  1  -> 1:HARMONY"]
+
+
+def test_overlay_lines_shows_v1_id_label_even_for_a_page_absent_from_the_roster():
+    # "tuner" (v1 ID 10) isn't in config.py's default roster, but its
+    # DEFAULT_KEYMAP binding is still PRESENT (engine/keymap.py) -- the
+    # overlay shows what it WOULD do, informatively, even though
+    # dispatching it is a graceful no-op on this build
+    # (engine/core.py::Engine._page_goto).
+    lines = overlay_lines({")": {"action": "page.goto", "args": {"name": "tuner"}}}, {},
+                          "eventlog")
+    assert lines == ["GLOBAL", "  )  -> 10:TUNER"]
+
+
+def test_overlay_lines_page_goto_without_a_v1_id_falls_back_to_bare_name():
+    lines = overlay_lines({"v": {"action": "page.goto", "args": {"name": "screensaver"}}}, {},
+                          "eventlog")
+    assert lines == ["GLOBAL", "  v  -> screensaver"]
+
+
+def test_overlay_lines_v1_id_digit_labels_match_marquee_titles_for_every_default_roster_page():
+    # Consistency test (task brief): for every marquee.PAGE_IDS entry
+    # whose page is in the default roster, DEFAULT_KEYMAP's own digit
+    # binding overlay label reads the SAME "id:TITLE" text the marquee
+    # itself shows for that page.
+    roster = Config().pages
+    lines = overlay_lines(DEFAULT_KEYMAP, {}, "eventlog")
+    rendered = "\n".join(lines)
+    for name, page_id in PAGE_IDS.items():
+        if name in roster:
+            assert f"-> {page_id}:{PAGE_TITLES[name]}" in rendered

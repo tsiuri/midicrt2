@@ -9,6 +9,7 @@ import pytest
 
 from midicrt.config import Config, ConfigError
 from midicrt.engine import capture as capture_mod
+from midicrt.engine import keymap as keymap_mod
 from midicrt.engine.actions import ActionError
 from midicrt.engine.bindings import LEARN_TIMEOUT_S
 from midicrt.engine.core import Engine, MidiEvent, _LearnArm
@@ -581,6 +582,70 @@ async def test_page_goto_valid_and_unknown():
     with pytest.raises(ActionError):
         await eng.actions.dispatch("page.goto", {"name": "nonexistent"})
     assert eng.current_page == "second"  # unchanged on error
+
+
+# -- page.goto graceful no-op for a known-v1-ID page absent from the       --
+# -- roster (Phase 9 Task 0, docs/gui-phase-decisions-2026-08-08.md        --
+# -- digit-nav reconciliation) -----------------------------------------------
+
+async def test_page_goto_known_v1_id_page_absent_from_roster_is_a_graceful_noop(caplog):
+    # "tuner" has a real v1 page ID (marquee.PAGE_IDS) but is excluded
+    # from config.py's default roster -- dispatching page.goto at it (as
+    # DEFAULT_KEYMAP's own shift+0 binding does, engine/keymap.py) must
+    # not raise, must not move current_page, and must log once -- the
+    # SAME "ordinary, expected" treatment `_page_jump`'s out-of-range
+    # position already gets (see Engine._page_goto's own docstring).
+    eng = Engine(Config())
+    assert "tuner" not in eng.pages
+    with caplog.at_level(logging.INFO):
+        r = await eng.actions.dispatch("page.goto", {"name": "tuner"})
+    assert r == {}
+    assert eng.current_page == "eventlog"
+    assert "tuner" in caplog.text
+
+
+async def test_page_goto_unknown_name_with_no_v1_id_still_raises():
+    # Narrowing check: a name that's neither a live page NOR a known v1-ID
+    # page name (a genuine typo) keeps raising loudly -- the graceful
+    # no-op above only ever makes MORE names succeed silently, never
+    # fewer error out.
+    eng = Engine(Config())
+    with pytest.raises(ActionError):
+        await eng.actions.dispatch("page.goto", {"name": "nonexistent"})
+
+
+async def test_pagecycle_v1_id_digit_bound_page_goto_pauses_rotation():
+    # Mirrors Phase 8 Task 6's own `test_pagecycle_page_jump_client_
+    # origin_pauses_rotation` -- proves the NEW default digit binding
+    # (page.goto, baked from marquee.PAGE_IDS, engine/keymap.py) still
+    # arms `pagecycle_user_pause` when dispatched exactly as a real
+    # keypress would send it. `page.goto` was already in
+    # `_PAGE_NAV_ACTIONS` before this task (see that set's own comment),
+    # so this is an integration/regression proof for the new binding
+    # shape, not a new engine-side wire.
+    fake_now = [0.0]
+    eng = Engine(Config(pagecycle_interval=5.0, pagecycle_user_pause=30.0,
+                        screensaver_enabled=False))
+    eng._clock = lambda: fake_now[0]
+    eng._last_activity_ts = 0.0
+    await eng._tick_behaviors(fake_now[0])   # bootstrap
+    # "#" is shift+3 -> v1 ID 13 -> "voices" (engine/keymap.py's own
+    # digit<->v1-ID formula) -- pulled from the REAL DEFAULT_KEYMAP, not
+    # hand-typed, so this actually exercises what a physical keypress
+    # sends.
+    entry = keymap_mod.DEFAULT_KEYMAP["#"]
+    assert entry == {"action": "page.goto", "args": {"name": "voices"}}
+    await eng.actions.dispatch(entry["action"], entry["args"], origin="client")
+    assert eng.current_page == "voices"
+    fake_now[0] = 5.0
+    await eng._tick_behaviors(fake_now[0])   # interval elapsed, but paused
+    assert eng.current_page == "voices"
+    fake_now[0] = 29.9
+    await eng._tick_behaviors(fake_now[0])
+    assert eng.current_page == "voices"
+    fake_now[0] = 30.0
+    await eng._tick_behaviors(fake_now[0])   # pause expired -- interval long since elapsed too
+    assert eng.current_page == "harmony"
 
 
 # -- page.jump (Phase 8 Task 6, docs/gui-phase-decisions-2026-08-08.md      --

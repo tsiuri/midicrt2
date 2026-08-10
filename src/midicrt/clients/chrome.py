@@ -14,7 +14,14 @@ both clients change together, they can never drift.
 
 Pure text in, text out -- no Surface, no blessed.Terminal, no font, so this
 module is trivially unit-testable and has zero rendering dependencies.
+`analyzers.marquee` is the one exception (Phase 9 Task 0, below) -- it is
+itself just as pure/dependency-free (see its own module docstring), so
+importing its `PAGE_IDS`/`PAGE_TITLES` tables here doesn't compromise that
+property, only reuses it.
 """
+
+from midicrt.analyzers.marquee import PAGE_IDS as _V1_PAGE_IDS
+from midicrt.analyzers.marquee import PAGE_TITLES as _V1_PAGE_TITLES
 
 OVERLAY_STATUS_TOPIC = "overlay.status"
 
@@ -378,20 +385,41 @@ def header_with_hint(marquee_slice: str, hint_text: str, width: int) -> str:
 
 def _entry_display_label(entry, roster: list[str] | None, key: str | None = None) -> str:
     """The overlay row's label for one entry -- `_entry_action_name`'s bare
-    action name, EXCEPT for a `page.jump` entry when `roster` (the live
-    page cycle order) is available: those resolve to the actual TARGET
-    PAGE NAME (`"-> voices"`) instead of the literal string "page.jump"
-    repeated identically for all 20 roster-positional jump bindings
-    (live-verification finding, task-6-report.md's own self-review: the
-    overlay's whole purpose is "what does this key actually do" --
-    "page.jump" answers that for a human far worse than "jump to voices"
-    does). `roster=None` (the default -- no caller currently omits it
-    except pre-existing test literals) falls back to the bare action name
-    unchanged, so this is purely additive. An out-of-range/malformed
-    `position` (shouldn't occur for a build's own DEFAULT_KEYMAP, but a
-    hand-edited keymap.toml could bind `page.jump` to a position past a
-    SMALLER roster) falls back to `"{key} (unassigned)"` when `key` is
-    provided, otherwise the bare action name."""
+    action name, EXCEPT for two args-table shapes that get a friendlier,
+    target-revealing label instead:
+
+    - a `page.jump` entry, when `roster` (the live page cycle order) is
+      available: resolves to the actual TARGET PAGE NAME (`"-> voices"`)
+      instead of the literal string "page.jump" repeated identically for
+      every roster-positional jump binding (live-verification finding,
+      task-6-report.md's own self-review: the overlay's whole purpose is
+      "what does this key actually do" -- "page.jump" answers that for a
+      human far worse than "jump to voices" does). `roster=None` (the
+      default) falls back to the bare action name unchanged. An
+      out-of-range/malformed `position` (shouldn't occur for a build's own
+      DEFAULT_KEYMAP, but a hand-edited keymap.toml could bind `page.jump`
+      to a position past a SMALLER roster) falls back to
+      `"{key} (unassigned)"` when `key` is provided, otherwise the bare
+      action name.
+    - a `page.goto` entry (Phase 9 Task 0, docs/gui-phase-decisions-
+      2026-08-08.md digit-nav reconciliation): resolves to `"-> {v1
+      ID}:{TITLE}"` (`"-> 8:PIANOROLL"`) when its `name` has a v1 page ID
+      (`analyzers.marquee.PAGE_IDS`) -- the SAME `id:TITLE` text the
+      marquee's own scrolling header uses for that page
+      (`analyzers/marquee.py::_marquee_text`), so a digit key's overlay
+      row and the marquee's `[id:TITLE]` entry read as the literal same
+      vocabulary (the whole point of mapping digits to v1 IDs in the first
+      place). Unlike `page.jump` above, this does NOT need `roster` at
+      all -- the v1 ID comes from the STATIC `PAGE_IDS` table, not the
+      live cycle order, so it resolves identically whether or not the
+      named page is actually reachable on this build (e.g. "tuner",
+      v1 ID 10, absent from the default roster -- see `engine/
+      core.py::Engine._page_goto`'s own graceful-no-op docstring for what
+      actually happens if this key IS pressed). A `page.goto` entry naming
+      a page with NO v1 ID (e.g. a hand-written keymap.toml binding a key
+      to "screensaver") falls back to the bare `"-> {name}"` -- still more
+      informative than the literal action name, just without an ID tag it
+      genuinely doesn't have."""
     if isinstance(entry, dict) and entry.get("action") == "page.jump" and roster:
         position = entry.get("args", {}).get("position")
         if isinstance(position, int) and 1 <= position <= len(roster):
@@ -399,6 +427,14 @@ def _entry_display_label(entry, roster: list[str] | None, key: str | None = None
         # Out-of-range position: show key with (unassigned) label if key provided
         if key:
             return f"{key} (unassigned)"
+    if isinstance(entry, dict) and entry.get("action") == "page.goto":
+        name = entry.get("args", {}).get("name")
+        if isinstance(name, str) and name:
+            page_id = _V1_PAGE_IDS.get(name)
+            if page_id is not None:
+                title = _V1_PAGE_TITLES.get(name, name.upper())
+                return f"-> {page_id}:{title}"
+            return f"-> {name}"
     return _entry_action_name(entry)
 
 

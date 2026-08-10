@@ -1827,7 +1827,36 @@ class Engine:
         return self._set_current_page(order[(idx - 1) % len(order)])
 
     def _page_goto(self, name: str) -> dict:
+        """`page.goto`'s handler. A `name` genuinely unknown to this whole
+        build (a typo, or any other caller's own bad page name) raises
+        loudly (`ActionError`), unchanged since Phase-3.
+
+        Phase 9 Task 0 (docs/gui-phase-decisions-2026-08-08.md digit-nav
+        reconciliation) narrows that: a `name` that IS one of `marquee.
+        PAGE_IDS`' known v1-mapped page names but simply isn't in THIS
+        build's roster (e.g. "tuner" -- has a real v1 ID, excluded from
+        config.py's default `pages` list) is treated as the SAME kind of
+        ordinary, expected situation `_page_jump`'s out-of-range position
+        already is below -- logged once and a plain no-op (`{}`), NOT an
+        `ActionError`. This is what lets `engine/keymap.py::DEFAULT_
+        KEYMAP`'s digit bindings (baked unconditionally from the FULL
+        `PAGE_IDS` table, regardless of any one build's roster -- see that
+        module's own docstring) stay harmless on a build that doesn't
+        happen to include every v1-numbered page, instead of a keypress
+        surfacing an "unknown page: tuner" `ClientError` to the user for a
+        page name that isn't actually a mistake at all.
+
+        This narrowing only ever makes MORE names succeed silently, never
+        fewer error out: `_MARQUEE_PAGE_IDS` is a small, fixed vocabulary
+        (14 names today) entirely unrelated to whatever a caller might
+        type by accident, so a real typo (anything outside that
+        vocabulary too) still raises exactly as before."""
         if name not in self.pages:
+            if name in _MARQUEE_PAGE_IDS:
+                _LOG.info(
+                    "page.goto: %r has a v1 page ID but is not in this build's roster -- "
+                    "no-op", name)
+                return {}
             raise ActionError(f"unknown page: {name}")
         return self._set_current_page(name)
 

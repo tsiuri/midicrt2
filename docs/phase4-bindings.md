@@ -134,34 +134,100 @@ Discriminated from an args-table entry purely by shape: a `[keys]` dict
 value WITHOUT an `"action"` key is a page section; WITH one, it's an
 args-table entry for that literal key.
 
-**Roster-positional page jumps.** `DEFAULT_KEYMAP` ships 20 bindings out of
-the box: `"1".."9","0"` → `page.jump` positions 1–10 (the roster's first
-ten pages, 1-indexed), and the shifted digit row `"!@#$%^&*()"` → positions
-11–20 (`!`=11 … `)`=20, standard US shift-row layout). `page.jump {position:
-int}` (unlike `page.goto {name: str}`) resolves against the roster's
-CURRENT order at dispatch time — always reachable, roster-shape-
-independent — and an out-of-range position (more jump keys ship by default
-than most rosters have pages) is a **silent no-op**, logged at INFO, never
-an `ActionError` — deliberately different from `page.goto`'s loud failure
-on an unknown NAME, since a typo'd name is a real mistake but an unmapped
-position number on a smaller-than-20-page roster is entirely expected.
-Modifier handling is client-specific, not part of this schema: the TUI
-gets a real keyboard's shift+1 resolved to the literal `"!"` for free from
-its terminal driver; the fb client's raw `evdev` input has no such
-resolution layer and tracks `KEY_LEFTSHIFT`/`KEY_RIGHTSHIFT` state itself
-(`clients/fb/app.py::_input_loop`/`_build_evdev_shifted_char_table`).
+**Roster-positional page jumps (`page.jump`, superseded as a DEFAULT
+binding by §1c below).** `page.jump {position: int}` (unlike
+`page.goto {name: str}`) resolves against the roster's CURRENT order at
+dispatch time — always reachable, roster-shape-independent — and an
+out-of-range position is a **silent no-op**, logged at INFO, never an
+`ActionError` — deliberately different from `page.goto`'s loud failure on
+an unknown NAME, since a typo'd name is a real mistake but an unmapped
+position number on a smaller roster is entirely expected. The action
+itself is unchanged and still fully dispatchable; `DEFAULT_KEYMAP` no
+longer bakes it onto the digit keys (§1c), but any `keymap.toml` can still
+bind a key to it directly (`"v" = {action = "page.jump", args =
+{position = 5}}`) for genuinely roster-relative behavior no fixed-ID
+scheme can express.
 
-**On-screen keymap indicator + help overlay** (the other half of this
-revamp, no `keymap.toml` schema of their own — mentioned here since both
-read straight off the tables above): a chrome element shows the CURRENT
-page's own `[keys.<page>]` hints compactly (toggle: `config.toml`'s
-`keymap_hints_enabled`, default `true`); `?` (a new `DEFAULT_KEYMAP`
+**On-screen keymap indicator + help overlay** (the other half of the
+Phase 8 revamp, no `keymap.toml` schema of their own — mentioned here
+since both read straight off the tables above): a chrome element shows the
+CURRENT page's own `[keys.<page>]` hints compactly (toggle: `config.toml`'s
+`keymap_hints_enabled`, default `true`); `?` (a `DEFAULT_KEYMAP`
 pseudo-action, `client.help_toggle`, resolved entirely client-side like
 `client.quit`) opens/closes a dim panel listing the GLOBAL section then
 the current page's own section — any key dismisses it (swallowed, never
 reaching the engine) — without switching pages or touching the underlying
 subscription. `midicrt-fb --out PATH --overlay` renders one frame with the
 panel forced on, for headless verification with no interactive keyboard.
+A `page.goto` entry with a v1 page ID resolves to `"-> {id}:{TITLE}"` in
+this overlay (`"-> 8:PIANOROLL"`, §1c below) — the same text the marquee's
+own `[8:PIANOROLL]` header shows for that page.
+
+---
+
+## 1c. Digit navigation: v1 page-ID based (Phase 9 Task 0)
+
+Added at the 2026-08-09 reconciliation (docs/gui-phase-decisions-
+2026-08-08.md's "Phase 8 CLOSED" section on motherbase; full design
+rationale in `engine/keymap.py`'s own module docstring and
+`.superpowers/sdd/2026-08-09-midicrt2-phase9-instruments/task-0-
+report.md`). §1b shipped roster-POSITIONAL digit jumps (`page.jump`,
+above); this task found that scheme clashed with `analyzers/marquee.py`'s
+header text, which shows v1's OWN page-ID vocabulary (`[8:PIANOROLL]`) —
+pressing "8" jumped to the 8th roster position (a DIFFERENT page,
+"config", on the stock roster), not the page the marquee's own "8"
+names. Resolved as a controller ruling: **digits now map to v1 IDs**, not
+roster position.
+
+`DEFAULT_KEYMAP`'s digit/shifted-digit bindings are regenerated from
+`analyzers/marquee.py::PAGE_IDS` (the marquee's own single source of
+truth for "v1 page ID ↔ v2 page name") as `page.goto {name: "..."}`
+args-table entries — reusing `page.goto` exactly as it already exists, no
+new action. One binding per `PAGE_IDS` entry (14 today), regardless of
+whether that page is in any particular build's roster:
+
+| v1 ID | key | page | v1 ID | key | page |
+|---|---|---|---|---|---|
+| 0 | `0` | help | 9 | `9` | spectrum |
+| 1 | `1` | harmony | 10 | `)` | tuner *(not in default roster)* |
+| 2 | `2` | sendnotes | 11 | `!` | chordkey |
+| 4 | `4` | ccmonitor | 13 | `#` | voices |
+| 5 | `5` | ccdashboard | 14 | `$` | config |
+| 6 | `6` | eventlog | 17 | `&` | img2txtviz |
+| 7 | `7` | progchanges | | | |
+| 8 | `8` | pianoroll | | | |
+
+(v1 IDs 3, 12, 15, 16, 18, 19 have no current page — those keys/shift-keys
+are simply absent from `DEFAULT_KEYMAP`, not bound to a no-op.)
+
+**Formula** (verified against v1's own real keymap, `docs/visual-audit.md`'s
+"Global page-switch keymap" audit row, not re-derived): unshifted digit
+character = the ID's ones digit for IDs 0–9; for IDs 10–19, the SHIFTED
+variant of that same ones-digit character (`"1"`→`"!"`, `"3"`→`"#"`, …,
+using the same `DIGIT_ROW`/`SHIFTED_DIGIT_ROW` pairing the fb client's own
+evdev shifted-char table already keys off of) — e.g. ID 11 → ones digit
+`"1"` → shifted `"!"`. This reproduces v1's own `!`→11 … `&`→17 shifted-row
+scheme exactly, with one disclosed deviation: v1 reaches page 10 ("tuner")
+via a dedicated `t`/`T` letter key instead of a digit at all; this scheme
+does not special-case it (letters are reserved for per-page functions
+under this revamp's own ruling) — tuner is reachable via shift+0 (`")"`)
+instead, same formula as every other ID.
+
+**Roster pages with no v1 ID** (`"screensaver"` today,
+`analyzers/marquee.py`'s own docstring) get **no** digit binding at all —
+there's no ID to derive one from.
+
+**Graceful no-op for a known-but-absent page.** A `page.goto` target that
+HAS a v1 ID but isn't in THIS build's roster (e.g. "tuner" on the stock
+default roster) is a logged, silent no-op — `Engine._page_goto`
+(`engine/core.py`) narrows its own "unknown page" `ActionError` to this
+exact case, the same "ordinary, expected situation" category `page.jump`'s
+out-of-range position already established. A name with no v1 ID at all
+(a genuine typo) still raises loudly, unchanged.
+
+Cleanly reversible: `page.jump` (§1b) is completely untouched, so a
+`keymap.toml` can restore roster-positional digits at any time by
+overriding each key back to a `page.jump {position: N}` entry.
 
 ---
 
