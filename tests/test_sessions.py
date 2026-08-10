@@ -252,7 +252,13 @@ def test_trim_session_only_keeps_lines_within_the_relative_window(tmp_path):
     sink = make_sink(tmp_path)
     start = sink.start()
     base = start["started_ts"]
-    sink.record_event(make_event(type="note_on", ts=base + 0.5, data1=1))   # before window
+    sink.record_event(make_event(type="note_on", ts=base + 0.5, data1=1))    # before window
+    sink.record_event(make_event(type="note_off", ts=base + 0.6, data1=1))  # ended before the
+                                                                              # window too (NOT
+                                                                              # sustained -- see
+                                                                              # the dedicated
+                                                                              # boundary-synthesis
+                                                                              # tests for that case)
     sink.record_event(make_event(type="note_on", ts=base + 1.5, data1=2))   # inside
     sink.record_event(make_event(type="note_on", ts=base + 2.5, data1=3))   # inside
     sink.record_event(make_event(type="note_on", ts=base + 5.0, data1=4))   # after window
@@ -296,6 +302,131 @@ def test_trim_session_output_is_replayable(tmp_path):
                                    now_fn=lambda: 1786170000.0, id_fn=lambda now: "session-trim-6")
     summary = replay_session(result["path"], instant=True)
     assert summary["events_total"] == 8   # 4 note_on + 4 note_off
+
+
+# -- boundary-state synthesis: notes sustained across --from (review round 2,
+# Important finding, live-reproduced by the reviewer) -------------------------
+
+def test_trim_session_synthesizes_a_note_sustained_across_from(tmp_path):
+    """The reviewer's exact reproduction: a note turned on BEFORE the
+    trim window and still held (no note_off) at the window's own start
+    must NOT vanish from the trimmed replay -- its sustained state must
+    be synthesized at the window boundary so a replay sees it as already
+    sounding, exactly like the live session did."""
+    from midicrt.engine.replay import replay_session
+    sink = make_sink(tmp_path)
+    start = sink.start()
+    base = start["started_ts"]
+    # Note A (ch0 n60): on at 0.5 (BEFORE --from=1.0), off at 3.0 (inside
+    # the window) -- sustained across the boundary.
+    sink.record_event(make_event(type="note_on", ts=base + 0.5, channel=0,
+                                 data1=60, data2=100, summary="note_on ch1 n60 v100"))
+    # Note B (ch0 n64): entirely inside the window -- ordinary.
+    sink.record_event(make_event(type="note_on", ts=base + 1.5, channel=0,
+                                 data1=64, data2=90, summary="note_on ch1 n64 v90"))
+    sink.record_event(make_event(type="note_off", ts=base + 2.5, channel=0,
+                                 data1=64, data2=0, summary="note_off ch1 n64"))
+    sink.record_event(make_event(type="note_off", ts=base + 3.0, channel=0,
+                                 data1=60, data2=0, summary="note_off ch1 n60"))
+    sink.stop()
+    sid = start["session_id"]
+
+    result = sessions.trim_session(str(tmp_path), sid, 1.0, 5.0,
+                                   now_fn=lambda: 1786170000.0,
+                                   id_fn=lambda now: "session-trim-sustain")
+    lines = read_jsonl(result["path"])
+    events = [line for line in lines if line["kind"] == "event"]
+
+    # A synthesized note_on for note A leads the kept events, at ts ==
+    # abs_start, honestly marked.
+    synthetic = [e for e in events if e.get("synthetic")]
+    assert len(synthetic) == 1
+    assert synthetic[0]["type"] == "note_on"
+    assert synthetic[0]["channel"] == 0
+    assert synthetic[0]["data1"] == 60
+    assert synthetic[0]["data2"] == 100   # real velocity preserved
+    assert synthetic[0]["ts"] == pytest.approx(base + 1.0)   # == abs_start
+
+    # No real captured event is ever marked synthetic.
+    assert all(not e.get("synthetic") for e in events if e is not synthetic[0])
+
+    # The replayed voice state is now CORRECT: both notes were held
+    # simultaneously between 1.5 and 2.5 -- peak concurrent voices == 2,
+    # not 1 (the reviewer's own reproduction of the bug: total_peak read
+    # 1, note A never registering at all).
+    summary = replay_session(result["path"], instant=True)
+    assert summary["final_state"]["voices"]["total_peak"] == 2
+
+
+def test_trim_session_does_not_synthesize_for_a_note_that_ended_before_the_window(tmp_path):
+    # A note fully on-and-off BEFORE --from must NOT be synthesized --
+    # only a note still ACTIVE (no note_off yet) at abs_start qualifies.
+    sink = make_sink(tmp_path)
+    start = sink.start()
+    base = start["started_ts"]
+    sink.record_event(make_event(type="note_on", ts=base + 0.1, channel=0, data1=60, data2=100))
+    sink.record_event(make_event(type="note_off", ts=base + 0.3, channel=0, data1=60, data2=0))
+    sink.record_event(make_event(type="note_on", ts=base + 2.0, channel=0, data1=64, data2=90))
+    sink.stop()
+    sid = start["session_id"]
+
+    result = sessions.trim_session(str(tmp_path), sid, 1.0, 5.0,
+                                   now_fn=lambda: 1786170000.0,
+                                   id_fn=lambda now: "session-trim-no-sustain")
+    lines = read_jsonl(result["path"])
+    events = [line for line in lines if line["kind"] == "event"]
+    assert not any(e.get("synthetic") for e in events)
+    # Only note B (real, inside the window) is present.
+    assert [e["data1"] for e in events] == [64]
+
+
+def test_trim_session_boundary_exact_from_lands_on_a_note_on_no_duplicate_synthesis(tmp_path):
+    """`--from` landing EXACTLY on a real note_on's own ts must keep that
+    note_on as a REAL kept event and must NOT also synthesize a duplicate
+    for the same note -- the reviewer's own explicitly-requested edge
+    case."""
+    sink = make_sink(tmp_path)
+    start = sink.start()
+    base = start["started_ts"]
+    # note_on lands EXACTLY at the from=2.0 boundary.
+    sink.record_event(make_event(type="note_on", ts=base + 2.0, channel=0, data1=60, data2=100))
+    sink.record_event(make_event(type="note_off", ts=base + 3.0, channel=0, data1=60, data2=0))
+    sink.stop()
+    sid = start["session_id"]
+
+    result = sessions.trim_session(str(tmp_path), sid, 2.0, 5.0,
+                                   now_fn=lambda: 1786170000.0,
+                                   id_fn=lambda now: "session-trim-boundary-exact")
+    lines = read_jsonl(result["path"])
+    events = [line for line in lines if line["kind"] == "event"]
+    note_ons = [e for e in events if e["type"] == "note_on" and e["data1"] == 60]
+    assert len(note_ons) == 1   # exactly one -- the real one, not duplicated
+    assert note_ons[0].get("synthetic") is not True
+    assert note_ons[0]["ts"] == pytest.approx(base + 2.0)
+
+
+def test_trim_session_synthesizes_independently_per_channel(tmp_path):
+    # Same note NUMBER on two different channels must be tracked
+    # independently -- (channel, data1) is the sustain key, not data1 alone.
+    sink = make_sink(tmp_path)
+    start = sink.start()
+    base = start["started_ts"]
+    sink.record_event(make_event(type="note_on", ts=base + 0.1, channel=0, data1=60, data2=100))
+    sink.record_event(make_event(type="note_on", ts=base + 0.2, channel=1, data1=60, data2=80))
+    sink.record_event(make_event(type="note_off", ts=base + 0.5, channel=1, data1=60, data2=0))
+    # ch1 n60 ends before the window; ch0 n60 stays held across it.
+    sink.record_event(make_event(type="note_off", ts=base + 3.0, channel=0, data1=60, data2=0))
+    sink.stop()
+    sid = start["session_id"]
+
+    result = sessions.trim_session(str(tmp_path), sid, 1.0, 5.0,
+                                   now_fn=lambda: 1786170000.0,
+                                   id_fn=lambda now: "session-trim-per-channel")
+    lines = read_jsonl(result["path"])
+    synthetic = [line for line in lines if line.get("synthetic")]
+    assert len(synthetic) == 1
+    assert synthetic[0]["channel"] == 0
+    assert synthetic[0]["data1"] == 60
 
 
 def test_trim_session_refuses_the_live_session(tmp_path):
@@ -548,14 +679,18 @@ def test_delete_session_twice_overwrites_the_trash_entry_not_raising(tmp_path):
 # over repeated runs).
 
 def test_index_write_lock_is_mutually_exclusive_across_both_modules(tmp_path):
-    """Direct proof the two independently-defined `_index_write_lock`
-    context managers (capture.py's and sessions.py's) contend on the SAME
-    underlying file: a sessions.py-side lock holder sleeps while holding
-    it; a capture.py-side lock acquisition attempt started concurrently
+    """Direct proof `sessions.py`'s plain blocking `_index_write_lock` and
+    `capture.py`'s bounded, non-blocking-with-retry `_try_index_write_lock`
+    (Task 6 SECOND review round -- capture.py's own lock had to become
+    LOCK_NB + bounded-retry so an engine action can never block the
+    asyncio loop, see that module's own docstring) still contend on the
+    SAME underlying file: a sessions.py-side lock holder sleeps while
+    holding it; a capture.py-side acquisition attempt started concurrently
     must observably wait for the FULL sleep before proceeding -- if the
     two locks were NOT targeting the same file (or `fcntl.flock` weren't
     actually being exercised), the second acquisition would return
-    near-instantly instead."""
+    near-instantly instead. Uses a GENEROUS timeout (well past
+    `hold_seconds`) so this test proves CONTENTION, not a busy-timeout."""
     capture_dir = str(tmp_path)
     hold_seconds = 0.4
     acquired_second_at = []
@@ -569,7 +704,7 @@ def test_index_write_lock_is_mutually_exclusive_across_both_modules(tmp_path):
     time.sleep(0.05)   # let the holder thread acquire the lock first
 
     start = time.monotonic()
-    with capture_mod._index_write_lock(capture_dir):
+    with capture_mod._try_index_write_lock(capture_dir, timeout_s=5.0):
         acquired_second_at.append(time.monotonic() - start)
     holder.join()
 

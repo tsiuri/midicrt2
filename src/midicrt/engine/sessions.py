@@ -479,7 +479,56 @@ def trim_session(capture_dir: str, session_id: str, from_s: float, to_s: float, 
     vocabulary; this is post-hoc file-surgery metadata, a different kind
     of fact entirely, and belongs in the one place a session already
     carries build-time-only facts -- its header (`engine_version`,
-    `instruments`)."""
+    `instruments`).
+
+    Boundary-state synthesis for notes sustained across `--from`
+    (SECOND review round, Important finding, live-reproduced): a note
+    turned on BEFORE the window and still held (no `note_off` yet) AT
+    `abs_start` used to simply vanish -- its `note_on` falls outside the
+    kept window (excluded, correctly, by the plain `abs_start <= ts <=
+    abs_end` filter), but its EVENTUAL `note_off` (occurring INSIDE the
+    window) was still kept as a dangling, unmatched event. A replay of
+    the trimmed file never saw the note turn on at all, so the note_off
+    was silently absorbed as a no-op by every consumer that guards
+    against "note-off with nothing held" -- undercounting voice/harmony
+    state for the ENTIRE window (reviewer's own reproduction: `total_
+    peak` read 1 instead of 2 for a session with one note already held
+    across `--from`).
+
+    Fix: a first pass over every line with `ts < abs_start` (i.e.
+    strictly BEFORE the window -- see the boundary-exact note below)
+    tracks, per `(channel, data1)`, whether the most recent `note_on`/
+    `note_off` for that note leaves it ACTIVE (a `note_on` with no
+    subsequent `note_off`) at the moment the window begins. For every
+    note still active, a SYNTHETIC copy of its ORIGINAL `note_on` line is
+    inserted at the very start of the kept output, with `"ts"` moved to
+    `abs_start` and a NEW `"synthetic": true` field added -- preserving
+    the note's real `channel`/`data1`/`data2` (velocity)/`source`, so a
+    replay's voice/harmony state is exactly as accurate as if the window
+    had genuinely started with that note already sounding (which is,
+    honestly, what happened). `"synthetic": true` is the ONLY new,
+    additive field on an "event" line this fix introduces -- documented
+    in docs/phase5-capture.md's own "event" section; it NEVER appears on
+    a real captured event, only on a trim-derived boundary-state note_on,
+    so a consumer can always tell a synthesized event apart from a real
+    one on inspection (task brief's own explicit requirement).
+
+    Boundary-exact case (`--from` lands EXACTLY on a real `note_on`'s own
+    `ts`): the pre-window scan only considers `ts < abs_start` (strictly
+    less-than); a `note_on` with `ts == abs_start` falls into the KEPT
+    window instead (`abs_start <= ts`, inclusive), so it is kept as a
+    real event and never ALSO tracked as "still active before the
+    window" -- no duplicate synthesis, by construction, not by a special
+    case (see test_sessions.py's own boundary-exact test).
+
+    Disclosed, deliberate scope limit: this fix covers `note_on`/
+    `note_off` sustain ONLY (the reviewer's own reproduction, and the
+    ONE stateful MIDI condition every current replay consumer -- voices/
+    harmony -- actually derives from). Other potentially-"held-across-a-
+    boundary" MIDI state (a sustain pedal, CC64, held down; an active
+    pitch-bend; the current program/patch) is NOT synthesized by this
+    fix -- a real, disclosed gap, not silently assumed away (see task-6-
+    report.md §2.3/§7)."""
     _check_not_live(session_id, live_session_id, "trim")
     try:
         from_s = float(from_s)
@@ -509,17 +558,47 @@ def trim_session(capture_dir: str, session_id: str, from_s: float, to_s: float, 
     kept: list[dict] = []
     counts: dict[str, int] = {}
     last_ts = abs_start
+    # (channel, data1) -> the ORIGINAL note_on line, for any note that is
+    # still held (no note_off seen yet) as of the last pre-window line
+    # processed -- see this function's own "Boundary-state synthesis"
+    # docstring section above.
+    active_before_window: dict[tuple, dict] = {}
     for line in _iter_lines(src_path):
         if line.get("kind") == "header":
             continue
         ts = line.get("ts")
-        if not isinstance(ts, int | float) or not (abs_start <= ts <= abs_end):
+        if not isinstance(ts, int | float):
+            continue
+        if ts < abs_start:
+            if line.get("kind") == "event":
+                note_type = line.get("type")
+                if note_type == "note_on":
+                    active_before_window[(line.get("channel"), line.get("data1"))] = line
+                elif note_type == "note_off":
+                    active_before_window.pop((line.get("channel"), line.get("data1")), None)
+            continue
+        if ts > abs_end:
             continue
         kept.append(line)
         last_ts = max(last_ts, ts)
         if line.get("kind") == "event":
             event_type = line.get("type", "?")
             counts[event_type] = counts.get(event_type, 0) + 1
+
+    # Synthesize boundary-state note_on events for anything still held at
+    # abs_start -- inserted BEFORE every real kept line (sorted for
+    # determinism; all share ts == abs_start so real replay/analyzer
+    # ordering among them doesn't matter, only that they precede every
+    # note_off that will legitimately turn them back off).
+    synthesized = []
+    for (channel, data1), original in sorted(
+            active_before_window.items(), key=lambda kv: (kv[0][0] or 0, kv[0][1] or 0)):
+        synth = dict(original)
+        synth["ts"] = abs_start
+        synth["synthetic"] = True
+        synthesized.append(synth)
+        counts["note_on"] = counts.get("note_on", 0) + 1
+    kept = synthesized + kept
 
     now = now_fn()
     new_id = id_fn(now)
@@ -603,13 +682,31 @@ def repair_index(capture_dir: str, *, live_session_id: str | None = None) -> dic
     orphan) full duration is far simpler to reason about correctly than a
     two-phase "scan outside the lock, reconcile inside it" scheme, which
     would still need to handle a file appearing/vanishing between the two
-    phases. The cost: a concurrently-running daemon's own `capture.stop`/
-    `.pin`/retention-sweep index write could block for up to that same
-    duration while a `repair-index` run is in progress -- acceptable
-    (the daemon's own MIDI tick loop is NOT gated on this at all; only
-    the one client request waiting on that specific action's response is
-    delayed) and disclosed in task-6-report.md rather than silently
-    accepted."""
+    phases.
+
+    The cost, corrected (SECOND review round -- the ORIGINAL text here
+    claimed "the daemon's own MIDI tick loop is NOT gated on this at
+    all," which was WRONG and reviewer-caught: before that round's own
+    fix, a concurrently-running daemon's own `capture.start`/`.stop`/
+    `.pin` (all reachable from `ActionRegistry.dispatch`, which runs
+    every handler SYNCHRONOUSLY on the ONE asyncio event loop) really
+    could block the WHOLE loop -- MIDI draining, ticks, rendering,
+    every other client's request -- for up to however long a
+    `repair-index` run held this lock, live-reproduced by the reviewer
+    as a 2227ms stall from a 2.0s hold). Now: `CaptureSink`'s own
+    engine-side lock acquisition (`_try_index_write_lock`, engine/
+    capture.py) is BOTH bounded (`capture_mod.ENGINE_LOCK_TIMEOUT_S`)
+    AND run off the event loop entirely (`asyncio.to_thread`, wired at
+    `Engine._capture_start_action_dispatch`/`_capture_stop_action_
+    dispatch`/`_capture_pin_action`, engine/core.py) -- so a concurrent
+    `repair-index` run genuinely CANNOT block the daemon's tick loop,
+    ever. What it CAN still do: delay the ONE client request waiting on
+    `capture.start`/`.stop`/`.pin`'s own response by up to that bound
+    (`capture.start`/`.stop` degrade gracefully instead of failing --
+    see `CaptureSink.start`/`.stop`'s own docstrings; only `capture.pin`
+    can report a clean busy `ActionError` if the bound is genuinely
+    exceeded). Disclosed in task-6-report.md, §9 item 1 (second review
+    round) for the full incident and fix."""
     from midicrt.engine.replay import _iter_lines  # lazy: see module docstring
 
     kept: list[str] = []

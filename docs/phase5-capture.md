@@ -73,6 +73,26 @@ replacement for the raw trace. `clock_tick` lines additionally carry
 `clock_batch_start`; `sysex` lines carry `sysex_data` (the raw payload
 bytes, F0/F7 framing stripped, as a JSON array of ints).
 
+**`"synthetic": true` (Phase 9 Task 6, capture editor — the ONLY case
+where an `event` line is not ground truth)**: `midicrt sessions trim`
+(`engine/sessions.py::trim_session`) can insert a synthesized `note_on`
+line, timestamped exactly at the trimmed window's own start (`--from`),
+for a note that was already turned on *before* the window and never
+received its `note_off` until *inside* it — without this, the note's
+real `note_off` would survive into the trimmed file as a dangling,
+unmatched event, and the note itself would never register in a replay of
+that file at all (undercounting voice/harmony state for the whole
+window). The synthesized line is a verbatim copy of the note's own
+*original* `note_on` (`channel`/`data1`/`data2`/`source`/`summary`
+preserved — only `ts` is moved to the window's start), with one
+additive field, `"synthetic": true`, that **never appears on a real
+captured event** — a consumer can always tell a synthesized boundary-
+state event apart from ground truth by checking for this field's
+presence. See `trim_session`'s own docstring for the full design
+(per-`(channel, data1)` sustain tracking, the boundary-exact case, and
+the disclosed scope limit — this covers note on/off sustain only, not
+sustain-pedal/pitch-bend/program state).
+
 ### `action` (a mark: something was dispatched, WITH PROVENANCE)
 
 ```json

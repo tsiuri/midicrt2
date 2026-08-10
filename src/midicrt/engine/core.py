@@ -1112,9 +1112,27 @@ class Engine:
         # (see `_handle_sysex`'s own sysex handlers, which call
         # `self._capture.record_action(..., origin="sysex")` directly).
         self.actions.set_dispatch_hook(self._on_action_dispatched)
-        self.actions.register("capture.start", self._capture_start_action,
+        # Phase 9 Task 6, SECOND review round (Important finding, live-
+        # reproduced): `capture.start`/`.stop` are registered against the
+        # `_dispatch` ASYNC wrapper methods below, NOT the sync `_capture_
+        # start_action`/`_capture_stop_action` methods themselves -- see
+        # those wrappers' own docstrings for why (`ActionRegistry.
+        # dispatch()` calls whatever's registered here SYNCHRONOUSLY, on
+        # the daemon's one asyncio loop; the sync methods' own
+        # `CaptureSink.start()`/`.stop()` calls can now block briefly on
+        # `index.json`'s bounded lock, `capture_mod.
+        # _try_index_write_lock`, and that wait must never happen ON the
+        # loop). The sync methods themselves are UNCHANGED and still the
+        # ones called directly from `__init__` (auto-start, below) and
+        # `Engine.stop()` (clean shutdown) -- neither of those two
+        # call sites goes through `ActionRegistry.dispatch` at all, so
+        # they're unaffected by this split; a bounded, synchronous wait at
+        # BOOT or SHUTDOWN time is harmless (nothing else needs the loop
+        # responsive at those two specific moments the way a live client
+        # request does).
+        self.actions.register("capture.start", self._capture_start_action_dispatch,
                               description="Start a new event-sourced capture session")
-        self.actions.register("capture.stop", self._capture_stop_action,
+        self.actions.register("capture.stop", self._capture_stop_action_dispatch,
                               description="Stop the active capture session")
         self.actions.register("capture.status", self._capture_status_action,
                               description="Report the active capture session's status")
@@ -1652,16 +1670,34 @@ class Engine:
         except OSError as exc:
             self._capture_write_failed(exc)
 
+    def _capture_start_finish(self, result: dict) -> dict:
+        """The engine-state half of `capture.start` (stamps the `rec`
+        chrome flag on the ALWAYS-present "status" analyzer, marks
+        `overlay.status` dirty, emits `capture_started`) -- factored out
+        of `_capture_start_action` so BOTH the sync version (still called
+        directly from `__init__` for `config.capture_auto_start`) and the
+        async, `to_thread`-offloaded dispatch wrapper below (second review
+        round) share this identical tail without duplicating it. Always
+        called back on the event-loop thread -- see
+        `_capture_start_action_dispatch`'s own docstring for why that's
+        guaranteed even though the CaptureSink call itself runs in a
+        worker thread."""
+        self.analyzers["status"].set_rec(True)
+        self._dirty.add("overlay.status")
+        self.emit_event("capture_started", {"id": result["session_id"]})
+        return {"recording": True, **result}
+
     def _capture_start_action(self) -> dict:
-        """`capture.start` action handler (also called directly from
-        `__init__` for `config.capture_auto_start` -- see that call
+        """`capture.start` -- the SYNCHRONOUS version, called directly
+        from `__init__` for `config.capture_auto_start` (see that call
         site's own comment for why it must ALSO explicitly record an
         `origin="auto"` mark, since a direct method call bypasses the
-        dispatch hook entirely). Stamps the `rec` chrome flag on the
-        ALWAYS-present "status" analyzer and marks `overlay.status` dirty
-        directly (mirrors `_sendnotes_key`'s own "engine-level state
-        change marks its page dirty itself" precedent -- there is no
-        `MidiEvent` here for `TransportAnalyzer.handle()` to react to).
+        dispatch hook entirely) and from test code that wants a plain,
+        non-async call. **NOT registered as the `capture.start` ACTION**
+        (second review round) -- `_capture_start_action_dispatch` below
+        is; see that method's own docstring for why a client-dispatched
+        call needs the async/threaded version and this direct call site
+        doesn't.
 
         Fix wave (Important finding): `CaptureSink.start()` can raise
         `OSError` (an unwritable/unreachable sessions directory) --
@@ -1675,50 +1711,39 @@ class Engine:
         except OSError as exc:
             _LOG.error("capture.start failed: %s", exc)
             raise ActionError(f"capture.start failed: {exc}") from exc
-        self.analyzers["status"].set_rec(True)
-        self._dirty.add("overlay.status")
-        self.emit_event("capture_started", {"id": result["session_id"]})
-        return {"recording": True, **result}
+        return self._capture_start_finish(result)
 
-    def _capture_stop_action(self, *, origin: str = "unknown") -> dict:
-        """`capture.stop` action handler. A no-op-shaped result (mirrors
-        `CaptureSink.stop`'s own "stopping nothing is harmless" precedent)
-        when nothing was recording -- no `capture_stopped` event in that
-        case either, matching `bind.cancel`'s own "no event for a no-op"
-        precedent right above.
-
-        `origin` (fix wave, Important finding) -- INJECTED by
-        `ActionRegistry.dispatch` (register-time introspection over this
-        method's own signature, see `ActionRegistry.register`'s own
-        docstring), never a client-suppliable arg. Needed because this
-        handler must record its OWN `capture.stop` action mark EXPLICITLY,
-        BEFORE actually stopping: `CaptureSink.stop()` flips `is_recording`
-        False as its very first observable effect, and `record_action`'s
-        own guard (`if not self._recording: return`) would otherwise
-        silently swallow a stop mark reported through the NORMAL
-        post-dispatch hook (which only ever fires AFTER this handler
-        returns, by which point recording has already stopped) -- this is
-        the asymmetry fix versus `capture.start` (which happens to work
-        without any special handling: `_capture.start()` flips recording
-        ON before the hook fires). `Engine.stop()` (a clean daemon
-        shutdown, bypassing the registry entirely like the auto-start
-        case) calls this directly with `origin="shutdown"` -- both
-        `"auto"` and `"shutdown"` join the documented origin set
-        (`binding:<id>` / `client` / `behavior` / `sysex` / `auto` /
-        `shutdown`).
-
-        Fix wave (Important finding): `CaptureSink.stop()` can also raise
-        `OSError` (the final `flush()` inside it fails) -- routed through
-        the SAME `_capture_write_failed` containment path a background
-        flush failure uses, then re-raised as a clean `ActionError` for
-        the requesting client (same "never let a raw OSError past
-        ActionRegistry.dispatch" reasoning as `_capture_start_action`)."""
-        self._capture.record_action("capture.stop", {}, origin)
+    async def _capture_start_action_dispatch(self) -> dict:
+        """The ACTUAL `capture.start` action handler (registered in
+        `__init__`, above) -- second review round (Important finding,
+        live-reproduced): `CaptureSink.start()` can now block briefly on
+        `index.json`'s bounded advisory lock (`capture_mod.
+        _try_index_write_lock`, up to `capture_mod.ENGINE_LOCK_TIMEOUT_S`)
+        -- `ActionRegistry.dispatch()` calls whatever's registered here
+        SYNCHRONOUSLY, on the daemon's ONE asyncio event loop, so a plain
+        blocking call here would stall MIDI draining/ticks/rendering/
+        every OTHER client's request for however long that wait takes,
+        exactly the bug the reviewer reproduced live (an unrelated
+        `status` request stalled 2227ms while another process held the
+        lock 2.0s). `asyncio.to_thread` moves ONLY the actual `CaptureSink.
+        start()` call (the one thing that can block) onto a worker
+        thread -- execution resumes back on the EVENT LOOP THREAD the
+        instant `await` returns, so `_capture_start_finish`'s own engine-
+        state mutations (dirty-marking, `emit_event`) still only ever run
+        on the loop, never concurrently with a tick -- no new thread-
+        safety surface is introduced beyond the one `to_thread` call
+        itself."""
         try:
-            result = self._capture.stop()
+            result = await asyncio.to_thread(self._capture.start)
         except OSError as exc:
-            result = self._capture_write_failed(exc)
-            raise ActionError(f"capture.stop failed: {exc}") from exc
+            _LOG.error("capture.start failed: %s", exc)
+            raise ActionError(f"capture.start failed: {exc}") from exc
+        return self._capture_start_finish(result)
+
+    def _capture_stop_finish(self, result: dict) -> dict:
+        """The engine-state half of `capture.stop` -- see
+        `_capture_start_finish`'s own docstring for why this is factored
+        out and shared between the sync and async/dispatch versions."""
         self.analyzers["status"].set_rec(False)
         self._dirty.add("overlay.status")
         if result.get("session_id"):
@@ -1726,16 +1751,112 @@ class Engine:
                             {"id": result["session_id"], "counts": result.get("counts", {})})
         return {"recording": False, **result}
 
+    def _capture_stop_action(self, *, origin: str = "unknown") -> dict:
+        """`capture.stop` -- the SYNCHRONOUS version. Called directly from
+        `Engine.stop()` (a clean daemon shutdown, bypassing the registry
+        entirely like the auto-start case) with `origin="shutdown"`.
+        **NOT registered as the `capture.stop` ACTION** (second review
+        round) -- `_capture_stop_action_dispatch` below is; same
+        "the registry-dispatched path must never block the loop, but a
+        direct sync call site like this one is fine to wait briefly"
+        reasoning as `_capture_start_action`'s own docstring.
+
+        A no-op-shaped result (mirrors `CaptureSink.stop`'s own "stopping
+        nothing is harmless" precedent) when nothing was recording -- no
+        `capture_stopped` event in that case either, matching `bind.
+        cancel`'s own "no event for a no-op" precedent right above.
+
+        `origin` (fix wave, Important finding) -- INJECTED by
+        `ActionRegistry.dispatch` when this shape of signature is
+        registered (register-time introspection, see `ActionRegistry.
+        register`'s own docstring); kept on this SYNC method's own
+        signature even though it's `Engine.stop()` that supplies it
+        directly now, not the registry, so `origin="shutdown"` still
+        reads the same at both call sites. Needed because this handler
+        must record its OWN `capture.stop` action mark EXPLICITLY, BEFORE
+        actually stopping: `CaptureSink.stop()` flips `is_recording` False
+        as its very first observable effect, and `record_action`'s own
+        guard (`if not self._recording: return`) would otherwise silently
+        swallow a stop mark reported through the NORMAL post-dispatch
+        hook (which only ever fires AFTER a REGISTRY-dispatched handler
+        returns, by which point recording has already stopped) -- this is
+        the asymmetry fix versus `capture.start` (which happens to work
+        without any special handling: `_capture.start()` flips recording
+        ON before the hook fires). `"auto"` and `"shutdown"` both join the
+        documented origin set (`binding:<id>` / `client` / `behavior` /
+        `sysex` / `auto` / `shutdown`).
+
+        Fix wave (Important finding): `CaptureSink.stop()` can also raise
+        `OSError` (the final `flush()` inside it fails) -- routed through
+        the SAME `_capture_write_failed` containment path a background
+        flush failure uses, then re-raised as a clean `ActionError` for
+        the requesting client (same "never let a raw OSError past
+        ActionRegistry.dispatch" reasoning as `_capture_start_action`).
+        Note this is UNRELATED to `IndexLockBusy` -- `CaptureSink.stop()`
+        (second review round) already catches THAT internally and
+        degrades gracefully (an orphaned session, healed later by
+        `repair-index`), so it never reaches this `except OSError` at
+        all; only a genuine disk-I/O failure does."""
+        self._capture.record_action("capture.stop", {}, origin)
+        try:
+            result = self._capture.stop()
+        except OSError as exc:
+            result = self._capture_write_failed(exc)
+            raise ActionError(f"capture.stop failed: {exc}") from exc
+        return self._capture_stop_finish(result)
+
+    async def _capture_stop_action_dispatch(self, *, origin: str = "unknown") -> dict:
+        """The ACTUAL `capture.stop` action handler (registered in
+        `__init__`, above) -- see `_capture_start_action_dispatch`'s own
+        docstring for the full "why `to_thread`, why this resumes safely
+        on the loop" reasoning, identical here. `record_action` (the
+        stop-mark-before-stopping ordering `_capture_stop_action`'s own
+        docstring explains) and `_capture_stop_finish` both still run on
+        the event-loop thread -- only the `CaptureSink.stop()` call
+        itself (the one thing that can block on the bounded index lock)
+        is offloaded."""
+        self._capture.record_action("capture.stop", {}, origin)
+        try:
+            result = await asyncio.to_thread(self._capture.stop)
+        except OSError as exc:
+            result = self._capture_write_failed(exc)
+            raise ActionError(f"capture.stop failed: {exc}") from exc
+        return self._capture_stop_finish(result)
+
     def _capture_status_action(self) -> dict:
         return self._capture.status()
 
-    def _capture_pin_action(self, id: str) -> dict:
+    async def _capture_pin_action(self, id: str) -> dict:
         """`capture.pin {id}` action handler -- translates `CaptureSink.
         pin`'s `ValueError` (unknown/not-yet-stopped session id) into
         `ActionError`, same "unknown named resource is a genuine caller
-        error" precedent `_bind_remove` already sets."""
+        error" precedent `_bind_remove` already sets. Has no OTHER direct
+        (non-dispatch) caller anywhere in this codebase (unlike `capture.
+        start`/`.stop`, which also need a sync version for `__init__`/
+        `Engine.stop()` -- see those methods' own docstrings), so this one
+        can simply BE the async, `to_thread`-offloaded version with no
+        separate sync sibling to keep in sync.
+
+        Async (second review round, Important finding): see
+        `_capture_start_action_dispatch`'s own docstring for the full
+        "why `to_thread`" reasoning. `IndexLockBusy` (`capture_mod`,
+        raised when the bounded index-lock wait, `capture_mod.
+        ENGINE_LOCK_TIMEOUT_S`, is exceeded) is caught SEPARATELY from
+        `ValueError` and reported with its OWN distinct wording -- unlike
+        `capture.start`/`.stop` (which both degrade gracefully on lock
+        contention, see `CaptureSink.start`/`.stop`'s own docstrings),
+        `CaptureSink.pin` has no honest degraded outcome and lets
+        `IndexLockBusy` propagate all the way here (see that method's own
+        docstring); reporting it as a generic "unknown session" `Value
+        Error`-shaped message would be actively misleading (the id is
+        perfectly valid, the STORE was just busy) -- a caller needs to be
+        able to tell "retry" apart from "that session doesn't exist"."""
         try:
-            return self._capture.pin(id)
+            return await asyncio.to_thread(self._capture.pin, id)
+        except capture_mod.IndexLockBusy as exc:
+            raise ActionError(
+                f"capture store busy (index.json locked by another operation), "
+                f"try again: {exc}") from exc
         except ValueError as exc:
             raise ActionError(str(exc)) from exc
 

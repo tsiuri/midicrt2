@@ -228,57 +228,114 @@ def _atomic_write_json(path: str, payload: Any) -> None:
 
 _INDEX_LOCK_FILE = ".index.lock"
 
+# Phase 9 Task 6, SECOND review round (Important finding, live-reproduced):
+# a plain BLOCKING `fcntl.flock(LOCK_EX)` here is safe for `engine/
+# sessions.py`'s own copy (the CLI, its own separate OS process -- blocking
+# there is correct and intended) but was WRONG for this module: every one
+# of `CaptureSink`'s index-mutating methods (`_sweep_retention`/
+# `_update_index_on_stop`/`pin`/`fail`) is reached from an `ActionRegistry.
+# dispatch()` call that runs SYNCHRONOUSLY on the daemon's single asyncio
+# event loop -- a blocking flock there doesn't just stall the ONE action
+# waiting on it, it stalls the WHOLE loop: MIDI draining, per-tick
+# analyzers, chrome rendering, every OTHER client's request, all of it,
+# for as long as some unrelated process (an operator's `midicrt sessions
+# repair-index`) happens to hold the lock. Reviewer reproduced this live:
+# an UNRELATED `status` request stalled 2227ms while another process held
+# the lock for 2.0s. `ENGINE_LOCK_TIMEOUT_S`/`_try_index_write_lock` below
+# fix this with two DISTINCT changes, both required together (see
+# `_try_index_write_lock`'s own docstring for why neither alone suffices):
+# (1) `LOCK_NB` + a bounded poll-retry loop (never blocks indefinitely,
+# ever) instead of a single blocking `flock()` call, and (2) every
+# ENGINE-reachable caller (`Engine._capture_start_action`/
+# `_capture_stop_action`/`_capture_pin_action`, engine/core.py) now runs
+# the actual `CaptureSink` call via `asyncio.to_thread` -- so even the
+# BOUNDED poll-wait happens on a worker thread, never the loop itself.
+ENGINE_LOCK_TIMEOUT_S = 2.0
+ENGINE_LOCK_POLL_INTERVAL_S = 0.05
+
+
+class IndexLockBusy(Exception):
+    """Raised by `_try_index_write_lock` when `index.json`'s advisory lock
+    could not be acquired within `timeout_s` -- a TRANSIENT, retryable
+    condition (some other process/thread is mid read-modify-write right
+    now), fundamentally DIFFERENT from `CaptureSink.fail()`'s own disk-I/O
+    failure containment (ENOSPC/EIO -- a condition that will NOT resolve
+    itself by retrying). Deliberately NOT an `OSError` subclass: `Engine.
+    _capture_start_action`/`_capture_stop_action` (engine/core.py) already
+    catch `OSError` from `CaptureSink.start`/`.stop` and route it through
+    `_capture_write_failed` -> `CaptureSink.fail()`, which DISABLES
+    CAPTURE OUTRIGHT (see that method's own docstring) -- letting a mere
+    lock-busy condition masquerade as an `OSError` would trip that SAME
+    path and disable a perfectly healthy capture subsystem just because
+    an unrelated `midicrt sessions repair-index` happened to be running at
+    that exact moment. `CaptureSink.start`/`.stop` therefore catch THIS
+    exception separately and degrade gracefully instead (see their own
+    docstrings); only `CaptureSink.pin` lets it propagate (there is no
+    honest partial-success outcome for a pin -- either the tag is
+    persisted or the caller is told to retry)."""
+
 
 @contextlib.contextmanager
-def _index_write_lock(capture_dir: str):
-    """Advisory `fcntl.flock` (exclusive) held for the ENTIRE read-modify-
-    write span of an `index.json` mutation -- Phase 9 Task 6 review-round
-    fix (Important finding, live-reproducible race): `_update_index_on_
-    stop`/`pin`/`fail`/`_sweep_retention` below each used to
-    `_load_index`/`_save_index` with NO lock at all -- meanwhile,
-    `engine/sessions.py`'s own `trim_session`/`delete_session`/
-    `repair_index` (the `midicrt sessions` CLI + the web sessions panel's
-    read actions) do their OWN independent read-modify-write against the
-    SAME `index.json`, from a SEPARATE process, whenever production has
-    `capture_auto_start` LIVE (the default) and an operator runs `midicrt
-    sessions ...` concurrently. Without a shared lock, two interleaved
-    read-then-write cycles can silently drop one side's edit (this
-    daemon reads rows A, `sessions.py` reads rows A, `sessions.py`
-    appends/removes and writes A', this daemon finishes its OWN edit and
-    writes A+new -- overwriting A' and losing whatever `sessions.py` just
-    did, or the symmetric loss the other way around) -- a real, silent
-    DATA-LOSS bug, not cosmetic.
+def _try_index_write_lock(capture_dir: str, *, timeout_s: float | None = None):
+    """Advisory `fcntl.flock(LOCK_EX | LOCK_NB)`, retried on a short poll
+    interval (`ENGINE_LOCK_POLL_INTERVAL_S`, default 50ms) until acquired
+    OR `timeout_s` (default `ENGINE_LOCK_TIMEOUT_S`, 2.0s -- a live-read
+    module attribute, not captured at import, so tests can `monkeypatch.
+    setattr` it exactly like `DEFAULT_STATE_DIR`) elapses, at which point
+    `IndexLockBusy` is raised instead of continuing to wait. Held for the
+    ENTIRE read-modify-write span of an `index.json` mutation once
+    acquired, same as `engine/sessions.py`'s own (still plain-blocking,
+    unbounded) `_index_write_lock` -- see module docstring above for why
+    THIS module specifically needs the bounded/non-blocking version and
+    that one doesn't.
 
-    `engine/sessions.py` carries an IDENTICAL copy of this exact context
-    manager (same name, same `.index.lock` filename, same
-    `<capture_dir>/.index.lock` convention) -- see this module's OWN
-    docstring's "Session index" section and `engine/sessions.py`'s own
-    module docstring for why duplicating a SMALL helper across the two
-    modules (rather than one importing the other's private API) is this
-    codebase's established convention; what matters for CORRECTNESS is
-    only that both copies lock the same file, which they do by
-    construction (both key off `capture_dir`/`self._dir`, the one value
-    every caller on both sides already agrees on). `fcntl.flock` (not a
-    separate lockfile-as-mutex library) because both lockers are always
-    on the same host, same LOCAL filesystem (this module's own "Storage
-    location" section -- `/var/lib/midicrt/sessions` or the dev fallback,
-    never network storage), where POSIX advisory locking is correct and
-    needs no extra dependency.
+    Two changes, BOTH required, neither sufficient alone (module
+    docstring's own numbered list): `LOCK_NB` + bounded retry ALONE, if
+    still called synchronously from an action handler, would replace "the
+    loop blocks for however long the other side holds the lock" with "the
+    loop polls (still ON the loop, still blocking each poll's `flock()`
+    syscall and its `time.sleep()`) for up to `timeout_s`" -- BETTER
+    (bounded) but still a real stall of up to `timeout_s` on every OTHER
+    client's request. `asyncio.to_thread` ALONE (keeping a single blocking
+    `flock()` call), if the other side holds the lock indefinitely (e.g. a
+    stuck process), would move the daemon's own OS thread pool into
+    contending unboundedly -- fine for the LOOP's responsiveness, but the
+    ONE client waiting on that specific action would never get a response
+    and the thread pool could exhaust under repeated contention. Both
+    together: the loop is NEVER blocked (to_thread), and the wait is
+    NEVER unbounded (LOCK_NB + timeout) -- see engine/core.py's own async
+    action-handler wrappers for the `to_thread` half.
 
-    Read-only callers (`status()`, `_load_index()`'s own plain reads
-    where the caller doesn't go on to write) deliberately do NOT take
-    this lock -- `os.replace()`'s own atomicity (`_atomic_write_json`
-    above) already guarantees any concurrent reader sees either the
-    fully-old or fully-new document, never a torn/partial one; the lock
-    exists ONLY to serialize WRITER-vs-WRITER read-modify-write races."""
+    Same `<capture_dir>/.index.lock` file convention as `engine/
+    sessions.py`'s own lock (unchanged by this fix -- `LOCK_NB` retried
+    with the SAME underlying kernel lock still correctly excludes a
+    concurrent BLOCKING `flock()` from the other module; only the WAITING
+    strategy differs between the two, not the lock itself, so the
+    original RMW-race fix -- Task 6's first review round -- is fully
+    preserved)."""
+    timeout_s = ENGINE_LOCK_TIMEOUT_S if timeout_s is None else timeout_s
     os.makedirs(capture_dir, exist_ok=True)
     lock_path = os.path.join(capture_dir, _INDEX_LOCK_FILE)
     fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    acquired = False
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise IndexLockBusy(
+                        f"index.json lock busy for over {timeout_s:.1f}s "
+                        f"(capture_dir={capture_dir!r})") from None
+                time.sleep(ENGINE_LOCK_POLL_INTERVAL_S)
         yield
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        if acquired:
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
 
 
@@ -394,7 +451,24 @@ class CaptureSink:
         recording -- mirrors `bind.cancel`'s own "stopping nothing is a
         harmless confirmation" precedent, since `Engine.stop()` calls this
         unconditionally on every shutdown (see engine/core.py's own
-        `stop()`)."""
+        `stop()`).
+
+        Second review-round fix: the actual DATA is safely flushed and
+        the file closed BEFORE the index write is even attempted -- if
+        `index.json`'s bounded lock is busy (`IndexLockBusy`), this
+        method does NOT fail or leave itself half-stopped; it logs a
+        warning and proceeds to reset state exactly as if the index write
+        had succeeded. The session simply becomes an ORPHAN (a `.jsonl`
+        file with no index row) -- the SAME, already-handled, already-
+        tested drift class `list_sessions`/`repair_index` (engine/
+        sessions.py) exist to report/heal; `midicrt sessions repair-index`
+        adopts it later, recovering its real `counts`/`ended_ts` from the
+        file itself. `capture.stop` therefore NEVER fails merely because
+        of lock contention, and never leaves `self._recording`/`self._fh`
+        in an inconsistent state (the bug an earlier draft of this fix
+        would have had if `IndexLockBusy` were simply left to propagate
+        out of this method mid-way through its own state-reset
+        sequence -- see task-6-report.md §9 item 1 for the reasoning)."""
         if not self._recording:
             return {"session_id": None, "counts": {}}
         self.flush()
@@ -405,7 +479,12 @@ class CaptureSink:
         if self._fh is not None:
             with contextlib.suppress(OSError):
                 self._fh.close()
-        self._update_index_on_stop(session_id, started_ts, ended_ts, counts)
+        try:
+            self._update_index_on_stop(session_id, started_ts, ended_ts, counts)
+        except IndexLockBusy as exc:
+            _LOG.warning("capture.stop: index.json busy, session %s left as an orphan "
+                        "(no index row yet) -- run `midicrt sessions repair-index` to "
+                        "adopt it (%s)", session_id, exc)
         self._last_session = {
             "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
             "counts": counts,
@@ -473,7 +552,7 @@ class CaptureSink:
                 "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
                 "counts": counts, "error": error_text,
             }
-            with contextlib.suppress(Exception), _index_write_lock(self._dir):
+            with contextlib.suppress(Exception), _try_index_write_lock(self._dir):
                 rows = [r for r in self._load_index() if r.get("id") != session_id]
                 rows.append({
                     "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
@@ -489,11 +568,24 @@ class CaptureSink:
         no row to pin yet). Raises `ValueError` for an unknown id --
         `Engine._capture_pin` translates that into `ActionError`, matching
         `bind.remove`'s own "unknown named resource is a genuine caller
-        error" precedent. Locked (see `_index_write_lock`'s own docstring)
-        across the read-modify-write span -- races against a concurrent
-        `midicrt sessions trim/delete/repair-index` (engine/sessions.py)
-        writing the SAME index.json from a separate process."""
-        with _index_write_lock(self._dir):
+        error" precedent. Locked (see `_try_index_write_lock`'s own
+        docstring) across the read-modify-write span -- races against a
+        concurrent `midicrt sessions trim/delete/repair-index` (engine/
+        sessions.py) writing the SAME index.json from a separate process.
+
+        Second review-round fix: unlike `start`/`stop` (which both
+        degrade gracefully on `IndexLockBusy` -- see their own
+        docstrings), `pin` lets it PROPAGATE. There is no honest
+        degraded outcome for a pin: it either actually persists the
+        `pinned: true` flag or it didn't, and silently reporting success
+        without having written it would be a real correctness bug (an
+        operator relying on the pin to protect a session from retention
+        could lose it). `Engine._capture_pin_action` (engine/core.py)
+        catches this and reports a clean, distinctly-worded busy
+        `ActionError` instead of `ValueError`'s "unknown session"
+        wording, so a caller can tell "try again" apart from "that id
+        doesn't exist"."""
+        with _try_index_write_lock(self._dir):
             rows = self._load_index()
             for row in rows:
                 if row.get("id") == session_id:
@@ -655,11 +747,15 @@ class CaptureSink:
 
     def _update_index_on_stop(self, session_id: str, started_ts: float, ended_ts: float,
                               counts: dict) -> None:
-        """Locked (see `_index_write_lock`'s own docstring) across the
+        """Locked (see `_try_index_write_lock`'s own docstring) across the
         read-modify-write span -- races against a concurrent `midicrt
         sessions trim/delete/repair-index` (engine/sessions.py) writing
-        the SAME index.json from a separate process."""
-        with _index_write_lock(self._dir):
+        the SAME index.json from a separate process. Raises
+        `IndexLockBusy` (propagated, uncaught here) if the bound is
+        exceeded -- `stop()`, this method's one caller, is what actually
+        catches it and degrades gracefully (see that method's own
+        docstring)."""
+        with _try_index_write_lock(self._dir):
             rows = [r for r in self._load_index() if r.get("id") != session_id]
             rows.append({
                 "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
@@ -685,7 +781,7 @@ class CaptureSink:
         test_capture.py::test_retention_sweep_never_deletes_a_pinned_session
         expecting the unpinned count to settle at exactly `retention`.
 
-        Locked (see `_index_write_lock`'s own docstring) for the entire
+        Locked (see `_try_index_write_lock`'s own docstring) for the entire
         read-decide-delete-write span -- same concurrent-writer race as
         every other index-mutating method here, PLUS this one also
         deletes `.jsonl` FILES, so holding the lock across the whole
@@ -693,20 +789,39 @@ class CaptureSink:
         sessions.py) from being handed a session id this sweep is about
         to remove out from under it mid-read (belt-and-suspenders; the
         primary defense for that is still `list_sessions`/`show_session`'s
-        own honest missing-file/orphan reporting, not this lock)."""
-        with _index_write_lock(self._dir):
-            rows = self._load_index()
-            unpinned = sorted(
-                (r for r in rows if not r.get("pinned")),
-                key=lambda r: float(r.get("started_ts", 0.0)),
-            )
-            excess = len(unpinned) - max(0, self._retention - 1)
-            if excess <= 0:
-                return
-            victims = unpinned[:excess]
-            victim_ids = {v["id"] for v in victims}
-            for victim in victims:
-                with contextlib.suppress(OSError):
-                    os.remove(self.session_path(victim["id"]))
-            rows = [r for r in rows if r.get("id") not in victim_ids]
-            self._save_index(rows)
+        own honest missing-file/orphan reporting, not this lock).
+
+        Second review-round fix: retention is a soft HYGIENE mechanism,
+        not a correctness requirement -- if the bounded lock is busy
+        (`IndexLockBusy`, e.g. a `midicrt sessions repair-index` is mid
+        full-file-scan on another process), this sweep is simply SKIPPED
+        for this one `start()` call (logged, not raised) rather than
+        failing the whole `capture.start` action. The store may briefly
+        sit one session over `retention` as a result -- harmless, and
+        self-corrects on the very next successful `start()`. `capture.
+        start` therefore NEVER fails merely because of lock contention."""
+        try:
+            with _try_index_write_lock(self._dir):
+                self._sweep_retention_locked()
+        except IndexLockBusy as exc:
+            _LOG.warning("capture: retention sweep skipped this cycle (%s)", exc)
+
+    def _sweep_retention_locked(self) -> None:
+        """The actual sweep body, factored out of `_sweep_retention` so
+        that method's own `try/except IndexLockBusy` wraps EXACTLY the
+        lock acquisition + this body, nothing more."""
+        rows = self._load_index()
+        unpinned = sorted(
+            (r for r in rows if not r.get("pinned")),
+            key=lambda r: float(r.get("started_ts", 0.0)),
+        )
+        excess = len(unpinned) - max(0, self._retention - 1)
+        if excess <= 0:
+            return
+        victims = unpinned[:excess]
+        victim_ids = {v["id"] for v in victims}
+        for victim in victims:
+            with contextlib.suppress(OSError):
+                os.remove(self.session_path(victim["id"]))
+        rows = [r for r in rows if r.get("id") not in victim_ids]
+        self._save_index(rows)
