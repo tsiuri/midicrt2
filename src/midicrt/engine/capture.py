@@ -453,22 +453,58 @@ class CaptureSink:
         unconditionally on every shutdown (see engine/core.py's own
         `stop()`).
 
-        Second review-round fix: the actual DATA is safely flushed and
-        the file closed BEFORE the index write is even attempted -- if
-        `index.json`'s bounded lock is busy (`IndexLockBusy`), this
-        method does NOT fail or leave itself half-stopped; it logs a
-        warning and proceeds to reset state exactly as if the index write
-        had succeeded. The session simply becomes an ORPHAN (a `.jsonl`
-        file with no index row) -- the SAME, already-handled, already-
-        tested drift class `list_sessions`/`repair_index` (engine/
-        sessions.py) exist to report/heal; `midicrt sessions repair-index`
-        adopts it later, recovering its real `counts`/`ended_ts` from the
-        file itself. `capture.stop` therefore NEVER fails merely because
-        of lock contention, and never leaves `self._recording`/`self._fh`
-        in an inconsistent state (the bug an earlier draft of this fix
-        would have had if `IndexLockBusy` were simply left to propagate
-        out of this method mid-way through its own state-reset
-        sequence -- see task-6-report.md §9 item 1 for the reasoning)."""
+        THIRD review round (Critical finding, deterministically live-
+        reproduced -- 100% on first attempt): state is reset (`self.
+        _recording = False`, `self._fh = None`, buffer cleared) BEFORE
+        the index write is even attempted, not after. This is a
+        correction of the SECOND round's own fix, which had it backwards
+        and shipped a NEW, worse bug: with `_update_index_on_stop`'s
+        bounded lock-wait now running OFF the event loop (`asyncio.
+        to_thread`, engine/core.py -- the whole POINT of that fix), the
+        daemon's tick loop keeps running DURING that up-to-`capture_mod.
+        ENGINE_LOCK_TIMEOUT_S`-second wait. The OLD order left `self.
+        _recording = True` with an ALREADY-CLOSED `self._fh` for that
+        entire window -- a real MIDI event arriving in that window passed
+        `record_event`'s `if not self._recording: return` guard (still
+        True) and appended to `self._buffer`; the next per-tick `_tick_
+        capture_flush` -> `maybe_flush` -> `flush()` call (gated only on
+        `_recording`/`fh is not None`, never `.closed`) then called
+        `self._fh.write(...)` on the closed handle, raising `ValueError:
+        I/O operation on closed file` -- NOT an `OSError`, so `_tick_
+        capture_flush`'s existing `except OSError` never caught it,
+        letting it escape the tick body and KILL THE WHOLE ENGINE TASK
+        (MIDI processing stops forever; systemd still shows the daemon
+        "active"). Reviewer's own repro: `[t+0.00s] recording=True
+        fh_closed=True` -> `_tick_capture_flush RAISED: ValueError`.
+
+        Fix, in order: flip `_recording`/`_fh`/the buffer to their
+        stopped state IMMEDIATELY after closing the file (a handful of
+        plain assignments, no I/O, no lock-wait -- the window this
+        leaves is GIL-scheduling-granularity narrow, not up-to-2-seconds
+        wide) -- so no tick can EVER again observe "recording with a
+        closed handle." `record_event`/`record_action`/`record_page_
+        changed` all already guard on `self._recording` first, so once
+        it flips False, nothing new lands in the buffer at all; anything
+        that landed in the NARROW pre-flip window (flush() already
+        drained the buffer moments earlier at this method's own top, so
+        this is only ever a handful of events at most) is explicitly
+        DROPPED via `self._buffer.clear()` right here -- an honest
+        choice, not an oversight: those events arrived logically AFTER
+        the stop decision, the file they'd have landed in is already
+        closed, and silently leaving them queued would only let them
+        leak into whatever session starts NEXT. `flush()`/`maybe_flush()`
+        also gained an explicit `.closed` check (defense in depth, belt-
+        and-suspenders on top of the ordering fix, which is the real
+        cure) and `_tick_capture_flush` (engine/core.py) now also catches
+        `ValueError`, not just `OSError`, so ANY future write-path
+        exception this shape degrades cleanly instead of killing the
+        loop.
+
+        The `IndexLockBusy` degradation itself is UNCHANGED in spirit
+        (still logs a warning and lets the session become an ORPHAN --
+        the SAME, already-handled, already-tested drift class `list_
+        sessions`/`repair_index`, engine/sessions.py, exist to report/
+        heal) -- only the ORDER relative to the state reset changed."""
         if not self._recording:
             return {"session_id": None, "counts": {}}
         self.flush()
@@ -479,6 +515,14 @@ class CaptureSink:
         if self._fh is not None:
             with contextlib.suppress(OSError):
                 self._fh.close()
+        # Reset FIRST -- see this method's own "THIRD review round"
+        # docstring section above for why this order is the actual fix.
+        self._recording = False
+        self._fh = None
+        self._session_id = None
+        self._started_ts = None
+        self._counts = {}
+        self._buffer.clear()
         try:
             self._update_index_on_stop(session_id, started_ts, ended_ts, counts)
         except IndexLockBusy as exc:
@@ -489,11 +533,6 @@ class CaptureSink:
             "id": session_id, "started_ts": started_ts, "ended_ts": ended_ts,
             "counts": counts,
         }
-        self._recording = False
-        self._fh = None
-        self._session_id = None
-        self._started_ts = None
-        self._counts = {}
         return {"session_id": session_id, "counts": counts}
 
     def fail(self, error: BaseException) -> dict:
@@ -661,9 +700,13 @@ class CaptureSink:
         """Called once per `Engine.run()` tick (injected `now`, same
         convention as `_tick_analyzers`/`_tick_pages`/`_tick_behaviors`) --
         gates `flush()` to roughly `flush_interval_s` cadence. A cheap
-        no-op both when not recording and when the interval hasn't
-        elapsed yet."""
+        no-op when not recording, when the interval hasn't elapsed yet,
+        or (THIRD review round, defense in depth -- see `flush()`'s own
+        docstring for the incident this guards against) when `self._fh`
+        is already closed."""
         if not self._recording:
+            return
+        if self._fh is None or self._fh.closed:
             return
         if now - self._last_flush_ts < self._flush_interval_s:
             return
@@ -676,8 +719,21 @@ class CaptureSink:
         see module docstring's "Writer design" section for why this is not
         `BindingsFile.save()`'s per-event synchronous-rewrite pattern (this
         appends; a rewrite pattern would be O(session-size) per flush, this
-        is O(buffered-since-last-flush))."""
-        if self._fh is None or not self._buffer:
+        is O(buffered-since-last-flush)).
+
+        `self._fh.closed` check (THIRD review round, defense in depth):
+        `stop()`'s own docstring has the full incident this guards
+        against -- a real, deterministically-reproduced bug where a tick
+        landing during `stop()`'s (now-fixed) lock-wait window could see
+        `self._fh` still set but ALREADY CLOSED, and `self._fh.write(...)`
+        on a closed file object raises `ValueError` (not `OSError`),
+        escaping every existing containment path and killing the whole
+        engine task. `stop()`'s own reordering (state reset BEFORE the
+        lock-wait) is the REAL fix -- this check is the backstop that
+        makes the failure mode structurally unreachable regardless, at
+        the one call site (`self._fh.write`) that would otherwise raise
+        it."""
+        if self._fh is None or self._fh.closed or not self._buffer:
             return
         while self._buffer:
             item = self._buffer.popleft()

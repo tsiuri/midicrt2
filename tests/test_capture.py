@@ -8,8 +8,11 @@ test_server.py instead -- this file is CaptureSink's own contract, fed
 directly, mirroring test_bindings.py's own "pure logic here, registry-
 aware engine wiring there" split (see that file's own module comment).
 """
+import contextlib
+import fcntl
 import json
 import os
+import threading
 import time
 
 import pytest
@@ -509,3 +512,156 @@ def test_malformed_index_that_is_valid_json_but_not_a_list_is_rebuilt(tmp_path):
 def test_missing_index_json_is_just_an_empty_list(tmp_path):
     sink = CaptureSink(capture_dir=str(tmp_path))
     assert sink._load_index() == []
+
+
+# -- THIRD review round (Critical finding, deterministically live-reproduced
+# by an independent reviewer against an isolated engine): stop()'s own
+# index-write lock-wait (engine/capture.py::_try_index_write_lock, Task 6
+# SECOND review round) can now run for up to `capture_mod.
+# ENGINE_LOCK_TIMEOUT_S` seconds OFF the event loop (`asyncio.to_thread`,
+# engine/core.py) -- the whole point of that fix. The SECOND round's own
+# `stop()` shipped the state reset (`self._recording = False`/`self._fh =
+# None`) AFTER that lock-wait, not before -- a real MIDI event landing
+# DURING the wait saw `recording=True` with an ALREADY-CLOSED `self._fh`,
+# and the next tick-flush's `self._fh.write(...)` raised `ValueError: I/O
+# operation on closed file` -- NOT an `OSError`, escaping every existing
+# containment path and killing the whole engine task (MIDI processing
+# stops forever, systemd still shows the daemon "active"). These tests
+# hold `.index.lock` externally (a raw `os.open`+`flock`, exactly
+# simulating a concurrent `midicrt sessions repair-index`/`trim`/`delete`)
+# so `stop()`'s/`start()`'s own lock-wait genuinely takes real wall-clock
+# time on a BACKGROUND THREAD (mirroring `asyncio.to_thread`'s actual
+# concurrency shape) while THIS thread fires a real `record_event` +
+# forced `maybe_flush` DURING that window -- the reviewer's exact repro,
+# automated, for BOTH the `stop()` and `start()` paths (the coordinator's
+# own explicitly-named coverage gap).
+
+def _hold_index_lock(capture_dir):
+    """Opens+locks `<capture_dir>/.index.lock` on THIS (test) thread's own
+    fd and returns it for the caller to unlock/close later -- simulates
+    "another process/operation" holding the lock, exactly like `engine/
+    sessions.py`'s own blocking `_index_write_lock` would from a real
+    `midicrt sessions ...` CLI invocation."""
+    os.makedirs(capture_dir, exist_ok=True)
+    lock_path = os.path.join(capture_dir, capture_mod._INDEX_LOCK_FILE)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def _release_index_lock(fd):
+    with contextlib.suppress(OSError):
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    os.close(fd)
+
+
+def test_stop_flips_recording_state_before_its_own_lock_wait_not_after(tmp_path):
+    """Direct proof of the ORDERING fix: self._recording/self._fh must
+    already reflect "stopped" WHILE stop()'s own index-write lock-wait is
+    still in progress on another thread -- not only after it returns."""
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    sink.start()
+
+    lock_fd = _hold_index_lock(str(tmp_path))
+    try:
+        stop_thread = threading.Thread(target=sink.stop)
+        stop_thread.start()
+        time.sleep(0.15)   # stop() should be well into its lock-wait by now
+
+        # Observed WHILE stop() is still blocked waiting on the
+        # externally-held lock, on a SEPARATE thread:
+        assert sink.is_recording is False, (
+            "self._recording must already be False DURING stop()'s own "
+            "lock-wait, not only after it returns -- this is the ordering "
+            "fix itself")
+        assert sink._fh is None
+    finally:
+        _release_index_lock(lock_fd)
+        stop_thread.join(timeout=5)
+
+
+def test_stop_lock_wait_survives_a_concurrent_event_and_forced_tick_flush(tmp_path):
+    """The reviewer's exact repro, automated: a real event + a forced
+    tick-flush landing DURING stop()'s own lock-wait window must never
+    raise -- this was a deterministic ValueError (closed-file write)
+    before the ordering fix."""
+    sink = CaptureSink(capture_dir=str(tmp_path))
+    sink.start()
+    sink.record_event(make_event())
+    sink.flush()
+
+    lock_fd = _hold_index_lock(str(tmp_path))
+    stop_errors = []
+    tick_errors = []
+    try:
+        stop_thread = threading.Thread(
+            target=lambda: stop_errors.append(_call_capturing_exception(sink.stop)))
+        stop_thread.start()
+        time.sleep(0.1)   # let stop() get past flush()/fh.close() into the lock-wait
+
+        # A real event + forced tick-flush, repeatedly, DURING the window.
+        for _ in range(5):
+            exc = _call_capturing_exception(
+                lambda: (sink.record_event(make_event(data1=99)),
+                        sink.maybe_flush(now=time.time() + 9999)))
+            if exc is not None:
+                tick_errors.append(exc)
+            time.sleep(0.05)
+    finally:
+        _release_index_lock(lock_fd)
+        stop_thread.join(timeout=5)
+
+    stop_errors = [e for e in stop_errors if e is not None]
+    assert not stop_errors, f"stop() itself raised: {stop_errors}"
+    assert not tick_errors, (
+        f"a concurrent record_event/maybe_flush during stop()'s lock-wait "
+        f"raised: {tick_errors}")
+    # The event(s) recorded DURING the window (after the state reset) were
+    # honestly DROPPED, not silently carried into whatever session starts
+    # next -- see stop()'s own docstring for why this is the deliberate,
+    # documented choice, not an oversight.
+    assert len(sink._buffer) == 0
+
+
+def _call_capturing_exception(fn):
+    try:
+        fn()
+        return None
+    except Exception as exc:  # noqa: BLE001 -- deliberately broad: we want to
+                              # catch AND report exactly what stop()/flush()
+                              # raise here, including a bare ValueError.
+        return exc
+
+
+def test_start_retention_sweep_lock_wait_never_lets_a_concurrent_event_corrupt_state(tmp_path):
+    """The coordinator's own explicitly-named coverage gap: start()'s own
+    lock-wait (inside _sweep_retention) happens BEFORE self._recording
+    ever flips True -- a record_event/maybe_flush landing during that
+    window must be a harmless no-op (recording is False throughout),
+    never touching a file handle that doesn't exist yet, and the event
+    must be dropped, not carried into the session that starts moments
+    later."""
+    sink = CaptureSink(capture_dir=str(tmp_path))
+
+    lock_fd = _hold_index_lock(str(tmp_path))
+    start_errors = []
+    try:
+        start_thread = threading.Thread(
+            target=lambda: start_errors.append(_call_capturing_exception(sink.start)))
+        start_thread.start()
+        time.sleep(0.15)   # start() should be inside _sweep_retention's lock-wait
+
+        assert sink.is_recording is False   # not yet flipped True
+
+        exc = _call_capturing_exception(
+            lambda: (sink.record_event(make_event()),
+                    sink.maybe_flush(now=time.time() + 9999)))
+        assert exc is None, f"concurrent record_event/maybe_flush during start() raised: {exc}"
+    finally:
+        _release_index_lock(lock_fd)
+        start_thread.join(timeout=5)
+
+    start_errors = [e for e in start_errors if e is not None]
+    assert not start_errors, f"start() itself raised: {start_errors}"
+    # The event recorded before recording ever went True must be dropped.
+    assert sink.status()["counts"] == {}

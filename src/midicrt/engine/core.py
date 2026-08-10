@@ -1621,7 +1621,7 @@ class Engine:
         if name in _PAGE_NAV_ACTIONS:
             self._pagecycle_behavior.notify_page_action(origin, self._clock())
 
-    def _capture_write_failed(self, exc: OSError) -> dict:
+    def _capture_write_failed(self, exc: OSError | ValueError) -> dict:
         """Shared write-failure containment (fix wave, Critical finding:
         see `CaptureSink.fail`'s own docstring for the full incident and
         "why disable instead of retry" rationale) -- called from BOTH
@@ -1664,10 +1664,25 @@ class Engine:
         reproduced live by test_engine_core.py::
         test_flush_write_failure_does_not_kill_the_run_loop_and_disables_capture).
         Mirrors `_dispatch_bindings`'s own "never let a single failure
-        escape and kill the loop" precedent exactly."""
+        escape and kill the loop" precedent exactly.
+
+        `except (OSError, ValueError)` (THIRD review round, Critical
+        finding, belt-and-suspenders): `ValueError` joined the tuple
+        after a real, deterministically-reproduced incident where this
+        exact call site was the one that actually raised (`self._fh.
+        write(...)` on an ALREADY-CLOSED file object -- `ValueError: I/O
+        operation on closed file`, not an `OSError`, so the original
+        `except OSError` here let it escape and kill the loop the SAME
+        way the ENOSPC incident above once did, just via a different
+        exception type). `CaptureSink.stop()`'s own reordering (state
+        reset BEFORE its lock-wait, see that method's own docstring) is
+        the REAL fix -- this addition is the second, independent backstop
+        the reviewer asked for: any FUTURE write-path exception of
+        either shape degrades cleanly (capture disabled, one log line,
+        one alert) instead of taking down MIDI processing entirely."""
         try:
             self._capture.maybe_flush(now)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             self._capture_write_failed(exc)
 
     def _capture_start_finish(self, result: dict) -> dict:

@@ -4366,6 +4366,58 @@ async def test_flush_write_failure_does_not_kill_the_run_loop_and_disables_captu
     await task
 
 
+async def test_flush_value_error_does_not_kill_the_run_loop_either(tmp_path, caplog):
+    """THIRD review round (Critical finding) belt-and-suspenders: the SAME
+    proof as `test_flush_write_failure_does_not_kill_the_run_loop_and_
+    disables_capture` immediately above, but for `ValueError` instead of
+    `OSError` -- `_tick_capture_flush`'s `except (OSError, ValueError)`
+    addition exists specifically because a closed-file `.write()` raises
+    `ValueError`, not `OSError` (see `CaptureSink.stop()`'s own docstring
+    for the real incident this defends against; the REAL fix is that
+    method's own state-reset reordering, this is the independent backstop
+    layer). Proven directly here by forcing `maybe_flush` to raise
+    `ValueError`, rather than trying to reproduce the exact closed-file
+    race a second time at the Engine level (already proven at the
+    CaptureSink level in test_capture.py)."""
+    eng = Engine(Config(tick_hz=200.0))
+    eng._capture_start_action()
+    eng._capture._flush_interval_s = 0.01
+
+    def failing_flush():
+        raise ValueError("I/O operation on closed file.")
+
+    real_flush = eng._capture.flush
+    eng._capture.flush = failing_flush
+
+    got = []
+    eng.add_listener(got.append)
+
+    task = asyncio.create_task(eng.run())
+    await eng.queue.put(ev(type="note_on", data1=60, data2=100))
+    with caplog.at_level("ERROR"):
+        await asyncio.sleep(0.15)   # long enough for maybe_flush to fire and raise
+
+    # The run() loop must still be ALIVE -- a subsequent event is still
+    # processed, proving a ValueError from the write path never escapes
+    # `_tick_capture_flush` and kills the task the way it used to.
+    events_before = eng.events_total
+    await eng.queue.put(ev(type="note_on", data1=61, data2=100))
+    await asyncio.sleep(0.05)
+    assert eng.events_total == events_before + 1
+    assert not task.done()
+
+    # Same containment outcome as the OSError case: capture disabled
+    # cleanly, one alert, one error log.
+    assert eng._capture.is_recording is False
+    alerts = [m for m in got if m.get("kind") == "event" and m.get("name") == "alert"]
+    assert len(alerts) == 1
+    assert "write failed" in alerts[0]["data"]["message"]
+
+    eng._capture.flush = real_flush
+    eng.stop()
+    await task
+
+
 # -- Phase 5 Task 2 (session replay, docs/phase5-notes.md): the `_handle`
 # suppression seam -- `Engine(..., replay=True)`. Full replay-driver
 # behavior (the offline engine builder, the JSONL streaming loop, mark
