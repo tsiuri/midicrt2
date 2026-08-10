@@ -470,3 +470,39 @@ restarted mid-websocket-session, showing gap → reconnect → fresh snapshot
 flow resuming on the SAME websocket): `task-4-report.md` (this phase's SDD
 folder). `bridge.py`'s own module docstring ("Engine-restart reconnect"
 section) is the from-the-source-code version of this same design.
+
+## 11. SysEx panel + sessions panel (Phase 9 Tasks 5 & 6 — staleness fix,
+Task 7)
+
+Two more web panels landed after this doc's last Task-4 pass and were
+never folded in here — both reach the engine through the SAME generic
+`/api/action` endpoint every other web action already uses (§2's `POST
+/api/action {"name": ..., "args": {...}}`), no new HTTP routes, so §2/§3
+(usage, security posture) apply to them unchanged.
+
+**`#sysex-panel`** (behind `allow_control`, `page.html`): recently-received
+sysex frames (`sysex.list`'s `recent` ring), a save-with-name form
+(`sysex.save {name, index}`, `index: 0` = most recent), the saved library
+list with play/delete buttons (`sysex.play {name}` — sends out the real
+MIDI output, provenance-marked; `sysex.delete {name}` — stages to
+`sysex_dir/trash/`, refuses on an unknown name), and a confirm() dialog
+before delete. `refreshSysexPanel()` re-polls `sysex.list` after every
+save/play/delete action AND on a `sysex_received` protocol event
+(deliberately unrate-limited — see `engine/sysex_store.py`'s own module
+docstring). Full inject→ring→save→play→independent-second-port-wire-
+observation→delete-to-trash round trip live-verified through this exact
+`/api/action` HTTP layer (not just the CLI) in this phase's own T7 smoke —
+see `~/projects/pivisualizer/docs/evidence-phase9-smoke/
+smoke5-web-sysex-sessions-summary.txt` (ops repo, motherbase).
+
+**`#sessions-panel`** (behind `allow_control`, read-only — no delete/trim
+buttons in the web UI, CLI-only for those per Task 6's own scope):
+`capture.sessions_list` (the drift-healed, no-writes index view) feeds a
+session list; clicking one calls `capture.sessions_show {id}` for its
+replay-engine summary (`duration_s`, `events_by_type`,
+`actions_by_origin`, `marks_by_kind`). Same live-verification evidence
+file as above covers both actions through the web layer.
+
+Full feature reference for both (config keys, provenance/synthetic
+markers, the CLI-only `sessions trim`/`repair-index`/`delete`
+subcommands): `docs/phase9-instruments.md`.

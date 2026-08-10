@@ -567,10 +567,12 @@ against the real daemon via `midicrt-fb --out`: shows the shipped
 
 **A session file exists but has no `index.json` row.** The daemon crashed
 or was `SIGKILL`ed before a clean `capture.stop` — see §4's loss-window
-disclosure. The `.jsonl` file itself (up through the last flush) is
-recoverable by hand; `capture.status`'s `last_session` won't reflect it
-until the NEXT time any session stops cleanly (which triggers a fresh
-`index.json` read/rebuild).
+disclosure. **Updated, Phase 9 Task 6**: no need to recover by hand or
+wait for the next clean stop — `midicrt sessions repair-index` adopts
+every such orphan directly, deriving honest metadata (`ended_ts`/counts)
+from the file's own last real event rather than fabricating anything; see
+§12 below. This is also `midicrt sessions list`'s live drift-healed view
+(`status: "orphan"`) without needing to run the repair itself.
 
 **Replay's `final_state.transport.running` is `false` but I know the
 source was playing.** See §6's dedicated nuance — the capture window
@@ -589,3 +591,43 @@ hand-edit its `port_pattern` to a glob per `docs/phase4-bindings.md`.
 `journalctl -u midicrtd` for a `capture: write failed` line (§4) — disk
 full or a read-only filesystem, most likely. Capture does NOT auto-retry;
 fix the underlying storage issue and issue a fresh `capture.start`.
+
+## 12. Capture editor CLI (Phase 9 Task 6, staleness fix, Task 7)
+
+`midicrt sessions {list,show,trim,repair-index,delete}` — added after
+this doc's original write-up, documented in full in
+`docs/phase9-instruments.md` and this phase's own `task-6-report.md`; this
+section is a pointer, not a duplicate. Needs **no running daemon** for its
+actual work (pure filesystem operations against `capture_dir`, resolved
+the same way `midicrtd`/`midicrt-web` resolve it via `--config`) — the
+ONE place a daemon matters is a best-effort liveness check so `trim`/
+`delete` never touch the session the daemon is CURRENTLY appending to.
+
+- `sessions list` — the drift-healed index view (adds a live `status:
+  "recording"|"finished"|"orphan"` per session; never writes anything).
+- `sessions show <id>` — a replay-engine summary (`duration_s`,
+  `events_by_type`, `actions_by_origin`, `marks_by_kind`).
+- `sessions trim <id> --from SECONDS --to SECONDS` — session-relative
+  offsets (`0.0` == session start, NOT wall-clock/epoch — see §2's
+  `started_ts` for the anchor), extracts to a NEW session file, original
+  untouched. A note already active before `--from` gets a synthesized
+  boundary `note_on` (`"synthetic": true` — see §2's `event` section,
+  the ONLY case a v2 event line can carry that key) so the trimmed
+  replay's totals are honest instead of silently missing a mid-sustain
+  note.
+- `sessions repair-index` — adopts every orphan (a `.jsonl` on disk with
+  no `index.json` row — the loss-window scenario §11 above describes) with
+  metadata derived from the file's own last real event line, never
+  fabricated. Ran against PRODUCTION once, this phase's own T7 close-out
+  task, adopting 12 real orphans (one 15MB+) with the daemon staying fully
+  responsive throughout (parallel-probed, 0 failures) — see
+  `~/projects/pivisualizer/docs/evidence-phase9-smoke/` (ops repo,
+  motherbase) for the before/after JSON and probe transcript.
+- `sessions delete <id>` — stages to `trash/` (stage-don't-delete, this
+  project's standing convention), refuses on a pinned session.
+
+The index-write lock is acquired off the daemon's asyncio event loop
+(non-blocking + retry) specifically so a long `repair-index` scan can
+never freeze the daemon for unrelated requests — see
+`docs/phase9-instruments.md`'s Task 6 section for the two review rounds
+that hardened this.

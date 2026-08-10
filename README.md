@@ -7,8 +7,41 @@ Design spec: `pivisualizer` project folder on motherbase
 Dev happens on-device (the Pi). Venv: `~/midicrt2-venv`.
 Run tests: `~/midicrt2-venv/bin/pytest`
 
+## Feature list (as of Phase 9 close, commit `2117288` + this phase's docs
+close-out; 1992 tests)
+
+14 pages (help, harmony, sendnotes, ccmonitor, ccdashboard, eventlog,
+progchanges, pianoroll, spectrum, **tuner**, chordkey, voices, config,
+img2txtviz — plus screensaver, chrome-only). Digit-key page nav maps to
+v1's own page-ID numbering (marquee is the single source of truth).
+Bindings: pattern-matched OR device-identity-matched (USB vendor:product
+[:serial], or `virt:` for software ports), trigger/continuous modes,
+learn/list/remove/cancel. Stuck-note detection with configurable
+panic-send (CC123 + synthetic release) and post-clear linger; poly-limit
+log + chrome flash. Live pitch tuner (numpy YIN, demand-gated audio
+capture). Event-sourced session capture (`midicrt sessions
+list/show/trim/repair-index/delete`) + CLI replay. SysEx manager
+(record/save/play/delete, stage-don't-delete). Web dashboard
+(`midicrt-web`, control ON by default, reconnects across a `midicrtd`
+restart without dropping browser tabs) — installed but **not enabled** by
+default; the operator starts it when wanted. Full feature reference for
+everything Phase 9 (Instruments & Tools) added: `docs/phase9-instruments.md`.
+
 ## Docs
 
+- `docs/phase9-instruments.md` — Phase 9 (Instruments & Tools) feature
+  reference: digit-nav→v1-IDs, device-identity bindings, panic-send/
+  stuck-linger/poly-limit log, the live tuner, web reconnect/control/tab-
+  nav, the SysEx manager, and the capture editor — config keys w/
+  defaults, provenance origins added this phase, the chrome secondary-row
+  priority chain's final state, and known limitations (the tuner's ~5:1
+  harmonic-dominance boundary, the still-open unbounded `Engine.queue`
+  ingestion follow-up, the `usb:` device-identity rung's fake-only
+  coverage, a pre-existing web-bridge test flake). Read this first for
+  anything Phase 9 added; per-task design rationale and live-verification
+  transcripts live in `~/projects/pivisualizer/.superpowers/sdd/
+  2026-08-09-midicrt2-phase9-instruments/task-*-report.md` (ops repo,
+  motherbase).
 - `docs/phase6-web.md` — `midicrt-web` usage/flags, the `0.0.0.0:8766`
   LAN-open security posture + rationale (control ON by default since Phase
   9 Task 4's `--read-only` opt-out flag, user ruling: "web control ON, no
