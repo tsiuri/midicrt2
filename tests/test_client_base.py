@@ -413,6 +413,28 @@ async def test_reader_loop_treats_a_malformed_async_line_as_eof_not_a_silent_thr
         msg = json.loads(line)
         writer.write(proto.encode(proto.response(msg["id"], {"ok": "hello"})))
         await writer.drain()
+        # Deliberately wait before writing garbage (CI-found race, first
+        # draft of this test): `LineDecoder.feed()` decodes every complete
+        # line in ONE `recv()` chunk in a single pass and raises partway
+        # through if ANY of them is malformed -- discarding the lines it
+        # already successfully decoded in THAT SAME call, not just the bad
+        # one. Writing the response and the garbage back-to-back (this
+        # coroutine's own `await writer.drain()` only guarantees the LOCAL
+        # write buffer isn't over-full, never that the remote side has
+        # actually read anything yet) let a fast reader's very next
+        # `recv()` legitimately capture BOTH lines in one chunk -- on a
+        # loaded Pi 3 the client thread reliably drained the response
+        # first, but a faster CI runner's `recv()` sometimes grabbed both
+        # together, discarding the valid response along with detecting the
+        # garbage and making `connect()` ITSELF raise `ClientError`
+        # instead of exercising `_reader_loop`'s own, separately-timed
+        # handling this test targets. A generous one-time delay (not a
+        # tight/hot-loop wait, so it carries none of the "flaky tight
+        # timing" risk a backoff-loop sleep would) guarantees `connect()`
+        # -- microseconds of work once its own recv() returns -- is long
+        # finished, and `start_reader()` already running, before the
+        # garbage is ever written.
+        await asyncio.sleep(0.2)
         writer.write(b"not-json-at-all\n")  # garbage instead of a real async message
         await writer.drain()
 
