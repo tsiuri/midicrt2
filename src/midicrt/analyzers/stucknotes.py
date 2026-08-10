@@ -148,6 +148,15 @@ WARN_AFTER = 2.0
 CRIT_AFTER = 10.0
 SUSPEND_WHEN_SUSTAIN = True
 
+# Phase 9 Task 2 (stuck-linger, config.stuck_hold_after): v1's
+# `zstucknotes.py:20` `HOLD_AFTER = 15.0` -- the module-level constant is
+# the default a fresh `StuckNotesAnalyzer()` uses; `Engine.__init__` wires
+# `config.stuck_hold_after` through the constructor (`hold_after=`
+# below), matching how `analyzers/marquee.py::MarqueeAnalyzer` already
+# takes a config-sourced `speed_cps` constructor arg (see
+# `engine/core.py::_ANALYZER_FACTORIES`).
+HOLD_AFTER = 15.0
+
 N_CHANNELS = 16
 _ALL_NOTES_OFF_CONTROLS = {120, 123}
 
@@ -158,15 +167,34 @@ class StuckNotesAnalyzer:
     `view_model() -> dict`, `drain_alerts() -> list[dict]` (new-escalation
     queue for the engine's `alert` event path). No I/O -- `tick`'s `now`
     is always injected by the caller, never read here.
+
+    `hold_after` (Phase 9 Task 2): mirrors v1's `HOLD_AFTER` -- see this
+    module's "Not ported" section above for why the ORIGINAL port
+    deliberately dropped linger, and `tick()`'s own docstring below for how
+    it's restored here without breaking the "analyzer never reads a clock"
+    rule.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, hold_after: float = HOLD_AFTER) -> None:
         # (channel 1-based, note) -> {"count": int, "last_on": float}
         self._active: dict[tuple[int, int], dict] = {}
         self._levels: dict[tuple[int, int], str] = {}
         self._ages: dict[tuple[int, int], float] = {}
         self._sustain: dict[int, bool] = dict.fromkeys(range(1, N_CHANNELS + 1), False)
         self._pending_alerts: list[dict] = []
+        # -- stuck-linger (Phase 9 Task 2) -----------------------------------
+        self._hold_after = hold_after
+        # v1's `_had_stuck`/`_last_stuck_snapshot` (zstucknotes.py:87-88):
+        # tracked ONLY inside `tick()` (v1's `draw()`), never touched by
+        # `handle()` (v1's message handlers) -- see `tick()`'s own
+        # docstring for why that gap is deliberate, not a bug.
+        self._had_stuck = False
+        self._last_alerting_snapshot: list[dict] = []
+        # `None` (not lingering) vs a frozen list (lingering) -- `_cleared_at`
+        # is the wall-clock timestamp the linger window started, compared
+        # against `_hold_after` on each subsequent `tick()`.
+        self._last_cleared: list[dict] | None = None
+        self._cleared_at: float | None = None
 
     # -- event handling -----------------------------------------------------
 
@@ -230,6 +258,19 @@ class StuckNotesAnalyzer:
     # -- wall-progress hook (see module docstring) ---------------------------
 
     def tick(self, now: float) -> bool:
+        """Phase 9 Task 2 addition: after the existing per-note escalation
+        pass (unchanged from before this task), also runs v1's `draw()`
+        "if not stuck" linger bookkeeping (zstucknotes.py:226-248) -- the
+        SAME "only checked here, at tick/poll time, never inside a MIDI
+        message handler" structure v1 itself has (`_had_stuck`/
+        `_last_stuck_snapshot` are read/written ONLY inside `draw()`, never
+        inside `_note_on`/`_note_off`/`_clear_channel`). Consequence,
+        matching v1 exactly: a note-off that clears the LAST active alert
+        makes `view_model()["alerts"]` empty IMMEDIATELY (handle()-time),
+        but `view_model()["cleared"]` only starts lingering on the NEXT
+        `tick()` call -- see the module docstring's stuck-linger tests for
+        the disclosed at-most-one-tick-period gap this reproduces on
+        purpose."""
         dirty = False
         for key, entry in list(self._active.items()):
             ch, _note = key
@@ -266,7 +307,44 @@ class StuckNotesAnalyzer:
                     "ch": ch, "note": key[1], "level": level,
                     "held_s": round(age, 1),
                 })
+        dirty = self._tick_linger(now) or dirty
         return dirty
+
+    def _tick_linger(self, now: float) -> bool:
+        """Stuck-linger bookkeeping (Phase 9 Task 2) -- v1's `draw()`
+        "if not stuck: ..." branch, isolated into its own method for
+        readability. See `tick()`'s own docstring for the overall
+        contract."""
+        if self._levels:
+            # Still (or newly) alerting -- keep the frozen "last known"
+            # snapshot fresh every tick while alerting, mirroring v1's own
+            # `_last_stuck_snapshot = stuck[:]` line, which runs every
+            # frame `stuck` is non-empty, not just on the transition into
+            # it. A fresh alert also ABANDONS any in-progress linger from a
+            # previous clear (v1 has no "resume the old linger" concept
+            # either -- `_had_stuck` simply goes True again).
+            self._had_stuck = True
+            self._last_alerting_snapshot = self._alerts_list()
+            if self._last_cleared is not None:
+                self._last_cleared = None
+                self._cleared_at = None
+                return True
+            return False
+        if self._had_stuck:
+            # Transition: alerting -> clear. Freeze the snapshot from the
+            # LAST alerting tick and start the hold_after linger window.
+            self._had_stuck = False
+            self._last_cleared = self._last_alerting_snapshot
+            self._cleared_at = now
+            return True
+        if self._cleared_at is not None and (now - self._cleared_at) > self._hold_after:
+            # Linger window elapsed with no new alert in the meantime --
+            # matches v1's own "if (now - _last_message_time) <= HOLD_AFTER"
+            # else-blank branch.
+            self._last_cleared = None
+            self._cleared_at = None
+            return True
+        return False
 
     def drain_alerts(self) -> list[dict]:
         drained, self._pending_alerts = self._pending_alerts, []
@@ -274,10 +352,23 @@ class StuckNotesAnalyzer:
 
     # -- view model -----------------------------------------------------------
 
-    def view_model(self) -> dict:
+    def _alerts_list(self) -> list[dict]:
         alerts = [
             {"ch": ch, "note": note, "level": level, "held_s": round(self._ages.get((ch, note), 0.0), 1)}
             for (ch, note), level in self._levels.items()
         ]
         alerts.sort(key=lambda a: a["held_s"], reverse=True)   # worst (oldest) first, matches v1
-        return {"alerts": alerts}
+        return alerts
+
+    def view_model(self) -> dict:
+        return {
+            "alerts": self._alerts_list(),
+            # Phase 9 Task 2: frozen snapshot from the moment the last
+            # alert cleared, shown DIMMED by both clients for
+            # `stuck_hold_after` seconds (`clients/chrome.py`'s
+            # `secondary_status_dim`/`alerts_text` -- monochrome mandate:
+            # "dim" is a lower luminance ramp tier, not a separate hue).
+            # `[]` whenever nothing is lingering, same "empty list, not
+            # None" convention as "alerts".
+            "cleared": list(self._last_cleared) if self._last_cleared else [],
+        }

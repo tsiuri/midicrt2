@@ -100,13 +100,14 @@ async def test_hello_and_describe(tmp_path):
     # test_topics_include_overlay_after_page_topics. Phase-3 task 12 (gap
     # ports) added "help" right after "config" -- see config.py's own
     # comment for the full default-roster ordering. Phase 8 Task 4 added
-    # "marquee" (the header page-title scrolling marquee).
+    # "marquee" (the header page-title scrolling marquee). Phase 9 Task 2
+    # added "polylimit" (poly-limit chrome flash), registered post-hoc last.
     assert d["data"]["topics"] == [
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll", "page.spectrum",
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
         "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes",
         "overlay.status", "overlay.alerts", "overlay.timesig",
-        "overlay.beatflash", "overlay.loopprogress", "overlay.marquee",
+        "overlay.beatflash", "overlay.loopprogress", "overlay.marquee", "overlay.polylimit",
     ]
     # Phase 4 Task 1 (docs/phase4-notes.md): "keymap" used to be a reserved
     # `{}` placeholder -- now the engine's real (default, no keymap.toml on

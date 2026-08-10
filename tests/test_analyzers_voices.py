@@ -10,7 +10,13 @@ per-channel clear, start/stop clears all channels, peak never decays).
 tests/test_analyzers_transport.py's own events) -- channel 0 below means
 "channel 1" in the analyzer's 1-based view_model.
 """
-from midicrt.analyzers.voices import VoiceMonitorAnalyzer
+from midicrt.analyzers.voices import (
+    EVENT_LOG_LEN,
+    FLASH_DURATION_S,
+    POLY_LIMIT_CH,
+    POLY_LIMIT_GLOBAL,
+    VoiceMonitorAnalyzer,
+)
 from midicrt.engine.core import MidiEvent
 
 
@@ -241,3 +247,220 @@ def test_note_on_with_no_channel_is_a_safe_noop():
     changed = a.handle(MidiEvent(ts=0.0, source="x", type="note_on", channel=None,
                                  data1=60, data2=100, summary="note_on"))
     assert changed is False
+# -- poly-limit log (Phase 9 Task 2, config.poly_limit_global/poly_limit_ch) -
+#
+# v1 evidence (`~/codex/midicrt/plugins/zvoicemonitor.py`): `POLY_LIMIT_GLOBAL
+# = 16` (line 11), `POLY_LIMIT_CH = 8` (line 12), `_events = deque(maxlen=
+# EVENT_LOG_LEN)` (line 56, `EVENT_LOG_LEN = 8`, line 14) recording an
+# "instant" tag event via `_events.appendleft(...)` (line 81) the moment a
+# note-on's resulting total/channel count first exceeds its limit
+# (`hit_global`/`hit_ch`, lines 78-81). v1's "sustain" tag (a SECOND,
+# beat-duration-gated re-notification via `_update_over`/`OVER_LIMIT_BEATS`,
+# lines 107-122) is NOT ported here -- it needs a MIDI-clock tick/beat
+# counter this analyzer has no access to (a disclosed simplification,
+# matching this task's own scope: only `poly_limit_global`/`poly_limit_ch`
+# are named config knobs). v1's `per_channel_limits` 16-entry override list
+# is also not ported (config.py's own docstring), so `ch_limit` in every
+# event here is always the SAME scalar `poly_limit_ch`.
+
+def test_poly_limit_defaults_match_v1s_shipped_constants():
+    assert POLY_LIMIT_GLOBAL == 16
+    assert POLY_LIMIT_CH == 8
+    a = VoiceMonitorAnalyzer()
+    assert a._limit_global == 16
+    assert a._limit_ch == 8
+
+
+def test_events_list_is_empty_initially():
+    a = VoiceMonitorAnalyzer()
+    assert a.view_model()["events"] == []
+
+
+def test_a_note_on_under_both_limits_logs_no_event():
+    a = VoiceMonitorAnalyzer(poly_limit_global=16, poly_limit_ch=8)
+    a.handle(note_on(0, 60, ts=1.0))
+    assert a.view_model()["events"] == []
+
+
+def test_exceeding_the_per_channel_limit_logs_an_instant_event():
+    a = VoiceMonitorAnalyzer(poly_limit_global=16, poly_limit_ch=2)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 62, ts=1.0))
+    changed = a.handle(note_on(0, 64, ts=1.5))   # 3rd voice on ch1 -- exceeds limit 2
+    assert changed is True
+    events = a.view_model()["events"]
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["ch"] == 1 and ev["note"] == 64
+    assert ev["total"] == 3 and ev["ch_total"] == 3 and ev["ch_limit"] == 2
+    assert ev["hit_global"] is False and ev["hit_ch"] is True
+
+
+def test_exceeding_the_global_limit_logs_an_instant_event():
+    a = VoiceMonitorAnalyzer(poly_limit_global=2, poly_limit_ch=16)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(1, 62, ts=1.0))
+    changed = a.handle(note_on(2, 64, ts=1.5))   # 3rd voice overall -- exceeds global limit 2
+    assert changed is True
+    ev = a.view_model()["events"][0]
+    assert ev["hit_global"] is True and ev["hit_ch"] is False
+    assert ev["total"] == 3
+
+
+def test_a_limit_of_zero_or_less_never_triggers_that_limit():
+    # Mirrors v1's own `if POLY_LIMIT_GLOBAL > 0`/`if ch_limit and ch_limit
+    # > 0` guards -- a non-positive limit means "no limit", not "always over".
+    a = VoiceMonitorAnalyzer(poly_limit_global=0, poly_limit_ch=0)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 62, ts=1.0))
+    assert a.view_model()["events"] == []
+
+
+def test_events_deque_evicts_oldest_beyond_event_log_len():
+    # poly_limit_ch=1: the FIRST note-on on a channel never exceeds (1 is
+    # not > 1); the SECOND (an overlapping retrigger of the SAME pitch,
+    # v1's own "count, not boolean" voice semantics) does -- exactly one
+    # qualifying event per iteration.
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    for i in range(EVENT_LOG_LEN + 3):
+        t = float(i)
+        a.handle(note_on(0, 60, ts=t))
+        a.handle(note_on(0, 60, ts=t + 0.01))   # exceeds -- logs one event
+        a.handle(note_off(0, 60, ts=t + 0.02))
+        a.handle(note_off(0, 60, ts=t + 0.02))
+    events = a.view_model()["events"]
+    assert len(events) == EVENT_LOG_LEN
+
+
+def test_events_are_newest_first_appendleft_matches_v1():
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))   # exceeds -- event #1 (note 60)
+    a.handle(note_off(0, 60, ts=1.1))
+    a.handle(note_off(0, 60, ts=1.1))
+    a.handle(note_on(0, 61, ts=2.0))
+    a.handle(note_on(0, 61, ts=2.0))   # exceeds -- event #2 (note 61)
+    events = a.view_model()["events"]
+    assert events[0]["note"] == 61   # most recent event first
+    assert events[1]["note"] == 60
+
+
+def test_age_s_defaults_to_zero_before_any_tick():
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))
+    assert a.view_model()["events"][0]["age_s"] == 0.0
+
+
+def test_age_s_reflects_the_injected_tick_clock():
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))
+    a.tick(3.5)
+    assert a.view_model()["events"][0]["age_s"] == 2.5
+
+
+def test_clear_channel_does_not_erase_the_event_log():
+    # v1's `_clear_channel` only zeroes `_active`/`_active_ch` -- `_events`
+    # is a HISTORY, untouched by any clear path, same "peak never resets"
+    # precedent this module's own docstring already established for `_peak`.
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(cc(0, 123, 0, ts=1.1))
+    assert a.view_model()["events"] != []
+
+
+# -- chrome flash (Phase 9 Task 2, disclosed v2-native addition -- v1's
+# zvoicemonitor.py has no visual/chrome home of its own at all, see module
+# docstring) ------------------------------------------------------------
+
+def test_flash_view_model_is_not_flashing_initially():
+    a = VoiceMonitorAnalyzer()
+    assert a.flash_view_model() == {"flashing": False}
+
+
+def test_flash_view_model_is_not_flashing_before_any_tick_even_after_an_exceed():
+    # handle() alone starts the flash window but never reports it "active"
+    # on its own -- flashing is a tick()-observed, wall-clock-bounded state
+    # (mirrors analyzers/beatflash.py's own injected-clock convention), not
+    # something handle()'s return value communicates.
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))
+    assert a.flash_view_model() == {"flashing": False}
+
+
+def test_tick_reports_flashing_true_right_after_an_exceed():
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))
+    dirty = a.tick(1.1)   # well within FLASH_DURATION_S
+    assert dirty is True
+    assert a.flash_view_model() == {"flashing": True}
+
+
+def test_tick_reports_flashing_false_once_flash_duration_elapses():
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))
+    a.tick(1.1)
+    dirty = a.tick(1.0 + FLASH_DURATION_S + 0.1)
+    assert dirty is True   # ON -> OFF transition
+    assert a.flash_view_model() == {"flashing": False}
+
+
+def test_tick_does_not_redundantly_report_dirty_mid_flash_or_after_it_ends():
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))
+    assert a.tick(1.05) is True    # OFF -> ON
+    assert a.tick(1.10) is False   # still ON -- no transition
+    assert a.tick(1.0 + FLASH_DURATION_S + 0.1) is True    # ON -> OFF
+    assert a.tick(1.0 + FLASH_DURATION_S + 0.2) is False   # still OFF -- no transition
+
+
+def test_a_second_exceed_during_an_active_flash_extends_the_window():
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 60, ts=1.0))
+    a.tick(1.1)
+    assert a.flash_view_model()["flashing"] is True
+    a.handle(note_on(1, 64, ts=1.3))
+    a.handle(note_on(1, 64, ts=1.3))   # a second, later exceed (different channel)
+    a.tick(1.0 + FLASH_DURATION_S + 0.1)   # past the FIRST window, still within the SECOND
+    assert a.flash_view_model()["flashing"] is True
+
+
+def test_tick_never_reads_a_clock_or_does_io():
+    # Structural guard, mirrors test_analyzers_stucknotes.py's own -- an
+    # analyzer must only ever compare timestamps it was GIVEN.
+    a = VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1)
+    a.handle(note_on(0, 60, ts=10_000_000.0))
+    a.handle(note_on(0, 60, ts=10_000_000.0))
+    dirty = a.tick(10_000_000.0 + 0.05)
+    assert dirty is True
+    assert a.flash_view_model() == {"flashing": True}
+
+
+# -- shared-instance dedup guard (needed for the chrome-flash overlay wiring,
+# engine/core.py -- see analyzers/harmony.py's own identical precedent for
+# why sharing one instance across two roster entries needs this) -----------
+
+def test_handle_is_idempotent_for_the_same_event_object_twice():
+    a = VoiceMonitorAnalyzer()
+    ev = note_on(0, 60, ts=1.0)
+    first = a.handle(ev)
+    second = a.handle(ev)   # SAME object reference -- simulates shared-instance double-dispatch
+    assert first is True
+    assert second is True   # cached dirty result, not a re-processed False
+    vm = a.view_model()
+    assert vm["channels"][0]["active"] == 1   # only counted ONCE, not twice
+    assert vm["total"] == 1
+
+
+def test_handle_processes_a_genuinely_new_event_object_normally():
+    a = VoiceMonitorAnalyzer()
+    a.handle(note_on(0, 60, ts=1.0))
+    a.handle(note_on(0, 62, ts=1.0))   # a DIFFERENT event object -- must process normally
+    assert a.view_model()["total"] == 2

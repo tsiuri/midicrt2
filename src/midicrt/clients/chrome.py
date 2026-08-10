@@ -53,7 +53,7 @@ def format_bpm(bpm: float | None) -> str:
 OVERLAY_ALERTS_TOPIC = "overlay.alerts"
 OVERLAY_TIMESIG_TOPIC = "overlay.timesig"
 
-DEFAULT_ALERTS_VM = {"alerts": []}
+DEFAULT_ALERTS_VM = {"alerts": [], "cleared": []}
 DEFAULT_TIMESIG_VM = {"labels": [], "confidence": 0.0, "events": 0,
                        "events_window": 0, "events_total": 0, "pending": None}
 
@@ -72,26 +72,54 @@ DEFAULT_TIMESIG_VM = {"labels": [], "confidence": 0.0, "events": 0,
 MAX_ALERT_LIST = 3   # matches v1's zstucknotes.py MAX_LIST
 
 
-def alerts_text(vm: dict) -> str:
-    """Build v1's "STUCK WARN/CRIT: ..." banner line from an
-    `overlay.alerts` view-model. `""` (blank row) when nothing is stuck --
-    v1 holds its last message for `HOLD_AFTER` (15s) after clearing; this
-    analyzer doesn't carry that history (see analyzers/stucknotes.py's
-    module docstring), so the row goes blank the instant the alert list
-    empties. Note numbers are shown raw (`n060`), not v1's octave-letter
-    name (`_fmt_note`, e.g. note 60 -> "C6(060)") -- see analyzers/
-    stucknotes.py's module docstring for why that convention isn't
-    reproduced.
-    """
-    alerts = vm.get("alerts") or []
-    if not alerts:
-        return ""
-    level = "CRIT" if any(a["level"] == "crit" for a in alerts) else "WARN"
-    parts = [f"CH{a['ch']:02d} n{a['note']:03d} {a['held_s']:4.1f}s" for a in alerts[:MAX_ALERT_LIST]]
-    extra = len(alerts) - MAX_ALERT_LIST
+def _fmt_alert_parts(entries: list[dict]) -> str:
+    """Shared `"CH03 n060  2.3s | ..."` formatter for both the active
+    `alerts` list and the lingering `cleared` snapshot below -- same
+    `MAX_ALERT_LIST`/"+N more" truncation either way, matching v1's own
+    `zstucknotes.py` (both its live `STUCK WARN/CRIT:` line and its
+    lingering `STUCK CLEARED:` message build the SAME per-entry token from
+    the SAME `(age, ch, note)` shape)."""
+    parts = [f"CH{a['ch']:02d} n{a['note']:03d} {a['held_s']:4.1f}s" for a in entries[:MAX_ALERT_LIST]]
+    extra = len(entries) - MAX_ALERT_LIST
     if extra > 0:
         parts.append(f"+{extra} more")
-    return f"STUCK {level}: " + " | ".join(parts)
+    return " | ".join(parts)
+
+
+def alerts_text(vm: dict) -> str:
+    """Build v1's "STUCK WARN/CRIT: ..." banner line from an
+    `overlay.alerts` view-model, falling back to a DIMMED (see
+    `secondary_status_dim` below) "STUCK CLEARED: ..." lingering message
+    (Phase 9 Task 2, `config.stuck_hold_after` -- v1's `HOLD_AFTER`) built
+    from the SAME view-model's `cleared` field, and finally `""` (blank
+    row) once neither is present. Note numbers are shown raw (`n060`), not
+    v1's octave-letter name (`_fmt_note`, e.g. note 60 -> "C6(060)") -- see
+    analyzers/stucknotes.py's module docstring for why that convention
+    isn't reproduced.
+    """
+    alerts = vm.get("alerts") or []
+    if alerts:
+        level = "CRIT" if any(a["level"] == "crit" for a in alerts) else "WARN"
+        return f"STUCK {level}: " + _fmt_alert_parts(alerts)
+    cleared = vm.get("cleared") or []
+    if cleared:
+        return "STUCK CLEARED: " + _fmt_alert_parts(cleared)
+    return ""
+
+
+def secondary_status_dim(alerts_vm: dict) -> bool:
+    """True exactly when the second chrome row is about to show the
+    DIMMED, lingering "STUCK CLEARED" message (Phase 9 Task 2) instead of
+    a live alert or the routine time-signature line -- the renderer's cue
+    to paint a LOWER luminance ramp tier (monochrome mandate: "dim" is a
+    shading level, never a separate hue or a blink) instead of the normal
+    bright reverse-video fill. False whenever a real alert is active (full
+    brightness, urgent -- matches v1's own CRIT reverse-video emphasis) or
+    the row is showing the ordinary time-signature line (also full
+    brightness -- v1 never dims that line either)."""
+    alerts = alerts_vm.get("alerts") or []
+    cleared = alerts_vm.get("cleared") or []
+    return not alerts and bool(cleared)
 
 
 def timesig_text(vm: dict) -> str:
@@ -202,12 +230,29 @@ def beatprogress_row_text(beatflash_vm: dict, loopprogress_vm: dict, width: int)
     return "".join(row)
 
 
-def secondary_status_text(alerts_vm: dict, timesig_vm: dict) -> str:
-    """The shared second chrome row's text: `alerts_text()` when any alert
-    is active, else `timesig_text()` -- see the module-level comment above
-    `alerts_text` for why these two share one row."""
+OVERLAY_POLYLIMIT_TOPIC = "overlay.polylimit"
+DEFAULT_POLYLIMIT_VM = {"flashing": False}
+
+POLYLIMIT_FLASH_TEXT = "POLY LIMIT EXCEEDED"
+
+
+def secondary_status_text(alerts_vm: dict, timesig_vm: dict, polylimit_vm: dict | None = None) -> str:
+    """The shared second chrome row's text: `alerts_text()` (stuck alerts,
+    live or lingering-cleared) when present, else the poly-limit chrome
+    flash (Phase 9 Task 2, `config.poly_limit_global`/`poly_limit_ch` --
+    disclosed v2-native addition, v1's `zvoicemonitor.py` has no chrome
+    home of its own, see `analyzers/voices.py`'s module docstring) when
+    `polylimit_vm["flashing"]`, else `timesig_text()` -- see the
+    module-level comment above `alerts_text` for why the routine
+    time-signature line only ever wins when nothing more urgent is
+    active. `polylimit_vm` is OPTIONAL (defaults to "not flashing") so
+    every pre-existing 2-arg call site keeps working unchanged."""
     text = alerts_text(alerts_vm)
-    return text if text else timesig_text(timesig_vm)
+    if text:
+        return text
+    if polylimit_vm and polylimit_vm.get("flashing"):
+        return POLYLIMIT_FLASH_TEXT
+    return timesig_text(timesig_vm)
 
 
 OVERLAY_MARQUEE_TOPIC = "overlay.marquee"

@@ -77,3 +77,45 @@ def test_set_instruments_swaps_names_live_without_losing_analyzer_state():
     assert vm["rows"][1]["name"] == "CH 2"           # fewer-than-16 fallback, same as ctor
     assert vm["rows"][0]["active"] == 1              # analyzer state untouched by the swap
     assert vm["total"] == 1
+
+
+# -- poly-limit log (Phase 9 Task 2, config.poly_limit_global/poly_limit_ch) -
+
+def test_view_model_surfaces_the_poly_limit_event_log():
+    # "rolling event log surfaced in the voices page view-model" (task
+    # brief) -- forwarded verbatim from the (optionally injected, see
+    # `test_analyzer_property_exposes_the_underlying_shared_instance`
+    # below) analyzer, same shape.
+    from midicrt.analyzers.voices import VoiceMonitorAnalyzer
+
+    page = VoicesPage(instruments=NAMES_16,
+                       analyzer=VoiceMonitorAnalyzer(poly_limit_global=100, poly_limit_ch=1))
+    page.handle(note_on(0, 60))
+    page.handle(note_on(0, 60))   # 2nd voice on ch1 -- exceeds poly_limit_ch=1
+    vm = page.view_model()
+    assert len(vm["events"]) == 1
+    assert vm["events"][0]["ch"] == 1 and vm["events"][0]["hit_ch"] is True
+
+
+def test_view_model_events_is_empty_under_the_limit():
+    page = VoicesPage(instruments=NAMES_16)
+    page.handle(note_on(0, 60))
+    assert page.view_model()["events"] == []
+
+
+def test_poly_limits_default_to_v1s_constants_when_no_analyzer_is_injected():
+    from midicrt.analyzers.voices import POLY_LIMIT_CH, POLY_LIMIT_GLOBAL
+
+    page = VoicesPage(instruments=NAMES_16)
+    assert page.analyzer._limit_global == POLY_LIMIT_GLOBAL
+    assert page.analyzer._limit_ch == POLY_LIMIT_CH
+
+
+def test_analyzer_property_exposes_the_underlying_shared_instance():
+    # Needed by engine/core.py's post-hoc `overlay.polylimit` wiring --
+    # mirrors pages/harmony.py's own identical `.analyzer` property (used
+    # by pages/chordkey.py the same way).
+    page = VoicesPage(instruments=NAMES_16)
+    from midicrt.analyzers.voices import VoiceMonitorAnalyzer
+
+    assert isinstance(page.analyzer, VoiceMonitorAnalyzer)

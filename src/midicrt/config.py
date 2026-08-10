@@ -176,6 +176,34 @@ class Config:
     # `instruments`, see `engine/core.py::Engine._config_reload`'s own
     # docstring).
     keymap_hints_enabled: bool = True
+    # Phase 9 Task 2 (panic-send / stuck-linger / poly-limit log): three v1
+    # `plugins/zstucknotes.py`/`plugins/zvoicemonitor.py` knobs, all
+    # confirmed on the Pi (READ-ONLY reference), not invented --
+    #
+    # `panic_on_crit` -- v1's `PANIC_ON_CRIT` (zstucknotes.py:23) ships
+    # `True` there. v2's default is a DELIBERATE posture change to `False`
+    # (2026-08-08 decisions doc, `docs/visual-audit.md`'s own §20a row 4
+    # note) -- restoring v1's literal default would auto-fire real MIDI
+    # output the moment a note goes critical on a fresh v2 install with no
+    # config.toml at all; the feature is opt-IN here, not opt-out.
+    #
+    # `stuck_hold_after` -- v1's `HOLD_AFTER` (zstucknotes.py:20,
+    # `stuck_notes.hold_after` in v1's OWN deployed `config/settings.json`
+    # on the Pi, `docs/visual-audit.md`'s §20a row 4 table) -- a straight
+    # 1:1 port of v1's actual shipped value, unlike `panic_on_crit` above.
+    #
+    # `poly_limit_global`/`poly_limit_ch` -- v1's `POLY_LIMIT_GLOBAL`/
+    # `POLY_LIMIT_CH` (zvoicemonitor.py:11-12). v1 also has a
+    # `per_channel_limits` 16-entry override list and an `event_log_len`/
+    # `over_limit_beats` pair (zvoicemonitor.py:13-15) -- NOT exposed here,
+    # matching this task's scope (only the two scalar limits) and the
+    # established "hardcode the rest of v1's defaults, don't invent new
+    # config surface the task didn't ask for" precedent (e.g.
+    # analyzers/stucknotes.py's own WARN_AFTER/CRIT_AFTER).
+    panic_on_crit: bool = False
+    stuck_hold_after: float = 15.0
+    poly_limit_global: int = 16
+    poly_limit_ch: int = 8
 
 
 def load(path: str | None = None) -> Config:

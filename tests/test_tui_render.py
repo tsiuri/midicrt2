@@ -400,6 +400,17 @@ def test_render_secondary_row_truncates_to_width():
     assert row == secondary_status_text(alerts_vm, DEFAULT_TIMESIG_VM)[:6]
 
 
+def test_render_secondary_row_shows_polylimit_flash_when_no_alerts():
+    row = render_secondary_row(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, width=60,
+                               polylimit_vm={"flashing": True})
+    assert row.strip() == "POLY LIMIT EXCEEDED"
+
+
+def test_render_secondary_row_polylimit_param_is_optional_backward_compatible():
+    row = render_secondary_row(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, width=60)
+    assert row.strip() == "Time Signature: (no lock)"
+
+
 # -- third chrome row: beatflash/loopprogress (phase-3 task 9) ---------------
 
 def test_render_beatprogress_row_is_exactly_width_wide():

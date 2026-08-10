@@ -185,6 +185,119 @@ def test_secondary_status_text_falls_back_to_timesig_when_no_alerts():
     assert text == "Time Signature: (no lock)"
 
 
+# -- stuck-linger (Phase 9 Task 2, config.stuck_hold_after) -------------------
+
+def test_alerts_text_shows_stuck_cleared_message_when_lingering():
+    vm = {"alerts": [], "cleared": [{"ch": 3, "note": 60, "level": "crit", "held_s": 11.2}]}
+    text = alerts_text(vm)
+    assert text.startswith("STUCK CLEARED:")
+    assert "CH03" in text
+    assert "n060" in text
+    assert "11.2s" in text
+
+
+def test_alerts_text_truncates_cleared_list_with_a_more_suffix():
+    vm = {"alerts": [],
+          "cleared": [{"ch": i, "note": 60, "level": "warn", "held_s": float(i)} for i in range(1, 6)]}
+    text = alerts_text(vm)
+    assert text.count("CH0") == 3   # MAX_ALERT_LIST
+    assert "+2 more" in text
+
+
+def test_alerts_text_prefers_active_alerts_over_a_lingering_cleared_message():
+    vm = {"alerts": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}],
+          "cleared": [{"ch": 2, "note": 64, "level": "crit", "held_s": 9.0}]}
+    text = alerts_text(vm)
+    assert text.startswith("STUCK WARN:")
+    assert "CH02" not in text
+
+
+def test_alerts_text_is_blank_when_neither_alerts_nor_cleared_are_present():
+    assert alerts_text({"alerts": [], "cleared": []}) == ""
+
+
+def test_secondary_status_text_shows_cleared_message_over_timesig():
+    vm = {"alerts": [], "cleared": [{"ch": 3, "note": 60, "level": "warn", "held_s": 2.0}]}
+    text = secondary_status_text(vm, DEFAULT_TIMESIG_VM)
+    assert text.startswith("STUCK CLEARED:")
+
+
+def test_secondary_status_dim_is_true_only_while_lingering():
+    from midicrt.clients.chrome import secondary_status_dim
+
+    assert secondary_status_dim(DEFAULT_ALERTS_VM) is False
+    active_vm = {"alerts": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}], "cleared": []}
+    assert secondary_status_dim(active_vm) is False
+    cleared_vm = {"alerts": [], "cleared": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}]}
+    assert secondary_status_dim(cleared_vm) is True
+
+
+def test_secondary_status_dim_is_false_when_a_fresh_alert_wins_over_lingering_cleared():
+    from midicrt.clients.chrome import secondary_status_dim
+
+    vm = {"alerts": [{"ch": 1, "note": 60, "level": "crit", "held_s": 1.0}],
+          "cleared": [{"ch": 2, "note": 64, "level": "warn", "held_s": 9.0}]}
+    assert secondary_status_dim(vm) is False
+
+
+# -- poly-limit chrome flash (Phase 9 Task 2, config.poly_limit_global/
+# poly_limit_ch) -- v2-native addition, v1's zvoicemonitor.py has no chrome
+# home of its own at all (analyzers/voices.py's own module docstring).
+# Shares the SAME urgent second chrome row as stuck alerts/linger, one tier
+# below them: stuck alerts/cleared (most urgent) > poly-limit flash > the
+# routine time-signature line (least urgent, shown most often) --------------
+
+def test_overlay_polylimit_topic_matches_engine_convention():
+    from midicrt.clients.chrome import OVERLAY_POLYLIMIT_TOPIC
+
+    assert OVERLAY_POLYLIMIT_TOPIC == "overlay.polylimit"
+
+
+def test_default_polylimit_vm_matches_analyzer_initial_flash_view_model():
+    from midicrt.analyzers.voices import VoiceMonitorAnalyzer
+    from midicrt.clients.chrome import DEFAULT_POLYLIMIT_VM
+
+    assert DEFAULT_POLYLIMIT_VM == VoiceMonitorAnalyzer().flash_view_model()
+
+
+def test_secondary_status_text_shows_polylimit_flash_when_no_alerts():
+    text = secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, {"flashing": True})
+    assert text == "POLY LIMIT EXCEEDED"
+
+
+def test_secondary_status_text_falls_back_to_timesig_when_not_flashing():
+    text = secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM, {"flashing": False})
+    assert text == "Time Signature: (no lock)"
+
+
+def test_secondary_status_text_polylimit_param_is_optional_backward_compatible():
+    # Every pre-existing call site (2-arg) must behave identically -- the
+    # 3rd param defaults to "not flashing".
+    text = secondary_status_text(DEFAULT_ALERTS_VM, DEFAULT_TIMESIG_VM)
+    assert text == "Time Signature: (no lock)"
+
+
+def test_secondary_status_text_stuck_alerts_win_over_polylimit_flash():
+    alerts_vm = {"alerts": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}], "cleared": []}
+    text = secondary_status_text(alerts_vm, DEFAULT_TIMESIG_VM, {"flashing": True})
+    assert text.startswith("STUCK WARN:")
+
+
+def test_secondary_status_text_lingering_cleared_message_wins_over_polylimit_flash():
+    cleared_vm = {"alerts": [], "cleared": [{"ch": 1, "note": 60, "level": "warn", "held_s": 3.0}]}
+    text = secondary_status_text(cleared_vm, DEFAULT_TIMESIG_VM, {"flashing": True})
+    assert text.startswith("STUCK CLEARED:")
+
+
+def test_secondary_status_dim_is_false_while_the_polylimit_flash_is_showing():
+    from midicrt.clients.chrome import secondary_status_dim
+
+    # The flash is urgent (full brightness), not the dimmed linger state --
+    # secondary_status_dim only ever looks at alerts_vm, unaffected by the
+    # (separate-topic) polylimit flash.
+    assert secondary_status_dim(DEFAULT_ALERTS_VM) is False
+
+
 # -- beatflash + loopprogress (phase-3 task 9) --------------------------------
 
 def test_overlay_beatflash_and_loopprogress_topics_match_engine_convention():

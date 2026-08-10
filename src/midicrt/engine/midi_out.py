@@ -147,6 +147,23 @@ class MidiOutput:
         except Exception as exc:  # noqa: BLE001 -- see class docstring
             _LOG.debug("midi note_off send failed (%s)", exc)
 
+    def all_notes_off(self, channel: int) -> None:
+        """Phase 9 Task 2 (panic-send): v1's `plugins/zstucknotes.py::
+        _send_all_notes_off` sends a channel-mode "All Notes Off" CC
+        (`control_change`, control=123, value=0) -- NOT a per-note
+        note-off, despite the v1 function's name -- see that module's own
+        docstring/the task report for the read-the-source evidence.
+        `channel` is 1-based (matches `note_on`/`note_off` above), never
+        raises (same class-wide contract)."""
+        self._ensure()
+        if self._port is None:
+            return
+        try:
+            self._port.send(self._backend.Message(
+                "control_change", control=123, value=0, channel=channel - 1))
+        except Exception as exc:  # noqa: BLE001 -- see class docstring
+            _LOG.debug("midi all_notes_off send failed (%s)", exc)
+
     def send_sysex(self, data: tuple[int, ...]) -> bool:
         """Used by `engine/sysex.py`'s versioned-frame replies. Returns
         whether the send actually happened (the caller logs/emits an event

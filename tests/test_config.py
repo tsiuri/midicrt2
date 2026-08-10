@@ -36,3 +36,40 @@ def test_load_overrides_capture_settings(tmp_path):
     assert cfg.capture_dir == "/tmp/sessions"
     assert cfg.capture_retention == 10
     assert cfg.capture_auto_start is True
+
+
+# -- panic-send / stuck-linger / poly-limit log (Phase 9 Task 2) ------------
+#
+# v1 evidence: ~/codex/midicrt/plugins/zstucknotes.py:23 `PANIC_ON_CRIT =
+# True` (v1's own shipped default -- v2 deliberately posture-changes to
+# OFF, a 2026-08-08 decision, not a restoration); line 20 `HOLD_AFTER =
+# 15.0`; ~/codex/midicrt/plugins/zvoicemonitor.py:11-12
+# `POLY_LIMIT_GLOBAL = 16` / `POLY_LIMIT_CH = 8`.
+
+def test_panic_on_crit_defaults_false_a_deliberate_posture_change_from_v1():
+    cfg = Config()
+    assert cfg.panic_on_crit is False
+
+
+def test_stuck_hold_after_defaults_to_v1s_hold_after_constant():
+    cfg = Config()
+    assert cfg.stuck_hold_after == 15.0
+
+
+def test_poly_limit_defaults_match_v1s_shipped_constants():
+    cfg = Config()
+    assert cfg.poly_limit_global == 16
+    assert cfg.poly_limit_ch == 8
+
+
+def test_load_overrides_panic_linger_polylimit_settings(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        "panic_on_crit = true\nstuck_hold_after = 5.0\n"
+        "poly_limit_global = 4\npoly_limit_ch = 2\n"
+    )
+    cfg = load(str(p))
+    assert cfg.panic_on_crit is True
+    assert cfg.stuck_hold_after == 5.0
+    assert cfg.poly_limit_global == 4
+    assert cfg.poly_limit_ch == 2

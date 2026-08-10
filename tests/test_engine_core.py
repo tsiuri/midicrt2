@@ -190,6 +190,11 @@ def test_engine_topics_reflects_roster_order():
         "page.second",
         "overlay.status", "overlay.alerts", "overlay.timesig",
         "overlay.beatflash", "overlay.loopprogress", "overlay.marquee",
+        # Phase 9 Task 2: "polylimit" is registered LAST (post-hoc, right
+        # after "voices" is built -- see Engine.__init__'s own comment),
+        # so it lands after every OTHER analyzer here, same insertion-order
+        # convention every topic list in this file already follows.
+        "overlay.polylimit",
     ]
 
 
@@ -199,19 +204,23 @@ def test_handle_marks_dirty_only_for_pages_reporting_true():
     # to it too, so they're dirty here alongside eventlog, same as any
     # other real page would be. Phase-3 task 6: "alerts" (StuckNotesAnalyzer)
     # is a real analyzer too, and a fresh note-on genuinely starts tracking
-    # it -- dirty for the same reason. Phase-3 task 12: "chordkey" wraps its
-    # own HarmonyAnalyzer instance (same class as "harmony"'s), so it reacts
-    # to a real note-on too. "timesig" does NOT react (TimesigAnalyzer gates
-    # note_on on transport being "running", and no "start" was ever sent
-    # here). "config" never reacts to MIDI events at all (a read-only
-    # viewer, pages/configview.py's own `handle()`).
+    # it -- dirty for the same reason. Phase 9 Task 2: "polylimit" wraps the
+    # SAME VoiceMonitorAnalyzer "voices" owns, so it reacts to a real
+    # note-on too (the poly-limit CHECK might not exceed anything, but the
+    # underlying `_note_on` call still returns dirty=True either way).
+    # Phase-3 task 12: "chordkey" wraps its own HarmonyAnalyzer instance
+    # (same class as "harmony"'s), so it reacts to a real note-on too.
+    # "timesig" does NOT react (TimesigAnalyzer gates note_on on transport
+    # being "running", and no "start" was ever sent here). "config" never
+    # reacts to MIDI events at all (a read-only viewer, pages/configview.py's
+    # own `handle()`).
     eng = Engine(Config())
     quiet = _FakePage(dirty=False)
     eng.register_page("quiet", quiet)
     eng._handle(ev())
     assert eng._dirty == {
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
-        "page.img2txtviz", "page.chordkey", "overlay.alerts",
+        "page.img2txtviz", "page.chordkey", "overlay.alerts", "overlay.polylimit",
     }
     assert quiet.seen == 1  # every page still SEES every event...
 
@@ -226,7 +235,7 @@ def test_handle_marks_non_current_page_dirty_too():
     eng._handle(ev())
     assert eng._dirty == {
         "page.eventlog", "page.voices", "page.harmony", "page.pianoroll",
-        "page.img2txtviz", "page.chordkey", "page.loud", "overlay.alerts",
+        "page.img2txtviz", "page.chordkey", "page.loud", "overlay.alerts", "overlay.polylimit",
     }
 
 
@@ -283,7 +292,10 @@ def test_default_analyzer_roster_is_status_alerts_timesig():
     # page-title scrolling marquee, v1's own primary anti-burn-in device.
     eng = Engine(Config())
     assert list(eng.analyzers) == [
-        "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee",
+        # Phase 9 Task 2: "polylimit" lands LAST -- registered post-hoc
+        # (Engine.__init__, right after "voices" is built), not via
+        # _ANALYZER_FACTORIES like the other five.
+        "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee", "polylimit",
     ]
 
 
@@ -292,7 +304,7 @@ def test_register_analyzer_appends_to_live_roster():
     fake = _FakePage()  # same handle()/view_model() shape as an Analyzer
     eng.register_analyzer("second", fake)
     assert list(eng.analyzers) == [
-        "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee", "second",
+        "status", "alerts", "timesig", "beatflash", "loopprogress", "marquee", "polylimit", "second",
     ]
     assert eng.analyzers["second"] is fake
 
@@ -304,7 +316,7 @@ def test_topics_include_overlay_after_page_topics():
         "page.screensaver", "page.img2txtviz", "page.config", "page.help", "page.progchanges",
         "page.ccmonitor", "page.ccdashboard", "page.chordkey", "page.sendnotes",
         "overlay.status", "overlay.alerts", "overlay.timesig",
-        "overlay.beatflash", "overlay.loopprogress", "overlay.marquee",
+        "overlay.beatflash", "overlay.loopprogress", "overlay.marquee", "overlay.polylimit",
     ]
 
 
@@ -477,6 +489,137 @@ def test_tick_analyzers_ignores_analyzers_with_no_drain_alerts_method():
     assert events == []
 
 
+# -- panic-send (Phase 9 Task 2, config.panic_on_crit) -----------------------
+#
+# v1 evidence (`~/codex/midicrt/plugins/zstucknotes.py`): `PANIC_ON_CRIT`
+# gates a channel-scoped "All Notes Off" CC (control=123) sent through a
+# dedicated MIDI output the moment a note's level transitions to "crit"
+# (zstucknotes.py:209-216, inside the SAME `if level != prev:` transition
+# block `analyzers/stucknotes.py::tick()`'s own `_pending_alerts.append`
+# mirrors) -- ported here as an engine-level `_tick_analyzers` side effect
+# on each DRAINED "crit" alert, gated on `config.panic_on_crit` (v2 default
+# False, see config.py). `PANIC_COOLDOWN=3.0` (zstucknotes.py:26) is
+# ported as a per-channel cooldown to bound the same "sustain-toggle
+# storm" vector analyzers/stucknotes.py's own docstring discloses
+# (repeated none->crit transitions on one channel must not spam real MIDI
+# output).
+
+def test_panic_on_crit_sends_channel_scoped_all_notes_off_on_a_crit_alert():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    analyzer = _FakeTickingAnalyzer(alerts=[{"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}])
+    eng.register_analyzer("fake", analyzer)
+    eng._tick_analyzers(1.0)
+    assert fake.control_change_calls == [(123, 0, 5)]
+
+
+def test_panic_on_crit_ignores_warn_level_alerts():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    analyzer = _FakeTickingAnalyzer(alerts=[{"ch": 5, "note": 60, "level": "warn", "held_s": 2.0}])
+    eng.register_analyzer("fake", analyzer)
+    eng._tick_analyzers(1.0)
+    assert fake.control_change_calls == []
+
+
+def test_panic_on_crit_defaults_off_sends_nothing():
+    eng = Engine(Config())   # panic_on_crit default False
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    analyzer = _FakeTickingAnalyzer(alerts=[{"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}])
+    eng.register_analyzer("fake", analyzer)
+    eng._tick_analyzers(1.0)
+    assert fake.control_change_calls == []
+
+
+def test_panic_on_crit_still_emits_the_ordinary_alert_event_too():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    events = []
+    eng.add_listener(lambda m: events.append(m) if m.get("kind") == "event" else None)
+    analyzer = _FakeTickingAnalyzer(alerts=[{"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}])
+    eng.register_analyzer("fake", analyzer)
+    eng._tick_analyzers(1.0)
+    assert [e["name"] for e in events if e["name"] == "alert"] == ["alert"]
+
+
+def test_panic_on_crit_is_cooled_down_per_channel():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    analyzer = _FakeTickingAnalyzer(alerts=[{"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}])
+    eng.register_analyzer("fake", analyzer)
+    eng._tick_analyzers(1.0)
+    assert len(fake.control_change_calls) == 1
+    analyzer._alerts = [{"ch": 5, "note": 60, "level": "crit", "held_s": 11.5}]
+    eng._tick_analyzers(1.5)   # 0.5s later -- well under the 3.0s cooldown
+    assert len(fake.control_change_calls) == 1   # still just the one send
+    analyzer._alerts = [{"ch": 5, "note": 60, "level": "crit", "held_s": 15.0}]
+    eng._tick_analyzers(4.5)   # 3.5s later -- past cooldown
+    assert len(fake.control_change_calls) == 2
+
+
+def test_panic_on_crit_cooldown_is_independent_per_channel():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    analyzer = _FakeTickingAnalyzer(alerts=[{"ch": 1, "note": 60, "level": "crit", "held_s": 11.0}])
+    eng.register_analyzer("fake", analyzer)
+    eng._tick_analyzers(1.0)
+    analyzer._alerts = [{"ch": 2, "note": 64, "level": "crit", "held_s": 11.0}]
+    eng._tick_analyzers(1.1)   # a DIFFERENT channel, well under ch1's cooldown
+    assert fake.control_change_calls == [(123, 0, 1), (123, 0, 2)]
+
+
+def test_panic_on_crit_records_a_provenance_marked_action():
+    eng = Engine(Config(panic_on_crit=True, capture_dir=None))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    eng._capture_start_action()
+    analyzer = _FakeTickingAnalyzer(alerts=[{"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}])
+    eng.register_analyzer("fake", analyzer)
+    eng._tick_analyzers(1.0)
+    marks = [line for line in eng._capture._buffer
+             if line.get("kind") == "action" and line.get("name") == "panic.notes_off"]
+    assert len(marks) == 1
+    assert marks[0]["origin"] == "alert"
+    assert marks[0]["args"] == {"ch": 5}
+
+
+# -- panic-send must never feed back as a new inbound event (CRITICAL,
+# brief's own callout -- the P3 self-subscription runaway is the ancestor
+# bug here) -----------------------------------------------------------------
+#
+# The panic CC goes out through the SAME shared `self._midi_out` port every
+# other real send already uses (sendnotes note-on, sysex replies) -- the
+# TWO existing self-subscription defense layers (engine/midi_in.py's own
+# `exclude_names`, and `Engine._handle`'s own source filter, both proven
+# above by test_handle_drops_an_event_whose_source_is_our_own_output_port/
+# test_handle_drops_an_event_with_the_real_prefixed_alsa_source_form)
+# therefore already cover it structurally -- this test pins the piece that
+# is genuinely NEW here: firing panic never itself synthesizes/queues a
+# fake inbound MidiEvent, only ever calls the OUTPUT method.
+
+def test_panic_send_never_synthesizes_a_new_inbound_event():
+    eng = Engine(Config(panic_on_crit=True))
+    fake = _FakeMidiOut()
+    eng._midi_out = fake
+    before_total = eng.events_total
+    before_dirty = set(eng._dirty)
+    analyzer = _FakeTickingAnalyzer(alerts=[{"ch": 5, "note": 60, "level": "crit", "held_s": 11.0}])
+    eng.register_analyzer("fake", analyzer)
+    eng._tick_analyzers(1.0)
+    assert fake.control_change_calls == [(123, 0, 5)]
+    # The panic send itself must never be counted as (or trigger) a real
+    # inbound MIDI event -- events_total only moves through _handle(), which
+    # _tick_analyzers never calls.
+    assert eng.events_total == before_total
+    assert eng._dirty - before_dirty == {"overlay.fake"}   # only the drained analyzer's own topic
+
+
 async def test_run_loop_calls_tick_analyzers_and_publishes_stucknotes_alert_end_to_end():
     # End-to-end proof (real StuckNotesAnalyzer, real run() loop, real
     # wall-clock `time.time()` reads from the engine -- NOT a scripted
@@ -504,6 +647,18 @@ async def test_run_loop_calls_tick_analyzers_and_publishes_stucknotes_alert_end_
     assert alert_events and alert_events[0]["data"]["note"] == 60
     alert_snaps = [m for m in got if m.get("kind") == "snapshot" and m["topic"] == "overlay.alerts"]
     assert alert_snaps and alert_snaps[-1]["data"]["alerts"][0]["note"] == 60
+
+
+# -- stuck-linger config wiring (Phase 9 Task 2, config.stuck_hold_after) ---
+
+def test_config_stuck_hold_after_is_wired_into_the_real_alerts_analyzer():
+    eng = Engine(Config(stuck_hold_after=5.0))
+    assert eng.analyzers["alerts"]._hold_after == 5.0
+
+
+def test_config_stuck_hold_after_default_matches_v1s_hold_after():
+    eng = Engine(Config())
+    assert eng.analyzers["alerts"]._hold_after == 15.0
 
 
 # -- page wall-clock tick (phase-3 task 7) -----------------------------------
@@ -1384,6 +1539,11 @@ class _FakeMidiOut:
     def __init__(self):
         self.note_on_calls: list[tuple[int, int, int]] = []
         self.note_off_calls: list[tuple[int, int]] = []
+        # Phase 9 Task 2 (panic-send): mirrors note_on_calls/note_off_calls'
+        # own convention -- (control, value, channel), matching
+        # MidiOutput.all_notes_off's real `control_change(control=123,
+        # value=0, channel=...)` send.
+        self.control_change_calls: list[tuple[int, int, int]] = []
         self.closed = False
         self.port_name = "fake"
         self.is_open = True
@@ -1399,6 +1559,10 @@ class _FakeMidiOut:
     def note_off(self, note, channel):
         self.note_off_calls.append((note, channel))
         self.call_order.append(("note_off", note, channel))
+
+    def all_notes_off(self, channel):
+        self.control_change_calls.append((123, 0, channel))
+        self.call_order.append(("all_notes_off", channel))
 
     def close(self):
         self.closed = True
@@ -1782,6 +1946,66 @@ def test_a_solo_harmony_page_still_gets_its_own_working_analyzer():
     eng = Engine(Config(pages=["eventlog", "harmony"]))
     eng._handle(ev(type="note_on", data1=60, data2=100, channel=0))
     assert eng.pages["harmony"].view_model()["key"] == "C maj"
+
+
+# -- voices/polylimit shared VoiceMonitorAnalyzer (Phase 9 Task 2) ---------
+#
+# Same "share one instance across two roster entries, protected by that
+# analyzer's own dedup guard" precedent as harmony/chordkey above -- here
+# the SECOND consumer is a NEW analyzer/overlay entry (`overlay.polylimit`,
+# `_PolyLimitOverlay`), not a second page, so poly-limit tracking is
+# computed exactly once per event while the chrome flash still gets its own
+# minimal, separately-subscribable topic (see analyzers/voices.py's own
+# module docstring for why a full channels-array duplicate onto chrome
+# would be wasteful).
+
+def test_voices_page_and_polylimit_overlay_share_one_analyzer_instance():
+    eng = Engine(Config())
+    assert eng.pages["voices"].analyzer is eng.analyzers["polylimit"]._shared
+
+
+def test_polylimit_topic_is_registered():
+    eng = Engine(Config())
+    assert "overlay.polylimit" in eng.topics
+
+
+def test_config_poly_limits_are_wired_into_the_real_voices_analyzer():
+    eng = Engine(Config(poly_limit_global=4, poly_limit_ch=2))
+    assert eng.pages["voices"].analyzer._limit_global == 4
+    assert eng.pages["voices"].analyzer._limit_ch == 2
+
+
+def test_voices_and_polylimit_do_not_double_count_a_shared_event():
+    eng = Engine(Config(poly_limit_global=100, poly_limit_ch=1))
+    shared = eng.pages["voices"].analyzer
+    eng._handle(ev(type="note_on", data1=60, data2=100, channel=0))
+    eng._handle(ev(type="note_on", data1=60, data2=100, channel=0))   # exceeds ch limit 1
+    assert shared.view_model()["channels"][0]["active"] == 2   # counted once each, not twice
+    assert len(shared.view_model()["events"]) == 1
+
+
+def test_polylimit_overlay_view_model_is_the_minimal_flash_shape():
+    eng = Engine(Config())
+    assert eng.analyzers["polylimit"].view_model() == {"flashing": False}
+
+
+def test_polylimit_flash_reaches_the_overlay_topic_via_tick_analyzers():
+    eng = Engine(Config(poly_limit_global=100, poly_limit_ch=1))
+    eng._handle(ev(type="note_on", data1=60, data2=100, channel=0, ts=1.0))
+    eng._handle(ev(type="note_on", data1=60, data2=100, channel=0, ts=1.0))
+    eng._tick_analyzers(1.1)
+    assert "overlay.polylimit" in eng._dirty
+    assert eng.analyzers["polylimit"].view_model() == {"flashing": True}
+
+
+def test_a_solo_voices_page_still_gets_its_own_working_analyzer_no_polylimit_overlay():
+    # Boundary case: a custom roster without "voices" -- nothing to wrap,
+    # no "polylimit" overlay registered at all (mirrors the harmony-solo
+    # boundary test above).
+    eng = Engine(Config(pages=["eventlog"]))
+    assert "voices" not in eng.pages
+    assert "polylimit" not in eng.analyzers
+    assert "overlay.polylimit" not in eng.topics
 
 
 # -- config-served keymap (Phase 4 Task 1, docs/phase4-notes.md) ------------

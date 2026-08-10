@@ -126,12 +126,31 @@ def render_status_row(vm: dict, width: int) -> str:
     return _fit(chrome.status_text(vm), width)
 
 
-def render_secondary_row(alerts_vm: dict, timesig_vm: dict, width: int) -> str:
+def render_secondary_row(alerts_vm: dict, timesig_vm: dict, width: int,
+                         polylimit_vm: dict | None = None) -> str:
     """TUI's presentation of the shared second chrome row (phase-3 task 6:
     stuck-note alerts when any are active, else the time-signature
     estimate -- see clients/chrome.py's `secondary_status_text()`). Same
-    fit/pad treatment as `render_status_row`."""
-    return _fit(chrome.secondary_status_text(alerts_vm, timesig_vm), width)
+    fit/pad treatment as `render_status_row`.
+
+    Phase 9 Task 2 (stuck-linger): `secondary_status_text`'s own
+    `alerts_text()` now also falls back to a lingering "STUCK CLEARED:
+    ..." message (`config.stuck_hold_after`) -- shown here identically to
+    an active alert, zero-touch. `clients/chrome.py::secondary_status_dim`
+    exists for the fb client's DIMMED luminance treatment specifically
+    (monochrome mandate: "dim" is a shading level) -- deliberately NOT
+    consulted here, matching this module's own existing precedent
+    (`run_tui`'s docstring: "the TUI has no dimming primitive, and
+    burn-in isn't a real concern on [a terminal]").
+
+    Phase 9 Task 2 (poly-limit chrome flash): `polylimit_vm` (OPTIONAL,
+    defaults to "not flashing" -- unchanged for every pre-existing 3-arg
+    call site) is forwarded straight into `secondary_status_text()`'s own
+    3rd param. Unlike the DIM treatment above, the flash is plain TEXT
+    (`"POLY LIMIT EXCEEDED"`) with no luminance concern at all, so it IS
+    shown here identically to the fb client -- nothing about it needs the
+    dimming primitive the TUI lacks."""
+    return _fit(chrome.secondary_status_text(alerts_vm, timesig_vm, polylimit_vm), width)
 
 
 def render_beatprogress_row(beatflash_vm: dict, loopprogress_vm: dict, width: int) -> str:
@@ -974,7 +993,7 @@ def run_tui(socket_path: str) -> int:
     client = EngineClient(socket_path)
     overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
                        chrome.OVERLAY_TIMESIG_TOPIC, chrome.OVERLAY_BEATFLASH_TOPIC,
-                       chrome.OVERLAY_LOOPPROGRESS_TOPIC]
+                       chrome.OVERLAY_LOOPPROGRESS_TOPIC, chrome.OVERLAY_POLYLIMIT_TOPIC]
     try:
         client.connect()
         page, topic = current_page_topic(client)
@@ -998,6 +1017,7 @@ def run_tui(socket_path: str) -> int:
              "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
              "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM),
+             "polylimit_vm": dict(chrome.DEFAULT_POLYLIMIT_VM),
              "learn_armed": False}
 
     def on_event(msg: dict) -> None:
@@ -1069,6 +1089,9 @@ def run_tui(socket_path: str) -> int:
                     dirty = True
                 if chrome.OVERLAY_TIMESIG_TOPIC in drained:
                     state["timesig_vm"] = drained[chrome.OVERLAY_TIMESIG_TOPIC]
+                    dirty = True
+                if chrome.OVERLAY_POLYLIMIT_TOPIC in drained:
+                    state["polylimit_vm"] = drained[chrome.OVERLAY_POLYLIMIT_TOPIC]
                     dirty = True
                 if chrome.OVERLAY_BEATFLASH_TOPIC in drained:
                     state["beatflash_vm"] = drained[chrome.OVERLAY_BEATFLASH_TOPIC]
@@ -1151,7 +1174,8 @@ def run_tui(socket_path: str) -> int:
                             # docstring for why this has no display window.
                             status_line = _fit("LEARN: waiting for MIDI...", term.width)
                         secondary_line = render_secondary_row(
-                            state["alerts_vm"], state["timesig_vm"], term.width)
+                            state["alerts_vm"], state["timesig_vm"], term.width,
+                            polylimit_vm=state["polylimit_vm"])
                         beatprogress_line = render_beatprogress_row(
                             state["beatflash_vm"], state["loopprogress_vm"], term.width)
                         # Accent (bold) highlighting reaches back into the

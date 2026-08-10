@@ -145,6 +145,7 @@ from midicrt.analyzers.marquee import MarqueeAnalyzer
 from midicrt.analyzers.stucknotes import StuckNotesAnalyzer
 from midicrt.analyzers.timesig import TimesigAnalyzer
 from midicrt.analyzers.transport import TransportAnalyzer
+from midicrt.analyzers.voices import VoiceMonitorAnalyzer
 from midicrt.behaviors.pagecycle import PageCycleBehavior
 from midicrt.behaviors.screensaver import ScreensaverBehavior
 from midicrt.config import Config, ConfigError
@@ -178,6 +179,18 @@ _LOG = logging.getLogger(__name__)
 # behaviors/screensaver.py's own docstring for why a free-running MIDI
 # clock must NOT count as activity).
 _ACTIVITY_EVENT_TYPES = {"note_on", "note_off", "control_change"}
+
+# Phase 9 Task 2 (panic-send): v1's `plugins/zstucknotes.py::
+# PANIC_COOLDOWN = 3.0` -- a per-channel minimum spacing between real panic
+# sends, ported here as a hardcoded engine-level constant (not exposed as
+# config -- same "hardcode the rest of v1's defaults, only the task's named
+# knob is configurable" precedent as `analyzers/stucknotes.py`'s own
+# WARN_AFTER/CRIT_AFTER). Bounds the exact "alert-storm" vector that
+# module's own docstring discloses (rapid CC64 sustain toggling on an
+# already-critical note re-fires a fresh none->crit transition, and
+# therefore a fresh drained alert, on every toggle) from also spamming real
+# MIDI output once per toggle.
+_PANIC_COOLDOWN_S = 3.0
 
 # Phase 8 Task 5 (behaviors/pagecycle.py's own "notify_page_action" +
 # "Origin ruling" docstring sections): every action name that moves
@@ -310,7 +323,16 @@ _PAGE_FACTORIES: dict[str, PageFactory] = {
     # Phase-3 task 4: v1's main screen, the first second page -- see
     # pages/voices.py + analyzers/voices.py. `config.pages` now defaults to
     # ["eventlog", "voices"] (config.py) so it's live without a config.toml.
-    "voices": lambda config: VoicesPage(instruments=config.instruments),
+    # Phase 9 Task 2: `poly_limit_global`/`poly_limit_ch` wired into the
+    # page's OWN `VoiceMonitorAnalyzer` instance here -- `Engine.__init__`
+    # below then hands this SAME instance to a `_PolyLimitOverlay` too (the
+    # `overlay.polylimit` chrome flash), mirroring "harmony"/"chordkey"'s
+    # existing shared-instance precedent just below.
+    "voices": lambda config: VoicesPage(
+        instruments=config.instruments,
+        analyzer=VoiceMonitorAnalyzer(
+            poly_limit_global=config.poly_limit_global, poly_limit_ch=config.poly_limit_ch),
+    ),
     # Phase-3 task 5: v1's Notes-page harmony fields (chord/scale/key/
     # tension/harmonic-rhythm/motif) -- see pages/harmony.py +
     # analyzers/harmony.py. `config.pages` now defaults to
@@ -412,7 +434,7 @@ _ANALYZER_FACTORIES: dict[str, AnalyzerFactory] = {
     # analyzers/stucknotes.py's/analyzers/timesig.py's own module
     # docstrings for the v1 layout evidence), so both are registered here
     # as analyzers/overlays, not pages, matching "status"'s own precedent.
-    "alerts": lambda config: StuckNotesAnalyzer(),
+    "alerts": lambda config: StuckNotesAnalyzer(hold_after=config.stuck_hold_after),
     "timesig": lambda config: TimesigAnalyzer(),
     # Phase-3 task 9: v1's plugins/beatflash.py (beat-synced flash pulse)
     # and plugins/loopprogress.py (8-bar cyclic position bar) -- both v1
@@ -461,6 +483,35 @@ _ANALYZER_FACTORIES: dict[str, AnalyzerFactory] = {
 # refactor, not a behavior change, and `test_engine_sysex_dispatch.py`'s
 # existing ID-based tests are the regression coverage that proves it.
 _SYSEX_PAGE_ID_MAP: dict[int, str] = {pid: name for name, pid in _MARQUEE_PAGE_IDS.items()}
+
+
+class _PolyLimitOverlay:
+    """Phase 9 Task 2 (poly-limit log): a thin `overlay.polylimit`
+    analyzer-shaped wrapper around a SHARED `VoiceMonitorAnalyzer`
+    instance -- the SAME one `pages/voices.py::VoicesPage` owns (wired in
+    `Engine.__init__` right after `self.pages` is built, mirroring
+    "harmony"/"chordkey"'s existing shared-instance precedent right
+    above). Delegates `handle`/`tick` straight through (the shared
+    instance's OWN dedup guard, `VoiceMonitorAnalyzer.handle`'s `ev is
+    self._last_handled_event` check, is what makes calling `handle` from
+    BOTH this overlay entry and the "voices" page entry safe -- see that
+    method's docstring) and reshapes `view_model()` into the SMALL
+    `{"flashing": bool}` chrome-flash payload
+    (`VoiceMonitorAnalyzer.flash_view_model()`) rather than exposing the
+    full 16-channel breakdown `page.voices`'s own subscribers already get
+    on every note played."""
+
+    def __init__(self, shared: VoiceMonitorAnalyzer) -> None:
+        self._shared = shared
+
+    def handle(self, ev: MidiEvent) -> bool:
+        return self._shared.handle(ev)
+
+    def tick(self, now: float) -> bool:
+        return self._shared.tick(now)
+
+    def view_model(self) -> dict:
+        return self._shared.flash_view_model()
 
 
 @dataclass
@@ -602,6 +653,16 @@ class Engine:
         # event, so both pages' calls land on this one instance.
         if "harmony" in self.pages and "chordkey" in self.pages:
             self.pages["chordkey"] = ChordKeyPage(self.pages["harmony"].analyzer)
+        # Phase 9 Task 2 (poly-limit log): "voices" always builds its OWN
+        # `VoiceMonitorAnalyzer` above (`_PAGE_FACTORIES["voices"]`) --
+        # wrap that SAME instance as a NEW `overlay.polylimit` analyzer
+        # entry here, mirroring the harmony/chordkey pattern immediately
+        # above (a page-owned analyzer, shared with a second roster
+        # entry). Guarded on presence (a custom `config.pages` without
+        # "voices" has nothing to wrap) -- see `_PolyLimitOverlay`'s own
+        # docstring for the dedup-guard reasoning that makes this safe.
+        if "voices" in self.pages:
+            self.register_analyzer("polylimit", _PolyLimitOverlay(self.pages["voices"].analyzer))
         self.current_page = next(iter(self.pages))
         # Phase-3 task 12: a single lazily-opened MIDI output, shared by
         # "sendnotes" (real note sends) and, when the roster reaches it,
@@ -615,6 +676,10 @@ class Engine:
         # actually CALLED later -- the bound-method reference itself
         # doesn't need `self._midi_out` to exist yet, just `self`.
         self._midi_out = MidiOutput()
+        # Phase 9 Task 2 (panic-send): per-channel "last real panic send"
+        # timestamp, mirroring v1's own `_panic_last` dict
+        # (zstucknotes.py:89) -- see `_maybe_panic`'s own docstring.
+        self._panic_last: dict[int, float] = {}
         # Phase 4 Task 0 (engine consolidation, docs/phase4-notes.md):
         # `self._page_info_providers` is the one genuinely irreducible
         # per-page bit left after formalizing PageHooks -- each of these
@@ -2467,7 +2532,13 @@ class Engine:
         drain/emit any resulting `alert` events -- see the module
         docstring's "Analyzer wall-clock tick + alert events" section.
         `now` is read ONCE here (the engine's job); analyzers only ever
-        receive it as a parameter, never read a clock themselves."""
+        receive it as a parameter, never read a clock themselves.
+
+        Phase 9 Task 2 (panic-send): every drained alert at "crit" level
+        also gets a chance at `_maybe_panic` -- generic over WHICH analyzer
+        drained it (no name check against "alerts" specifically), since the
+        `{"ch", "note", "level", "held_s"}` shape is the only contract
+        `drain_alerts()` callers rely on anywhere else in this method."""
         for name, analyzer in self.analyzers.items():
             tick_fn = getattr(analyzer, "tick", None)
             if tick_fn is not None and tick_fn(now):
@@ -2476,6 +2547,66 @@ class Engine:
             if drain is not None:
                 for alert in drain():
                     self.emit_event("alert", alert)
+                    if self.config.panic_on_crit and alert.get("level") == "crit":
+                        self._maybe_panic(alert, now)
+
+    def _maybe_panic(self, alert: dict, now: float) -> None:
+        """`config.panic_on_crit` side effect (default False -- see
+        config.py's own docstring for the deliberate v1-default posture
+        change): v1's `zstucknotes.py::draw()` sends a channel-scoped "All
+        Notes Off" CC the instant a note's level transitions to "crit"
+        (zstucknotes.py:209-216), gated by a per-channel `PANIC_COOLDOWN`
+        (3.0s, `_PANIC_COOLDOWN_S` above) -- ported here as REAL I/O
+        (`self._midi_out.all_notes_off`), the one place in this whole
+        method that touches MIDI output, mirroring `_tick_pages`'s own
+        "pure module reports, engine acts" split for its sendnotes
+        auto-off drain.
+
+        v1 sends `_send_all_notes_off(channel=ch)` -- despite that function
+        NAME, it is a single channel-mode CC (control=123, value=0) for
+        `PANIC_SCOPE="channel"` (v1's own default, read from
+        `~/codex/midicrt/plugins/zstucknotes.py:24` -- NOT v1's
+        `PANIC_SCOPE="all"` alternative, and NOT a per-note note-off
+        despite the brief's own initial "targeted note-off" wording; see
+        the task report for the full read-the-source evidence). v1's other
+        panic knobs (`PANIC_SCOPE`, `PANIC_OUTPUT_NAME`, `PANIC_AUTOCONNECT`,
+        `PANIC_DST_HINTS`) are v1's own ALSA-port-discovery plumbing for a
+        SEPARATE named output port -- this engine already has exactly one
+        shared, self-subscription-guarded `MidiOutput` (see that module's
+        own docstring), so none of that plumbing is ported; only the
+        channel-scoped send itself.
+
+        A drained alert with no `"ch"` (shouldn't occur for
+        `StuckNotesAnalyzer`'s own `{"ch", "note", "level", "held_s"}`
+        shape, but this method is deliberately generic over ANY analyzer's
+        drained alerts, see `_tick_analyzers`'s own docstring) is a safe
+        no-op rather than a crash.
+
+        No-feedback-loop note (brief's own CRITICAL callout): this call
+        only ever reaches `self._midi_out.all_notes_off(...)`, the SAME
+        shared, self-subscription-guarded output every other real send
+        (sendnotes note-on, sysex replies) already uses -- it never
+        constructs or queues a `MidiEvent`, so it cannot itself become a
+        new inbound event regardless of the two existing self-subscription
+        defense layers (`engine/midi_in.py::MidiInput`'s `exclude_names`,
+        `Engine._handle`'s own source filter) -- see
+        test_panic_send_never_synthesizes_a_new_inbound_event in
+        test_engine_core.py for the pinning proof."""
+        ch = alert.get("ch")
+        if ch is None:
+            return
+        # `None` (never sent), not `0.0` -- a `0.0` sentinel would wrongly
+        # suppress the very FIRST send whenever `now` is a small
+        # test-clock/relative value (`now - 0.0 < _PANIC_COOLDOWN_S`),
+        # unlike v1's own `_panic_last = {ch: 0.0 ...}` default, which gets
+        # away with it only because v1's `now` is always a real, huge
+        # `time.time()` epoch value in practice.
+        last_sent = self._panic_last.get(ch)
+        if last_sent is not None and (now - last_sent) < _PANIC_COOLDOWN_S:
+            return
+        self._panic_last[ch] = now
+        self._midi_out.all_notes_off(ch)
+        self._capture.record_action("panic.notes_off", {"ch": ch}, "alert")
 
     def _tick_pages(self, now: float) -> None:
         """Mirrors `_tick_analyzers` above but for PAGES (phase-3 task 7):

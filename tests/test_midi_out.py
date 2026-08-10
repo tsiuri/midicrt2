@@ -86,6 +86,38 @@ def test_note_off_sends_velocity_zero():
     assert port.sent[-1] == {"type": "note_off", "note": 60, "velocity": 0, "channel": 9}
 
 
+def test_all_notes_off_sends_cc123_value_0_on_the_target_channel():
+    # Phase 9 Task 2 (panic-send): v1's `zstucknotes.py::_send_all_notes_off`
+    # sends a channel-mode "All Notes Off" CC (control=123, value=0), NOT a
+    # per-note note-off -- see that module's own docstring/report for the
+    # v1 evidence. Ported here as a dedicated MidiOutput method, same
+    # "channel is 1-based at this boundary, converted to mido's 0-based
+    # once" convention as note_on/note_off above.
+    backend = FakeBackend()
+    out = MidiOutput(backend=backend)
+    out.all_notes_off(3)   # channel 3 (1-based) -> mido channel 2
+    port = out._port
+    assert port.sent[-1] == {"type": "control_change", "control": 123, "value": 0, "channel": 2}
+
+
+def test_all_notes_off_opens_the_port_lazily_like_every_other_send():
+    backend = FakeBackend()
+    out = MidiOutput(backend=backend)
+    out.all_notes_off(1)
+    assert backend.opened == [(DEFAULT_PORT_NAME, False)]
+
+
+def test_all_notes_off_failure_never_raises():
+    class RaisingPort(FakePort):
+        def send(self, msg):
+            raise RuntimeError("device unplugged mid-send")
+
+    backend = FakeBackend()
+    out = MidiOutput(backend=backend)
+    out._port = RaisingPort("x")
+    out.all_notes_off(1)   # must not raise
+
+
 def test_send_sysex_returns_true_on_success():
     backend = FakeBackend()
     out = MidiOutput(backend=backend)
