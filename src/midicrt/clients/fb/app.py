@@ -1927,6 +1927,29 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
         state["_fps_last_t"] = now
         return chrome.format_fps(1.0 / frame_dt if frame_dt and frame_dt > 0 else None)
 
+    def _render_vm(page: str, vm: dict) -> dict:
+        """Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9):
+        the pianoroll page's own vm gets client-side extrapolated forward
+        to THIS render's wall-clock instant before painting -- every other
+        page's vm passes through unchanged (this is a pianoroll-specific
+        fix, not a general snapshot-staleness smoothing mechanism; see
+        `pages/pianoroll.py`'s module docstring, "Client-side
+        extrapolation" section, for why only this page needs it). `time.
+        time()` (not `time.monotonic()`) -- the SAME clock basis `origin_
+        ts` and every note's `onset_ts`/`release_ts` already use.
+        Defensive against an older server predating `window.origin_ts`
+        (additive wire field, same "older/newer client and server never
+        crash each other" contract as every other new describe()/snapshot
+        field in this codebase): a missing/non-numeric `origin_ts` computes
+        `elapsed_s=0.0`, which `chrome.extrapolate_pianoroll_vm` already
+        treats as a safe no-op."""
+        if page != "pianoroll":
+            return vm
+        window = vm.get("window")
+        origin_ts = window.get("origin_ts") if isinstance(window, dict) else None
+        elapsed_s = time.time() - origin_ts if isinstance(origin_ts, (int, float)) else 0.0
+        return chrome.extrapolate_pianoroll_vm(vm, elapsed_s)
+
     on_event = _make_page_switcher(client, state, fps)
     # Phase 8 Task 6 (help overlay): shared with `_input_loop`'s background
     # thread the SAME way `state["keymap"]` is -- see `_dispatch_evdev_key`'s
@@ -1957,7 +1980,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
 
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
         vm_topic = state["topic"]
-        _paint_frame(surface, state["page"], vm, font, state["status_vm"],
+        _paint_frame(surface, state["page"], _render_vm(state["page"], vm), font,
+                     state["status_vm"],
                      state["alerts_vm"], state["timesig_vm"],
                      state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"],
                      page_keymap=state["keymap_page"],
@@ -2051,14 +2075,28 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             overlay_changed = overlay_now != overlay_active_prev
             overlay_active_prev = overlay_now
             vm_is_current = vm_topic == state["topic"]
+            # Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9):
+            # the pianoroll page repaints EVERY tick while it's current --
+            # the whole point of client-side extrapolation is a smoothly
+            # advancing paper between real snapshots, which a repaint gated
+            # on "did something actually change" can never show (nothing
+            # in `vm` itself changes between snapshots; only the WALL CLOCK
+            # does). Every other page is UNCHANGED (still gated exactly as
+            # before) -- this is scoped to pianoroll specifically, not a
+            # general "always repaint" regression; see `_render_vm`'s own
+            # docstring for the CPU-budget disclosure (the investigation
+            # this task ran already measured this page repainting ~93% of
+            # ticks even before this change).
+            pianoroll_live = vm_is_current and state["page"] == "pianoroll"
             if vm_is_current and (page_updated or status_updated or secondary_updated
                                    or beatprogress_updated or marquee_updated
-                                   or overlay_changed):
+                                   or overlay_changed or pianoroll_live):
                 # `render_frame` clears the WHOLE surface, so all THREE
                 # chrome strips must be repainted on every redraw, not just
                 # when their own vm changed (`_paint_frame` skips them
                 # entirely on the screensaver page -- see its own docstring).
-                _paint_frame(surface, state["page"], vm, font, state["status_vm"],
+                _paint_frame(surface, state["page"], _render_vm(state["page"], vm), font,
+                             state["status_vm"],
                              state["alerts_vm"], state["timesig_vm"],
                              state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"],
                              page_keymap=state["keymap_page"],

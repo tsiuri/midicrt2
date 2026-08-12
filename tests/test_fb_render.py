@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from itertools import pairwise
 from pathlib import Path
 
 from PIL import Image
@@ -2907,6 +2908,77 @@ def test_run_device_measures_fps_only_across_actual_repaints_when_show_fps_true(
     assert fps_texts, "expected at least the initial paint"
     assert all(t == "" for t in fps_texts), (
         f"show_fps=False must never attach fps_text, got {fps_texts!r}")
+
+
+def test_run_device_repaints_pianoroll_every_tick_with_extrapolated_positions(
+        tmp_path, monkeypatch):
+    """Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9): the
+    whole point of client-side extrapolation is motion BETWEEN real
+    snapshots -- this proves it end-to-end: with only ONE real page.
+    pianoroll snapshot ever delivered, `_run_device`'s own idle poll ticks
+    (no new content, `page_updated=False` every time) must still produce
+    MULTIPLE `_paint_frame` calls (the pianoroll-only forced-repaint gate),
+    each with a note x0 that has visibly moved (via `chrome.extrapolate_
+    pianoroll_vm`) relative to the one real snapshot's own x0 -- not the
+    same static vm redrawn unchanged. Other pages are proven UNCHANGED
+    (still gated) by every other `_run_device` test in this file already
+    passing with this same code path."""
+    monkeypatch.setattr(app, "_read_fb_geometry", lambda: (10, 10, 20))
+
+    seen_x0s = []
+    real_paint_frame = app._paint_frame
+
+    def spy_paint_frame(surface, page, vm, *rest, **kwargs):
+        if page == "pianoroll":
+            seen_x0s.append(vm["notes"][0]["x0"])
+        return real_paint_frame(surface, page, vm, *rest, **kwargs)
+
+    monkeypatch.setattr(app, "_paint_frame", spy_paint_frame)
+
+    class FakeClient:
+        def subscribe(self, topics, max_rate):
+            pass
+
+        def unsubscribe(self, topics):
+            pass
+
+    inbox = queue.Queue()
+    now = time.time()
+    inbox.put({
+        "kind": "snapshot", "topic": "page.pianoroll",
+        "data": {
+            "title": "PIANOROLL",
+            "notes": [{"ch": 1, "y": 0.5, "x0": 0.9, "x1": 1.0, "vel": 0.8, "active": False}],
+            "window": {"mode": "tempo", "span_s": 8.0, "span_beats": 16.0, "zoom": 1.0,
+                      "origin_ts": now, "velocity": -2.0, "running": True},
+            "range": {"lo": 36, "hi": 83},
+            "grid": {"beat_xs": [], "bar_xs": [], "pitch_guide_ys": [], "running": True},
+            "row_tint": [], "overlap_flash": [],
+        },
+    })
+    # No second real snapshot ever arrives -- every repaint after the
+    # initial one must come from the forced-every-tick pianoroll gate.
+    shutdown = threading.Timer(0.12, inbox.put, args=(None,))
+    shutdown.start()
+    fb_path = str(tmp_path / "fb0-pianoroll-extrapolate")
+    try:
+        app._run_device(FakeClient(), inbox, fb_path, True, 200.0, "pianoroll",
+                        "page.pianoroll",
+                        {"effective": {"q": "client.quit"}, "global": {}, "page": {},
+                         "hints_enabled": True})
+    except ClientError:
+        pass  # expected clean shutdown via the `None` sentinel
+    finally:
+        shutdown.cancel()
+
+    assert len(seen_x0s) >= 3, (
+        f"expected several forced pianoroll repaints from one snapshot, got {seen_x0s!r}")
+    # x0 must be monotonically non-increasing (velocity is negative) and
+    # strictly less than the original by the last repaint -- proves real
+    # motion happened between paints, not just the same vm redrawn.
+    assert all(a >= b for a, b in pairwise(seen_x0s)), (
+        f"expected non-increasing x0 as the paper scrolls, got {seen_x0s!r}")
+    assert seen_x0s[-1] < seen_x0s[0]
 
 
 # -- evdev keymap dispatch (Phase 4 Task 1, docs/phase4-notes.md) -----------

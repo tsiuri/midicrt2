@@ -1,3 +1,5 @@
+import pytest
+
 from midicrt.analyzers.marquee import PAGE_IDS, PAGE_TITLES
 from midicrt.clients.chrome import (
     DEFAULT_ALERTS_VM,
@@ -16,6 +18,7 @@ from midicrt.clients.chrome import (
     alerts_text,
     beatflash_glyph,
     beatprogress_row_text,
+    extrapolate_pianoroll_vm,
     format_bpm,
     format_fps,
     header_with_hint,
@@ -716,3 +719,94 @@ def test_overlay_lines_v1_id_digit_labels_match_marquee_titles_for_every_default
     for name, page_id in PAGE_IDS.items():
         if name in roster:
             assert f"-> {page_id}:{PAGE_TITLES[name]}" in rendered
+
+
+# -- extrapolate_pianoroll_vm (Phase 10 Task A, items 3+9) -----------------
+
+def _roll_vm(**window_extra):
+    window = {"mode": "wallclock", "span_s": 8.0, "span_beats": 16.0, "zoom": 1.0,
+             "origin_ts": 100.0, "velocity": -0.125, "running": True}
+    window.update(window_extra)
+    return {
+        "title": "PIANOROLL",
+        "notes": [
+            {"ch": 1, "y": 0.5, "x0": 0.6, "x1": 0.8, "vel": 0.8, "active": False},
+            {"ch": 1, "y": 0.4, "x0": 0.9, "x1": 1.0, "vel": 0.5, "active": True},
+        ],
+        "window": window,
+        "range": {"lo": 36, "hi": 83},
+        "grid": {"beat_xs": [0.5, 0.75], "bar_xs": [0.25], "pitch_guide_ys": [], "running": True},
+        "row_tint": [{"y": 0.5, "intensity": 1.0}],
+        "overlap_flash": [],
+    }
+
+
+def test_extrapolate_pianoroll_vm_shifts_closed_note_x0_and_x1_by_velocity_times_elapsed():
+    vm = _roll_vm()
+    out = extrapolate_pianoroll_vm(vm, elapsed_s=1.0)
+    # velocity=-0.125, elapsed=1.0 -> dx=-0.125
+    assert out["notes"][0]["x0"] == pytest.approx(0.6 - 0.125)
+    assert out["notes"][0]["x1"] == pytest.approx(0.8 - 0.125)
+
+
+def test_extrapolate_pianoroll_vm_never_shifts_an_active_notes_x1_off_1_0():
+    vm = _roll_vm()
+    out = extrapolate_pianoroll_vm(vm, elapsed_s=1.0)
+    assert out["notes"][1]["x1"] == 1.0   # active -- pinned, never extrapolated
+    assert out["notes"][1]["x0"] == pytest.approx(0.9 - 0.125)   # x0 still shifts
+
+
+def test_extrapolate_pianoroll_vm_shifts_grid_beat_and_bar_xs():
+    vm = _roll_vm()
+    out = extrapolate_pianoroll_vm(vm, elapsed_s=1.0)
+    assert out["grid"]["beat_xs"] == [pytest.approx(0.5 - 0.125), pytest.approx(0.75 - 0.125)]
+    assert out["grid"]["bar_xs"] == [pytest.approx(0.25 - 0.125)]
+
+
+def test_extrapolate_pianoroll_vm_clamps_to_the_0_1_range():
+    vm = _roll_vm()
+    out = extrapolate_pianoroll_vm(vm, elapsed_s=100.0)   # huge dx, would go negative
+    assert out["notes"][0]["x0"] == 0.0
+    assert out["grid"]["beat_xs"] == [0.0, 0.0]
+
+
+def test_extrapolate_pianoroll_vm_does_not_mutate_the_original():
+    vm = _roll_vm()
+    original_x0 = vm["notes"][0]["x0"]
+    extrapolate_pianoroll_vm(vm, elapsed_s=1.0)
+    assert vm["notes"][0]["x0"] == original_x0
+
+
+def test_extrapolate_pianoroll_vm_leaves_row_tint_and_overlap_flash_untouched():
+    # Disclosed scope boundary -- see extrapolate_pianoroll_vm's own
+    # docstring: secondary/derived decoration, not the scrolling paper.
+    vm = _roll_vm()
+    out = extrapolate_pianoroll_vm(vm, elapsed_s=1.0)
+    assert out["row_tint"] == vm["row_tint"]
+    assert out["overlap_flash"] == vm["overlap_flash"]
+
+
+def test_extrapolate_pianoroll_vm_returns_unchanged_object_when_elapsed_is_zero_or_negative():
+    vm = _roll_vm()
+    assert extrapolate_pianoroll_vm(vm, elapsed_s=0.0) is vm
+    assert extrapolate_pianoroll_vm(vm, elapsed_s=-0.5) is vm
+
+
+def test_extrapolate_pianoroll_vm_returns_unchanged_object_when_velocity_is_zero():
+    vm = _roll_vm(velocity=0.0)
+    assert extrapolate_pianoroll_vm(vm, elapsed_s=1.0) is vm
+
+
+def test_extrapolate_pianoroll_vm_returns_unchanged_object_when_window_is_missing():
+    assert extrapolate_pianoroll_vm({"title": "X"}, elapsed_s=1.0) == {"title": "X"}
+
+
+def test_extrapolate_pianoroll_vm_correct_for_tempo_mode_too_same_velocity_formula():
+    # No mode branch in extrapolate_pianoroll_vm itself -- velocity already
+    # carries whatever the active projection's own formula produced (see
+    # pages/pianoroll.py::_window()'s docstring); this just proves a
+    # "tempo"-mode vm extrapolates identically to a "wallclock"-mode one
+    # given the same velocity value.
+    vm = _roll_vm(mode="tempo", velocity=-0.25)
+    out = extrapolate_pianoroll_vm(vm, elapsed_s=0.5)
+    assert out["notes"][0]["x0"] == pytest.approx(0.6 - 0.125)

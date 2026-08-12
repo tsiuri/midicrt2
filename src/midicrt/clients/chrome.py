@@ -20,6 +20,8 @@ importing its `PAGE_IDS`/`PAGE_TITLES` tables here doesn't compromise that
 property, only reuses it.
 """
 
+import math
+
 from midicrt.analyzers.marquee import PAGE_IDS as _V1_PAGE_IDS
 from midicrt.analyzers.marquee import PAGE_TITLES as _V1_PAGE_TITLES
 
@@ -683,3 +685,78 @@ def status_text(vm: dict) -> str:
         f"{marker}BAR {bar:04d}  BEAT {beat:02d}   {format_bpm(vm.get('bpm'))} BPM   "
         f"{state}   clock: {source}"
     )
+
+
+# -- pianoroll client-side extrapolation (Phase 10 Task A, docs/demo-
+# feedback-2026-08-12.md items 3+9) ------------------------------------
+
+
+def extrapolate_pianoroll_vm(vm: dict, elapsed_s: float) -> dict:
+    """Advance a `page.pianoroll` view-model's own x-coordinates locally by
+    `elapsed_s` real seconds, using the SAME `window.velocity`/`_x()` clamp
+    the engine's own `pages/pianoroll.py::_window()` already documents --
+    see that function's own docstring for the full derivation (one
+    `-1.0/span_s` formula, correct for both projection modes, no mode
+    branch needed here either). The ONE shared implementation both the fb
+    and TUI clients call every render frame between real snapshots (never
+    duplicated per-client) -- see `pages/pianoroll.py`'s module docstring,
+    "Client-side extrapolation" section, for the measured investigation
+    this exists to fix.
+
+    Pure: takes `elapsed_s` as a plain float rather than reading a clock
+    itself, same "renderer/helper stays pure, caller owns the wall-clock
+    read + policy" split every other function in this module follows --
+    the caller computes `elapsed_s = client_now - vm["window"]["origin_ts"]`
+    using ITS OWN `time.time()` (the SAME clock basis `origin_ts` and
+    every note's `onset_ts`/`release_ts` already assume -- valid because
+    client and engine run on the same machine/system clock in this
+    deployment).
+
+    Returns `vm` UNCHANGED (same object, no copy) when there is nothing
+    useful to extrapolate: no `window` dict, a non-finite/zero velocity
+    (the degenerate zoom/bpm edge case `_window()` itself already guards),
+    or `elapsed_s <= 0` (a clock-skew/out-of-order call must never shift
+    the paper BACKWARD). Otherwise returns a NEW dict -- `vm` itself, and
+    every `notes[]`/`grid` entry, are never mutated in place, so a caller
+    that also holds onto the ORIGINAL snapshot (to compute `elapsed_s`
+    fresh against `origin_ts` on the NEXT frame, not compounding drift
+    from a previously-extrapolated copy) is safe to keep doing so.
+
+    Only `notes[].x0`/`grid.beat_xs`/`grid.bar_xs` shift unconditionally;
+    `notes[].x1` shifts ONLY for a note that is `not active` -- a held
+    note's `x1` is pinned at 1.0 by definition (module docstring's VM-shape
+    bullet: "A still-held note (active: true) always has x1 == 1.0"),
+    shifting it too would incorrectly slide a still-sounding note's right
+    edge away from "now". `row_tint`/`overlap_flash` are deliberately NOT
+    extrapolated (disclosed, not silently dropped) -- both are secondary,
+    position-DERIVED decoration (fade/overlap state, not the scrolling
+    paper itself), scoped out to keep this function's contract to exactly
+    what items 3+9 asked for: smooth NOTE and GRID motion."""
+    window = vm.get("window")
+    if not isinstance(window, dict):
+        return vm
+    velocity = window.get("velocity")
+    if not isinstance(velocity, (int, float)) or not math.isfinite(velocity) or velocity == 0.0:
+        return vm
+    if elapsed_s <= 0:
+        return vm
+    dx = velocity * elapsed_s
+
+    def shift(x: float) -> float:
+        return max(0.0, min(1.0, x + dx))
+
+    notes = vm.get("notes")
+    new_notes = notes
+    if isinstance(notes, list):
+        new_notes = [
+            {**note, "x0": shift(note["x0"]),
+             "x1": note["x1"] if note.get("active") else shift(note["x1"])}
+            for note in notes
+        ]
+    grid = vm.get("grid")
+    new_grid = grid
+    if isinstance(grid, dict):
+        new_grid = {**grid,
+                    "beat_xs": [shift(x) for x in grid.get("beat_xs", [])],
+                    "bar_xs": [shift(x) for x in grid.get("bar_xs", [])]}
+    return {**vm, "notes": new_notes, "grid": new_grid}

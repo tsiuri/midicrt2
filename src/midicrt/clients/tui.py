@@ -1057,6 +1057,21 @@ def run_tui(socket_path: str) -> int:
              # would otherwise produce.
              "show_fps": show_fps, "_fps_last_t": None}
 
+    def _render_vm(page: str, vm: dict) -> dict:
+        """Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9):
+        TUI's own consumer of `chrome.extrapolate_pianoroll_vm` -- see
+        `clients/fb/app.py::_run_device`'s identical `_render_vm` helper
+        for the full rationale (shared logic, same defensive-against-an-
+        older-server contract); this is the TUI's copy only because each
+        client owns its own render-loop `state` closure, not because the
+        behavior differs at all."""
+        if page != "pianoroll":
+            return vm
+        window = vm.get("window")
+        origin_ts = window.get("origin_ts") if isinstance(window, dict) else None
+        elapsed_s = time.time() - origin_ts if isinstance(origin_ts, (int, float)) else 0.0
+        return chrome.extrapolate_pianoroll_vm(vm, elapsed_s)
+
     def on_event(msg: dict) -> None:
         if msg.get("kind") == "event" and msg.get("name") == "page_changed":
             new_page = msg["data"]["page"]
@@ -1150,6 +1165,18 @@ def run_tui(socket_path: str) -> int:
                 # same way `render_frame` did. `dirty` deliberately stays
                 # True when skipped, so the render fires as soon as
                 # vm_topic catches up.
+                #
+                # Phase 10 Task A (docs/demo-feedback-2026-08-12.md items
+                # 3+9): pianoroll forces `dirty` every loop iteration while
+                # it's the current page -- mirrors clients/fb/app.py::
+                # _run_device's identical "pianoroll_live" gate (see that
+                # comment for the full rationale: nothing in `vm` itself
+                # changes between real snapshots, only the wall clock does,
+                # so a change-gated repaint can never show the extrapolated
+                # motion `_render_vm` below computes). Every other page is
+                # unchanged.
+                if state["page"] == "pianoroll" and vm_topic == state["topic"]:
+                    dirty = True
                 if dirty and vm_topic == state["topic"]:
                     # Chrome reserves the LAST THREE rows (phase-3 task 9
                     # adds the beatflash/loopprogress row BELOW the
@@ -1159,7 +1186,8 @@ def run_tui(socket_path: str) -> int:
                     # offset evidence); the page renders header + body into
                     # the remaining `height - 3` rows.
                     renderer = RENDERERS.get(state["page"], _render_unknown)
-                    page_lines = renderer(vm, term.width, term.height - 3)
+                    page_lines = renderer(_render_vm(state["page"], vm), term.width,
+                                          term.height - 3)
                     header_line, body_lines = page_lines[0], page_lines[1:]
                     if state["page"] == SCREENSAVER_PAGE:
                         # Important fix (task-9 review): a TRUE full blank,

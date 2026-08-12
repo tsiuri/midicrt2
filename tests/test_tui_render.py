@@ -1,6 +1,7 @@
 import queue
 import threading
 import time
+from itertools import pairwise
 
 from midicrt.clients import tui
 from midicrt.clients.base import ClientError
@@ -440,6 +441,66 @@ def test_run_tui_omits_fps_readout_when_show_fps_not_configured(monkeypatch, cap
     assert "exception" not in outcome, f"run_tui crashed: {outcome.get('exception')!r}"
     captured = capsys.readouterr()
     assert "fps:" not in captured.out
+
+
+def test_run_tui_repaints_pianoroll_every_tick_with_extrapolated_positions(monkeypatch):
+    """Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9): TUI's
+    own end-to-end proof, mirroring test_fb_render.py::test_run_device_
+    repaints_pianoroll_every_tick_with_extrapolated_positions -- with only
+    ONE real page.pianoroll snapshot ever delivered, `run_tui`'s own idle
+    loop ticks (`term.inkey(timeout=0.05)` pacing, no new content) must
+    still call the pianoroll renderer MULTIPLE times with a note x0 that
+    keeps moving (`chrome.extrapolate_pianoroll_vm`), not the same static
+    vm redrawn."""
+    seen_x0s = []
+    real_render_pianoroll_lines = render_pianoroll_lines
+
+    def spy_render_pianoroll_lines(vm, width, height):
+        seen_x0s.append(vm["notes"][0]["x0"])
+        return real_render_pianoroll_lines(vm, width, height)
+
+    monkeypatch.setitem(RENDERERS, "pianoroll", spy_render_pianoroll_lines)
+
+    inbox = queue.Queue()
+    now = time.time()
+    inbox.put({
+        "kind": "snapshot", "topic": "page.pianoroll",
+        "data": {
+            "title": "PIANOROLL",
+            "notes": [{"ch": 1, "y": 0.5, "x0": 0.9, "x1": 1.0, "vel": 0.8, "active": False}],
+            "window": {"mode": "tempo", "span_s": 8.0, "span_beats": 16.0, "zoom": 1.0,
+                      "origin_ts": now, "velocity": -2.0, "running": True},
+            "range": {"lo": 36, "hi": 83},
+            "grid": {"beat_xs": [], "bar_xs": [], "pitch_guide_ys": [], "running": True},
+            "row_tint": [], "overlap_flash": [],
+        },
+    })
+
+    monkeypatch.setattr(
+        tui, "EngineClient",
+        _make_fake_engine_client(inbox, {"current_page": "pianoroll"}))
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = run_tui("/tmp/unused.sock")
+        except BaseException as exc:  # noqa: BLE001 -- capture ANY crash
+            outcome["exception"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=0.6)
+    inbox.put(None)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive(), "run_tui did not exit after the shutdown sentinel"
+    assert "exception" not in outcome, f"run_tui crashed: {outcome.get('exception')!r}"
+
+    assert len(seen_x0s) >= 3, (
+        f"expected several forced pianoroll repaints from one snapshot, got {seen_x0s!r}")
+    assert all(a >= b for a, b in pairwise(seen_x0s)), (
+        f"expected non-increasing x0 as the paper scrolls, got {seen_x0s!r}")
+    assert seen_x0s[-1] < seen_x0s[0]
 
 
 def test_render_unknown_fallback_has_no_crash_on_bare_vm():
