@@ -59,7 +59,10 @@ def test_initial_view_model_is_empty():
     assert vm["title"] == "PIANOROLL"
     assert vm["notes"] == []
     assert vm["range"] == {"lo": 36, "hi": 83}
-    assert vm["window"]["mode"] == "wallclock"
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9): default
+    # flipped from "wallclock" to "tempo" -- v1-parity fix, see pages/
+    # pianoroll.py's own __init__ comment for the full file:line evidence.
+    assert vm["window"]["mode"] == "tempo"
     assert vm["window"]["zoom"] == 1.0
 
 
@@ -256,8 +259,12 @@ def test_clock_tick_derives_bpm_matching_transport_analyzer_formula():
 
 def test_clock_tick_only_dirties_in_tempo_mode():
     # wallclock mode's geometry is bpm-independent -- see module docstring's
-    # disclosed "cosmetic span_beats lag" trade-off.
-    s = PianorollState(now=100.0)   # default mode is "wallclock"
+    # disclosed "cosmetic span_beats lag" trade-off. Explicit set_projection
+    # (Phase 10 Task A flipped the DEFAULT to "tempo" -- see pages/
+    # pianoroll.py's own __init__ comment) since this test's whole point is
+    # wallclock's own dirty-gating, not whatever the default happens to be.
+    s = PianorollState(now=100.0)
+    s.set_projection("wallclock")
     s.handle(transport("start", ts=0.0))
     changed = s.handle(clock_tick(ts=0.5, batch_start=0.0))
     assert changed is False
@@ -311,8 +318,13 @@ def test_tempo_mode_lower_current_bpm_squishes_history_toward_now():
 
 
 def test_wallclock_mode_is_unaffected_by_current_bpm():
+    # Explicit set_projection: Phase 10 Task A flipped the DEFAULT to
+    # "tempo" (pages/pianoroll.py's own __init__ comment) -- this test's
+    # name/point is wallclock's own bpm-independence, so it must pin the
+    # mode explicitly rather than lean on whatever the default is.
     def _x0(bpm: float) -> float:
         s = PianorollState(now=100.0, span_s=8.0)
+        s.set_projection("wallclock")
         s.handle(transport("start", ts=0.0))
         s.handle(clock_tick(ts=60.0 / bpm, batch_start=0.0))
         s.handle(note_on(0, 60, ts=97.0))
@@ -393,6 +405,58 @@ def test_window_always_reports_both_span_fields():
     s.set_projection("tempo")
     w = s.view_model()["window"]
     assert "span_s" in w and "span_beats" in w
+
+
+# -- client-side extrapolation params (Phase 10 Task A, items 3+9) ---------
+
+def test_window_origin_ts_is_the_states_own_now():
+    s = PianorollState(now=123.5)
+    assert s.view_model()["window"]["origin_ts"] == 123.5
+    s.tick(200.0)
+    assert s.view_model()["window"]["origin_ts"] == 200.0
+
+
+def test_window_velocity_is_negative_reciprocal_of_span_s_in_wallclock_mode():
+    s = PianorollState(now=100.0, span_s=8.0)
+    s.set_projection("wallclock")
+    w = s.view_model()["window"]
+    assert w["velocity"] == pytest.approx(-1.0 / 8.0)
+
+
+def test_window_velocity_matches_wallclock_formula_in_tempo_mode_too():
+    # The whole point of a single shared "velocity" field (module
+    # docstring's "Client-side extrapolation" section): `-1.0/span_s` is
+    # algebraically identical in EITHER mode once span_s is correctly
+    # mode-aware -- no client-side mode branch needed. Cross-checked here
+    # against tempo mode's own from-first-principles formula
+    # `-(bpm/60)/span_beats` at a non-trivial bpm.
+    s = PianorollState(now=100.0, span_beats=16.0)
+    s.set_projection("tempo")
+    s.handle(transport("start", ts=0.0))
+    s.handle(clock_tick(ts=0.25, batch_start=0.0))   # bpm = 60/0.25 = 240
+    w = s.view_model()["window"]
+    assert w["velocity"] == pytest.approx(-1.0 / w["span_s"])
+    assert w["velocity"] == pytest.approx(-(240.0 / 60.0) / 16.0)
+
+
+def test_window_velocity_is_zero_when_span_s_is_zero():
+    # Degenerate zoom/bpm edge case -- _x() itself already guards `span <=
+    # 0` by returning 1.0 rather than dividing by zero; velocity must be
+    # equally safe, never NaN/inf.
+    s = PianorollState(now=100.0, span_s=0.0)
+    s.set_projection("wallclock")
+    assert s.view_model()["window"]["velocity"] == 0.0
+
+
+def test_window_running_mirrors_the_grids_own_running_flag():
+    s = PianorollState(now=100.0)
+    vm = s.view_model()
+    assert vm["window"]["running"] is False
+    assert vm["grid"]["running"] is False
+    s.handle(transport("start", ts=100.0))
+    vm = s.view_model()
+    assert vm["window"]["running"] is True
+    assert vm["grid"]["running"] is True
 
 
 # -- channel spec parsing / set_channels -----------------------------------
@@ -636,7 +700,16 @@ def test_grid_uses_last_run_bpm_after_stop_not_idle_bpm():
     # v1's `last_run_bpm` persists across a stop -- the grid must keep
     # scrolling at the tempo the transport actually ran at, not fall back
     # to idle_scroll_bpm just because the transport is currently stopped.
+    # Explicit set_projection("wallclock"): this test's own math (grid
+    # spacing = period/span_s, i.e. BPM-DEPENDENT) is specifically
+    # wallclock's grid formula -- "tempo" mode (Phase 10 Task A's new
+    # DEFAULT, see pages/pianoroll.py's own __init__ comment) places grid
+    # marks a CONSTANT 1/span_beats apart regardless of bpm by
+    # construction (that constancy IS item 9's whole point -- "division
+    # width stable"), so this bpm-persistence assertion needs wallclock
+    # mode to mean anything.
     s = PianorollState(now=0.0, span_s=8.0, idle_bpm=120.0)
+    s.set_projection("wallclock")
     s.handle(transport("start", ts=0.0))
     s.handle(clock_tick(ts=0.25, batch_start=0.0))   # bpm = 60/0.25 = 240
     assert s._current_bpm() == pytest.approx(240.0)

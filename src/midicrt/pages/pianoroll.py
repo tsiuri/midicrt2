@@ -112,7 +112,10 @@ computes)
      "notes": [{"ch": int, "y": 0..1, "x0": 0..1, "x1": 0..1,
                 "vel": 0..1, "active": bool}, ...],
      "window": {"mode": "wallclock"|"tempo", "span_s": float,
-                "span_beats": float, "zoom": float},
+                "span_beats": float, "zoom": float,
+                # Phase 10 Task A (items 3+9) additions -- see _window()'s
+                # own docstring for the full client-extrapolation derivation.
+                "origin_ts": float, "velocity": float, "running": bool},
      "range": {"lo": midi, "hi": midi},
      "grid": {...},   # see "Paper grid" section below
      "row_tint": [{"y": 0..1, "intensity": 0..1}, ...],
@@ -125,6 +128,49 @@ computes)
   fraction data, not colors -- the renderer maps them through `clients/
   fb/lum.py`'s ramps, same convention `window`/`range`/`grid` already
   establish.
+
+Client-side extrapolation (Phase 10 Task A, docs/demo-feedback-2026-08-12.md
+items 3+9 -- "MERGES with #3" per that doc's own cluster note)
+---------------------------------------------------------------------------
+Investigation (measured live against a scratch daemon, docs/phase10-task-a-
+report.md has the full numbers): at the fb client's own default `--fps 30`,
+the engine's `_flush_dirty()`/`ProtocolServer._push_loop` pair deliver a
+fresh `page.pianoroll` snapshot roughly every 33-36ms (~28-29/s, matching
+`tick_hz=30`) -- but the fb redraw loop (`clients/fb/app.py::_run_device`)
+polls on its OWN independent ~33ms clock (`period = 1.0/fps`) and only
+repaints `if page_updated` (a NEW snapshot was actually drained THIS tick).
+Two independently-phased ~33ms clocks are not synchronized, so ~7% of
+redraw ticks find nothing new and silently hold the previous frame for one
+extra tick (~33ms) -- occasional, small, but real "jerkiness", and on TOP
+of that, motion between any two snapshots is a hard jump (whatever `x0`/`x1`
+the ENGINE last computed at ITS tick), never smoothly interpolated -- v1 by
+contrast drew LOCALLY at a 30-60fps target, recomputing its own scroll
+position from `_frame_dt` every single frame, hence visibly smoother even
+at an equivalent or lower underlying MIDI-clock data rate.
+
+The fix: `_window()`'s `origin_ts`/`velocity` (above) let a client advance
+EVERY x-coordinate this VM carries -- `notes[].x0` always, `notes[].x1`
+ONLY when `not active` (an active/held note's `x1` is pinned at 1.0 by
+definition, see the VM-shape bullet above -- extrapolating it too would
+incorrectly slide a still-sounding note's right edge leftward), and
+`grid.beat_xs`/`grid.bar_xs` -- locally, every render frame, via
+`x_now = clamp(x_snapshot + velocity * (client_now - origin_ts), 0, 1)`,
+the same clamp `_x()` above already applies server-side. `clients/chrome.
+py::extrapolate_pianoroll_vm` is the ONE shared pure implementation both
+the fb and TUI clients call (never per-client-duplicated); each client's
+OWN render loop is responsible for calling it every frame it repaints,
+using its OWN wall-clock `time.time()` read (the SAME clock basis
+`origin_ts`/every `onset_ts`/`release_ts` this whole module already uses --
+valid because client and engine run on the SAME machine/system clock in
+this deployment, not across a network boundary). fb's `_run_device` was
+additionally changed to repaint the pianoroll page EVERY tick (not only
+`if page_updated`) so the extrapolation is actually visible between real
+snapshots -- other pages are UNCHANGED (still snapshot-driven only), so
+this task's own CPU-budget constraint ("no material idle-floor regression")
+is scoped to time spent ON the pianoroll page, where the measured baseline
+was already repainting ~93% of ticks (see investigation numbers above) --
+repainting the remaining ~7% is a small, disclosed, page-scoped increment,
+not a new always-on cost.
 
 - `y`: 0 at the HIGHEST visible pitch, 1 at the lowest -- matches v1's own
   top-down convention (`pitches = range(pitch_high, pitch_low-1, -1)`, drawn
@@ -582,7 +628,29 @@ class PianorollState:
         self._span_beats = float(span_beats)
         self._idle_bpm = float(idle_bpm)
         self._zoom = ZOOM_DEFAULT
-        self._projection = "wallclock"
+        # Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9):
+        # DEFAULT FLIPPED from "wallclock" to "tempo" -- v1-parity fix, not
+        # a preference change. v1's OWN default pianoroll behavior
+        # (`~/codex/midicrt/pages/pianoroll.py:22`, `PROJECTION_MODE =
+        # "beat"`) advances its scroll by TICK COLUMNS that arrive at the
+        # live MIDI clock's real-time rate (`engine/modules/pianoroll_
+        # state.py::on_tick`, `moved = tick - self.last_tick` where `tick`
+        # is the real, wall-clock-paced 24-ppqn counter) while each column
+        # always represents a FIXED tick count (`TICKS_PER_COL`, constant
+        # beat-fraction) -- i.e. v1's actual live behavior is EXACTLY this
+        # module's "tempo" mode's own property (constant-ish division
+        # width, paper velocity proportional to tempo), not "wallclock"'s
+        # (constant real-time speed, tempo only reshapes the grid's
+        # cosmetic spacing). The user's item-9 report ("BPM changes bar-
+        # division WIDTH while scroll speed stays constant") is a literal
+        # description of "wallclock" mode as experienced live -- v2 shipped
+        # with the WRONG default relative to v1, an inverted-from-v1
+        # choice this task task-7's own original port never called out as
+        # deliberate. "wallclock" mode itself is UNCHANGED and still fully
+        # available (`pianoroll.projection`/`.projection_toggle` actions,
+        # `p` keybind, `engine/keymap.py:349`) -- this is a default-VALUE
+        # fix, not a feature removal.
+        self._projection = "tempo"
         self._visible_channels: set[int] = set(range(1, N_CHANNELS + 1))
         self._active: dict[tuple[int, int], _Span] = {}
         self._closed: deque[_Span] = deque()
@@ -865,8 +933,36 @@ class PianorollState:
         else:
             span_s = self._effective_span_s()
             span_beats = span_s * bpm / 60.0
+        # Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9):
+        # client-side extrapolation params -- "origin_ts"/"velocity" let a
+        # client advance the WHOLE paper (every x-coordinate this VM
+        # carries: notes' x0/x1, grid.beat_xs/bar_xs) locally between
+        # snapshots instead of only redrawing on receipt of a new one (see
+        # module docstring's "Client-side extrapolation" section for the
+        # full derivation and clients/chrome.py::extrapolate_pianoroll_vm
+        # for the shared client-side consumer). "velocity" is deliberately
+        # ONE scalar, not a per-mode formula the client has to know about:
+        # `-1.0/span_s` is algebraically identical to wallclock's own
+        # `dx/dt = -1/span_s` AND tempo's own `dx/dt = -(bpm/60)/span_beats`
+        # (substitute tempo's `span_s = span_beats*60/bpm` above and they
+        # cancel to the exact same expression) -- `span_s` is ALREADY
+        # correctly mode-aware by this point, so one formula covers both
+        # modes with no branch a client would otherwise have to duplicate.
+        # "running" mirrors `_grid()`'s own field of the same name (Phase
+        # 10 Task A: co-located here so a client's extrapolation code reads
+        # one dict instead of two) -- informational only, disclosed: v2's
+        # `_dist()` is wall-clock-driven regardless of transport state (no
+        # v1-style "freeze when stopped" -- `_current_bpm()`'s idle-bpm
+        # fallback keeps the paper moving even with no clock running, the
+        # SAME as v1's own idle-scroll precedent), so `running` does not
+        # gate whether `velocity` is valid to extrapolate with; it exists
+        # for a client that wants to visually distinguish "live tempo" from
+        # "idle fallback" motion, not required for correctness.
+        origin_ts = self._now
+        velocity = -1.0 / span_s if span_s > 0 else 0.0
         return {"mode": self._projection, "span_s": span_s, "span_beats": span_beats,
-                "zoom": self._zoom}
+                "zoom": self._zoom, "origin_ts": origin_ts, "velocity": velocity,
+                "running": self._running}
 
     # -- paper grid (module docstring's "Paper grid" section) -----------------
 

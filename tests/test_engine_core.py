@@ -1323,12 +1323,18 @@ async def test_pianoroll_channel_toggle_is_a_true_toggle_leaving_others_untouche
 
 
 async def test_pianoroll_projection_toggle_flips_wallclock_to_tempo_and_back():
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9): default
+    # flipped from "wallclock" to "tempo" -- v1-parity fix, see pages/
+    # pianoroll.py's own __init__ comment for the file:line evidence. The
+    # toggle itself is unchanged -- still just flips between the two modes
+    # -- so this test now starts from "tempo" and asserts the same
+    # round-trip in the other direction.
     eng = Engine(Config())
-    assert eng.pages["pianoroll"].view_model()["window"]["mode"] == "wallclock"
-    r = await eng.actions.dispatch("pianoroll.projection_toggle", {})
-    assert r["mode"] == "tempo"
+    assert eng.pages["pianoroll"].view_model()["window"]["mode"] == "tempo"
     r = await eng.actions.dispatch("pianoroll.projection_toggle", {})
     assert r["mode"] == "wallclock"
+    r = await eng.actions.dispatch("pianoroll.projection_toggle", {})
+    assert r["mode"] == "tempo"
 
 
 # -- spectrum page (phase-3 task 8) ------------------------------------------
