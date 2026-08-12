@@ -248,10 +248,48 @@ class MidiInput:
         # outage -- same "log each skipped name once" discipline
         # `_excluded_warned` right above already established.
         self._identity_retry_warned: set[str] = set()
+        # Phase-10 wedge fix (live incident 2026-08-09/10): under a heavy
+        # enough event storm the port's ALSA seq input pool can overflow
+        # (200/200 cells in /proc/asound/seq/clients), after which rtmidi's
+        # C reader thread goes permanently broken -- it spams "MidiInAlsa:
+        # unknown MIDI input error!" ~1/s and, worse, the dead subscriber
+        # back-pressures every OTHER subscriber of the same Through port
+        # (observed live: v1's feed lagged seconds behind and kept draining
+        # after playing stopped) until the daemon was restarted by hand.
+        # rtmidi reports those errors via its error callback; `_install_
+        # error_watch` flags the port name here (a GIL-atomic set.add, the
+        # only thing safe to do on the rtmidi C thread) and `_watch()`
+        # close+reopens flagged ports on its own thread -- at most once per
+        # `poll_interval`, so an error storm cannot cause reopen thrash.
+        self._errored_ports: set[str] = set()
 
     @property
     def open_ports(self) -> list[str]:
         return sorted(self._ports)
+
+    def _install_error_watch(self, name: str, port) -> None:
+        """Arm the rtmidi-level error callback that flags `name` for reopen.
+
+        Best-effort by design: mido's rtmidi backend exposes the underlying
+        `rtmidi.MidiIn` as `_rt`; a backend without it (test fakes, a future
+        backend swap) silently gets no watch and keeps today's behavior.
+        The callback closure is pinned onto the port object so it cannot be
+        garbage-collected out from under the C library (same lifetime trick
+        v1's `_install_midi_error_filter` uses).
+        """
+        rt = getattr(port, "_rt", None)
+        if rt is None or not hasattr(rt, "set_error_callback"):
+            return
+
+        def _on_error(_etype, _msg, _data=None, _name=name):
+            # rtmidi C thread: set.add is GIL-atomic; do nothing else here.
+            self._errored_ports.add(_name)
+
+        port._midicrt_error_watch = _on_error
+        try:
+            rt.set_error_callback(_on_error)
+        except Exception:  # noqa: BLE001 — the watch is best-effort, never fatal
+            pass
 
     @property
     def open_device_ids(self) -> list[str]:
@@ -337,6 +375,23 @@ class MidiInput:
             except Exception as exc:  # noqa: BLE001 — backend/driver errors must not kill the poll loop
                 _LOG.warning("port scan failed: %s", exc)
                 available = set()
+            # Phase-10 wedge fix: close any port whose rtmidi reader errored
+            # (see `self._errored_ports` in __init__). Runs BEFORE the open
+            # pass below so a still-available port reopens in this same poll
+            # cycle; identity state is dropped exactly like the vanished-port
+            # path so the reopen re-resolves it.
+            for name in sorted(self._errored_ports):
+                self._errored_ports.discard(name)
+                port = self._ports.pop(name, None)
+                if port is None:
+                    continue
+                _LOG.warning("MIDI input errored (reader wedged?); reopening: %s", name)
+                try:
+                    port.close()
+                except Exception:  # noqa: BLE001 — a wedged port may not close cleanly
+                    pass
+                self._device_ids.pop(name, None)
+                self._identity_retry_warned.discard(name)
             for name in sorted(available):
                 if name in self._ports or not matches(name, self._patterns):
                     continue
@@ -351,6 +406,7 @@ class MidiInput:
                 try:
                     self._ports[name] = self._backend.open_input(
                         name, callback=lambda m, n=name: self._enqueue(m, n))
+                    self._install_error_watch(name, self._ports[name])
                     # Phase 9 Task 1: resolve device identity ONCE at open
                     # time -- see this class's own docstring comment on
                     # `self._identity` for why this must not happen

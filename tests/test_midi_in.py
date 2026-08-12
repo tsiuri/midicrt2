@@ -566,3 +566,92 @@ async def test_translate_still_ignores_clock_when_called_directly():
     # translate() called directly (e.g. from other tests/tools) must still
     # drop clock on its own, per _IGNORED_TYPES.
     assert translate(mido.Message("clock"), "USB", 1.0) is None
+
+
+class _ErrorWatchBackend:
+    """FakeBackend variant whose ports expose a rtmidi-style `_rt` with
+    `set_error_callback`, for the Phase-10 wedge-fix tests."""
+
+    def __init__(self):
+        self.names = ["NetMIDI 128:0"]
+        self.opened = {}
+        self.open_counts: dict[str, int] = {}
+        self.ports: dict[str, object] = {}
+
+    def get_input_names(self):
+        return list(self.names)
+
+    def open_input(self, name, callback):
+        backend = self
+        self.opened[name] = callback
+        self.open_counts[name] = self.open_counts.get(name, 0) + 1
+
+        class _Port:
+            def __init__(self):
+                self.name = name
+                self.error_cb = None
+                self.closed = False
+                self._rt = self
+
+            def set_error_callback(self, cb):
+                self.error_cb = cb
+
+            def close(self):
+                self.closed = True
+                backend.opened.pop(name, None)
+
+        port = _Port()
+        self.ports[name] = port
+        return port
+
+
+async def test_midi_input_reopens_port_after_rtmidi_error():
+    # Reproduces the 2026-08-09/10 live wedge: the port's ALSA input pool
+    # overflowed under a heavy event storm, rtmidi's reader thread went
+    # permanently broken (1/s "unknown MIDI input error"), and the dead
+    # subscriber back-pressured every other subscriber of the shared
+    # Through port until the daemon was restarted by hand. The error watch
+    # must flag the port and _watch() must close + reopen it by itself.
+    backend = _ErrorWatchBackend()
+    queue = asyncio.Queue()
+    mi = MidiInput(["NetMIDI*"], queue, poll_interval=0.05, backend=backend)
+    mi.start(asyncio.get_running_loop())
+    try:
+        for _ in range(50):
+            if mi.open_ports:
+                break
+            await asyncio.sleep(0.05)
+        first = backend.ports["NetMIDI 128:0"]
+        assert first.error_cb is not None, "error watch not installed"
+
+        # rtmidi C thread reports the input error
+        first.error_cb("etype", "MidiInAlsa::alsaMidiHandler: unknown MIDI input error!")
+
+        for _ in range(50):
+            if backend.open_counts["NetMIDI 128:0"] >= 2:
+                break
+            await asyncio.sleep(0.05)
+        assert backend.open_counts["NetMIDI 128:0"] >= 2, "port was not reopened"
+        assert first.closed, "wedged port was not closed"
+        assert mi.open_ports == ["NetMIDI 128:0"]
+        # The replacement port gets its own armed watch.
+        assert backend.ports["NetMIDI 128:0"].error_cb is not None
+    finally:
+        mi.stop()
+
+
+async def test_midi_input_error_watch_is_noop_without_rt_handle():
+    # FakeBackend ports have no `_rt`: the watch install must silently
+    # no-op and normal open behavior must be unchanged.
+    backend = FakeBackend()
+    queue = asyncio.Queue()
+    mi = MidiInput(["NetMIDI*"], queue, poll_interval=0.05, backend=backend)
+    mi.start(asyncio.get_running_loop())
+    try:
+        for _ in range(50):
+            if mi.open_ports:
+                break
+            await asyncio.sleep(0.05)
+        assert mi.open_ports == ["NetMIDI 128:0"]
+    finally:
+        mi.stop()
