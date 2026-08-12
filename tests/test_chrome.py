@@ -66,7 +66,7 @@ def test_format_fps_none_is_placeholder_dashes():
 
 def test_format_fps_rounds_to_one_decimal():
     # Same `"fps:{value:.1f}"` literal format v1 computed
-    # (`~/codex/midicrt/midicrt.py:993`), ported byte-for-byte.
+    # (`~/codex/midicrt/midicrt.py:1097`), ported byte-for-byte.
     assert format_fps(29.97) == "fps:30.0"
     assert format_fps(9.949) == "fps:9.9"
     assert format_fps(0.0) == "fps:0.0"

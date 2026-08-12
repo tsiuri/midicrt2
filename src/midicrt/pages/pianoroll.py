@@ -162,15 +162,36 @@ OWN render loop is responsible for calling it every frame it repaints,
 using its OWN wall-clock `time.time()` read (the SAME clock basis
 `origin_ts`/every `onset_ts`/`release_ts` this whole module already uses --
 valid because client and engine run on the SAME machine/system clock in
-this deployment, not across a network boundary). fb's `_run_device` was
-additionally changed to repaint the pianoroll page EVERY tick (not only
-`if page_updated`) so the extrapolation is actually visible between real
-snapshots -- other pages are UNCHANGED (still snapshot-driven only), so
-this task's own CPU-budget constraint ("no material idle-floor regression")
-is scoped to time spent ON the pianoroll page, where the measured baseline
-was already repainting ~93% of ticks (see investigation numbers above) --
-repainting the remaining ~7% is a small, disclosed, page-scoped increment,
-not a new always-on cost.
+this deployment, not across a network boundary). A fresh REAL snapshot
+always wins immediately, in full -- a caller's own `vm` is replaced
+wholesale the instant one arrives (`state["topic"]` draining a new
+snapshot, e.g. `clients/fb/app.py::_run_device`'s `page_updated` branch),
+never blended with whatever the last extrapolated frame showed; a visible
+snap after an engine-side hiccup (a slow tick, a burst of MIDI) is the
+deliberate, correct behavior, not an extrapolation bug to smooth over.
+
+fb's `_run_device` was additionally changed to repaint the pianoroll page
+EVERY tick (not only `if page_updated`) so the extrapolation is actually
+visible between real snapshots -- other pages are UNCHANGED (still
+snapshot-driven only), so this task's own CPU-budget constraint ("no
+material idle-floor regression") is scoped to time spent ON the pianoroll
+page specifically. Two DISTINCT costs, disclosed separately (the first is
+new; the second mostly isn't):
+  1. `extrapolate_pianoroll_vm` itself now runs on EVERY tick spent on
+     this page (~30Hz, not just the ticks that previously would have been
+     skipped) -- genuinely new, always-on-while-on-this-page work.
+     Measured directly (`timeit`, this Pi, the real function): ~63us/call
+     for a typical handful of held notes (~0.19% of one core at 30Hz), up
+     to ~211us/call for a dense 40-note/16-grid-mark stress payload
+     (~0.63% of one core) -- cheap either way, well inside "no material
+     regression".
+  2. The actual REPAINT (surface clear + draw calls) this enables only
+     fires on ticks that wouldn't otherwise have repainted -- the
+     investigation above already measured the pre-fix baseline repainting
+     ~93% of ticks from server-driven churn alone; the remaining ~7% is
+     the only NET-NEW repaint cost, not the extrapolation math (item 1),
+     which is genuinely 100%-of-ticks new regardless of how many of those
+     ticks would have repainted anyway.
 
 - `y`: 0 at the HIGHEST visible pitch, 1 at the lowest -- matches v1's own
   top-down convention (`pitches = range(pitch_high, pitch_low-1, -1)`, drawn
@@ -631,7 +652,7 @@ class PianorollState:
         # Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9):
         # DEFAULT FLIPPED from "wallclock" to "tempo" -- v1-parity fix, not
         # a preference change. v1's OWN default pianoroll behavior
-        # (`~/codex/midicrt/pages/pianoroll.py:22`, `PROJECTION_MODE =
+        # (`~/codex/midicrt/pages/pianoroll.py:25`, `PROJECTION_MODE =
         # "beat"`) advances its scroll by TICK COLUMNS that arrive at the
         # live MIDI clock's real-time rate (`engine/modules/pianoroll_
         # state.py::on_tick`, `moved = tick - self.last_tick` where `tick`
@@ -863,10 +884,18 @@ class PianorollState:
         v1's two directional clamps for `delta = +-1` starting from any
         valid (already in-range) state (the "other" bound can never be hit
         by a single one-semitone step), and is additionally safe for ANY
-        `delta` magnitude -- `engine/bindings.py`'s continuous-MIDI-binding
-        mode can drive this action with a larger delta than a single
-        keypress ever produces, the same "trigger vs continuous" case
-        `zoom_by`'s own docstring documents.
+        `delta` magnitude. NOT for `engine/bindings.py`'s continuous-MIDI-
+        binding mode, unlike `zoom_by`'s own docstring precedent --
+        `pianoroll.pan`'s `delta` is declared `"int"` (see `actions()`
+        below), and a continuous binding's fill-target arg must be
+        declared `"float"` (`engine/bindings.py::validate_binding`,
+        `schema.get(fill_key) != "float"` rejects it outright at bind time)
+        -- this action can never be armed as a continuous binding at all.
+        The general clamp is still worth having on its own merits: a
+        hand-authored TRIGGER binding (a `keymap.toml`/CLI-baked `pianoroll.
+        pan {delta: 12}` "jump an octave" convenience binding, say) is a
+        realistic, larger-than-one delta this same clamp must still handle
+        correctly, even with no continuous-mode caller in the picture.
 
         v1 also has PGUP/PGDN (12-semitone jumps) and a HOME-key reset to
         the pitch defaults (`pages/pianoroll.py:199-206,217-218`) -- NOT
@@ -992,13 +1021,17 @@ class PianorollState:
         # "running" mirrors `_grid()`'s own field of the same name (Phase
         # 10 Task A: co-located here so a client's extrapolation code reads
         # one dict instead of two) -- informational only, disclosed: v2's
-        # `_dist()` is wall-clock-driven regardless of transport state (no
-        # v1-style "freeze when stopped" -- `_current_bpm()`'s idle-bpm
-        # fallback keeps the paper moving even with no clock running, the
-        # SAME as v1's own idle-scroll precedent), so `running` does not
-        # gate whether `velocity` is valid to extrapolate with; it exists
-        # for a client that wants to visually distinguish "live tempo" from
-        # "idle fallback" motion, not required for correctness.
+        # `_dist()` is wall-clock-driven regardless of transport state,
+        # matching v1's OWN behavior here (not diverging from it) -- v1's
+        # `on_tick` (`~/codex/midicrt/engine/modules/pianoroll_state.py:
+        # 162-217`) ALSO keeps advancing while stopped, via the identical
+        # idle-fallback pattern (`eff_bpm = self.last_run_bpm if self.
+        # last_run_bpm else self.idle_scroll_bpm`, mirrored here by
+        # `_current_bpm()`'s own `self._bpm if self._bpm is not None else
+        # self._idle_bpm`). So `running` does not gate whether `velocity`
+        # is valid to extrapolate with in EITHER codebase; it exists here
+        # for a client that wants to visually distinguish "live tempo"
+        # from "idle fallback" motion, not required for correctness.
         origin_ts = self._now
         velocity = -1.0 / span_s if span_s > 0 else 0.0
         return {"mode": self._projection, "span_s": span_s, "span_beats": span_beats,

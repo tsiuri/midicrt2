@@ -1075,7 +1075,7 @@ def run_tui(socket_path: str) -> int:
              # repaints when `dirty`, see the render loop below) so the
              # measured figure is the true draw cadence, matching v1's own
              # `_frame_dt`-per-redraw intent (`~/codex/midicrt/midicrt.py:
-             # 987-989`) rather than a busier "how often did we poll"
+             # 1093-1094`) rather than a busier "how often did we poll"
              # number this loop's own `term.inkey(timeout=0.05)` pacing
              # would otherwise produce.
              "show_fps": show_fps, "_fps_last_t": None}

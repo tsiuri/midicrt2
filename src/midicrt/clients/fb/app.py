@@ -1947,7 +1947,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
         once per ACTUAL repaint (never per idle poll tick), so the
         measured figure is the true draw cadence, matching v1's own
         `_frame_dt`-per-redraw intent (`~/codex/midicrt/midicrt.py:
-        987-989`)."""
+        1093-1094`)."""
         if not show_fps:
             return ""
         now = time.monotonic()

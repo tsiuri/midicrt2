@@ -64,7 +64,7 @@ def format_fps(fps: float | None) -> str:
     run, or a headless single-shot `--out` capture with nothing to measure
     a delta against) -- same "no data yet" shape as `format_bpm`'s em-dash,
     just v1's own literal text instead of a dash (`~/codex/midicrt/
-    midicrt.py:993`, `fps_status = f"fps:{1.0/_frame_dt:.1f}" if
+    midicrt.py:1097`, `fps_status = f"fps:{1.0/_frame_dt:.1f}" if
     _frame_dt > 0 else "fps:--"` -- this ports that exact "fps:X.X"/
     "fps:--" formatting byte-for-byte, the one piece of v1's own fps
     readout this task's new footer element reuses; PLACEMENT is new
@@ -710,7 +710,12 @@ def extrapolate_pianoroll_vm(vm: dict, elapsed_s: float) -> dict:
     using ITS OWN `time.time()` (the SAME clock basis `origin_ts` and
     every note's `onset_ts`/`release_ts` already assume -- valid because
     client and engine run on the same machine/system clock in this
-    deployment).
+    deployment). This function only ever extrapolates FORWARD from the
+    caller's own current `vm` -- the caller is responsible for replacing
+    that `vm` wholesale (never blending) the instant a fresh real snapshot
+    actually arrives; see `pages/pianoroll.py`'s module docstring,
+    "Client-side extrapolation" section, for why that's the deliberate
+    behavior, not a gap.
 
     Returns `vm` UNCHANGED (same object, no copy) when there is nothing
     useful to extrapolate: no `window` dict, a non-finite/zero velocity
