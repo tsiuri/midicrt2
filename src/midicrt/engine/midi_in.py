@@ -288,7 +288,7 @@ class MidiInput:
         port._midicrt_error_watch = _on_error
         try:
             rt.set_error_callback(_on_error)
-        except Exception:  # noqa: BLE001 — the watch is best-effort, never fatal
+        except Exception:  # noqa: BLE001, S110 — the watch is best-effort, never fatal
             pass
 
     @property
@@ -388,7 +388,7 @@ class MidiInput:
                 _LOG.warning("MIDI input errored (reader wedged?); reopening: %s", name)
                 try:
                     port.close()
-                except Exception:  # noqa: BLE001 — a wedged port may not close cleanly
+                except Exception:  # noqa: BLE001, S110 — a wedged port may not close cleanly
                     pass
                 self._device_ids.pop(name, None)
                 self._identity_retry_warned.discard(name)
