@@ -3009,6 +3009,19 @@ def test_build_evdev_char_table_values_are_all_single_lowercase_chars():
     assert all(len(ch) == 1 and ch == ch.lower() for ch in table.values())
 
 
+def test_build_evdev_special_key_table_covers_up_and_down_arrows():
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 11): a
+    # SEPARATE table from _build_evdev_char_table (deliberately -- see
+    # this function's own docstring) so that one's "every value is a
+    # single lowercase char" contract stays true.
+    import evdev
+
+    table = app._build_evdev_special_key_table(evdev)
+    assert table[evdev.ecodes.KEY_UP] == "KEY_UP"
+    assert table[evdev.ecodes.KEY_DOWN] == "KEY_DOWN"
+    assert len(table) == 2
+
+
 # -- action-dispatch failure is logged, not silently swallowed forever ------
 # (Important, bindings review -- covered by/alongside the TUI's own Critical
 # fix: `_input_loop`'s old `except ClientError: pass` was a SILENT,

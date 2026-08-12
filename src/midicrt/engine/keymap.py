@@ -339,9 +339,12 @@ DEFAULT_KEYMAP: dict[str, Any] = {
 # engine action requires args -- see docs/visual-audit.md's per-page key
 # tables and task-6-report.md for the audit-row -> action -> key mapping
 # this was built from, including what's DELIBERATELY not (yet) covered
-# here (pianoroll pitch-window panning, most of spectrum's 23 v1 retuning
-# keys, img2txtviz gamma/block-size/fps-cap/auto-quality -- all disclosed
-# gaps, not silent ones, see each page module's own docstring).
+# here (most of spectrum's 23 v1 retuning keys, img2txtviz gamma/block-
+# size/fps-cap/auto-quality -- all disclosed gaps, not silent ones, see
+# each page module's own docstring). Pianoroll pitch-window panning WAS
+# in that gap list -- Phase 10 Task A (docs/demo-feedback-2026-08-12.md
+# item 11) closes it below via "KEY_UP"/"KEY_DOWN" -- see
+# PianorollState.pan_by's own docstring for the v1 file:line semantics.
 DEFAULT_PAGE_KEYMAPS: dict[str, dict[str, Any]] = {
     "pianoroll": {
         "[": {"action": "pianoroll.zoom", "args": {"delta": -0.1}},
@@ -349,6 +352,17 @@ DEFAULT_PAGE_KEYMAPS: dict[str, dict[str, Any]] = {
         "p": "pianoroll.projection_toggle",
         "d": {"action": "pianoroll.channel_toggle", "args": {"channel": 10}},
         "*": {"action": "pianoroll.channels", "args": {"spec": ""}},
+        # "KEY_UP"/"KEY_DOWN": the canonical arrow-key names this whole
+        # codebase uses for the FIRST time (Phase 10 Task A) -- matches
+        # blessed's own `Keystroke.name` convention (`clients/tui.py`'s
+        # `run_tui` normalizes a sequence keypress to `key.name` before
+        # this lookup) AND v1's own naming for this exact feature
+        # (`~/codex/midicrt/pages/pianoroll.py:208,213`, `ch.name ==
+        # "KEY_UP"`/`"KEY_DOWN"`) -- `clients/fb/app.py`'s evdev table and
+        # the web client's keydown handler both normalize their own raw
+        # input to these SAME strings, see each one's own comment.
+        "KEY_UP": {"action": "pianoroll.pan", "args": {"delta": 1}},
+        "KEY_DOWN": {"action": "pianoroll.pan", "args": {"delta": -1}},
     },
     "img2txtviz": {
         "i": "img2txtviz.invert",

@@ -146,6 +146,18 @@ def test_default_page_keymaps_cover_the_pages_this_task_restored_keys_for():
         "action": "sendnotes.key", "args": {"key": "z"}}
 
 
+def test_default_page_keymaps_pianoroll_binds_arrow_keys_to_pan():
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 11) -- closes
+    # the gap this module's own DEFAULT_PAGE_KEYMAPS comment used to name
+    # explicitly ("pianoroll pitch-window panning... deliberately not (yet)
+    # covered"). "KEY_UP"/"KEY_DOWN" match blessed's own Keystroke.name
+    # convention AND v1's own naming for this exact feature.
+    assert DEFAULT_PAGE_KEYMAPS["pianoroll"]["KEY_UP"] == {
+        "action": "pianoroll.pan", "args": {"delta": 1}}
+    assert DEFAULT_PAGE_KEYMAPS["pianoroll"]["KEY_DOWN"] == {
+        "action": "pianoroll.pan", "args": {"delta": -1}}
+
+
 def test_load_keymap_missing_file_returns_defaults(tmp_path):
     result = load_keymap(str(tmp_path / "nope.toml"))
     assert result == DEFAULT_KEYMAP

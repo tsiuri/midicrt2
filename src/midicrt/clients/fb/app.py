@@ -1634,6 +1634,30 @@ def _build_evdev_char_table(evdev) -> dict[int, str]:
     return table
 
 
+def _build_evdev_special_key_table(evdev) -> dict[int, str]:
+    """Evdev keycode -> NAMED (multi-char) key-string table, for keymap
+    entries a single lowercase ASCII char can't represent -- a deliberate
+    SEPARATE function from `_build_evdev_char_table` above (not folded in)
+    so that function's own narrow, directly-tested contract ("every value
+    is exactly one lowercase char", `test_build_evdev_char_table_values_
+    are_all_single_lowercase_chars`) stays true and unchanged; `_input_
+    loop` merges both tables into one lookup. Phase 10 Task A (docs/demo-
+    feedback-2026-08-12.md item 11) adds the first two entries -- "KEY_UP"/
+    "KEY_DOWN", matching blessed's own `Keystroke.name` convention
+    (`clients/tui.py`'s `run_tui` normalizes to the SAME strings) and v1's
+    own naming for this exact feature (`~/codex/midicrt/pages/pianoroll.py:
+    208,213`) -- `engine/keymap.py`'s DEFAULT_PAGE_KEYMAPS["pianoroll"]
+    binds these two names, not raw evdev/ASCII forms, so any future named
+    key (e.g. a later task's ESC) has an obvious place to join this table
+    rather than inventing a new mechanism."""
+    table = {}
+    for name in ("KEY_UP", "KEY_DOWN"):
+        code = getattr(evdev.ecodes, name, None)
+        if code is not None:
+            table[code] = name
+    return table
+
+
 # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap revamp):
 # engine/keymap.py's module docstring "Modifier handling" section has the
 # full rationale for why fb (unlike the TUI, which gets shift-resolved
@@ -1770,8 +1794,13 @@ def _input_loop(client: EngineClient, quit_event: threading.Event,
     if dev is None:
         _LOG.info("no input device with KEY_Q capability found; continuing without input")
         return
-    char_table = _build_evdev_char_table(evdev)
-    shifted_table = _build_evdev_shifted_char_table(evdev)
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 11): named
+    # keys (arrows) are merged into BOTH tables -- they mean the same
+    # thing regardless of shift state (v1 has no shift+arrow variant
+    # either), unlike the shift ROW's actual symbol remapping.
+    special_table = _build_evdev_special_key_table(evdev)
+    char_table = {**_build_evdev_char_table(evdev), **special_table}
+    shifted_table = {**_build_evdev_shifted_char_table(evdev), **special_table}
     shift_keycodes = _resolve_shift_keycodes(evdev)
     shift_state = {"down": False}
     rate_state: dict = {}   # one shared "last warned" timestamp for this whole read_loop

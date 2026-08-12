@@ -1242,7 +1242,7 @@ def test_pianoroll_is_in_the_default_roster():
 def test_pianoroll_actions_are_registered_when_the_page_is_present():
     eng = Engine(Config())
     described = eng.actions.describe()
-    assert {"pianoroll.zoom", "pianoroll.zoom_level", "pianoroll.projection",
+    assert {"pianoroll.zoom", "pianoroll.zoom_level", "pianoroll.pan", "pianoroll.projection",
             "pianoroll.channels"} <= set(described)
 
 
@@ -1252,8 +1252,8 @@ def test_pianoroll_actions_are_absent_when_the_page_is_not_in_the_roster():
     # never advertises these actions (no KeyError at dispatch time either).
     eng = Engine(Config(pages=["eventlog"]))
     described = eng.actions.describe()
-    assert not ({"pianoroll.zoom", "pianoroll.zoom_level", "pianoroll.projection",
-                "pianoroll.channels"} & set(described))
+    assert not ({"pianoroll.zoom", "pianoroll.zoom_level", "pianoroll.pan",
+                "pianoroll.projection", "pianoroll.channels"} & set(described))
 
 
 async def test_pianoroll_zoom_level_action_sets_absolute_value_and_marks_dirty():
@@ -1275,6 +1275,15 @@ async def test_pianoroll_zoom_action_mutates_and_marks_dirty():
     eng = Engine(Config())
     r = await eng.actions.dispatch("pianoroll.zoom", {"delta": "1.0"})
     assert r["zoom"] == pytest.approx(2.0)
+    assert "page.pianoroll" in eng._dirty
+
+
+async def test_pianoroll_pan_action_mutates_and_marks_dirty():
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 11).
+    eng = Engine(Config())
+    r = await eng.actions.dispatch("pianoroll.pan", {"delta": "1"})
+    assert r["range"] == {"lo": 37, "hi": 84}
+    assert eng.pages["pianoroll"].view_model()["range"] == {"lo": 37, "hi": 84}
     assert "page.pianoroll" in eng._dirty
 
 

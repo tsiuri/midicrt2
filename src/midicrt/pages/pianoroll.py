@@ -841,6 +841,47 @@ class PianorollState:
         self._zoom = max(ZOOM_MIN, min(ZOOM_MAX, float(level)))
         return self._zoom
 
+    def pan_by(self, delta: int) -> dict:
+        """Pan the visible pitch WINDOW by `delta` semitones (positive =
+        up, negative = down), window SIZE preserved -- ported from v1's
+        UP/DOWN arrow handling (`~/codex/midicrt/pages/pianoroll.py:
+        208-215`):
+
+            elif ch.name == "KEY_UP":
+                max_top = 127 - (pitch_high - pitch_low)
+                pitch_low = min(max_top, pitch_low + 1)
+                pitch_high = pitch_low + (pitch_high - pitch_low)
+            elif ch.name == "KEY_DOWN":
+                pitch_low = max(0, pitch_low - 1)
+                pitch_high = pitch_low + (pitch_high - pitch_low)
+
+        v1 codes this as two SEPARATE handlers, each clamping only in ITS
+        OWN direction of travel (UP only ever clamps the upper bound via
+        `max_top`; DOWN only ever clamps the lower bound at 0) -- this port
+        generalizes both into ONE double-sided clamp, `max(0, min(127 -
+        size, pitch_lo + delta))`, which is mathematically identical to
+        v1's two directional clamps for `delta = +-1` starting from any
+        valid (already in-range) state (the "other" bound can never be hit
+        by a single one-semitone step), and is additionally safe for ANY
+        `delta` magnitude -- `engine/bindings.py`'s continuous-MIDI-binding
+        mode can drive this action with a larger delta than a single
+        keypress ever produces, the same "trigger vs continuous" case
+        `zoom_by`'s own docstring documents.
+
+        v1 also has PGUP/PGDN (12-semitone jumps) and a HOME-key reset to
+        the pitch defaults (`pages/pianoroll.py:199-206,217-218`) -- NOT
+        ported here (disclosed, not silently dropped): the task-11 brief
+        (docs/demo-feedback-2026-08-12.md) asks specifically for "Up/down
+        arrows", not v1's full pitch-navigation key set; straightforward
+        future work if wanted, same "ported what the brief actually named"
+        precedent `pages/pianoroll.py`'s own module docstring already
+        established for pitch-range panning as a whole before this task."""
+        size = self._pitch_hi - self._pitch_lo
+        new_lo = max(0, min(127 - size, self._pitch_lo + int(delta)))
+        self._pitch_lo = new_lo
+        self._pitch_hi = new_lo + size
+        return {"lo": self._pitch_lo, "hi": self._pitch_hi}
+
     def set_projection(self, mode: str) -> str:
         mode = str(mode).strip().lower()
         if mode not in _PROJECTION_MODES:
@@ -1138,6 +1179,9 @@ class PianorollPage:
     def set_zoom_level(self, level: float) -> float:
         return self._state.set_zoom_level(level)
 
+    def pan_by(self, delta: int) -> dict:
+        return self._state.pan_by(delta)
+
     def set_projection(self, mode: str) -> str:
         return self._state.set_projection(mode)
 
@@ -1174,6 +1218,9 @@ class PianorollPage:
     def _action_zoom_level(self, level: float) -> dict:
         return {"zoom": self.set_zoom_level(level)}
 
+    def _action_pan(self, delta: int) -> dict:
+        return {"range": self.pan_by(delta)}
+
     def _action_projection(self, mode: str) -> dict:
         return {"mode": self.set_projection(mode)}
 
@@ -1200,6 +1247,14 @@ class PianorollPage:
             ("pianoroll.zoom_level", self._action_zoom_level,
              ("Set the pianoroll's zoom level directly (absolute; see "
               "pianoroll.zoom for the cumulative delta version)"), {"level": "float"}),
+            # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 11):
+            # v1's UP/DOWN arrow pitch-window pan, previously a disclosed
+            # gap (engine/keymap.py's own DEFAULT_PAGE_KEYMAPS comment
+            # named it explicitly) -- see PianorollState.pan_by's own
+            # docstring for the file:line v1 semantics this ports.
+            ("pianoroll.pan", self._action_pan,
+             "Pan the pianoroll's pitch window by N semitones (v1 UP/DOWN arrow precedent)",
+             {"delta": "int"}),
             ("pianoroll.projection", self._action_projection,
              "Switch the pianoroll's projection mode (wallclock|tempo)",
              {"mode": "str"}),

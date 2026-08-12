@@ -121,6 +121,49 @@ class _RecordingClient:
         self.calls.append(name)
 
 
+# -- _normalize_key (Phase 10 Task A, docs/demo-feedback-2026-08-12.md
+# item 11) -------------------------------------------------------------
+
+class _FakeKeystroke:
+    """Trivial duck-typed stand-in for a `blessed.Keystroke` -- no real
+    Terminal/tty needed (see `_normalize_key`'s own docstring for why it
+    was extracted specifically to make this possible)."""
+
+    def __init__(self, s: str, is_sequence: bool = False, name: str | None = None):
+        self._s = s
+        self.is_sequence = is_sequence
+        self.name = name
+
+    def __str__(self) -> str:
+        return self._s
+
+
+def test_normalize_key_passes_through_an_ordinary_printable_char():
+    assert tui._normalize_key(_FakeKeystroke("d")) == "d"
+
+
+def test_normalize_key_passes_through_blank_on_a_timeout_with_no_keypress():
+    assert tui._normalize_key(_FakeKeystroke("")) == ""
+
+
+def test_normalize_key_resolves_a_sequence_key_to_its_symbolic_name():
+    # The actual fix: str(key) on a sequence would be the raw escape code
+    # (e.g. "\x1b[A" for up-arrow on most terminals) -- never matches
+    # anything in a keymap keyed by friendly names like "KEY_UP".
+    key = _FakeKeystroke("\x1b[A", is_sequence=True, name="KEY_UP")
+    assert tui._normalize_key(key) == "KEY_UP"
+    key = _FakeKeystroke("\x1b[B", is_sequence=True, name="KEY_DOWN")
+    assert tui._normalize_key(key) == "KEY_DOWN"
+
+
+def test_normalize_key_unnamed_sequence_becomes_blank_not_none():
+    # Defensive: a sequence blessed recognizes as "is a sequence" but has
+    # no symbolic name for (name=None) must still return a str (never
+    # None) -- dispatch_key's keymap.get(key) is safe either way, but this
+    # keeps _normalize_key's own return type honestly `-> str` always.
+    assert tui._normalize_key(_FakeKeystroke("\x1bOP", is_sequence=True, name=None)) == ""
+
+
 def test_handle_key_press_returns_true_only_for_client_quit():
     state = {"keymap": {"q": "client.quit"}}
     assert tui._handle_key_press(_RecordingClient(), "q", state) is True

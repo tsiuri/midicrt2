@@ -75,6 +75,28 @@ async def test_describe_endpoint_proxies_engine_describe(tmp_path):
     eng.stop(); await task; await srv.close()
 
 
+async def test_index_serves_the_pianoroll_arrow_pan_keydown_wiring(tmp_path):
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 11): the web
+    # client had NO keyboard binding of any kind before this task -- a
+    # content-presence check, matching this file's own established
+    # "server-testable without a browser: the served page's JS source is
+    # plain text" convention (see test_index_page_renderer_registry_
+    # covers_full_default_roster's own docstring) -- proves the served
+    # page actually ships the keydown listener wired to the real engine
+    # action name and arrow key names, not a full JS execution/behavior
+    # test (no browser/JS runtime in this test suite at all).
+    eng, srv, task, client = await _client_for(tmp_path, allow_control=True)
+    resp = await client.get("/")
+    body = await resp.text()
+    assert 'addEventListener("keydown"' in body
+    assert '"pianoroll.pan"' in body
+    assert '"ArrowUp"' in body and '"ArrowDown"' in body
+    assert 'currentPage !== "pianoroll"' in body
+
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
 async def test_action_endpoint_403_without_allow_control(tmp_path):
     eng, srv, task, client = await _client_for(tmp_path, allow_control=False)
     resp = await client.post("/api/action", json={"name": "page.next", "args": {}})
@@ -90,6 +112,23 @@ async def test_action_endpoint_works_with_allow_control(tmp_path):
     assert resp.status == 200
     data = await resp.json()
     assert data["page"] == "voices"
+
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
+async def test_action_endpoint_forwards_pianoroll_pan(tmp_path):
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 11): no
+    # web-specific server code was added for this action -- `/api/action`
+    # already forwards any real action name generically (proven by every
+    # OTHER action already tested via this same endpoint above) -- this is
+    # ONE direct confirmation for the specific action the web client's new
+    # keydown handler posts, not a new code path.
+    eng, srv, task, client = await _client_for(tmp_path, allow_control=True)
+    resp = await client.post("/api/action", json={"name": "pianoroll.pan", "args": {"delta": "1"}})
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["range"] == {"lo": 37, "hi": 84}
 
     await client.close()
     eng.stop(); await task; await srv.close()

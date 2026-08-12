@@ -1015,6 +1015,39 @@ if (ALLOW_CONTROL) {
   refreshCaptureStatus();  // seed the REC toggle label + last_session panel on load
   refreshSysexPanel();     // seed the SysEx recent/library lists on load
   refreshSessionsPanel();  // seed the capture sessions list on load
+
+  // -- pianoroll arrow-key pan (Phase 10 Task A, docs/demo-feedback-
+  // 2026-08-12.md item 11): the web client had NO keyboard binding of any
+  // kind before this -- every control here is a click/submit affordance
+  // (buttons, the generic action form). This is the first, scoped
+  // specifically to the one gap the task brief names ("fb evdev + TUI +
+  // web"), not a general keymap-on-the-web feature (the fb/TUI clients'
+  // full `keymap`/`keymap_page` tables have no web equivalent renderer
+  // yet -- future work, not invented here). "ArrowUp"/"ArrowDown" are the
+  // browser's OWN `KeyboardEvent.key` names for these keys (MDN standard,
+  // unlike blessed's "KEY_UP"/evdev's KEY_UP constant -- each client
+  // platform normalizes its own raw input to the SAME engine action,
+  // `pianoroll.pan`, they just start from different raw key
+  // representations, see clients/tui.py::_normalize_key's and
+  // clients/fb/app.py::_build_evdev_special_key_table's own docstrings
+  // for those two). Guarded: only fires on the pianoroll page (mirrors
+  // the fb/TUI keymap's own PER-PAGE section scoping -- arrows have no
+  // meaning on any other page today), and never while focus is in a real
+  // form control (the action-args text inputs, the action <select>) --
+  // an arrow keypress there must still move the cursor/selection, not
+  // get hijacked into a pan action.
+  document.addEventListener("keydown", (ev) => {
+    if (currentPage !== "pianoroll") return;
+    const tag = ev.target && ev.target.tagName;
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+    if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      postAction("pianoroll.pan", { delta: 1 });
+    } else if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      postAction("pianoroll.pan", { delta: -1 });
+    }
+  });
 }
 
 // -- websocket connection with auto-reconnect + exponential backoff -------

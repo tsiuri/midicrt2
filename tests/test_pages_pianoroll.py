@@ -383,6 +383,50 @@ def test_set_zoom_level_clamps_to_min_and_max():
     assert s.set_zoom_level(999.0) == pytest.approx(ZOOM_MAX)
 
 
+# -- pitch-window pan (Phase 10 Task A, docs/demo-feedback-2026-08-12.md
+# item 11: v1's UP/DOWN arrow pitch-window pan, previously a disclosed gap) --
+
+def test_pan_by_shifts_the_pitch_window_up_preserving_its_size():
+    s = PianorollState(now=100.0)   # default range 36..83, size 47
+    result = s.pan_by(1)
+    assert result == {"lo": 37, "hi": 84}
+    assert s.view_model()["range"] == {"lo": 37, "hi": 84}
+
+
+def test_pan_by_shifts_the_pitch_window_down_preserving_its_size():
+    s = PianorollState(now=100.0)
+    result = s.pan_by(-1)
+    assert result == {"lo": 35, "hi": 82}
+
+
+def test_pan_by_repeated_calls_accumulate():
+    s = PianorollState(now=100.0)
+    s.pan_by(1)
+    s.pan_by(1)
+    assert s.pan_by(1) == {"lo": 39, "hi": 86}
+
+
+def test_pan_by_clamps_at_the_top_127():
+    # v1: `max_top = 127 - (pitch_high - pitch_low); pitch_low = min(max_top,
+    # pitch_low + 1)` -- pitch_high must never exceed 127.
+    s = PianorollState(now=100.0, pitch_lo=120, pitch_hi=127)   # size 7, already at the top
+    assert s.pan_by(1) == {"lo": 120, "hi": 127}   # no further movement possible
+    assert s.pan_by(50) == {"lo": 120, "hi": 127}   # a huge delta clamps the same way
+
+
+def test_pan_by_clamps_at_the_bottom_0():
+    # v1: `pitch_low = max(0, pitch_low - 1)` -- pitch_low must never go
+    # below 0.
+    s = PianorollState(now=100.0, pitch_lo=0, pitch_hi=7)   # size 7, already at the bottom
+    assert s.pan_by(-1) == {"lo": 0, "hi": 7}
+    assert s.pan_by(-50) == {"lo": 0, "hi": 7}
+
+
+def test_pan_by_zero_delta_is_a_noop():
+    s = PianorollState(now=100.0)
+    assert s.pan_by(0) == {"lo": 36, "hi": 83}
+
+
 # -- projection mode control ----------------------------------------------
 
 def test_set_projection_accepts_known_modes():

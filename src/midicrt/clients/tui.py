@@ -854,6 +854,29 @@ _SUBSCRIBE_RATE = 10.0
 _ERROR_DISPLAY_S = 3.0
 
 
+def _normalize_key(key) -> str:
+    """Normalize a `blessed.Terminal.inkey()` result to the string
+    `clients/base.py::dispatch_key` looks up in the keymap. Phase 10 Task A
+    (docs/demo-feedback-2026-08-12.md item 11): a SEQUENCE keypress
+    (arrows, and any future special key) resolves to blessed's own
+    symbolic `key.name` ("KEY_UP"/"KEY_DOWN"/...) -- `str(key)` on a
+    sequence is instead the raw multi-byte escape code, which never
+    matches anything in `state["keymap"]` (this is WHY arrow keys
+    previously did nothing at all here, matching the demo feedback's own
+    "are arrow keycodes even bound... TUI?" question). An ordinary
+    printable keypress, or the blank/no-keypress timeout case, is
+    unaffected -- `is_sequence` is False for both, `str(key)` unchanged
+    from before this function existed.
+
+    Extracted as its own pure function -- same "pull the per-keypress
+    body out for direct testability" precedent `clients/fb/app.py::
+    _dispatch_evdev_key` already set for the fb client -- takes anything
+    duck-typing blessed's `Keystroke` (`.is_sequence`, `.name`, `str()`),
+    so a test can pass a trivial stand-in with no real blessed Terminal/
+    tty involved."""
+    return (key.name or "") if key.is_sequence else str(key)
+
+
 def _handle_key_press(client, key: str, state: dict) -> bool:
     """Resolve `key` against `state["keymap"]` and dispatch it -- the ONE
     place `run_tui`'s main loop must distinguish an action-dispatch
@@ -1300,7 +1323,7 @@ def run_tui(socket_path: str) -> int:
                     dirty = False
                 key = term.inkey(timeout=0.05)
                 overlay_before = state.get("help_overlay", False)
-                if _handle_key_press(client, str(key), state):
+                if _handle_key_press(client, _normalize_key(key), state):
                     return 0
                 if state.get("help_overlay", False) != overlay_before:
                     # Phase 8 Task 6: the overlay's on/off state is flipped
