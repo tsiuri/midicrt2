@@ -169,3 +169,54 @@ def test_burn_in_tripwire_offset_differs_at_t_and_t_plus_n():
     a.tick(1003.0)   # +3s * 4 chars/sec = +12 chars, comfortably >= 1
     offset_t_plus_n = a.view_model()["offset"]
     assert offset_t != offset_t_plus_n
+
+
+# -- reset_to_page (Phase 10 Task B, docs/demo-feedback-2026-08-12.md item 7) -
+
+def test_reset_to_page_puts_the_target_entrys_bracket_at_offset_zero():
+    a = MarqueeAnalyzer(["harmony", "pianoroll"])   # text = "[1:HARMONY]  [8:PIANOROLL]"
+    a.tick(50.0)   # scroll to some arbitrary non-zero position first
+    a.tick(53.0)
+    assert a.reset_to_page("pianoroll", now=53.0) is True
+    vm = a.view_model()
+    assert vm["doubled"][vm["offset"]:vm["offset"] + len("[8:PIANOROLL]")] == "[8:PIANOROLL]"
+
+
+def test_reset_to_page_first_entry_lands_at_literal_offset_zero():
+    a = MarqueeAnalyzer(["harmony", "pianoroll"])
+    a.tick(50.0)
+    a.tick(53.0)   # scroll away from offset 0 first
+    assert a.view_model()["offset"] != 0
+    assert a.reset_to_page("harmony", now=53.0) is True
+    assert a.view_model()["offset"] == 0
+
+
+def test_reset_to_page_then_resumes_scrolling_from_the_new_anchor():
+    a = MarqueeAnalyzer(["harmony", "pianoroll"], speed_cps=4.0)
+    a.tick(50.0)
+    a.reset_to_page("pianoroll", now=100.0)
+    reset_offset = a.view_model()["offset"]
+    a.tick(101.0)   # 1.0s later at 4.0 chars/sec -> +4 chars from the reset point
+    modulo = len(a.view_model()["text"]) + len(GAP)
+    assert a.view_model()["offset"] == (reset_offset + 4) % modulo
+
+
+def test_reset_to_page_unknown_page_name_is_a_noop():
+    # "screensaver" has no v1 ID -- no marquee entry to reset to at all.
+    a = MarqueeAnalyzer(["harmony", "screensaver"])
+    a.tick(50.0)
+    before = a.view_model()
+    assert a.reset_to_page("screensaver", now=50.0) is False
+    assert a.view_model() == before
+
+
+def test_reset_to_page_returns_false_when_offset_is_already_correct():
+    a = MarqueeAnalyzer(["harmony", "pianoroll"])
+    a.reset_to_page("harmony", now=10.0)
+    assert a.reset_to_page("harmony", now=10.0) is False   # already at offset 0
+
+
+def test_reset_to_page_on_empty_roster_is_a_noop_without_crashing():
+    a = MarqueeAnalyzer([])
+    assert a.reset_to_page("eventlog", now=10.0) is False
+    assert a.view_model()["offset"] == 0

@@ -97,6 +97,45 @@ async def test_index_serves_the_pianoroll_arrow_pan_keydown_wiring(tmp_path):
     eng.stop(); await task; await srv.close()
 
 
+async def test_index_serves_the_esc_overlay_wiring_in_both_control_and_read_only_modes(tmp_path):
+    # Phase 10 Task B (docs/demo-feedback-2026-08-12.md item 6): "web
+    # keydown Escape trivial" -- same content-presence convention as the
+    # arrow-pan test above. Deliberately checked under BOTH allow_control
+    # values: unlike the arrow-pan listener (gated behind ALLOW_CONTROL,
+    # since it dispatches a real action), the overlay is read-only info
+    # display and must be wired identically either way -- see page.html's
+    # own comment on why this listener sits OUTSIDE the ALLOW_CONTROL
+    # block.
+    for allow_control in (False, True):
+        eng, srv, task, client = await _client_for(tmp_path, allow_control=allow_control)
+        resp = await client.get("/")
+        body = await resp.text()
+        assert 'ev.key !== "Escape"' in body
+        assert "toggleHelpOverlay" in body
+        assert 'id="help-overlay"' in body
+        assert "renderHelpOverlay" in body
+        assert "keymap_global" in body and "keymap_page" in body
+
+        await client.close()
+        eng.stop(); await task; await srv.close()
+
+
+async def test_index_serves_the_overlay_precedence_guard_over_pianoroll_arrows(tmp_path):
+    # Phase 10 Task B: "overlay-open arrows take precedence over per-page
+    # arrows" -- the pianoroll arrow-pan handler must check
+    # `helpOverlayOpen` before anything else, so a keypress while the
+    # modal is open never leaks through to pan the page underneath.
+    eng, srv, task, client = await _client_for(tmp_path, allow_control=True)
+    resp = await client.get("/")
+    body = await resp.text()
+    guard_idx = body.index("if (helpOverlayOpen) return;")
+    pianoroll_check_idx = body.index('if (currentPage !== "pianoroll") return;')
+    assert guard_idx < pianoroll_check_idx
+
+    await client.close()
+    eng.stop(); await task; await srv.close()
+
+
 async def test_action_endpoint_403_without_allow_control(tmp_path):
     eng, srv, task, client = await _client_for(tmp_path, allow_control=False)
     resp = await client.post("/api/action", json={"name": "page.next", "args": {}})

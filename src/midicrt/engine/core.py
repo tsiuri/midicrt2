@@ -2266,6 +2266,23 @@ class Engine:
         # No-op when not recording (`CaptureSink.record_page_changed`'s
         # own guard).
         self._capture.record_page_changed(name)
+        # Phase 10 Task B (docs/demo-feedback-2026-08-12.md item 7): this
+        # SAME funnel point is why `reset_to_page` lives here rather than
+        # at each individual `page.next`/`.prev`/`.goto`/`.jump` call site
+        # (or the sysex/pagecycle/screensaver paths that also land here) --
+        # "on any current_page change (all origins)" is exactly what
+        # calling it from this one method, unconditionally, already gets
+        # for free. `self._clock()` (not a raw `time.time()`) so this stays
+        # correct under the injected-clock fake-time tests every other
+        # wall-clock read in this class already uses (see `Engine.__init__`'s
+        # own comment next to `self._clock`). Marks `overlay.marquee` dirty
+        # only when the reset actually MOVED the offset (`reset_to_page`'s
+        # own "did anything visibly move" return contract) -- a transition
+        # to a page with no marquee entry at all (e.g. "screensaver") or
+        # one that was already sitting at the correct offset costs nothing
+        # extra here.
+        if self.analyzers["marquee"].reset_to_page(name, self._clock()):
+            self._dirty.add("overlay.marquee")
         # Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
         # revamp): `self.keymap_page` (and the effective `self.keymap`) is
         # PAGE-SCOPED now -- every transition through this one funnel point

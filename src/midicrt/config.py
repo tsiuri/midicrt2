@@ -188,6 +188,16 @@ class Config:
     # `config.toml` but has never live-applied anything beyond
     # `instruments`, see `engine/core.py::Engine._config_reload`'s own
     # docstring).
+    #
+    # REDESIGNED Phase 10 Task B (docs/demo-feedback-2026-08-12.md item 5,
+    # user: "keybind hint display janky -- scrolls next to already-
+    # scrolling nav"): this flag's MEANING changed, its default/contract
+    # didn't -- Phase 8's version was an ALWAYS-ON, endlessly scrolling
+    # hint; this now gates a TRANSIENT hint shown motionless for
+    # `chrome.HINT_DISPLAY_S` seconds right after a page switch, then gone
+    # entirely, with the ESC-invoked overlay (item 6, `clients/chrome.py`'s
+    # `overlay_lines`) as the PERMANENT keybind home. `False` still means
+    # "never show it at all," same as before.
     keymap_hints_enabled: bool = True
     # Phase 9 Task 2 (panic-send / stuck-linger / poly-limit log): three v1
     # `plugins/zstucknotes.py`/`plugins/zvoicemonitor.py` knobs, all

@@ -525,12 +525,16 @@ def test_burn_in_tripwire_marquee_header_pixels_differ_at_t_and_t_plus_n():
     assert body_t == body_t_plus_n
 
 
-def test_burn_in_tripwire_keymap_hint_pixels_differ_at_t_and_t_plus_n():
-    """Phase 8 Task 6's own mover: `page_keymap_hint_window_text` reuses the
-    marquee's offset (see its own docstring) -- twin of the marquee tripwire
-    right above, proving a too-long-to-fit hint list actually scrolls in
-    the real render path, not just at the pure chrome.py function level
-    (test_chrome.py's own coverage)."""
+def test_keymap_hint_no_longer_scrolls_pixels_are_identical_at_t_and_t_plus_n():
+    """Phase 10 Task B (docs/demo-feedback-2026-08-12.md item 5): the OLD
+    Phase 8 always-on scrolling hint (`page_keymap_hint_window_text`,
+    since deleted) is REPLACED by a transient, motionless hint -- the
+    OPPOSITE claim of what this test used to prove (twin of the marquee
+    tripwire above): a too-long-to-fit hint list must render BYTE-
+    IDENTICAL headers at two different wall-clock instants, since it no
+    longer reads the marquee's own scroll offset at all. `hint_active=True`
+    at both instants (this test is about the hint's own motion, not the
+    Task B transient-display-window mechanic covered separately below)."""
     from midicrt.analyzers.marquee import MarqueeAnalyzer
 
     analyzer = MarqueeAnalyzer(["eventlog"], speed_cps=4.0)   # fits -> header itself is static
@@ -538,49 +542,68 @@ def test_burn_in_tripwire_keymap_hint_pixels_differ_at_t_and_t_plus_n():
     surf = Surface(*GOLDEN_SURFACE_SIZE)
     capacity = app._header_char_capacity(surf, font)
     hint_budget = capacity // app._KEYMAP_HINT_MAX_FRACTION - 1
-    # A page_keymap with enough entries that its hint text overflows the
-    # reserved budget -- deliberately synthetic/oversized, proportional to
-    # this surface's own real character budget rather than a hardcoded
-    # count that might happen to fit a different font/surface.
+    # A page_keymap with enough entries that its hint text would have
+    # overflowed the old scrolling budget -- kept oversized/synthetic on
+    # purpose so this test still means something if a future task ever
+    # reconsiders truncation vs. scrolling for an unusually long hint.
     page_keymap = {str(i): f"page.action_{i}" for i in range(max(8, hint_budget))}
     from midicrt.clients import chrome as chrome_mod
-    assert len(chrome_mod.page_keymap_hint_text(page_keymap)) > hint_budget   # sanity: scroll engaged
+    assert len(chrome_mod.page_keymap_hint_text(page_keymap)) > hint_budget   # sanity: still oversized
 
     analyzer.tick(2000.0)
     frame_t = Surface(*GOLDEN_SURFACE_SIZE)
     app._paint_frame(frame_t, "eventlog", EMPTY_VM, font,
                       chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
                       chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
-                      analyzer.view_model(), page_keymap=page_keymap)
+                      analyzer.view_model(), page_keymap=page_keymap, hint_active=True)
 
     analyzer.tick(2003.0)
     frame_t_plus_n = Surface(*GOLDEN_SURFACE_SIZE)
     app._paint_frame(frame_t_plus_n, "eventlog", EMPTY_VM, font,
                       chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
                       chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
-                      analyzer.view_model(), page_keymap=page_keymap)
+                      analyzer.view_model(), page_keymap=page_keymap, hint_active=True)
 
-    header_h = font.height + 2 * app.HEADER_PAD
-    header_t = frame_t.image.crop((0, 0, frame_t.width, header_h)).tobytes()
-    header_t_plus_n = frame_t_plus_n.image.crop((0, 0, frame_t_plus_n.width, header_h)).tobytes()
-    assert header_t != header_t_plus_n
-    body_t = frame_t.image.crop((0, header_h, frame_t.width, frame_t.height)).tobytes()
-    body_t_plus_n = frame_t_plus_n.image.crop((0, header_h, frame_t_plus_n.width,
-                                                frame_t_plus_n.height)).tobytes()
-    assert body_t == body_t_plus_n
+    assert frame_t.image.tobytes() == frame_t_plus_n.image.tobytes()
+
+
+def test_paint_frame_hint_active_false_hides_the_hint_even_when_enabled():
+    # Phase 10 Task B (item 5): the transient display-window gate --
+    # `hint_active=False` (the caller's "more than HINT_DISPLAY_S seconds
+    # since the last page switch" clock read) must suppress the hint
+    # exactly like `keymap_hints_enabled=False` does, even though the
+    # config gate itself is still on.
+    page_keymap = {"i": "img2txtviz.invert"}
+    shown = _paint_eventlog(page_keymap=page_keymap, hint_active=True)
+    expired = _paint_eventlog(page_keymap=page_keymap, hint_active=False)
+    no_keymap_at_all = _paint_eventlog(page_keymap=None, hint_active=True)
+    assert shown.image.tobytes() != expired.image.tobytes()
+    assert expired.image.tobytes() == no_keymap_at_all.image.tobytes()
+
+
+def test_paint_frame_hint_active_defaults_true_for_backward_compat():
+    # Every pre-Task-B call site (and the golden-ish tests above/below that
+    # never pass `hint_active`) keeps rendering exactly as before -- the
+    # param defaults to the OLD "always show whenever there's hint text"
+    # behavior.
+    page_keymap = {"i": "img2txtviz.invert"}
+    default_call = _paint_eventlog(page_keymap=page_keymap)
+    explicit_true = _paint_eventlog(page_keymap=page_keymap, hint_active=True)
+    assert default_call.image.tobytes() == explicit_true.image.tobytes()
 
 
 # -- on-screen keymap indicator + help overlay (Phase 8 Task 6) -------------
 
 def _paint_eventlog(page_keymap=None, keymap_hints_enabled=True, overlay_active=False,
-                    keymap_global=None, roster=None):
+                    keymap_global=None, roster=None, hint_active=True, overlay_scroll=0):
     font = load_font()
     surf = Surface(*GOLDEN_SURFACE_SIZE)
     app._paint_frame(surf, "eventlog", EMPTY_VM, font,
                       chrome.DEFAULT_STATUS_VM, chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
                       chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
                       DEFAULT_MARQUEE_VM, page_keymap=page_keymap,
-                      keymap_hints_enabled=keymap_hints_enabled, overlay_active=overlay_active,
+                      keymap_hints_enabled=keymap_hints_enabled, hint_active=hint_active,
+                      overlay_active=overlay_active, overlay_scroll=overlay_scroll,
                       keymap_global=keymap_global, roster=roster)
     return surf
 
@@ -3019,7 +3042,19 @@ def test_build_evdev_special_key_table_covers_up_and_down_arrows():
     table = app._build_evdev_special_key_table(evdev)
     assert table[evdev.ecodes.KEY_UP] == "KEY_UP"
     assert table[evdev.ecodes.KEY_DOWN] == "KEY_DOWN"
-    assert len(table) == 2
+    assert len(table) == 3   # KEY_UP, KEY_DOWN, KEY_ESC (Phase 10 Task B)
+
+
+def test_build_evdev_special_key_table_bridges_key_esc_to_key_escape():
+    # Phase 10 Task B (docs/demo-feedback-2026-08-12.md item 6): evdev's
+    # OWN name for this key is "KEY_ESC" -- the table value must be the
+    # shared canonical "KEY_ESCAPE" string (engine/keymap.py::DEFAULT_
+    # KEYMAP's own key), not evdev's name verbatim, or this client's
+    # keymap lookup would never match the "?" toggle's own binding.
+    import evdev
+
+    table = app._build_evdev_special_key_table(evdev)
+    assert table[evdev.ecodes.KEY_ESC] == "KEY_ESCAPE"
 
 
 # -- action-dispatch failure is logged, not silently swallowed forever ------
@@ -3094,23 +3129,67 @@ def test_dispatch_evdev_key_unmapped_key_is_a_noop():
 
 def test_dispatch_evdev_key_help_toggle_arms_overlay_without_calling_action():
     client = _RecordingClient()
-    overlay_state = {"active": False}
+    overlay_state = {"active": False, "scroll": 5}
     result = app._dispatch_evdev_key(
         client, "?", {"?": "client.help_toggle"}, {}, overlay_state)
     assert result is False
     assert overlay_state["active"] is True
+    assert overlay_state["scroll"] == 0   # reset on open
     assert client.calls == []
 
 
-def test_dispatch_evdev_key_swallows_any_key_while_overlay_active():
+# -- Phase 10 Task B: ESC/q dismiss, arrows scroll (docs/demo-feedback-      --
+# -- 2026-08-12.md item 6, narrowing Phase 8's "ANY key dismisses") ---------
+
+def test_dispatch_evdev_key_escape_dismisses_while_overlay_active():
+    client = _RecordingClient()
+    overlay_state = {"active": True, "scroll": 4}
+    result = app._dispatch_evdev_key(
+        client, "KEY_ESCAPE", {"c": "eventlog.clear"}, {}, overlay_state)
+    assert result is False
+    assert overlay_state["active"] is False
+    assert overlay_state["scroll"] == 0
+    assert client.calls == []
+
+
+def test_dispatch_evdev_key_q_dismisses_while_overlay_active_and_does_not_quit():
+    client = _RecordingClient()
+    overlay_state = {"active": True}
+    result = app._dispatch_evdev_key(
+        client, "q", {"q": "client.quit"}, {}, overlay_state)
+    assert result is False   # never quits -- q closes the overlay instead
+    assert overlay_state["active"] is False
+    assert client.calls == []
+
+
+def test_dispatch_evdev_key_arrows_scroll_instead_of_dismissing_while_overlay_active():
+    client = _RecordingClient()
+    overlay_state = {"active": True, "scroll": 2}
+    assert app._dispatch_evdev_key(
+        client, "KEY_DOWN", {"KEY_UP": "pianoroll.pan"}, {}, overlay_state) is False
+    assert overlay_state["scroll"] == 3
+    assert overlay_state["active"] is True   # still open
+    assert client.calls == []   # never reached the current page's own keymap
+    app._dispatch_evdev_key(client, "KEY_UP", {}, {}, overlay_state)
+    assert overlay_state["scroll"] == 2
+
+
+def test_dispatch_evdev_key_arrow_up_never_goes_negative():
+    client = _RecordingClient()
+    overlay_state = {"active": True, "scroll": 0}
+    app._dispatch_evdev_key(client, "KEY_UP", {}, {}, overlay_state)
+    assert overlay_state["scroll"] == 0
+
+
+def test_dispatch_evdev_key_other_keys_are_swallowed_while_overlay_active():
     client = _RecordingClient()
     overlay_state = {"active": True}
     # Even a REAL, otherwise-dispatchable key must be swallowed -- the
-    # overlay-dismiss rule takes priority over normal dispatch.
+    # overlay is a modal window, not a transparent input pass-through.
     result = app._dispatch_evdev_key(
         client, "c", {"c": "eventlog.clear"}, {}, overlay_state)
     assert result is False
-    assert overlay_state["active"] is False   # dismissed
+    assert overlay_state["active"] is True   # NOT dismissed -- only ESC/q dismiss now
     assert client.calls == []                 # never reached the engine
 
 

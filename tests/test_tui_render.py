@@ -200,12 +200,51 @@ def test_handle_key_press_help_toggle_arms_overlay_without_calling_action():
     assert client.calls == []
 
 
-def test_handle_key_press_swallows_any_key_while_overlay_active():
+def test_handle_key_press_escape_dismisses_while_overlay_active():
+    state = {"keymap": {"c": "eventlog.clear"}, "help_overlay": True, "overlay_scroll": 3}
+    client = _RecordingClient()
+    result = tui._handle_key_press(client, "KEY_ESCAPE", state)
+    assert result is False
+    assert state["help_overlay"] is False
+    assert state["overlay_scroll"] == 0   # reset on dismiss
+    assert client.calls == []
+
+
+def test_handle_key_press_q_dismisses_while_overlay_active_and_does_not_quit():
+    # Phase 10 Task B (item 6): "q" closes the OVERLAY while it's open --
+    # it does NOT fall through to its normal client.quit meaning.
+    state = {"keymap": {"q": "client.quit"}, "help_overlay": True}
+    client = _RecordingClient()
+    result = tui._handle_key_press(client, "q", state)
+    assert result is False   # never quits
+    assert state["help_overlay"] is False
+    assert client.calls == []
+
+
+def test_handle_key_press_arrows_scroll_instead_of_dismissing_while_overlay_active():
+    state = {"keymap": {"KEY_UP": {"action": "pianoroll.pan", "args": {"delta": 1}}},
+             "help_overlay": True, "overlay_scroll": 2}
+    client = _RecordingClient()
+    assert tui._handle_key_press(client, "KEY_DOWN", state) is False
+    assert state["overlay_scroll"] == 3
+    assert state["help_overlay"] is True   # still open
+    assert client.calls == []   # never reached the underlying page's own keymap
+    assert tui._handle_key_press(client, "KEY_UP", state) is False
+    assert state["overlay_scroll"] == 2
+
+
+def test_handle_key_press_arrow_up_never_goes_negative():
+    state = {"keymap": {}, "help_overlay": True, "overlay_scroll": 0}
+    tui._handle_key_press(_RecordingClient(), "KEY_UP", state)
+    assert state["overlay_scroll"] == 0
+
+
+def test_handle_key_press_other_keys_are_swallowed_while_overlay_active():
     state = {"keymap": {"c": "eventlog.clear"}, "help_overlay": True}
     client = _RecordingClient()
     result = tui._handle_key_press(client, "c", state)
     assert result is False
-    assert state["help_overlay"] is False   # dismissed
+    assert state["help_overlay"] is True   # NOT dismissed -- only ESC/q dismiss now
     assert client.calls == []               # never reached the engine
 
 
@@ -214,10 +253,19 @@ def test_handle_key_press_quit_still_works_when_overlay_is_not_active():
     assert tui._handle_key_press(_RecordingClient(), "q", state) is True
 
 
-# -- Phase 8 Task 6: TUI's boxed help-overlay panel --------------------------
+def test_handle_key_press_help_toggle_resets_scroll_on_open():
+    state = {"keymap": {"?": "client.help_toggle"}, "help_overlay": False,
+             "overlay_scroll": 5}
+    tui._handle_key_press(_RecordingClient(), "?", state)
+    assert state["help_overlay"] is True
+    assert state["overlay_scroll"] == 0
+
+
+# -- Phase 8 Task 6 (REDESIGNED Phase 10 Task B): TUI's boxed help-overlay --
+# -- panel ---------------------------------------------------------------
 
 def test_render_help_overlay_box_global_and_page_sections():
-    box_x, box_y, rows = render_help_overlay_box(
+    box_x, box_y, rows, _scroll = render_help_overlay_box(
         {"q": "client.quit"}, {"p": "pianoroll.projection_toggle"}, "pianoroll",
         width=60, height=20)
     assert rows[0].startswith("+") and rows[0].endswith("+")
@@ -229,30 +277,65 @@ def test_render_help_overlay_box_global_and_page_sections():
 
 
 def test_render_help_overlay_box_centers_within_the_given_dimensions():
-    box_x, box_y, rows = render_help_overlay_box({"q": "client.quit"}, {}, "eventlog",
-                                                  width=80, height=24)
+    box_x, box_y, rows, _scroll = render_help_overlay_box({"q": "client.quit"}, {}, "eventlog",
+                                                           width=80, height=24)
     box_w = len(rows[0])
     assert box_x == (80 - box_w) // 2
     assert box_y == (24 - len(rows)) // 2
 
 
 def test_render_help_overlay_box_falls_back_to_placeholder_when_empty():
-    _box_x, _box_y, rows = render_help_overlay_box({}, {}, "eventlog", width=40, height=10)
+    _box_x, _box_y, rows, _scroll = render_help_overlay_box({}, {}, "eventlog",
+                                                             width=40, height=10)
     assert any("no bindings" in row for row in rows)
 
 
 def test_render_help_overlay_box_every_row_is_the_same_width():
-    _box_x, _box_y, rows = render_help_overlay_box(
+    _box_x, _box_y, rows, _scroll = render_help_overlay_box(
         {"q": "client.quit", "n": "page.next"}, {}, "eventlog", width=60, height=20)
     widths = {len(row) for row in rows}
     assert len(widths) == 1
 
 
 def test_render_help_overlay_box_resolves_page_jump_with_a_roster():
-    _box_x, _box_y, rows = render_help_overlay_box(
+    _box_x, _box_y, rows, _scroll = render_help_overlay_box(
         {"2": {"action": "page.jump", "args": {"position": 2}}}, {}, "eventlog",
         width=60, height=20, roster=["eventlog", "voices"])
     assert any("-> voices" in row for row in rows)
+
+
+# -- Phase 10 Task B (item 6): window capped well short of full screen,     --
+# -- content overflow scrolls -------------------------------------------------
+
+def test_render_help_overlay_box_stays_within_the_max_fraction_of_a_tall_terminal():
+    # A GLOBAL section long enough to overflow even a generous cap --
+    # DEFAULT_KEYMAP has ~19 global entries; nest it further with a large
+    # synthetic page section so the box would have grown to (near) full
+    # height under the old `min(height, len(lines)+2)` rule.
+    big_page_keymap = {chr(ord("a") + i): f"fake.action_{i}" for i in range(40)}
+    _box_x, box_y, rows, _scroll = render_help_overlay_box(
+        {"q": "client.quit"}, big_page_keymap, "eventlog", width=80, height=40)
+    assert len(rows) <= int(40 * tui._OVERLAY_MAX_HEIGHT_FRACTION) + 1
+    assert box_y > 0   # a real margin remains above the box
+
+
+def test_render_help_overlay_box_scrolls_when_content_overflows_the_cap():
+    big_page_keymap = {chr(ord("a") + i): f"fake.action_{i}" for i in range(40)}
+    _bx, _by, rows_at_0, clamped_0 = render_help_overlay_box(
+        {"q": "client.quit"}, big_page_keymap, "eventlog", width=80, height=40,
+        scroll_offset=0)
+    _bx, _by, rows_at_5, clamped_5 = render_help_overlay_box(
+        {"q": "client.quit"}, big_page_keymap, "eventlog", width=80, height=40,
+        scroll_offset=5)
+    assert clamped_0 == 0
+    assert clamped_5 == 5
+    assert rows_at_0 != rows_at_5   # different content actually visible
+
+
+def test_render_help_overlay_box_scroll_offset_is_clamped_to_a_valid_range():
+    _bx, _by, _rows, clamped = render_help_overlay_box(
+        {"q": "client.quit"}, {}, "eventlog", width=80, height=40, scroll_offset=999)
+    assert clamped == 0   # short content -- nothing to scroll to
 
 
 def test_active_error_text_none_when_no_error_recorded():

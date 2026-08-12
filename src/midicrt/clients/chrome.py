@@ -452,7 +452,8 @@ def marquee_window_text(vm: dict, width: int) -> str:
 
 # -- on-screen keymap indicator (Phase 8 Task 6, docs/gui-phase-decisions-
 # 2026-08-08.md keymap revamp: "on-screen indicators of current keymap...
-# [should be] developed") ---------------------------------------------------
+# [should be] developed"; REDESIGNED Phase 10 Task B, docs/demo-feedback-
+# 2026-08-12.md item 5) ------------------------------------------------------
 #
 # A compact CHROME element, not a whole new reserved strip: it shares the
 # HEADER row's own remaining width, to the right of the marquee text --
@@ -462,20 +463,26 @@ def marquee_window_text(vm: dict, width: int) -> str:
 # no marquee/burn-in concern at all, `run_tui`'s own docstring) shows the
 # SAME compact text statically appended to its header row instead.
 #
-# Burn-in rule (docs/gui-phase-decisions-2026-08-08.md ruling #3: "ALL of
-# v1's animations are valuable... many exist for CRT BURN-IN PREVENTION"):
-# `page_keymap_hint_text` builds PLAIN text with no motion of its own --
-# motion comes from `header_with_hint` reusing the SAME `overlay.marquee`
-# scroll offset the page-title marquee already ticks on (via `scroll_
-# window`, byte-identical engage/slice mechanic), rather than inventing a
-# second independent clock. A hint line short enough to fit its reserved
-# width never needs to scroll at all (matches the marquee's OWN "static
-# when it fits" rule) -- on the fb client specifically, that's fine
-# burn-in-wise ONLY because it sits inside the header's reverse-video bar,
-# which is already a solid-fill chrome element with its OWN separate
-# anti-burn-in mitigation (v1's header row precedent, `analyzers/
-# marquee.py`'s whole reason for existing) -- this hint text riding along
-# in the same bar doesn't add a new static-bright hazard.
+# Phase 10 Task B, item 5 ("keybind hint display janky -- scrolls next to
+# already-scrolling nav"): the user found the Phase 8 always-on, endlessly
+# scrolling hint indistinguishable from the marquee's own scroll right next
+# to it. Controller ruling (b), the plan's own disclosed standing decision:
+# the always-on scroller is REPLACED by a TRANSIENT hint -- shown plain
+# (motionless) for `HINT_DISPLAY_S` seconds right after a page switch, then
+# gone entirely, with the ESC overlay (below) as the PERMANENT keybind
+# home. This removes the whole "does it need to scroll" burn-in question
+# Phase 8's version had to solve (`page_keymap_hint_window_text`, since
+# deleted): a hint that's only ever on-screen for a few seconds after a
+# page switch is never static long enough to be a burn-in hazard in the
+# first place, scrolling or not -- so `page_keymap_hint_text` below is
+# used UNTRUNCATED-but-motionless, and `header_with_hint`'s own existing
+# hard truncation (`hint_text[:width]`) is what keeps an unusually long
+# page's hint list from overflowing its reserved width, exactly as before.
+# Each CLIENT (`clients/tui.py::run_tui`, `clients/fb/app.py::_run_device`)
+# owns the "how long ago did the page change" wall-clock comparison against
+# `HINT_DISPLAY_S` -- this module stays a pure text/formatting layer with
+# no clock of its own, same split every other function here follows.
+HINT_DISPLAY_S = 3.0   # seconds a post-page-switch hint stays visible before it disappears
 
 
 def _short_action_label(action: str) -> str:
@@ -514,29 +521,6 @@ def page_keymap_hint_text(page_keymap: dict) -> str:
     return "  ".join(parts)
 
 
-_HINT_GAP = "    "   # same 4-space seam convention as analyzers/marquee.py's own GAP
-
-
-def page_keymap_hint_window_text(page_keymap: dict, offset: int, width: int) -> str:
-    """Width-aware slice of `page_keymap_hint_text()`, scrolling via the
-    SAME `scroll_window()` mechanic (and, at the fb call site, the SAME
-    `overlay.marquee` offset) the header marquee itself uses -- burn-in
-    rule (docs/gui-phase-decisions-2026-08-08.md ruling #3): a hint list
-    too long to fit its reserved width must not sit static-bright at a
-    fixed screen position indefinitely any more than the marquee's own
-    roster text would. Static (no scroll) when it already fits `width`,
-    exactly mirroring `marquee_window_text`'s own "static when it fits"
-    engage condition -- the common case (most pages' hint lists are a
-    handful of short entries)."""
-    text = page_keymap_hint_text(page_keymap)
-    if not text or width <= 0:
-        return ""
-    if len(text) <= width:
-        return text
-    doubled = (text + _HINT_GAP) * 2
-    return scroll_window(text, doubled, offset, width)
-
-
 def header_with_hint(marquee_slice: str, hint_text: str, width: int) -> str:
     """Compose the final header-row string: `marquee_slice` (already
     sized/scrolled for whatever width the CALLER reserved for it) on the
@@ -560,19 +544,44 @@ def header_with_hint(marquee_slice: str, hint_text: str, width: int) -> str:
     return "".join(row)
 
 
-# -- help OVERLAY (Phase 8 Task 6): togglable, dim panel over the current
-# page ------------------------------------------------------------------
+# -- help OVERLAY (Phase 8 Task 6; REDESIGNED Phase 10 Task B, docs/demo-
+# feedback-2026-08-12.md item 6): togglable, centered WINDOW over the
+# current page --------------------------------------------------------------
 #
 # `client.help_toggle` (engine/keymap.py) is a pure CLIENT-LOCAL pseudo-
 # action -- the overlay never reaches the engine at all (no page switch,
 # no dirty topic, the underlying page's own subscription/render keeps
 # ticking normally underneath, matching the brief's "not a page switch"
 # requirement literally: there is nothing server-side to switch). Both
-# clients render it the SAME way structurally: a GLOBAL section (`Engine.
-# keymap_global`) followed by a CURRENT-PAGE section (`Engine.keymap_
-# page`) -- see `overlay_lines` below for the shared line-building this
-# module gives both renderers so the two can never drift on WHAT the
-# overlay lists, only on how each draws a dim backdrop/box around it.
+# clients render it the SAME way structurally: a PAGES nav section (`_nav_
+# lines` below, item 6's "nav list... current page highlighted"), then a
+# GLOBAL section (`Engine.keymap_global`), then a CURRENT-PAGE section
+# (`Engine.keymap_page`) -- see `overlay_lines` below for the shared
+# line-building this module gives both renderers so the two can never
+# drift on WHAT the overlay lists, only on how each draws a window/box
+# around it.
+#
+# Item 6 is a REDESIGN of Phase 8's own full-dim backdrop, not a new
+# pseudo-action or a second, coexisting overlay -- same toggle, same
+# content-building split (this module owns WHAT, each client owns HOW),
+# different shape: a WINDOW sized to content but CAPPED well short of the
+# full screen (both clients' own `_OVERLAY_MAX_*_FRACTION` constants),
+# leaving the underlying page genuinely visible around the edges ("like a
+# regular window", the user's own phrasing) instead of Phase 8's box that
+# grew toward full-screen the moment the combined global+page keymap list
+# got long enough to hit its old `min(height, len(lines)+2)` cap. Content
+# that overflows the capped window SCROLLS (`clamp_overlay_scroll`/
+# `overlay_footer_text` below) rather than forcing the window bigger --
+# arrows move the scroll position while the overlay is open, taking
+# PRECEDENCE over whatever the current page's own per-page keymap would
+# otherwise bind them to (e.g. pianoroll's arrow-pan, Phase 10 Task A) --
+# each client's own keypress handler is what enforces that precedence
+# (checked BEFORE the normal keymap dispatch, see `clients/tui.py::
+# _handle_key_press`'s/`clients/fb/app.py::_dispatch_evdev_key`'s own
+# docstrings), not anything in this module. Dismiss is narrowed from Phase
+# 8's "ANY key dismisses" to "ESC or q dismisses, arrows scroll" for the
+# same reason -- an arrow press while the window is open must reach the
+# scroll logic, not close the window out from under it.
 
 
 def _entry_display_label(entry, roster: list[str] | None, key: str | None = None) -> str:
@@ -644,29 +653,107 @@ def _section_lines(title: str, section: dict, roster: list[str] | None) -> list[
     return lines
 
 
+def _nav_lines(roster: list[str] | None, current_page: str) -> list[str]:
+    """Item 6's own "nav list (second representation, current page
+    highlighted)" -- one line per page in ROSTER CYCLE order (the same
+    order `page.next`/`page.prev` walk, i.e. what pressing those keys
+    would actually visit next -- deliberately NOT the marquee's v1-ID
+    sort, nor the GLOBAL section's digit-jump targets, both of which
+    already exist elsewhere in this same window; this is a genuinely
+    different, complementary fact: "where am I in the walk order"). The
+    current page is marked with a plain `"> "` text prefix, every other
+    page with two leading spaces so every line still lines up in a
+    monospace renderer -- a TEXT marker, not a color/reverse-video flag,
+    so the fb pixel renderer and the TUI's plain ASCII box render this
+    identically with zero renderer-specific styling logic, the same
+    "build it once here" precedent every other line this module hands
+    both clients already follows. `[]` when `roster` is empty/None (no
+    nav section at all -- matches every other optional-roster fallback in
+    this module, e.g. `_entry_display_label`'s own `page.jump` handling).
+    Titled `"PAGES"`, matching `_section_lines`' own "title as the first
+    element" shape -- so `overlay_lines` below can treat this section
+    exactly like the GLOBAL/page-specific ones it assembles right after."""
+    if not roster:
+        return []
+    return ["PAGES"] + [f"{'> ' if name == current_page else '  '}{name}" for name in roster]
+
+
 def overlay_lines(keymap_global: dict, keymap_page: dict, page_name: str,
                   roster: list[str] | None = None) -> list[str]:
-    """The help overlay's full text content, as plain lines -- a GLOBAL
-    section (every key from `Engine.keymap_global`, full action names,
-    unlike the compact indicator's abbreviated labels: the overlay is the
-    place a user goes to actually LOOK UP a binding, so it should be
-    unambiguous) followed by a blank separator and a `page_name`-titled
-    section for `keymap_page` (skipped entirely when empty -- most pages
-    have no page-specific keys today). `clients/tui.py`'s boxed panel and
+    """The help overlay's full text content, as plain lines -- a PAGES nav
+    section (`_nav_lines` above, skipped when `roster` is empty/omitted),
+    then a GLOBAL section (every key from `Engine.keymap_global`, full
+    action names, unlike the compact indicator's abbreviated labels: the
+    overlay is the place a user goes to actually LOOK UP a binding, so it
+    should be unambiguous), then a `page_name`-titled section for
+    `keymap_page` (skipped entirely when empty -- most pages have no
+    page-specific keys today) -- each present section separated from the
+    next by one blank line. `clients/tui.py`'s boxed panel and
     `clients/fb/app.py`'s pixel key-table both draw this SAME list, never
     their own independently-assembled copy.
 
-    `roster` (optional, the live page cycle order -- see `_entry_display_
-    label`'s own docstring) resolves `page.jump` entries to their actual
-    target page name instead of the bare action name; omitted, this
-    function's output is unchanged from before that enhancement."""
-    lines = _section_lines("GLOBAL", keymap_global, roster)
+    `roster` (optional, the live page cycle order) does DOUBLE duty as of
+    Phase 10 Task B: it still resolves `page.jump` entries to their actual
+    target page name instead of the bare action name (`_entry_display_
+    label`'s own docstring, unchanged), and now ALSO drives the new nav
+    section above. Omitted (the pre-Task-B default), this function's
+    output has no nav section at all and is otherwise unchanged from
+    before either enhancement."""
+    lines = _nav_lines(roster, page_name)
+    global_section = _section_lines("GLOBAL", keymap_global, roster)
+    if global_section:
+        if lines:
+            lines.append("")
+        lines.extend(global_section)
     page_section = _section_lines(page_name.upper(), keymap_page, roster)
     if page_section:
         if lines:
             lines.append("")
         lines.extend(page_section)
     return lines
+
+
+def clamp_overlay_scroll(total_lines: int, visible_rows: int, scroll_offset: int) -> int:
+    """Clamp a requested help-overlay scroll offset to a valid range: `0`
+    when everything already fits (`total_lines <= visible_rows`, the same
+    "static when it fits" precedent `scroll_window` establishes for the
+    marquee/hint text), else `[0, total_lines - visible_rows]` -- never
+    negative, never past the point where the LAST line would sit above
+    the visible window's bottom edge (an empty trailing gap the user
+    would have to scroll past nothing to reach).
+
+    Both clients call this fresh on every repaint (not just when a scroll
+    keypress lands) so a stale offset -- e.g. captured while `page_name`
+    had a long page-specific section, now showing a page with none -- can
+    never draw a blank window with content stranded above/below it; see
+    `clients/tui.py::run_tui`'s/`clients/fb/app.py::_run_device`'s own
+    "clamp on every repaint, persist the clamped value" call sites."""
+    if visible_rows <= 0 or total_lines <= visible_rows:
+        return 0
+    return max(0, min(scroll_offset, total_lines - visible_rows))
+
+
+def overlay_footer_text(scroll_offset: int, visible_count: int, total_lines: int) -> str:
+    """The help overlay's dismiss/scroll hint line -- item 6's "ESC/q
+    dismiss (arrows scroll, NOT dismiss)" made DISCOVERABLE on-screen,
+    since Phase 8's "any key dismisses" no longer holds and a user has no
+    other way to learn the new, narrower dismiss key set. Drawn OUTSIDE
+    the panel's own scrollable content area by both clients (a separate
+    row/strip, never overlapping a content line) so the panel's interior
+    never has to sacrifice a line of actual content to make room for it.
+
+    Always ends with the dismiss hint. The scroll-position hint
+    (`"N-M/total  <arrows> scroll"`) is prepended only when there's
+    actually more content than `visible_count` currently shows
+    (`total_lines > visible_count`) -- mirrors `clamp_overlay_scroll`'s
+    own "static when it fits" contract, so a short panel (most pages,
+    today) shows a plain `"ESC/q close"` with no scroll hint at all."""
+    bits = []
+    if total_lines > visible_count:
+        bits.append(f"{scroll_offset + 1}-{scroll_offset + visible_count}/{total_lines}")
+        bits.append("↑↓ scroll")
+    bits.append("ESC/q close")
+    return "  ".join(bits)
 
 
 def status_text(vm: dict) -> str:

@@ -41,6 +41,10 @@ def test_default_keymap_matches_documented_reality():
     assert DEFAULT_KEYMAP["c"] == "eventlog.clear"
     assert DEFAULT_KEYMAP["n"] == "page.next"
     assert DEFAULT_KEYMAP["?"] == "client.help_toggle"
+    # Phase 10 Task B (docs/demo-feedback-2026-08-12.md item 6): ESC arms
+    # the SAME toggle "?" does -- see DEFAULT_KEYMAP's own comment for why
+    # this is the canonical "KEY_ESCAPE" string, not evdev's "KEY_ESC".
+    assert DEFAULT_KEYMAP["KEY_ESCAPE"] == "client.help_toggle"
     assert CLIENT_QUIT_ACTION == "client.quit"
     assert CLIENT_HELP_TOGGLE_ACTION == "client.help_toggle"
     assert PAGE_JUMP_ACTION == "page.jump"
@@ -49,12 +53,14 @@ def test_default_keymap_matches_documented_reality():
 # -- digit navigation: v1 page-ID based (Phase 9 Task 0, docs/gui-phase-  --
 # -- decisions-2026-08-08.md's Phase-8-CLOSED reconciliation ruling)       --
 
-def test_default_keymap_has_the_four_named_keys_plus_one_binding_per_v1_page_id():
+def test_default_keymap_has_the_five_named_keys_plus_one_binding_per_v1_page_id():
     # One `page.goto` digit/shifted-digit binding per `marquee.PAGE_IDS`
     # entry (14 today) -- NOT a fixed 20-slot scheme like the superseded
     # roster-positional design, since there's no reason to reserve a key
-    # for a v1 ID no page currently claims.
-    named = {"q", "c", "n", "?"}
+    # for a v1 ID no page currently claims. Five named keys as of Phase 10
+    # Task B: the original "q"/"c"/"n" plus "?" and "KEY_ESCAPE" (both
+    # `client.help_toggle`).
+    named = {"q", "c", "n", "?", "KEY_ESCAPE"}
     assert len(DEFAULT_KEYMAP) == len(named) + len(PAGE_IDS)
     assert set(DEFAULT_KEYMAP) - named <= set("1234567890!@#$%^&*()")
 

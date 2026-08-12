@@ -8,6 +8,7 @@ from midicrt.clients.chrome import (
     DEFAULT_MARQUEE_VM,
     DEFAULT_STATUS_VM,
     DEFAULT_TIMESIG_VM,
+    HINT_DISPLAY_S,
     LOOPPROGRESS_BAR_WIDTH,
     OVERLAY_ALERTS_TOPIC,
     OVERLAY_BEATFLASH_TOPIC,
@@ -18,15 +19,16 @@ from midicrt.clients.chrome import (
     alerts_text,
     beatflash_glyph,
     beatprogress_row_text,
+    clamp_overlay_scroll,
     extrapolate_pianoroll_vm,
     format_bpm,
     format_fps,
     header_with_hint,
     loopprogress_bar,
     marquee_window_text,
+    overlay_footer_text,
     overlay_lines,
     page_keymap_hint_text,
-    page_keymap_hint_window_text,
     scroll_window,
     secondary_status_text,
     status_text,
@@ -599,25 +601,11 @@ def test_header_with_hint_truncates_an_oversized_hint_to_fit_width():
     assert len(result) == 10
 
 
-def test_page_keymap_hint_window_text_empty_section_is_blank():
-    assert page_keymap_hint_window_text({}, offset=0, width=40) == ""
-
-
-def test_page_keymap_hint_window_text_static_when_it_fits():
-    section = {"i": "img2txtviz.invert"}
-    assert page_keymap_hint_window_text(section, offset=99, width=40) == "i:invert"
-
-
-def test_page_keymap_hint_window_text_scrolls_when_narrower_than_content():
-    # Same shared `scroll_window` mechanic the marquee uses -- a too-long
-    # hint list is a MOVER (burn-in rule), not a second static string.
-    section = {"1": "a.one", "2": "b.two", "3": "c.three", "4": "d.four"}
-    text = page_keymap_hint_text(section)
-    window_0 = page_keymap_hint_window_text(section, offset=0, width=10)
-    window_5 = page_keymap_hint_window_text(section, offset=5, width=10)
-    assert len(text) > 10   # sanity: scroll IS engaged at this width
-    assert len(window_0) == 10 and len(window_5) == 10
-    assert window_0 != window_5
+def test_hint_display_s_is_a_small_positive_number_of_seconds():
+    # Phase 10 Task B (item 5): the transient hint's own display window --
+    # sanity-check it's a real, small, positive duration, not e.g. 0 (which
+    # would make the hint invisible) or something absurdly long.
+    assert 0 < HINT_DISPLAY_S <= 10
 
 
 # -- help overlay content (Phase 8 Task 6) -----------------------------------
@@ -650,24 +638,95 @@ def test_overlay_lines_resolves_page_jump_to_the_target_page_name_when_roster_gi
     # Live-verification finding (task-6-report.md's self-review): without
     # a roster, all 20 jump keys show the uninformative literal
     # "page.jump" -- with one, each resolves to the actual page it jumps
-    # TO, which is what a human actually wants to know.
+    # TO, which is what a human actually wants to know. A non-empty roster
+    # ALSO now (Phase 10 Task B) prepends the PAGES nav section -- see
+    # test_overlay_lines_includes_a_pages_nav_section_when_roster_given
+    # below for that section's own dedicated coverage.
     roster = ["eventlog", "voices", "harmony"]
     lines = overlay_lines({"2": {"action": "page.jump", "args": {"position": 2}}}, {},
                           "eventlog", roster)
-    assert lines == ["GLOBAL", "  2  -> voices"]
+    assert lines == [
+        "PAGES", "> eventlog", "  voices", "  harmony", "", "GLOBAL", "  2  -> voices",
+    ]
 
 
 def test_overlay_lines_page_jump_out_of_range_position_shows_unassigned_label():
     roster = ["eventlog"]
     lines = overlay_lines({"5": {"action": "page.jump", "args": {"position": 5}}}, {},
                           "eventlog", roster)
-    assert lines == ["GLOBAL", "  5  5 (unassigned)"]
+    assert lines == ["PAGES", "> eventlog", "", "GLOBAL", "  5  5 (unassigned)"]
 
 
 def test_overlay_lines_non_jump_entries_unaffected_by_roster():
     roster = ["eventlog", "voices"]
     lines = overlay_lines({"q": "client.quit"}, {}, "eventlog", roster)
+    assert lines == ["PAGES", "> eventlog", "  voices", "", "GLOBAL", "  q  client.quit"]
+
+
+# -- PAGES nav section (Phase 10 Task B, docs/demo-feedback-2026-08-12.md   --
+# -- item 6: "nav list (second representation, current page highlighted)") --
+
+def test_overlay_lines_includes_a_pages_nav_section_when_roster_given():
+    lines = overlay_lines({}, {}, "voices", ["eventlog", "voices", "harmony"])
+    assert lines == ["PAGES", "  eventlog", "> voices", "  harmony"]
+
+
+def test_overlay_lines_no_pages_section_when_roster_omitted():
+    # Matches every other optional-roster fallback in this module --
+    # omitting `roster` entirely (the pre-Task-B default) must not change
+    # the GLOBAL/page-section-only shape any caller not yet passing a
+    # roster already relies on.
+    lines = overlay_lines({"q": "client.quit"}, {}, "eventlog")
     assert lines == ["GLOBAL", "  q  client.quit"]
+
+
+def test_overlay_lines_no_pages_section_when_roster_is_an_empty_list():
+    lines = overlay_lines({"q": "client.quit"}, {}, "eventlog", [])
+    assert lines == ["GLOBAL", "  q  client.quit"]
+
+
+def test_overlay_lines_pages_nav_section_alone_when_no_keymap_at_all():
+    lines = overlay_lines({}, {}, "eventlog", ["eventlog", "voices"])
+    assert lines == ["PAGES", "> eventlog", "  voices"]
+
+
+# -- overlay scroll clamping (Phase 10 Task B, item 6: "scroll machinery    --
+# -- for overflow") -----------------------------------------------------------
+
+def test_clamp_overlay_scroll_zero_when_content_fits():
+    assert clamp_overlay_scroll(total_lines=5, visible_rows=10, scroll_offset=3) == 0
+
+
+def test_clamp_overlay_scroll_zero_when_exactly_fits():
+    assert clamp_overlay_scroll(total_lines=10, visible_rows=10, scroll_offset=2) == 0
+
+
+def test_clamp_overlay_scroll_never_negative():
+    assert clamp_overlay_scroll(total_lines=20, visible_rows=5, scroll_offset=-3) == 0
+
+
+def test_clamp_overlay_scroll_never_past_the_last_full_page():
+    # 20 lines, 5 visible -> max valid offset is 15 (lines 15..19 shown).
+    assert clamp_overlay_scroll(total_lines=20, visible_rows=5, scroll_offset=99) == 15
+
+
+def test_clamp_overlay_scroll_zero_visible_rows_is_zero():
+    assert clamp_overlay_scroll(total_lines=20, visible_rows=0, scroll_offset=5) == 0
+
+
+def test_clamp_overlay_scroll_passes_through_a_valid_mid_range_offset():
+    assert clamp_overlay_scroll(total_lines=20, visible_rows=5, scroll_offset=7) == 7
+
+
+# -- overlay dismiss/scroll footer text (Phase 10 Task B, item 6) -----------
+
+def test_overlay_footer_text_plain_dismiss_when_content_fits():
+    assert overlay_footer_text(scroll_offset=0, visible_count=5, total_lines=5) == "ESC/q close"
+
+
+def test_overlay_footer_text_includes_scroll_hint_and_position_when_overflowing():
+    text = overlay_footer_text(scroll_offset=2, visible_count=5, total_lines=20)
+    assert text == "3-7/20  ↑↓ scroll  ESC/q close"
 
 
 # -- page.goto v1-ID labels (Phase 9 Task 0, docs/gui-phase-decisions-      --

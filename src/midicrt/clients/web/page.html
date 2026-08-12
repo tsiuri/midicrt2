@@ -107,6 +107,44 @@
   .ascii-grid { line-height: 1.05; letter-spacing: 0; font-size: 10px; }
   /* -- pianoroll / spectrum canvases ---------------------------------------*/
   #page-body canvas { display: block; width: 100%; height: auto; margin-top: 6px; background: #0b0f0c; }
+  /* -- ESC-invoked nav/help overlay (Phase 10 Task B, docs/demo-feedback-
+     2026-08-12.md item 6): a centered WINDOW over the page, backdrop dim
+     (not opaque) so the content behind it stays genuinely visible around
+     the edges ("like a regular window", the user's own phrasing) -- the
+     fb/TUI clients' own redesign, ported here for cross-platform
+     consistency (item 6's "web keydown Escape trivial" platform note).
+     Content OVERFLOW scrolls via plain CSS (`overflow-y: auto`) -- no
+     arrow-key hijacking needed on a mouse/touch-native surface, unlike
+     fb/TUI where arrows are the only pointing device. */
+  #help-overlay { display: none; position: fixed; inset: 0; z-index: 30; }
+  #help-overlay.open { display: block; }
+  #help-overlay-backdrop {
+    position: absolute; inset: 0; background: rgba(0, 0, 0, 0.55);
+  }
+  #help-overlay-window {
+    position: absolute; top: 8%; left: 10%; right: 10%; bottom: 8%;
+    background: #0b0f0c; border: 1px solid #2b6b3a; border-radius: 6px;
+    display: flex; flex-direction: column; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
+  }
+  #help-overlay-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 8px 12px; border-bottom: 1px solid #1f4a29; flex-shrink: 0;
+  }
+  #help-overlay-close {
+    background: transparent; border: none; color: #7CFF9E; font-size: 1.3em;
+    cursor: pointer; line-height: 1; padding: 0 4px;
+  }
+  #help-overlay-body { padding: 10px 14px; overflow-y: auto; flex: 1; font-size: 0.9em; }
+  #help-overlay-body .help-section-title {
+    font-weight: bold; margin-top: 10px; letter-spacing: 0.04em;
+  }
+  #help-overlay-body .help-section-title:first-child { margin-top: 0; }
+  #help-overlay-body .help-current { color: #fff; font-weight: bold; }
+  #help-overlay-body .help-key { display: inline-block; min-width: 5em; opacity: 0.85; }
+  #help-overlay-footer {
+    padding: 6px 14px; border-top: 1px solid #1f4a29; opacity: 0.75;
+    font-size: 0.8em; flex-shrink: 0;
+  }
 </style>
 </head>
 <body>
@@ -149,6 +187,17 @@
   <div id="action-result"></div>
 </div>
 <div id="toast-container"></div>
+<div id="help-overlay">
+  <div id="help-overlay-backdrop"></div>
+  <div id="help-overlay-window">
+    <div id="help-overlay-header">
+      <strong>Pages / Keybinds</strong>
+      <button id="help-overlay-close" type="button" aria-label="Close">&times;</button>
+    </div>
+    <div id="help-overlay-body"></div>
+    <div id="help-overlay-footer">ESC to close</div>
+  </div>
+</div>
 <script>
 const ALLOW_CONTROL = __ALLOW_CONTROL__;
 
@@ -170,10 +219,15 @@ const sysexRecentEl = document.getElementById("sysex-recent");
 const sysexLibraryEl = document.getElementById("sysex-library");
 const sessionsPanelEl = document.getElementById("sessions-panel");
 const sessionsListEl = document.getElementById("sessions-list");
+const helpOverlayEl = document.getElementById("help-overlay");
+const helpOverlayBackdropEl = document.getElementById("help-overlay-backdrop");
+const helpOverlayBodyEl = document.getElementById("help-overlay-body");
+const helpOverlayCloseEl = document.getElementById("help-overlay-close");
 
 let describeCache = null;
 let currentPage = null;
 let recording = false;
+let helpOverlayOpen = false;   // Phase 10 Task B (item 6) -- see toggleHelpOverlay() below
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({
@@ -420,6 +474,61 @@ function renderPageNav(current, pages) {
     }
     pagesEl.appendChild(btn);
   });
+}
+
+// -- ESC-invoked nav/help overlay (Phase 10 Task B, docs/demo-feedback-
+// 2026-08-12.md item 6): the fb/TUI clients' own windowed redesign, ported
+// here for cross-platform consistency ("web keydown Escape trivial", the
+// plan's own platform note for this item) -- built ENTIRELY from data this
+// page already fetches (`describeCache`), no new server surface needed.
+//
+// Unlike fb/TUI, this is NOT gated behind ALLOW_CONTROL: it's a pure,
+// read-only information display (nav roster + keybind reference), useful
+// in BOTH control and read-only modes -- a read-only viewer especially
+// benefits from it, since `renderPageNav`'s own nav buttons render
+// disabled (not hidden) when `!ALLOW_CONTROL`, so this modal is the one
+// place that content stays genuinely INSPECTABLE without the ability to
+// click through it.
+//
+// Content overflow uses plain CSS `overflow-y: auto` (see the stylesheet's
+// own comment on `#help-overlay-body`) -- no arrow-key scroll hijacking
+// needed on a mouse/touch-native surface, unlike fb/TUI where arrows are
+// the only pointing device available at all.
+function _helpOverlaySectionHtml(title, keymap) {
+  const keys = Object.keys(keymap || {}).sort();
+  if (!keys.length) return "";
+  const rows = keys.map((key) => {
+    const entry = keymap[key];
+    const action = typeof entry === "string" ? entry : ((entry && entry.action) || "?");
+    const args = (entry && typeof entry === "object" && entry.args
+                  && Object.keys(entry.args).length) ? JSON.stringify(entry.args) : "";
+    return `<div><span class="help-key">${escapeHtml(key)}</span>` +
+           `${escapeHtml(action)}${args ? "  " + escapeHtml(args) : ""}</div>`;
+  }).join("");
+  return `<div class="help-section-title">${escapeHtml(title)}</div>${rows}`;
+}
+
+function renderHelpOverlay() {
+  const roster = describeCache ? pageRoster(describeCache) : [];
+  const navHtml = roster.length
+    ? `<div class="help-section-title">PAGES</div>` + roster.map((name) => {
+        const cls = name === currentPage ? ' class="help-current"' : "";
+        const marker = name === currentPage ? "&gt; " : "&nbsp;&nbsp;";
+        return `<div${cls}>${marker}${escapeHtml(name)}</div>`;
+      }).join("")
+    : "";
+  const globalHtml = _helpOverlaySectionHtml(
+    "GLOBAL", describeCache && describeCache.keymap_global);
+  const pageHtml = _helpOverlaySectionHtml(
+    (currentPage || "").toUpperCase(), describeCache && describeCache.keymap_page);
+  helpOverlayBodyEl.innerHTML = navHtml + globalHtml + pageHtml
+    || '<div class="help-section-title">(no bindings)</div>';
+}
+
+function toggleHelpOverlay() {
+  helpOverlayOpen = !helpOverlayOpen;
+  if (helpOverlayOpen) renderHelpOverlay();
+  helpOverlayEl.classList.toggle("open", helpOverlayOpen);
 }
 
 // -- per-page renderers (thin: markup only, no protocol logic) ------------
@@ -1032,11 +1141,20 @@ if (ALLOW_CONTROL) {
   // clients/fb/app.py::_build_evdev_special_key_table's own docstrings
   // for those two). Guarded: only fires on the pianoroll page (mirrors
   // the fb/TUI keymap's own PER-PAGE section scoping -- arrows have no
-  // meaning on any other page today), and never while focus is in a real
+  // meaning on any other page today), never while focus is in a real
   // form control (the action-args text inputs, the action <select>) --
   // an arrow keypress there must still move the cursor/selection, not
-  // get hijacked into a pan action.
+  // get hijacked into a pan action -- and (Phase 10 Task B) never while
+  // the help overlay is open: "overlay-open arrows take precedence over
+  // per-page arrows" is the SAME keymap-layering rule the fb/TUI clients'
+  // own `_dispatch_evdev_key`/`_handle_key_press` enforce (see their own
+  // docstrings) -- without this guard, ArrowUp/Down would silently pan
+  // the pianoroll UNDERNEATH the modal at the same time a user thinks
+  // they're just eyeballing the reference (the modal's own scroll is
+  // native CSS, not arrow-driven, so there'd be no compensating benefit
+  // either way).
   document.addEventListener("keydown", (ev) => {
+    if (helpOverlayOpen) return;
     if (currentPage !== "pianoroll") return;
     const tag = ev.target && ev.target.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
@@ -1049,6 +1167,25 @@ if (ALLOW_CONTROL) {
     }
   });
 }
+
+// -- ESC-invoked nav/help overlay: keydown/click wiring (Phase 10 Task B,
+// docs/demo-feedback-2026-08-12.md item 6) -----------------------------
+//
+// Deliberately OUTSIDE the `if (ALLOW_CONTROL)` block above -- unlike the
+// pianoroll arrow-pan handler (which dispatches a real engine action and
+// therefore needs control mode to mean anything), this overlay is pure,
+// read-only information display and works identically in both modes; see
+// `renderHelpOverlay`'s own docstring for why that matters especially for
+// a read-only viewer.
+document.addEventListener("keydown", (ev) => {
+  if (ev.key !== "Escape") return;
+  const tag = ev.target && ev.target.tagName;
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+  ev.preventDefault();
+  toggleHelpOverlay();
+});
+helpOverlayCloseEl.addEventListener("click", () => { if (helpOverlayOpen) toggleHelpOverlay(); });
+helpOverlayBackdropEl.addEventListener("click", () => { if (helpOverlayOpen) toggleHelpOverlay(); });
 
 // -- websocket connection with auto-reconnect + exponential backoff -------
 let backoff = 500;

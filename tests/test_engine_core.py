@@ -1187,6 +1187,66 @@ async def test_page_jump_emits_page_changed_and_keymap_changed_like_page_goto():
     assert [e["name"] for e in events] == ["page_changed", "keymap_changed"]
 
 
+# -- marquee reset-on-page-change (Phase 10 Task B, docs/demo-feedback-      --
+# -- 2026-08-12.md item 7) ---------------------------------------------------
+
+async def test_page_change_resets_the_marquee_to_the_new_pages_own_entry():
+    # `_set_current_page` is the SINGLE funnel every page-nav action goes
+    # through (module docstring) -- one representative action (page.goto)
+    # is enough to prove the wiring; `MarqueeAnalyzer.reset_to_page`'s own
+    # tests (test_analyzers_marquee.py) cover the offset math itself.
+    fake_now = [10.0]
+    eng = Engine(Config())
+    eng._clock = lambda: fake_now[0]
+    marquee = eng.analyzers["marquee"]
+    marquee.tick(fake_now[0])
+    fake_now[0] = 13.0
+    marquee.tick(fake_now[0])   # scroll away from offset 0 first
+    before_offset = marquee.view_model()["offset"]
+    await eng.actions.dispatch("page.goto", {"name": "pianoroll"})
+    vm = marquee.view_model()
+    assert vm["offset"] != before_offset
+    assert vm["doubled"][vm["offset"]:vm["offset"] + len("[8:PIANOROLL]")] == "[8:PIANOROLL]"
+
+
+async def test_page_change_marks_overlay_marquee_dirty_when_the_reset_actually_moves_it():
+    eng = Engine(Config())
+    eng._clock = lambda: 20.0
+    eng.analyzers["marquee"].tick(20.0)
+    eng._dirty.clear()
+    await eng.actions.dispatch("page.goto", {"name": "pianoroll"})
+    assert "overlay.marquee" in eng._dirty
+
+
+async def test_page_change_to_a_page_with_no_marquee_entry_does_not_mark_it_dirty_solely_for_that():
+    # "screensaver" has no v1 page ID (analyzers/marquee.py) -- resetting
+    # to it is a no-op on the marquee itself; `overlay.marquee` may still
+    # be marked dirty by the marquee's own independent wall-clock tick
+    # (unrelated to this transition), but the page-change reset call
+    # itself contributes nothing extra. Proven by comparing to a page.goto
+    # dispatched with the analyzer's tick() never having been called at
+    # all between the two -- if the reset itself were marking it dirty,
+    # THIS dispatch would too, even with a screensaver-bound roster.
+    eng = Engine(Config(pages=["eventlog", "screensaver"]))
+    eng._clock = lambda: 20.0
+    eng._dirty.clear()
+    await eng.actions.dispatch("page.goto", {"name": "screensaver"})
+    assert "overlay.marquee" not in eng._dirty
+
+
+async def test_page_change_still_resumes_scrolling_normally_after_a_reset():
+    fake_now = [0.0]
+    eng = Engine(Config())
+    eng._clock = lambda: fake_now[0]
+    await eng.actions.dispatch("page.goto", {"name": "pianoroll"}, )
+    reset_offset = eng.analyzers["marquee"].view_model()["offset"]
+    fake_now[0] = 1.0
+    eng.analyzers["marquee"].tick(fake_now[0])
+    # Some real time passed post-reset -- the marquee must have kept
+    # advancing from the reset point (not frozen there, not reset to 0).
+    assert eng.analyzers["marquee"].view_model()["offset"] != reset_offset
+
+
 # -- per-page keymap sections (Phase 8 Task 6) -------------------------------
 
 def test_keymap_page_reflects_the_current_pages_own_default_section():

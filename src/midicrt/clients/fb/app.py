@@ -1436,9 +1436,11 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
                   alerts_vm: dict, timesig_vm: dict, beatflash_vm: dict,
                   loopprogress_vm: dict, marquee_vm: dict, *,
                   page_keymap: dict | None = None, keymap_hints_enabled: bool = True,
-                  overlay_active: bool = False, keymap_global: dict | None = None,
+                  hint_active: bool = True,
+                  overlay_active: bool = False, overlay_scroll: int = 0,
+                  keymap_global: dict | None = None,
                   roster: list[str] | None = None, polylimit_vm: dict | None = None,
-                  sysex_vm: dict | None = None, fps_text: str = "") -> None:
+                  sysex_vm: dict | None = None, fps_text: str = "") -> int | None:
     """Render `page`'s body, then all THREE chrome strips -- UNLESS `page`
     is the screensaver page (Important fix, task-9 review), in which case
     NO chrome is painted at all, matching v1's true full-screen blank --
@@ -1495,21 +1497,39 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
     gate and the actual frame-to-frame measurement -- this function only
     ever draws whatever string it's handed, same "renderer stays pure,
     caller owns policy" split every other keyword-only param here
-    follows."""
+    follows.
+
+    Phase 10 Task B (docs/demo-feedback-2026-08-12.md items 5+6):
+    `hint_active` (OPTIONAL, defaults `True` -- preserves the pre-Task-B
+    "always show whenever there's hint text" behavior for any caller not
+    yet updated) gates the transient keymap hint alongside `keymap_hints_
+    enabled` -- the caller (`_run_device`'s redraw loop) computes "is this
+    still within `chrome.HINT_DISPLAY_S` seconds of the last page switch"
+    and passes it in, same "renderer stays pure, caller owns the clock"
+    split `fps_text` above already follows. `overlay_scroll` (OPTIONAL,
+    defaults 0) forwards into `_draw_help_overlay`'s own scroll param --
+    this function's RETURN VALUE is the re-clamped scroll offset `_draw_
+    help_overlay` actually used (`None` when `overlay_active` is False,
+    since there's nothing to clamp), which the caller persists back into
+    its own `overlay_state["scroll"]` so the next arrow-key nudge starts
+    from a value already valid for the CURRENT content -- see `chrome.
+    clamp_overlay_scroll`'s own docstring for why re-clamping every
+    repaint matters."""
     renderer = RENDERERS.get(page, _render_unknown)
     capacity = _header_char_capacity(surface, font)
-    # `hint_budget` is reserved BEFORE computing the hint text (not the
-    # other way around) so `page_keymap_hint_window_text` can decide for
-    # itself whether the hint fits statically or needs to scroll -- fed
-    # the SAME `overlay.marquee` offset the title marquee scrolls on, so a
-    # too-long hint list is a mover too (burn-in rule), not a second
-    # static-bright text this task would otherwise be reintroducing right
-    # next to the one v1 mechanism it's reusing to avoid exactly that.
+    # `hint_budget` reserves header width for the (now TRANSIENT, Phase 10
+    # Task B item 5) keymap hint -- `keymap_hints_enabled` is the boot-time
+    # config gate, `hint_active` is the CALLER's own "are we still within
+    # the post-page-switch display window" clock read (see this function's
+    # own docstring). The hint is drawn PLAIN/motionless now (no more
+    # `page_keymap_hint_window_text` scrolling -- see chrome.py's own
+    # module comment for why a transient-only element needs none), so
+    # `header_with_hint`'s existing hard truncation (`hint_text[:width]`)
+    # is what keeps an unusually long page's hint list from overflowing
+    # its reserved width, exactly as it always has.
     hint_budget = (max(0, capacity // _KEYMAP_HINT_MAX_FRACTION - 1)
-                  if keymap_hints_enabled else 0)
-    hint_text = (chrome.page_keymap_hint_window_text(
-                    page_keymap or {}, marquee_vm.get("offset", 0), hint_budget)
-                if hint_budget else "")
+                  if keymap_hints_enabled and hint_active else 0)
+    hint_text = chrome.page_keymap_hint_text(page_keymap or {}) if hint_budget else ""
     hint_width = len(hint_text) + 1 if hint_text else 0
     marquee_width = max(0, capacity - hint_width)
     marquee_slice = chrome.marquee_window_text(marquee_vm, marquee_width)
@@ -1517,23 +1537,43 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
     renderer(vm, surface, marquee_text)
     if page == SCREENSAVER_PAGE:
         if overlay_active:
-            _draw_help_overlay(surface, font, keymap_global or {}, page_keymap or {}, page, roster)
-        return
+            return _draw_help_overlay(surface, font, keymap_global or {}, page_keymap or {},
+                                      page, roster, overlay_scroll)
+        return None
     _draw_secondary(surface, alerts_vm, timesig_vm, font, polylimit_vm=polylimit_vm,
                     sysex_vm=sysex_vm)
     _draw_status(surface, status_vm, font, fps_text=fps_text)
     _draw_beatprogress(surface, beatflash_vm, loopprogress_vm, font)
     if overlay_active:
-        _draw_help_overlay(surface, font, keymap_global or {}, page_keymap or {}, page, roster)
+        return _draw_help_overlay(surface, font, keymap_global or {}, page_keymap or {}, page,
+                                  roster, overlay_scroll)
+    return None
 
 
-# -- help overlay (Phase 8 Task 6) -------------------------------------------
+# -- help overlay (Phase 8 Task 6; REDESIGNED Phase 10 Task B, docs/demo-
+# feedback-2026-08-12.md item 6) ---------------------------------------------
 
-_OVERLAY_PAD = 8   # px inset between the dim panel's edge and its text, both axes
+_OVERLAY_PAD = 8   # px inset between the panel's edge and its text, both axes
+
+# Item 6's "centered window... content visible around the edges, like a
+# regular window": capped at a FRACTION of the surface, never the full
+# thing -- a real, guaranteed margin on every side, unlike Phase 8's
+# `min(surface.dimension - 2*_OVERLAY_PAD, content size)`, which let the
+# panel grow to (near) the FULL surface the instant the combined global+
+# page keymap list got long enough (today's DEFAULT_KEYMAP alone is ~19
+# global entries) -- on the real 800x475 CRT that read as a "full dimmed
+# backdrop" to the user even though it was technically "sized to content,
+# clamped to the surface". Short content still shrinks the panel to fit it
+# exactly (unchanged from Phase 8) -- only the UPPER bound changed;
+# content that overflows the cap SCROLLS instead of growing the panel
+# further.
+_OVERLAY_MAX_WIDTH_FRACTION = 0.85
+_OVERLAY_MAX_HEIGHT_FRACTION = 0.8
 
 
 def _draw_help_overlay(surface: Surface, font, keymap_global: dict, page_keymap: dict,
-                        page_name: str, roster: list[str] | None = None) -> None:
+                        page_name: str, roster: list[str] | None = None,
+                        scroll_offset: int = 0) -> int:
     """Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
     revamp): a dim panel drawn OVER whatever `_paint_frame` already
     painted onto `surface` this frame -- NOT a `surface.clear()`/page
@@ -1541,35 +1581,57 @@ def _draw_help_overlay(surface: Surface, font, keymap_global: dict, page_keymap:
     the panel's own rect (module docstring: "not a page switch"). Content
     is `chrome.overlay_lines()` -- the SAME line-building both this
     renderer and the TUI's boxed panel share, so the two can never
-    disagree on WHAT the overlay lists.
+    disagree on WHAT the overlay lists (now including the PAGES nav
+    section, item 6's "nav list... current page highlighted").
 
-    "Dim panel" (brief's own wording): the backdrop fills with `LUM_FAINT`
-    (the dimmest tier this codebase's monochrome framework defines, see
-    `clients/fb/lum.py`) rather than `HEADER_BG`'s bright reverse-video
-    treatment every OTHER chrome element uses -- a deliberate LOW-CONTRAST
-    look, distinguishing "a reference panel you summoned on purpose and
-    will dismiss in a second" from the always-on, must-stay-legible-at-a-
-    glance chrome strips. Text draws in `LUM_DIM` for the same reason.
-    Sized to the actual content (centered, clamped to the surface) rather
-    than a fixed box -- a page with no page-specific keys shows a shorter
-    panel than one with several, and `chrome.overlay_lines`'s own "(no
-    bindings)" case never arises in practice (the global section always
-    has at least `q`/`?`) but is handled defensively regardless."""
+    "Dim panel" (Phase 8 brief's own wording, still accurate): the
+    backdrop fills with `LUM_FAINT` (the dimmest tier this codebase's
+    monochrome framework defines, see `clients/fb/lum.py`) rather than
+    `HEADER_BG`'s bright reverse-video treatment every OTHER chrome
+    element uses -- a deliberate LOW-CONTRAST look, distinguishing "a
+    reference panel you summoned on purpose and will dismiss in a second"
+    from the always-on, must-stay-legible-at-a-glance chrome strips. Text
+    draws in `LUM_DIM` for the same reason. Sized to the actual content
+    (centered, capped at `_OVERLAY_MAX_WIDTH_FRACTION`/`_OVERLAY_MAX_
+    HEIGHT_FRACTION` of the surface -- see those constants' own comment
+    for why this changed from Phase 8's "clamped to the surface") -- a
+    page with no page-specific keys shows a shorter panel than one with
+    several, and `chrome.overlay_lines`'s own "(no bindings)" case never
+    arises in practice (the PAGES/global sections always have content
+    once a roster + `q`/`?` exist) but is handled defensively regardless.
+
+    Returns the ACTUAL (re-clamped, `chrome.clamp_overlay_scroll`) scroll
+    offset used -- `_paint_frame`'s own docstring covers why the caller
+    persists this back into `overlay_state["scroll"]`. A dismiss/scroll
+    footer line (`chrome.overlay_footer_text`, item 6's "ESC/q dismiss
+    (arrows scroll)" made discoverable on-screen) is drawn in `LUM_MID`
+    (brighter than the body's `LUM_DIM` -- reads as chrome/status, not
+    content) just BELOW the panel's own rect, in the surrounding margin
+    the fraction cap now guarantees exists -- never inside the panel
+    (never sacrifices a content line to make room for it)."""
     lines = chrome.overlay_lines(keymap_global, page_keymap, page_name, roster)
     if not lines:
         lines = ["(no bindings)"]
     line_h = font.height + LINE_GAP
+    max_box_w = max(1, int(surface.width * _OVERLAY_MAX_WIDTH_FRACTION))
+    max_box_h = max(1, int(surface.height * _OVERLAY_MAX_HEIGHT_FRACTION))
     text_w = max((len(line) for line in lines), default=0) * font.width
-    box_w = min(surface.width - 2 * _OVERLAY_PAD, text_w + 2 * _OVERLAY_PAD)
-    box_h = min(surface.height - 2 * _OVERLAY_PAD, len(lines) * line_h + 2 * _OVERLAY_PAD)
+    box_w = min(max_box_w, text_w + 2 * _OVERLAY_PAD)
+    box_h = min(max_box_h, len(lines) * line_h + 2 * _OVERLAY_PAD)
     box_x = max(0, (surface.width - box_w) // 2)
     box_y = max(0, (surface.height - box_h) // 2)
     surface.rect(box_x, box_y, box_w, box_h, LUM_FAINT)
-    for i, line in enumerate(lines):
+    inner_rows = max(0, (box_h - 2 * _OVERLAY_PAD) // line_h)
+    clamped = chrome.clamp_overlay_scroll(len(lines), inner_rows, scroll_offset)
+    visible = lines[clamped:clamped + inner_rows]
+    for i, line in enumerate(visible):
         y = box_y + _OVERLAY_PAD + i * line_h
-        if y + font.height > box_y + box_h:
-            break   # more lines than the box can hold (shouldn't happen -- sized above) -- clip
         draw_text(surface, box_x + _OVERLAY_PAD, y, line, LUM_DIM, font)
+    footer_text = chrome.overlay_footer_text(clamped, len(visible), len(lines))
+    footer_y = box_y + box_h + LINE_GAP
+    if footer_y + font.height <= surface.height:
+        draw_text(surface, box_x + _OVERLAY_PAD, footer_y, footer_text, LUM_MID, font)
+    return clamped
 
 
 # -- real-device geometry (coded here, exercised only in Task 4) -----------
@@ -1642,19 +1704,33 @@ def _build_evdev_special_key_table(evdev) -> dict[int, str]:
     is exactly one lowercase char", `test_build_evdev_char_table_values_
     are_all_single_lowercase_chars`) stays true and unchanged; `_input_
     loop` merges both tables into one lookup. Phase 10 Task A (docs/demo-
-    feedback-2026-08-12.md item 11) adds the first two entries -- "KEY_UP"/
+    feedback-2026-08-12.md item 11) added the first two entries -- "KEY_UP"/
     "KEY_DOWN", matching blessed's own `Keystroke.name` convention
     (`clients/tui.py`'s `run_tui` normalizes to the SAME strings) and v1's
     own naming for this exact feature (`~/codex/midicrt/pages/pianoroll.py:
     208,213`) -- `engine/keymap.py`'s DEFAULT_PAGE_KEYMAPS["pianoroll"]
     binds these two names, not raw evdev/ASCII forms, so any future named
-    key (e.g. a later task's ESC) has an obvious place to join this table
-    rather than inventing a new mechanism."""
+    key has an obvious place to join this table rather than inventing a
+    new mechanism, EXACTLY as predicted: Phase 10 Task B (docs/demo-
+    feedback-2026-08-12.md item 6) adds `evdev.ecodes.KEY_ESC` here as the
+    third entry -- but mapped to the string `"KEY_ESCAPE"`, NOT evdev's own
+    `"KEY_ESC"` name. Unlike arrows (where evdev and blessed happen to
+    agree on "KEY_UP"/"KEY_DOWN" verbatim), evdev calls this key `KEY_ESC`
+    while blessed's `Keystroke.name` calls it `KEY_ESCAPE` -- two DIFFERENT
+    strings for the same physical key. `engine/keymap.py::DEFAULT_KEYMAP`
+    picked `"KEY_ESCAPE"` as the one canonical string every client's
+    keymap dispatch shares (see that module's own comment for why), so
+    THIS is the one place that bridges the mismatch -- explicitly
+    overriding what would otherwise be the evdev-name default, not an
+    oversight."""
     table = {}
     for name in ("KEY_UP", "KEY_DOWN"):
         code = getattr(evdev.ecodes, name, None)
         if code is not None:
             table[code] = name
+    esc_code = getattr(evdev.ecodes, "KEY_ESC", None)
+    if esc_code is not None:
+        table[esc_code] = "KEY_ESCAPE"   # bridges evdev's "KEY_ESC" -> the shared "KEY_ESCAPE"
     return table
 
 
@@ -1727,21 +1803,37 @@ def _dispatch_evdev_key(client: EngineClient, key: str, keymap: dict,
     this failure at all, forever).
 
     Phase 8 Task 6 (help overlay, docs/gui-phase-decisions-2026-08-08.md
-    keymap revamp): `overlay_state` is the shared `{"active": bool}`
-    mutable dict `_run_device` also reads from its render loop to decide
-    whether to paint the overlay panel -- the SAME "shared dict, GIL-atomic
-    single-key read/write, no lock needed" pattern `state["keymap"]`/
-    `get_keymap()` already use elsewhere in this module. Two rules, checked
-    in this order (module docstring: "ANY key dismisses" while active):
-      1. If the overlay IS currently active, THIS key (whatever it is)
-         dismisses it and is SWALLOWED -- never reaches `dispatch_key`/the
-         engine at all, matching v1 having no overlay precedent to
-         contradict and the brief's own explicit "next key -> dismiss +
-         swallow" design.
-      2. Otherwise, resolve normally via `dispatch_key` (`clients/base.py`)
-         -- the TUI client's SAME resolution function. `KEY_HELP_TOGGLE`
-         (the `client.help_toggle` pseudo-action) flips `overlay_state
-         ["active"]` to `True` and returns `False` (never quits).
+    keymap revamp); REDESIGNED Phase 10 Task B (docs/demo-feedback-
+    2026-08-12.md item 6): `overlay_state` is the shared `{"active": bool,
+    "scroll": int}` mutable dict `_run_device` also reads from its render
+    loop to decide whether/how to paint the overlay panel -- the SAME
+    "shared dict, GIL-atomic single-key read/write, no lock needed"
+    pattern `state["keymap"]`/`get_keymap()` already use elsewhere in this
+    module. Rules, checked in this order, while the overlay IS active
+    (item 6 narrows Phase 8's "ANY key dismisses" to "ESC or q dismisses,
+    arrows scroll"):
+      1. `"KEY_ESCAPE"` or `"q"` dismisses -- SWALLOWED, never reaches
+         `dispatch_key`/the engine. `"q"` deliberately does NOT fall
+         through to `client.quit` here: while the overlay is open, `q`
+         closes IT, not the whole client (the SAME real behavior change
+         `clients/tui.py::_handle_key_press`'s own docstring discloses).
+      2. `"KEY_UP"`/`"KEY_DOWN"` adjust `overlay_state["scroll"]` by one
+         line (clamped at 0 on the low end here; the HIGH end is clamped
+         by `_draw_help_overlay`'s own `chrome.clamp_overlay_scroll` call
+         against the CURRENT content/window size) -- also SWALLOWED. This
+         is what makes "overlay-open arrows take precedence over per-page
+         arrows" (e.g. pianoroll's own arrow-pan, Phase 10 Task A) true:
+         checking this BEFORE `dispatch_key` means `dispatch_key` never
+         even SEES "KEY_UP" while the overlay is open.
+      3. Any OTHER key while the overlay is open is SWALLOWED with no
+         effect -- the overlay is a modal window, not a transparent
+         input pass-through.
+    Otherwise (overlay not active): resolve normally via `dispatch_key`
+    (`clients/base.py`) -- the TUI client's SAME resolution function.
+    `KEY_HELP_TOGGLE` (the `client.help_toggle` pseudo-action, now armable
+    by either "?" or "KEY_ESCAPE") flips `overlay_state["active"]` to
+    `True`, resets `overlay_state["scroll"]` to 0 (opening always starts
+    at the top), and returns `False` (never quits).
 
     A `ClientError` (a rejected action -- bad/missing args, unknown
     action) is ALWAYS treated as "an action failed, not fatal": logged as
@@ -1749,8 +1841,17 @@ def _dispatch_evdev_key(client: EngineClient, key: str, keymap: dict,
     function returns `False`. Returns `True` only for the `client.quit`
     pseudo-action."""
     if overlay_state.get("active"):
-        overlay_state["active"] = False
-        return False
+        if key in ("KEY_ESCAPE", "q"):
+            overlay_state["active"] = False
+            overlay_state["scroll"] = 0
+            return False
+        if key == "KEY_UP":
+            overlay_state["scroll"] = max(0, overlay_state.get("scroll", 0) - 1)
+            return False
+        if key == "KEY_DOWN":
+            overlay_state["scroll"] = overlay_state.get("scroll", 0) + 1
+            return False
+        return False   # any other key while the overlay is open: swallowed, no effect
     try:
         outcome = dispatch_key(client, key, keymap)
     except ClientError as exc:
@@ -1761,6 +1862,7 @@ def _dispatch_evdev_key(client: EngineClient, key: str, keymap: dict,
         return False
     if outcome == KEY_HELP_TOGGLE:
         overlay_state["active"] = True
+        overlay_state["scroll"] = 0
         return False
     return outcome == KEY_QUIT
 
@@ -1868,6 +1970,10 @@ def _make_page_switcher(client: EngineClient, state: dict, max_rate: float):
             new_topic = f"page.{new_page}"
             switch_topic(client, state["topic"], new_topic, max_rate)
             state["page"], state["topic"] = new_page, new_topic
+            # Phase 10 Task B (item 5): every page transition (any origin --
+            # `page_changed` is Engine._set_current_page's own single
+            # funnel event) restarts the transient hint's display window.
+            state["page_switch_ts"] = time.time()
         elif msg.get("kind") == "event" and msg.get("name") == "keymap_changed":
             bundle = fetch_keymap_sections(client)
             state["keymap"] = bundle["effective"]
@@ -1937,7 +2043,24 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
              "sysex_vm": dict(chrome.DEFAULT_SYSEX_VM),
              # Phase 10 Task A: last ACTUAL repaint's wall-clock timestamp
              # -- see `_next_fps_text`'s own docstring just below.
-             "_fps_last_t": None}
+             "_fps_last_t": None,
+             # Phase 10 Task B (item 5): wall-clock timestamp of the most
+             # recent page switch (startup counts as the first one) --
+             # `_hint_active` below stops showing the transient per-page
+             # keymap hint `chrome.HINT_DISPLAY_S` seconds after this.
+             # Bumped by `_make_page_switcher`'s `on_event` on every
+             # `page_changed`.
+             "page_switch_ts": time.time()}
+
+    def _hint_active() -> bool:
+        """Phase 10 Task B (item 5): True while the transient per-page
+        keymap hint is still within its display window since the last
+        page switch -- same shape as `clients/tui.py::_hint_active`, a
+        closure here (not a module function taking `state`) purely
+        because every other small per-loop helper in THIS function
+        already follows that convention (`_next_fps_text`, `_render_vm`
+        right below)."""
+        return time.time() - state["page_switch_ts"] < chrome.HINT_DISPLAY_S
 
     def _next_fps_text() -> str:
         """Returns the `chrome.format_fps` text for THIS repaint (empty
@@ -1980,10 +2103,11 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
         return chrome.extrapolate_pianoroll_vm(vm, elapsed_s)
 
     on_event = _make_page_switcher(client, state, fps)
-    # Phase 8 Task 6 (help overlay): shared with `_input_loop`'s background
-    # thread the SAME way `state["keymap"]` is -- see `_dispatch_evdev_key`'s
-    # own docstring for the swallow-while-active contract this backs.
-    overlay_state = {"active": False}
+    # Phase 8 Task 6 (help overlay); "scroll" added Phase 10 Task B (item
+    # 6): shared with `_input_loop`'s background thread the SAME way
+    # `state["keymap"]` is -- see `_dispatch_evdev_key`'s own docstring for
+    # the swallow/scroll-while-active contract this backs.
+    overlay_state = {"active": False, "scroll": 0}
 
     fb_file, fb_mm = open_fb_mmap(fb_path, stride * height)
     try:
@@ -2009,15 +2133,19 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
 
         vm = wait_first_snapshot(inbox, lambda: state["topic"], on_event)
         vm_topic = state["topic"]
-        _paint_frame(surface, state["page"], _render_vm(state["page"], vm), font,
-                     state["status_vm"],
-                     state["alerts_vm"], state["timesig_vm"],
-                     state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"],
-                     page_keymap=state["keymap_page"],
-                     keymap_hints_enabled=state["keymap_hints_enabled"],
-                     overlay_active=overlay_state["active"], keymap_global=state["keymap_global"],
-                     roster=state["roster"], polylimit_vm=state["polylimit_vm"],
-                     sysex_vm=state["sysex_vm"], fps_text=_next_fps_text())
+        clamped_scroll = _paint_frame(
+            surface, state["page"], _render_vm(state["page"], vm), font,
+            state["status_vm"],
+            state["alerts_vm"], state["timesig_vm"],
+            state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"],
+            page_keymap=state["keymap_page"],
+            keymap_hints_enabled=state["keymap_hints_enabled"], hint_active=_hint_active(),
+            overlay_active=overlay_state["active"], overlay_scroll=overlay_state["scroll"],
+            keymap_global=state["keymap_global"],
+            roster=state["roster"], polylimit_vm=state["polylimit_vm"],
+            sysex_vm=state["sysex_vm"], fps_text=_next_fps_text())
+        if clamped_scroll is not None:
+            overlay_state["scroll"] = clamped_scroll
         surface.write_to_mmap(fb_mm, stride=stride)
         # Phase 8 Task 6: the overlay's on/off state changes on the INPUT
         # thread (a keypress), not through any of the drained topics below
@@ -2026,7 +2154,12 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
         # happened to coincide with it. Compared every tick against the
         # value as of the LAST paint (this local, not `overlay_state`
         # itself, which the input thread can flip again between checks).
+        # Phase 10 Task B: `overlay_scroll_prev` is the SAME "compare
+        # against the last-painted value" pattern, for a scroll nudge that
+        # happens while the overlay STAYS open (open/close state alone
+        # doesn't change at all in that case).
         overlay_active_prev = overlay_state["active"]
+        overlay_scroll_prev = overlay_state["scroll"]
 
         period = 1.0 / fps
         while not quit_event.is_set():
@@ -2103,6 +2236,23 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             overlay_now = overlay_state["active"]
             overlay_changed = overlay_now != overlay_active_prev
             overlay_active_prev = overlay_now
+            # Phase 10 Task B (item 6): the SAME "compare against the last
+            # PAINTED value" pattern as `overlay_changed` above, for an
+            # arrow-key scroll nudge that happens while the overlay STAYS
+            # open (its own on/off state doesn't change in that case).
+            overlay_scroll_now = overlay_state["scroll"]
+            overlay_scroll_changed = overlay_scroll_now != overlay_scroll_prev
+            overlay_scroll_prev = overlay_scroll_now
+            # Phase 10 Task B (item 5): the transient per-page keymap hint
+            # has no drained-topic/keypress event of its own marking it
+            # stale -- it simply stops being within `chrome.HINT_DISPLAY_S`
+            # seconds of the last page switch at some wall-clock instant.
+            # Forcing a repaint every tick while it's STILL active (not
+            # just once at expiry) means the tick that finally crosses the
+            # threshold actually repaints WITHOUT it, same "keep
+            # repainting while a transient display window is open" pattern
+            # `clients/tui.py::run_tui`'s own bottom-of-loop check follows.
+            hint_now = _hint_active()
             vm_is_current = vm_topic == state["topic"]
             # Phase 10 Task A (docs/demo-feedback-2026-08-12.md items 3+9):
             # the pianoroll page repaints EVERY tick while it's current --
@@ -2119,20 +2269,26 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
             pianoroll_live = vm_is_current and state["page"] == "pianoroll"
             if vm_is_current and (page_updated or status_updated or secondary_updated
                                    or beatprogress_updated or marquee_updated
-                                   or overlay_changed or pianoroll_live):
+                                   or overlay_changed or overlay_scroll_changed
+                                   or pianoroll_live or hint_now):
                 # `render_frame` clears the WHOLE surface, so all THREE
                 # chrome strips must be repainted on every redraw, not just
                 # when their own vm changed (`_paint_frame` skips them
                 # entirely on the screensaver page -- see its own docstring).
-                _paint_frame(surface, state["page"], _render_vm(state["page"], vm), font,
-                             state["status_vm"],
-                             state["alerts_vm"], state["timesig_vm"],
-                             state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"],
-                             page_keymap=state["keymap_page"],
-                             keymap_hints_enabled=state["keymap_hints_enabled"],
-                             overlay_active=overlay_now, keymap_global=state["keymap_global"],
-                             roster=state["roster"], polylimit_vm=state["polylimit_vm"],
-                             sysex_vm=state["sysex_vm"], fps_text=_next_fps_text())
+                clamped_scroll = _paint_frame(
+                    surface, state["page"], _render_vm(state["page"], vm), font,
+                    state["status_vm"],
+                    state["alerts_vm"], state["timesig_vm"],
+                    state["beatflash_vm"], state["loopprogress_vm"], state["marquee_vm"],
+                    page_keymap=state["keymap_page"],
+                    keymap_hints_enabled=state["keymap_hints_enabled"], hint_active=hint_now,
+                    overlay_active=overlay_now, overlay_scroll=overlay_state["scroll"],
+                    keymap_global=state["keymap_global"],
+                    roster=state["roster"], polylimit_vm=state["polylimit_vm"],
+                    sysex_vm=state["sysex_vm"], fps_text=_next_fps_text())
+                if clamped_scroll is not None:
+                    overlay_state["scroll"] = clamped_scroll
+                    overlay_scroll_prev = clamped_scroll
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
     finally:
@@ -2141,7 +2297,8 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
 
 
 def run(socket_path: str, fb_path: str, out_path: str | None,
-        no_input: bool, fps: float, show_overlay: bool = False) -> int:
+        no_input: bool, fps: float, show_overlay: bool = False,
+        overlay_scroll: int = 0) -> int:
     client = EngineClient(socket_path)
     overlay_topics = [chrome.OVERLAY_STATUS_TOPIC, chrome.OVERLAY_ALERTS_TOPIC,
                        chrome.OVERLAY_TIMESIG_TOPIC, chrome.OVERLAY_BEATFLASH_TOPIC,
@@ -2227,7 +2384,8 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
                          marquee["vm"],
                          page_keymap=keymap_bundle["page"],
                          keymap_hints_enabled=keymap_bundle.get("hints_enabled", True),
-                         overlay_active=show_overlay, keymap_global=keymap_bundle["global"],
+                         overlay_active=show_overlay, overlay_scroll=overlay_scroll,
+                         keymap_global=keymap_bundle["global"],
                          roster=keymap_bundle.get("roster", []),
                          polylimit_vm=secondary["polylimit_vm"],
                          sysex_vm=secondary["sysex_vm"],
@@ -2276,10 +2434,14 @@ def main() -> None:
     ap.add_argument("--overlay", action="store_true",
                      help="(--out only) render one frame WITH the help overlay panel "
                           "shown, for live verification without a real keyboard")
+    ap.add_argument("--overlay-scroll", type=int, default=0,
+                     help="(--out --overlay only) scroll offset into the overlay's own "
+                          "content -- for live verification that overflow actually scrolls")
     args = ap.parse_args()
 
     socket_path = args.socket or config_mod.load(None).socket_path
-    raise SystemExit(run(socket_path, args.fb, args.out, args.no_input, args.fps, args.overlay))
+    raise SystemExit(run(socket_path, args.fb, args.out, args.no_input, args.fps, args.overlay,
+                         args.overlay_scroll))
 
 
 if __name__ == "__main__":

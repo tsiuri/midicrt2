@@ -155,18 +155,59 @@ PAGE_TITLES: dict[str, str] = {
 }
 
 
+_JOIN = "  "   # v1's own `"  ".join(...)` separator -- named for `_page_start_offsets`' own use
+
+
+def _sorted_entries(roster: list[str]) -> list[tuple[int, str, str]]:
+    """`(v1 id, page name, title)` triples, sorted by v1 page ID -- the SAME
+    entry set/order `_marquee_text` has always built, factored out (Phase
+    10 Task B, docs/demo-feedback-2026-08-12.md item 7) so `_page_start_
+    offsets` below can compute character offsets for the IDENTICAL entries
+    `_marquee_text` joins into a string, without either function risking
+    disagreement on which pages appear or in what order."""
+    return sorted(
+        ((PAGE_IDS[name], name, PAGE_TITLES.get(name, name.upper()))
+         for name in roster if name in PAGE_IDS),
+        key=lambda e: e[0],
+    )
+
+
 def _marquee_text(roster: list[str]) -> str:
     """v1's exact `"  ".join(f"[{pid}:{name}]" for pid, p in sorted(...))`
     -- entries sorted by v1 page ID (NOT roster/insertion order), names
     absent from `PAGE_IDS` (no v1 page concept, e.g. "screensaver") silently
     excluded, matching v1's own `PAGES` dict never having contained them
     either."""
-    entries = sorted(
-        ((PAGE_IDS[name], PAGE_TITLES.get(name, name.upper()))
-         for name in roster if name in PAGE_IDS),
-        key=lambda e: e[0],
-    )
-    return "  ".join(f"[{pid}:{title}]" for pid, title in entries)
+    entries = _sorted_entries(roster)
+    return _JOIN.join(f"[{pid}:{title}]" for pid, _name, title in entries)
+
+
+def _page_start_offsets(roster: list[str]) -> dict[str, int]:
+    """Page name -> the character index within `_marquee_text(roster)`
+    where that page's OWN `"[pid:TITLE]"` entry begins -- Phase 10 Task B
+    (docs/demo-feedback-2026-08-12.md item 7): `MarqueeAnalyzer.reset_to_
+    page` uses this to know where to restart the scroll window so the
+    just-switched-to page's own entry lands at the marquee's LEFT edge.
+    Built from the SAME `_sorted_entries` list `_marquee_text` itself joins
+    (same order, same separator width, same excluded-names rule) so the
+    two can never disagree about where an entry actually sits in the
+    joined string.
+
+    A page name absent from `PAGE_IDS` (no v1 page concept -- only
+    "screensaver" today, see this module's own "Page roster + titles"
+    docstring section) is simply absent from this dict too -- `reset_to_
+    page` treats that as "nothing to reset to" and leaves the scroll
+    position wherever it already was, the same disclosed no-op every
+    other "no v1 ID" case in this module already documents."""
+    entries = _sorted_entries(roster)
+    offsets: dict[str, int] = {}
+    pos = 0
+    for i, (pid, name, title) in enumerate(entries):
+        offsets[name] = pos
+        pos += len(f"[{pid}:{title}]")
+        if i < len(entries) - 1:
+            pos += len(_JOIN)
+    return offsets
 
 
 def autoconnect_window_size(msg_len: int, max_avail: int) -> int:
@@ -189,7 +230,13 @@ class MarqueeAnalyzer:
     title text + pre-doubled string + current integer offset for CLIENT
     renderers to slice (screen-width-aware slicing happens in
     `clients/chrome.py::marquee_window_text` -- see module docstring's
-    "Screen width is a renderer concern" section)."""
+    "Screen width is a renderer concern" section).
+
+    `reset_to_page` (Phase 10 Task B, docs/demo-feedback-2026-08-12.md item
+    7) is the ONE other public mutator: `Engine._set_current_page` calls it
+    on EVERY page transition (all origins) so the marquee window restarts
+    with the newly-current page's own entry leftmost, then resumes normal
+    scrolling from there -- see that method's own docstring."""
 
     def __init__(self, roster: list[str], speed_cps: float = HEADER_SCROLL_SPEED) -> None:
         self._text = _marquee_text(roster)
@@ -198,6 +245,13 @@ class MarqueeAnalyzer:
         self._speed = float(speed_cps)
         self._anchor: float | None = None
         self._offset: int = 0
+        # Phase 10 Task B (item 7): the offset `tick()`'s own anchor-
+        # relative formula below adds to `int(speed * elapsed)` -- stays 0
+        # (a pure no-op) unless `reset_to_page` has ever been called, so
+        # every PRE-existing behavior/test (which never calls it) is
+        # completely unaffected by this field's mere existence.
+        self._base_offset: int = 0
+        self._page_offsets: dict[str, int] = _page_start_offsets(roster)
 
     def handle(self, ev: MidiEvent) -> bool:
         return False   # no MIDI dependency, mirrors v1 exactly (see module docstring)
@@ -210,9 +264,50 @@ class MarqueeAnalyzer:
             self._offset = 0
             return changed
         elapsed = now - self._anchor
-        offset = int(self._speed * elapsed) % self._modulo
+        offset = (self._base_offset + int(self._speed * elapsed)) % self._modulo
         changed = offset != self._offset
         self._offset = offset
+        return changed
+
+    def reset_to_page(self, page_name: str, now: float) -> bool:
+        """Restart the scroll window so `page_name`'s own `"[pid:TITLE]"`
+        entry sits at the marquee's LEFT edge, then resume scrolling
+        normally from `now` -- item 7's "on any current_page change ...
+        marquee window restarts with new page leftmost, then resumes
+        scrolling" literally. Called by `Engine._set_current_page` on
+        EVERY page transition (digit/tab/action/sysex/pagecycle/
+        screensaver -- every origin funnels through that one method, see
+        its own docstring), so this is the single place item 7's whole
+        behavior lives.
+
+        A `page_name` with no marquee entry at all (`_page_offsets`
+        doesn't have it -- only "screensaver" today, see that function's
+        own docstring) is a no-op: there is no entry to put at the left
+        edge, so the window is left exactly where it already was. Returns
+        whether the OFFSET actually changed, mirroring `tick()`'s own
+        "did anything visibly move" return contract -- `Engine._set_
+        current_page` uses this to decide whether `overlay.marquee` needs
+        marking dirty, so resetting to a page that's already sitting at
+        offset 0 (or transitioning while the marquee doesn't scroll at
+        all, `_modulo <= 0`) doesn't force a redundant repaint.
+
+        Implementation: rather than a one-off write to `self._offset`
+        (which `tick()`'s own anchor-relative formula would silently
+        overwrite on its very next call), this moves the anchor to `now`
+        and sets `self._base_offset` to the target index -- the SAME
+        formula `tick()` already uses (`base_offset + int(speed *
+        elapsed)) % modulo`) then reproduces `target` exactly on the very
+        next `tick(now)` call (`elapsed == 0`), and every LATER call
+        resumes advancing from there at the configured speed, exactly as
+        if the marquee had been anchored there all along."""
+        target = self._page_offsets.get(page_name)
+        if target is None or self._modulo <= 0:
+            return False
+        target %= self._modulo
+        self._anchor = now
+        self._base_offset = target
+        changed = self._offset != target
+        self._offset = target
         return changed
 
     def view_model(self) -> dict:

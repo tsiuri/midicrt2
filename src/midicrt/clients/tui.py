@@ -900,17 +900,52 @@ def _handle_key_press(client, key: str, state: dict) -> bool:
     `client.quit` pseudo-action.
 
     Phase 8 Task 6 (help overlay, docs/gui-phase-decisions-2026-08-08.md
-    keymap revamp): `state["help_overlay"]` is the sticky bool this
+    keymap revamp; REDESIGNED Phase 10 Task B, docs/demo-feedback-
+    2026-08-12.md item 6): `state["help_overlay"]` is the sticky bool this
     function owns (mirrors `state["learn_armed"]`'s own sticky-flag
-    precedent right below in this module). Two rules, checked in this
-    order (module docstring: "ANY key dismisses"):
-      1. If the overlay IS currently showing, THIS key dismisses it and
-         is SWALLOWED -- never reaches `dispatch_key`/the engine.
-      2. Otherwise, `KEY_HELP_TOGGLE` (`client.help_toggle`) sets the flag
-         and returns `False` (never quits)."""
+    precedent right below in this module); `state["overlay_scroll"]` is
+    the companion scroll-position int (re-clamped every repaint by
+    `render_help_overlay_box` -- see that function's own docstring).
+    Rules, checked in this order, while the overlay IS currently showing
+    (item 6 narrows Phase 8's "ANY key dismisses" to "ESC or q dismisses,
+    arrows scroll"):
+      1. `"KEY_ESCAPE"` or `"q"` dismisses -- SWALLOWED, never reaches
+         `dispatch_key`/the engine. `"q"` deliberately does NOT fall
+         through to its normal `client.quit` meaning here: while the
+         overlay is open, `q` closes IT, not the whole client -- a real
+         behavior change from when the overlay wasn't active, disclosed
+         explicitly since it's easy to miss in a diff.
+      2. `"KEY_UP"`/`"KEY_DOWN"` adjust `state["overlay_scroll"]` by one
+         line (clamped at 0 on the low end here; the HIGH end is clamped
+         by `render_help_overlay_box`'s own `chrome.clamp_overlay_scroll`
+         call against the CURRENT content/window size, which this
+         function has no access to) -- also SWALLOWED. This is the
+         "overlay-open arrows take precedence over per-page arrows"
+         requirement (item 6's own platform note; e.g. pianoroll's own
+         arrow-pan, Phase 10 Task A) -- checking this BEFORE `dispatch_
+         key` is what enforces that precedence, since `dispatch_key`
+         would otherwise happily resolve "KEY_UP" through the CURRENT
+         page's own keymap section.
+      3. Any OTHER key while the overlay is open is SWALLOWED with no
+         effect at all -- the overlay is a modal window, not a
+         transparent input pass-through.
+    Otherwise (overlay not showing): `KEY_HELP_TOGGLE` (`client.
+    help_toggle`, now armable by either "?" or "KEY_ESCAPE", see engine/
+    keymap.py's own DEFAULT_KEYMAP comment) sets the flag AND resets
+    `state["overlay_scroll"]` to 0 -- opening always starts at the top,
+    never resumes wherever a PREVIOUS session happened to leave off."""
     if state.get("help_overlay"):
-        state["help_overlay"] = False
-        return False
+        if key in ("KEY_ESCAPE", "q"):
+            state["help_overlay"] = False
+            state["overlay_scroll"] = 0
+            return False
+        if key == "KEY_UP":
+            state["overlay_scroll"] = max(0, state.get("overlay_scroll", 0) - 1)
+            return False
+        if key == "KEY_DOWN":
+            state["overlay_scroll"] = state.get("overlay_scroll", 0) + 1
+            return False
+        return False   # any other key while the overlay is open: swallowed, no effect
     try:
         outcome = dispatch_key(client, key, state["keymap"])
     except ClientError as exc:
@@ -919,6 +954,7 @@ def _handle_key_press(client, key: str, state: dict) -> bool:
         return False
     if outcome == KEY_HELP_TOGGLE:
         state["help_overlay"] = True
+        state["overlay_scroll"] = 0
         return False
     return outcome == KEY_QUIT
 
@@ -932,6 +968,16 @@ def _active_error_text(state: dict) -> str | None:
     if state.get("last_error") and time.time() < state.get("last_error_until", 0):
         return state["last_error"]
     return None
+
+
+def _hint_active(state: dict) -> bool:
+    """Phase 10 Task B (item 5): True while the transient per-page keymap
+    hint is still within its `chrome.HINT_DISPLAY_S`-second display window
+    since the last page switch (`state["page_switch_ts"]`, bumped by
+    `on_event`'s `page_changed` branch) -- same "compute freshness from a
+    timestamp, no explicit expiry step" shape as `_active_error_text`
+    above, just keyed off a page switch instead of a recorded error."""
+    return time.time() - state.get("page_switch_ts", 0.0) < chrome.HINT_DISPLAY_S
 
 
 # -- DAW-style MIDI learn status-line flash (Phase 4 Task 3,
@@ -985,7 +1031,8 @@ def _apply_learn_event(state: dict, msg: dict) -> None:
         _set_learn_message(state, f"LEARN: cancelled ({reason})")
 
 
-# -- help overlay (Phase 8 Task 6) -------------------------------------------
+# -- help overlay (Phase 8 Task 6; REDESIGNED Phase 10 Task B, docs/demo-
+# feedback-2026-08-12.md item 6) ---------------------------------------------
 #
 # TUI equivalent of `clients/fb/app.py::_draw_help_overlay` -- an
 # alternate-screen-style boxed panel (module docstring's own "TUI:
@@ -993,40 +1040,64 @@ def _apply_learn_event(state: dict, msg: dict) -> None:
 # (the TUI has no dimming primitive, and burn-in isn't a real concern on
 # a terminal emulator anyway -- see chrome.py's own indicator docstring
 # for why the TUI skips the fb-specific burn-in machinery entirely). Reuses
-# `chrome.overlay_lines()` for CONTENT (global + current-page sections),
-# same as the fb renderer -- only the ASCII border framing here is TUI-
-# specific.
+# `chrome.overlay_lines()` for CONTENT (nav + global + current-page
+# sections), same as the fb renderer -- only the ASCII border framing here
+# is TUI-specific.
+#
+# Item 6's "centered window... content visible around the edges, like a
+# regular window": the box is capped at `_OVERLAY_MAX_WIDTH_FRACTION`/
+# `_OVERLAY_MAX_HEIGHT_FRACTION` of the terminal -- a REAL margin
+# guaranteed on every side, unlike Phase 8's `min(height, len(lines)+2)`,
+# which let the box grow all the way to the full terminal height the
+# moment the combined global+page keymap list got long enough (today's
+# DEFAULT_KEYMAP alone is ~19 global entries). Short content still shrinks
+# the box to fit it exactly (unchanged from Phase 8) -- only the UPPER
+# bound changed; content that overflows the cap SCROLLS instead of
+# growing the box further.
+_OVERLAY_MAX_WIDTH_FRACTION = 0.85
+_OVERLAY_MAX_HEIGHT_FRACTION = 0.8
 
 
 def render_help_overlay_box(keymap_global: dict, keymap_page: dict, page_name: str,
                             width: int, height: int,
-                            roster: list[str] | None = None) -> tuple[int, int, list[str]]:
-    """Returns `(box_x, box_y, rows)`: the box's top-left terminal
-    position and its own full row strings (border included) -- sized to
-    the actual content, centered, clamped to `width`x`height`. `run_tui`
-    blits each row via `term.move_xy(box_x, box_y + i) + row`, writing
-    ONLY the box's own columns so the rest of whatever frame was already
-    printed underneath is left completely undisturbed outside the box's
-    own rectangle (module docstring: "not a page switch" -- the page
-    keeps rendering beneath; here that means literally: this function
-    never touches the terminal itself, and the caller only overwrites the
-    exact cells the box occupies). `roster` (optional, the live page
-    cycle order) resolves `page.jump` entries to their target page name --
-    see `clients/chrome.py::overlay_lines`'s own docstring."""
+                            roster: list[str] | None = None,
+                            scroll_offset: int = 0) -> tuple[int, int, list[str], int]:
+    """Returns `(box_x, box_y, rows, scroll_offset)`: the box's top-left
+    terminal position, its own full row strings (border included), and
+    the ACTUAL (re-clamped) scroll offset used -- `run_tui` blits each row
+    via `term.move_xy(box_x, box_y + i) + row`, writing ONLY the box's own
+    columns so the rest of whatever frame was already printed underneath
+    is left completely undisturbed outside the box's own rectangle
+    (module docstring: "not a page switch" -- the page keeps rendering
+    beneath; here that means literally: this function never touches the
+    terminal itself, and the caller only overwrites the exact cells the
+    box occupies), and stores the returned `scroll_offset` back into
+    `state["overlay_scroll"]` so the NEXT arrow-key nudge starts from a
+    value already valid for the CURRENT content (see `chrome.clamp_
+    overlay_scroll`'s own docstring for why re-clamping on every repaint,
+    not just at the point of the +/-1 nudge, matters). `roster` (optional,
+    the live page cycle order) resolves `page.jump` entries to their
+    target page name AND drives the new PAGES nav section -- see
+    `clients/chrome.py::overlay_lines`'s own docstring."""
     lines = chrome.overlay_lines(keymap_global, keymap_page, page_name, roster)
     if not lines:
         lines = ["(no bindings)"]
-    inner_w = max(1, min(max(0, width - 4), max(len(line) for line in lines)))
+    max_box_w = max(1, int(width * _OVERLAY_MAX_WIDTH_FRACTION))
+    max_box_h = max(1, int(height * _OVERLAY_MAX_HEIGHT_FRACTION))
+    inner_w = max(1, min(max(0, max_box_w - 4), max(len(line) for line in lines)))
     box_w = inner_w + 4
-    box_h = min(height, len(lines) + 2)
+    box_h = min(max_box_h, len(lines) + 2)
+    inner_h = max(0, box_h - 2)
+    clamped = chrome.clamp_overlay_scroll(len(lines), inner_h, scroll_offset)
+    visible = lines[clamped:clamped + inner_h]
     box_x = max(0, (width - box_w) // 2)
     box_y = max(0, (height - box_h) // 2)
     rows = ["+" + "-" * (box_w - 2) + "+"]
-    for i in range(box_h - 2):
-        content = lines[i][:inner_w] if i < len(lines) else ""
+    for i in range(inner_h):
+        content = visible[i][:inner_w] if i < len(visible) else ""
         rows.append("| " + content.ljust(inner_w) + " |")
     rows.append("+" + "-" * (box_w - 2) + "+")
-    return box_x, box_y, rows
+    return box_x, box_y, rows, clamped
 
 
 def run_tui(socket_path: str) -> int:
@@ -1062,6 +1133,18 @@ def run_tui(socket_path: str) -> int:
              # comment); resolves page.jump entries in the help overlay.
              "roster": list(keymap_bundle.get("roster", [])),
              "help_overlay": False,
+             # Phase 10 Task B (item 6): the overlay's own scroll position,
+             # re-clamped every repaint by `render_help_overlay_box` (see
+             # its own docstring) -- 0 until the first `KEY_UP`/`KEY_DOWN`
+             # nudge, and reset to 0 on every open/close in
+             # `_handle_key_press`.
+             "overlay_scroll": 0,
+             # Phase 10 Task B (item 5): wall-clock timestamp of the most
+             # recent page switch (startup counts as the first one) --
+             # `chrome.HINT_DISPLAY_S` seconds after this, the transient
+             # per-page keymap hint (below) stops rendering. See `on_event`'s
+             # `page_changed` branch for where this gets bumped.
+             "page_switch_ts": time.time(),
              "status_vm": dict(chrome.DEFAULT_STATUS_VM),
              "alerts_vm": dict(chrome.DEFAULT_ALERTS_VM), "timesig_vm": dict(chrome.DEFAULT_TIMESIG_VM),
              "beatflash_vm": dict(chrome.DEFAULT_BEATFLASH_VM),
@@ -1101,6 +1184,10 @@ def run_tui(socket_path: str) -> int:
             new_topic = f"page.{new_page}"
             switch_topic(client, state["topic"], new_topic, _SUBSCRIBE_RATE)
             state["page"], state["topic"] = new_page, new_topic
+            # Phase 10 Task B (item 5): every page transition (any origin --
+            # `page_changed` is Engine._set_current_page's own single
+            # funnel event) restarts the transient hint's display window.
+            state["page_switch_ts"] = time.time()
         elif msg.get("kind") == "event" and msg.get("name") == "keymap_changed":
             # Phase 4 Task 1: the engine's `config.reload` action (Phase 8
             # Task 6: also every page transition, see `Engine.
@@ -1226,20 +1313,23 @@ def run_tui(socket_path: str) -> int:
                             out.append(term.move_xy(0, i + 1) + line)
                         print("".join(out), end="", flush=True)
                     else:
-                        # Phase 8 Task 6 (on-screen keymap indicator): the
-                        # CURRENT page's own compact key hints, appended
-                        # right-aligned into the header row's spare width --
-                        # see clients/chrome.py::header_with_hint's own
-                        # docstring for why this is the SAME function fb's
-                        # header-row integration uses, just fed a static
-                        # (non-scrolling) left string instead of a marquee
-                        # slice: the TUI has no burn-in concern of its own
-                        # (chrome.py's indicator-section docstring), so a
-                        # static hint here is not a gap versus fb, just a
-                        # simpler equivalent for a renderer that was never
-                        # going to scroll its header to begin with.
+                        # Phase 8 Task 6 (on-screen keymap indicator);
+                        # REDESIGNED Phase 10 Task B (item 5): the CURRENT
+                        # page's own compact key hints, appended
+                        # right-aligned into the header row's spare width
+                        # via `header_with_hint` -- but now only for
+                        # `chrome.HINT_DISPLAY_S` seconds right after a page
+                        # switch (`_hint_active`, below), then gone entirely,
+                        # per controller ruling (b) (docs/demo-feedback-
+                        # 2026-08-12.md's plan header). Always plain/static
+                        # text either way -- the TUI has no burn-in concern
+                        # of its own (chrome.py's indicator-section
+                        # docstring) and the transient window is now short
+                        # enough that scrolling would add motion without
+                        # adding legibility.
                         hint_text = (chrome.page_keymap_hint_text(state["keymap_page"])
-                                    if state["keymap_hints_enabled"] else "")
+                                    if state["keymap_hints_enabled"] and _hint_active(state)
+                                    else "")
                         header_line = chrome.header_with_hint(header_line, hint_text, term.width)
                         status_line = render_status_row(state["status_vm"], term.width)
                         error_text = _active_error_text(state)
@@ -1314,32 +1404,60 @@ def run_tui(socket_path: str) -> int:
                         # printed (screensaver included -- toggling help
                         # while screensaving is allowed, same as fb) --
                         # see render_help_overlay_box's own docstring.
-                        box_x, box_y, box_rows = render_help_overlay_box(
+                        # Phase 10 Task B (item 6): `state["overlay_scroll"]`
+                        # is re-clamped here every repaint and the ACTUAL
+                        # value used is written back -- see render_help_
+                        # overlay_box's own docstring for why.
+                        box_x, box_y, box_rows, clamped_scroll = render_help_overlay_box(
                             state["keymap_global"], state["keymap_page"], state["page"],
-                            term.width, term.height, state["roster"])
+                            term.width, term.height, state["roster"], state["overlay_scroll"])
+                        state["overlay_scroll"] = clamped_scroll
                         overlay_out = [term.move_xy(box_x, box_y + i) + row
                                       for i, row in enumerate(box_rows)]
+                        # Item 6's dismiss/scroll hint (chrome.
+                        # overlay_footer_text) -- drawn on the row directly
+                        # BELOW the box, never inside it (never sacrifices a
+                        # content line), guarded so a terminal too short to
+                        # leave a spare row below the box simply omits it
+                        # rather than overwriting the box's own bottom
+                        # border.
+                        footer_row = box_y + len(box_rows)
+                        if footer_row < term.height:
+                            total = len(chrome.overlay_lines(
+                                state["keymap_global"], state["keymap_page"], state["page"],
+                                state["roster"])) or 1
+                            visible_count = max(0, min(len(box_rows) - 2, total - clamped_scroll))
+                            footer_text = chrome.overlay_footer_text(
+                                clamped_scroll, visible_count, total)
+                            overlay_out.append(term.move_xy(box_x, footer_row) + footer_text)
                         print("".join(overlay_out), end="", flush=True)
                     dirty = False
                 key = term.inkey(timeout=0.05)
                 overlay_before = state.get("help_overlay", False)
+                scroll_before = state.get("overlay_scroll", 0)
                 if _handle_key_press(client, _normalize_key(key), state):
                     return 0
-                if state.get("help_overlay", False) != overlay_before:
+                if (state.get("help_overlay", False) != overlay_before
+                        or state.get("overlay_scroll", 0) != scroll_before):
                     # Phase 8 Task 6: the overlay's on/off state is flipped
                     # entirely inside `_handle_key_press` (no vm/topic
                     # change involved at all -- module docstring: "not a
                     # page switch") -- without this, toggling help would
                     # never trigger a repaint until some UNRELATED update
-                    # happened to coincide with it.
+                    # happened to coincide with it. Phase 10 Task B: the
+                    # SAME gap exists for a scroll nudge while the overlay
+                    # stays open (open/close state doesn't change at all),
+                    # so `overlay_scroll` gets the identical before/after
+                    # comparison.
                     dirty = True
-                if _active_error_text(state) or _active_learn_message(state) or state.get(
-                        "learn_armed"):
-                    # Keep repainting while the transient error/learn
+                if (_active_error_text(state) or _active_learn_message(state)
+                        or state.get("learn_armed") or _hint_active(state)):
+                    # Keep repainting while the transient error/learn/hint
                     # message is still within its display window, or while
                     # a learn slot is armed, even with no other state
-                    # change (see _handle_key_press/_active_error_text and
-                    # _apply_learn_event/_active_learn_message above).
+                    # change (see _handle_key_press/_active_error_text,
+                    # _apply_learn_event/_active_learn_message, and
+                    # _hint_active above).
                     dirty = True
     finally:
         client.close()

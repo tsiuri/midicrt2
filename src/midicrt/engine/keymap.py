@@ -325,12 +325,32 @@ def _default_v1_id_goto_bindings() -> dict[str, dict[str, Any]]:
 # overlay toggle, plus Phase 9 Task 0's v1-ID-based digit/shifted-digit
 # `page.goto` bindings (superseding Phase 8 Task 6's own roster-positional
 # `page.jump` bindings for THIS table specifically -- see module
-# docstring's "Digit navigation: v1 page-ID based" section).
+# docstring's "Digit navigation: v1 page-ID based" section), plus Phase 10
+# Task B's `"KEY_ESCAPE"` binding (docs/demo-feedback-2026-08-12.md item
+# 6): the SAME `client.help_toggle` pseudo-action `?` already triggers --
+# item 6 is a redesign of what the toggle SHOWS (a scrollable, centered
+# nav+keybind window replacing Phase 8's full-dim panel, see clients/
+# chrome.py::overlay_lines' own docstring), not a new pseudo-action, so
+# ESC and `?` are simply two keys that both arm the one existing flag.
+# `"KEY_ESCAPE"` (not evdev's own `"KEY_ESC"` name) is the canonical
+# string this codebase's shared keymap uses for the Escape key -- chosen
+# to match `blessed.Keystroke.name`'s own vocabulary for free (TUI's
+# `_normalize_key` needs zero changes to already produce it, see that
+# function's own docstring), the same "borrow whichever platform's naming
+# needs no client-side translation" precedent `"KEY_UP"`/`"KEY_DOWN"` set
+# for arrows (Phase 10 Task A) -- unlike arrows, evdev and blessed do NOT
+# happen to agree on ESC's name (`"KEY_ESC"` vs `"KEY_ESCAPE"`), so
+# `clients/fb/app.py::_build_evdev_special_key_table` is the one place
+# that bridges the mismatch, mapping evdev's `KEY_ESC` code to THIS
+# string explicitly -- see that function's own docstring, which predicted
+# exactly this ("any future named key... has an obvious place to join
+# this table").
 DEFAULT_KEYMAP: dict[str, Any] = {
     "q": CLIENT_QUIT_ACTION,
     "c": "eventlog.clear",
     "n": "page.next",
     "?": CLIENT_HELP_TOGGLE_ACTION,
+    "KEY_ESCAPE": CLIENT_HELP_TOGGLE_ACTION,
     **_default_v1_id_goto_bindings(),
 }
 
