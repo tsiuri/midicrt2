@@ -421,6 +421,27 @@ def fetch_keymap(client: EngineClient) -> dict[str, str]:
     return dict(keymap) if isinstance(keymap, dict) else dict(DEFAULT_KEYMAP)
 
 
+def fetch_show_fps(client: EngineClient) -> bool:
+    """Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4): ask the
+    engine (via `describe`) for `config.show_fps` -- called ONCE at
+    connect (unlike `fetch_keymap_sections`'s per-`keymap_changed` refetch,
+    this value is boot-time-only, same contract as `keymap_hints_enabled`
+    itself -- see config.py's `show_fps` field docstring). A separate
+    small function rather than folded into `fetch_keymap_sections`, same
+    precedent `fetch_keymap` above sets for itself: this flag has nothing
+    to do with keymaps, bundling it into that function's return shape
+    would be a naming/scope smell for a bundle whose own docstring
+    enumerates "every keymap-shaped field a client needs".
+
+    Same defensive-against-an-older-server contract as `fetch_keymap`:
+    a `describe` response with no `"show_fps"` key at all, or a non-bool
+    value there, falls back to `False` (the same default `config.show_fps`
+    itself ships)."""
+    data = client.request("describe")["data"]
+    show_fps = data.get("show_fps")
+    return show_fps if isinstance(show_fps, bool) else False
+
+
 def fetch_keymap_sections(client: EngineClient) -> dict:
     """Phase 8 Task 6 (docs/gui-phase-decisions-2026-08-08.md keymap
     revamp): ONE `describe` round trip returning every keymap-shaped field

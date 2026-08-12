@@ -17,6 +17,7 @@ from midicrt.clients.chrome import (
     beatflash_glyph,
     beatprogress_row_text,
     format_bpm,
+    format_fps,
     header_with_hint,
     loopprogress_bar,
     marquee_window_text,
@@ -50,6 +51,22 @@ def test_format_bpm_rounds_to_one_decimal():
     assert format_bpm(120.0) == "120.0"
     assert format_bpm(89.9999) == "90.0"
     assert format_bpm(63.049) == "63.0"
+
+
+def test_format_fps_none_is_placeholder_dashes():
+    # Mirrors v1's own `fps:--` (plugins/timeclock.py:73) for the "no frame
+    # delta yet" case (first frame of a run, or a headless single-shot
+    # capture with nothing to measure a delta against) -- same "no data
+    # yet" convention format_bpm's em-dash uses for BPM.
+    assert format_fps(None) == "fps:--"
+
+
+def test_format_fps_rounds_to_one_decimal():
+    # Same `"fps:{value:.1f}"` literal format v1 computed
+    # (`~/codex/midicrt/midicrt.py:993`), ported byte-for-byte.
+    assert format_fps(29.97) == "fps:30.0"
+    assert format_fps(9.949) == "fps:9.9"
+    assert format_fps(0.0) == "fps:0.0"
 
 
 def test_status_text_shows_bar_beat_bpm_state_and_source():

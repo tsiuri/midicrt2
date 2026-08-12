@@ -341,6 +341,107 @@ def test_run_tui_handles_learn_events_without_crashing(monkeypatch):
     assert not thread.is_alive(), "run_tui did not exit after the shutdown sentinel"
 
 
+def _make_fake_engine_client(inbox, describe_extra=None):
+    """Shared fake for the two show_fps tests below -- same shape as
+    `test_run_tui_handles_learn_events_without_crashing`'s own inline
+    `FakeEngineClient`, factored out only because both new tests need it
+    with a different `describe()` payload (`show_fps` True vs absent)."""
+    describe_data = {"current_page": "eventlog", "keymap": {}}
+    if describe_extra:
+        describe_data.update(describe_extra)
+
+    class FakeEngineClient:
+        def __init__(self, socket_path):
+            pass
+
+        def connect(self):
+            pass
+
+        def request(self, cmd):
+            return {"data": dict(describe_data)}
+
+        def subscribe(self, topics, max_rate):
+            pass
+
+        def unsubscribe(self, topics):
+            pass
+
+        def start_reader(self):
+            return inbox
+
+        def action(self, name, args=None):
+            pass
+
+        def close(self):
+            pass
+
+    return FakeEngineClient
+
+
+def test_run_tui_shows_fps_readout_in_status_row_when_show_fps_configured(monkeypatch, capsys):
+    """Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4): with
+    `config.show_fps` True (surfaced via `describe`'s new field, see
+    clients/base.py::fetch_show_fps), the printed status row carries a
+    `"fps:"` readout -- proven end-to-end (not just the pure `chrome.
+    format_fps`/`header_with_hint` unit tests) via the same scripted-
+    inbox/FakeEngineClient/background-thread technique the learn-events
+    test above uses, capturing real stdout since `run_tui` writes frames
+    with a plain `print(..., flush=True)` (blessed degrades gracefully
+    off a real tty, no monkeypatch needed for that part)."""
+    inbox = queue.Queue()
+    inbox.put({"kind": "snapshot", "topic": "page.eventlog",
+               "data": {"title": "EVENT LOG", "count": 0, "lines": []}})
+    monkeypatch.setattr(tui, "EngineClient",
+                        _make_fake_engine_client(inbox, {"show_fps": True}))
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = run_tui("/tmp/unused.sock")
+        except BaseException as exc:  # noqa: BLE001 -- capture ANY crash
+            outcome["exception"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+    inbox.put(None)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive(), "run_tui did not exit after the shutdown sentinel"
+    assert "exception" not in outcome, f"run_tui crashed: {outcome.get('exception')!r}"
+    captured = capsys.readouterr()
+    assert "fps:" in captured.out
+
+
+def test_run_tui_omits_fps_readout_when_show_fps_not_configured(monkeypatch, capsys):
+    """Mirror of the test above with the config gate OFF (the default --
+    an older server predating the field, or a fresh describe() with no
+    override, both fall back to False per fetch_show_fps's own defensive
+    contract) -- the status row must never carry "fps:" text."""
+    inbox = queue.Queue()
+    inbox.put({"kind": "snapshot", "topic": "page.eventlog",
+               "data": {"title": "EVENT LOG", "count": 0, "lines": []}})
+    monkeypatch.setattr(tui, "EngineClient", _make_fake_engine_client(inbox))
+
+    outcome = {}
+
+    def target():
+        try:
+            outcome["result"] = run_tui("/tmp/unused.sock")
+        except BaseException as exc:  # noqa: BLE001 -- capture ANY crash
+            outcome["exception"] = exc
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    thread.join(timeout=1.0)
+    inbox.put(None)
+    thread.join(timeout=2.0)
+    assert not thread.is_alive(), "run_tui did not exit after the shutdown sentinel"
+    assert "exception" not in outcome, f"run_tui crashed: {outcome.get('exception')!r}"
+    captured = capsys.readouterr()
+    assert "fps:" not in captured.out
+
+
 def test_render_unknown_fallback_has_no_crash_on_bare_vm():
     out = _render_unknown({}, width=20, height=3)
     assert len(out) == 3

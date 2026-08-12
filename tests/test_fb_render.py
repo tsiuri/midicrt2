@@ -231,6 +231,62 @@ def test_draw_status_text_matches_shared_chrome_status_text():
     assert surf_a.image.tobytes() == surf_b.image.tobytes()
 
 
+# -- fps readout (Phase 10 Task A, docs/demo-feedback-2026-08-12.md item 4) --
+
+def test_draw_status_omits_fps_text_by_default():
+    # `fps_text` defaults to "" -- must be byte-identical to the pre-task
+    # call shape (already proven by test_draw_status_text_matches_shared_
+    # chrome_status_text above); this test just names the contract
+    # explicitly against a real LUM_DIM absence check, not only a byte
+    # comparison.
+    font = load_font()
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    surf.clear(app.BG)
+    app._draw_status(surf, GOLDEN_STATUS_VM, font)
+    strip_h = app._status_strip_height(font)
+    y = surf.height - app._beatprogress_strip_height(font) - strip_h
+    px = surf.image.load()
+    assert not any(px[x, yy] == app.LUM_DIM
+                   for x in range(surf.width)
+                   for yy in range(y, y + strip_h))
+
+
+def test_draw_status_draws_fps_text_dim_and_right_aligned_when_provided():
+    font = load_font()
+    surf = Surface(*GOLDEN_SURFACE_SIZE)
+    surf.clear(app.BG)
+    app._draw_status(surf, GOLDEN_STATUS_VM, font, fps_text="fps:30.0")
+    strip_h = app._status_strip_height(font)
+    y = surf.height - app._beatprogress_strip_height(font) - strip_h
+    px = surf.image.load()
+    # A LUM_DIM (not BG, not HEADER_BG) pixel exists somewhere in the strip
+    # -- the fps text was actually drawn, in the dim (not reverse-video
+    # black-on-bright) ink the burn-in mandate calls for.
+    assert any(px[x, yy] == app.LUM_DIM
+              for x in range(surf.width)
+              for yy in range(y, y + strip_h))
+    # Right-aligned: no dim pixel appears in the strip's LEFT half, where
+    # the primary (much shorter, in this fixture) status text lives.
+    assert not any(px[x, yy] == app.LUM_DIM
+                   for x in range(surf.width // 2)
+                   for yy in range(y, y + strip_h))
+
+
+def test_paint_frame_forwards_fps_text_to_the_status_strip():
+    font = load_font()
+    surf_off = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf_off, "eventlog", EMPTY_VM, font, chrome.DEFAULT_STATUS_VM,
+                     chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                     chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
+                     chrome.DEFAULT_MARQUEE_VM)
+    surf_on = Surface(*GOLDEN_SURFACE_SIZE)
+    app._paint_frame(surf_on, "eventlog", EMPTY_VM, font, chrome.DEFAULT_STATUS_VM,
+                     chrome.DEFAULT_ALERTS_VM, chrome.DEFAULT_TIMESIG_VM,
+                     chrome.DEFAULT_BEATFLASH_VM, chrome.DEFAULT_LOOPPROGRESS_VM,
+                     chrome.DEFAULT_MARQUEE_VM, fps_text="fps:12.3")
+    assert surf_off.image.tobytes() != surf_on.image.tobytes()
+
+
 # -- third chrome strip: beatflash/loopprogress (phase-3 task 9) ------------
 
 def test_beatprogress_strip_height_matches_the_other_strips_sizing_convention():
@@ -2785,6 +2841,72 @@ def test_run_device_survives_page_switch_before_new_topics_snapshot_arrives(tmp_
         if page == "eventlog":
             assert "count" in vm, (
                 f"eventlog page painted with a non-eventlog (stale) vm: {vm!r}")
+
+
+def test_run_device_measures_fps_only_across_actual_repaints_when_show_fps_true(
+        tmp_path, monkeypatch):
+    """Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4): the
+    initial paint (right after `wait_first_snapshot`) has no PRIOR repaint
+    to measure a delta against -- `fps_text` must be the "no data yet"
+    placeholder there. A SECOND repaint (a genuinely new page.eventlog
+    snapshot, matching this loop's own `page_updated` gate) must carry a
+    real `fps:X.X` reading. `show_fps=False` (the default) must never
+    attach any fps_text at all, on either call."""
+    monkeypatch.setattr(app, "_read_fb_geometry", lambda: (10, 10, 20))
+
+    fps_texts = []
+    real_paint_frame = app._paint_frame
+
+    def spy_paint_frame(surface, page, vm, *rest, **kwargs):
+        fps_texts.append(kwargs.get("fps_text", ""))
+        return real_paint_frame(surface, page, vm, *rest, **kwargs)
+
+    monkeypatch.setattr(app, "_paint_frame", spy_paint_frame)
+
+    class FakeClient:
+        def subscribe(self, topics, max_rate):
+            pass
+
+        def unsubscribe(self, topics):
+            pass
+
+    def _run(show_fps):
+        fps_texts.clear()
+        inbox = queue.Queue()
+        inbox.put({"kind": "snapshot", "topic": "page.eventlog",
+                   "data": {"title": "EVENT LOG", "count": 0, "lines": []}})
+        # A SECOND, genuinely-new snapshot -- triggers a real repaint (not
+        # just an idle poll tick) after a real, measurable wall-clock gap.
+        second = threading.Timer(
+            0.05, inbox.put,
+            args=({"kind": "snapshot", "topic": "page.eventlog",
+                   "data": {"title": "EVENT LOG", "count": 1, "lines": []}},))
+        second.start()
+        shutdown = threading.Timer(0.15, inbox.put, args=(None,))
+        shutdown.start()
+        fb_path = str(tmp_path / f"fb0-{show_fps}")
+        try:
+            app._run_device(FakeClient(), inbox, fb_path, True, 1000.0, "eventlog",
+                            "page.eventlog",
+                            {"effective": {"q": "client.quit"}, "global": {}, "page": {},
+                             "hints_enabled": True},
+                            show_fps=show_fps)
+        except ClientError:
+            pass  # expected clean shutdown via the `None` sentinel
+        finally:
+            second.cancel()
+            shutdown.cancel()
+
+    _run(show_fps=True)
+    assert len(fps_texts) >= 2, "expected at least the initial paint plus one real repaint"
+    assert fps_texts[0] == "fps:--"
+    assert any(t not in ("", "fps:--") and t.startswith("fps:") for t in fps_texts[1:]), (
+        f"expected a real fps:X.X reading on a later repaint, got {fps_texts!r}")
+
+    _run(show_fps=False)
+    assert fps_texts, "expected at least the initial paint"
+    assert all(t == "" for t in fps_texts), (
+        f"show_fps=False must never attach fps_text, got {fps_texts!r}")
 
 
 # -- evdev keymap dispatch (Phase 4 Task 1, docs/phase4-notes.md) -----------

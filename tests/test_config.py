@@ -88,3 +88,24 @@ def test_load_overrides_sysex_dir(tmp_path):
     p.write_text(f'sysex_dir = "{override}"\n')
     cfg = load(str(p))
     assert cfg.sysex_dir == override
+
+
+# -- fps readout (Phase 10 Task A, docs/demo-feedback-2026-08-12.md item 4) --
+
+def test_show_fps_defaults_false_opt_in_new_diagnostic_not_a_v1_restore():
+    # v1 always computed/showed its fps readout (no config gate at all,
+    # `~/codex/midicrt/midicrt.py:992-995`) -- this is NOT a v1-parity
+    # restore, it's a brand-new v2 feature the demo feedback explicitly
+    # asked to be config-gated, so it follows this dataclass's own
+    # opt-IN-by-default precedent for new diagnostic surface
+    # (`panic_on_crit`'s own comment above), not `keymap_hints_enabled`'s
+    # default-on precedent (which restores an always-on v1 chrome element).
+    cfg = Config()
+    assert cfg.show_fps is False
+
+
+def test_load_overrides_show_fps(tmp_path):
+    p = tmp_path / "config.toml"
+    p.write_text("show_fps = true\n")
+    cfg = load(str(p))
+    assert cfg.show_fps is True

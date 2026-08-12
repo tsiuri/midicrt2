@@ -94,6 +94,7 @@ from midicrt.clients.base import (
     dispatch_key,
     drain_latest,
     fetch_keymap_sections,
+    fetch_show_fps,
     switch_topic,
     wait_first_snapshot,
 )
@@ -1280,7 +1281,7 @@ def _status_strip_height(font) -> int:
     return font.height + 2 * STATUS_PAD
 
 
-def _draw_status(surface: Surface, vm: dict, font) -> None:
+def _draw_status(surface: Surface, vm: dict, font, fps_text: str = "") -> None:
     """Paint the status strip onto `surface`: a reverse-video bar (same
     `HEADER_BG` fill / `BG` text convention as the page header) showing the
     shared chrome status text (`clients/chrome.py` -- word-for-word
@@ -1290,11 +1291,30 @@ def _draw_status(surface: Surface, vm: dict, font) -> None:
     layout -- see module docstring), not pinned to `surface.height` itself
     any more. Pure aside from the font glyph cache, same contract as
     `render_frame`.
-    """
+
+    `fps_text` (Phase 10 Task A, docs/demo-feedback-2026-08-12.md item 4):
+    optional, keyword-compatible-by-position default `""` -- an empty
+    string draws NOTHING extra, byte-identical to every existing call site
+    (see test_draw_status_text_matches_shared_chrome_status_text). When
+    non-empty (the caller's own `config.show_fps` gate, see `_paint_frame`
+    below), right-aligned into this SAME strip's spare width, drawn in
+    `LUM_DIM` rather than `BG` -- unlike every other glyph on this strip
+    (which are `BG`/black ink stamped onto the strip's own bright
+    `HEADER_BG` fill, the reverse-video look), `LUM_DIM`-on-`HEADER_BG` is
+    a deliberately LOW-contrast dark-green-on-bright-green combination: it
+    reads as a muted, recessive readout rather than competing with the
+    primary transport status text for attention -- the literal "keep it
+    dim" instruction the demo feedback gave for this element, applied the
+    only way this strip's existing reverse-video convention allows a
+    second, visually-subordinate text layer to coexist on it."""
     strip_h = _status_strip_height(font)
     y = surface.height - _beatprogress_strip_height(font) - strip_h
     surface.rect(0, y, surface.width, strip_h, HEADER_BG)
     draw_text(surface, LEFT_MARGIN, y + STATUS_PAD, chrome.status_text(vm), BG, font)
+    if fps_text:
+        fps_w = len(fps_text) * font.width
+        fx = max(LEFT_MARGIN, surface.width - LEFT_MARGIN - fps_w)
+        draw_text(surface, fx, y + STATUS_PAD, fps_text, LUM_DIM, font)
 
 
 # -- chrome: secondary (alerts/timesig) strip (phase-3 task 6) ---------------
@@ -1418,7 +1438,7 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
                   page_keymap: dict | None = None, keymap_hints_enabled: bool = True,
                   overlay_active: bool = False, keymap_global: dict | None = None,
                   roster: list[str] | None = None, polylimit_vm: dict | None = None,
-                  sysex_vm: dict | None = None) -> None:
+                  sysex_vm: dict | None = None, fps_text: str = "") -> None:
     """Render `page`'s body, then all THREE chrome strips -- UNLESS `page`
     is the screensaver page (Important fix, task-9 review), in which case
     NO chrome is painted at all, matching v1's true full-screen blank --
@@ -1464,7 +1484,18 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
 
     Phase 9 Task 5: `sysex_vm` (`overlay.sysex`, OPTIONAL, same convention)
     forwards straight into `_draw_secondary` too -- see that function's own
-    docstring for the sysex-status chrome text."""
+    docstring for the sysex-status chrome text.
+
+    Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4): `fps_text`
+    (OPTIONAL, defaults `""` -- same "additive, unchanged rendering when
+    omitted" convention as every param above) forwards straight into
+    `_draw_status` -- see that function's own docstring for the dim
+    right-aligned readout it paints when non-empty. The caller (`_run_
+    device`'s redraw loop) is responsible for BOTH the `config.show_fps`
+    gate and the actual frame-to-frame measurement -- this function only
+    ever draws whatever string it's handed, same "renderer stays pure,
+    caller owns policy" split every other keyword-only param here
+    follows."""
     renderer = RENDERERS.get(page, _render_unknown)
     capacity = _header_char_capacity(surface, font)
     # `hint_budget` is reserved BEFORE computing the hint text (not the
@@ -1490,7 +1521,7 @@ def _paint_frame(surface: Surface, page: str, vm: dict, font, status_vm: dict,
         return
     _draw_secondary(surface, alerts_vm, timesig_vm, font, polylimit_vm=polylimit_vm,
                     sysex_vm=sysex_vm)
-    _draw_status(surface, status_vm, font)
+    _draw_status(surface, status_vm, font, fps_text=fps_text)
     _draw_beatprogress(surface, beatflash_vm, loopprogress_vm, font)
     if overlay_active:
         _draw_help_overlay(surface, font, keymap_global or {}, page_keymap or {}, page, roster)
@@ -1820,7 +1851,7 @@ def _make_page_switcher(client: EngineClient, state: dict, max_rate: float):
 
 def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
                  no_input: bool, fps: float, page: str, topic: str,
-                 keymap_bundle: dict) -> int:
+                 keymap_bundle: dict, show_fps: bool = False) -> int:
     """Real-/dev/fb0 render loop. Coded per the task brief's geometry spec
     but NOT exercised by this task's tests -- v1 owns the CRT until Task
     4's supervised smoke window runs this path for real.
@@ -1838,7 +1869,17 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
     sections` returns -- `run()`'s only caller fetches it once at connect;
     `_make_page_switcher`'s `on_event` refetches the same shape on every
     `keymap_changed`.
-    """
+
+    `show_fps` (Phase 10 Task A, docs/demo-feedback-2026-08-12.md item 4):
+    `run()`'s only caller fetches this once at connect too (`fetch_show_
+    fps`, boot-time-only, no refetch-on-event needed -- see that
+    function's own docstring). When True, every ACTUAL repaint (the `if
+    vm_is_current and (...):` block below -- this loop, like the TUI's,
+    only repaints when something changed, so measuring wall-clock delta
+    ACROSS repaints is the true draw cadence this task's own investigation
+    needed, not "how often did we wake up to check") computes `1/dt`
+    against the previous repaint's timestamp and threads the formatted
+    text into `_paint_frame`'s new `fps_text` param."""
     width, height, stride = _read_fb_geometry()
     surface = Surface(width, height)
     font = load_font()
@@ -1864,7 +1905,28 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
              "polylimit_vm": dict(chrome.DEFAULT_POLYLIMIT_VM),
              # Phase 9 Task 5 (SysEx manager): shares the SAME second
              # chrome row too -- see the `secondary_updated` gate below.
-             "sysex_vm": dict(chrome.DEFAULT_SYSEX_VM)}
+             "sysex_vm": dict(chrome.DEFAULT_SYSEX_VM),
+             # Phase 10 Task A: last ACTUAL repaint's wall-clock timestamp
+             # -- see `_next_fps_text`'s own docstring just below.
+             "_fps_last_t": None}
+
+    def _next_fps_text() -> str:
+        """Returns the `chrome.format_fps` text for THIS repaint (empty
+        string when `show_fps` is off, so both `_paint_frame` call sites
+        below can pass it unconditionally without their own `if`), and
+        advances `state["_fps_last_t"]` as a side effect -- called exactly
+        once per ACTUAL repaint (never per idle poll tick), so the
+        measured figure is the true draw cadence, matching v1's own
+        `_frame_dt`-per-redraw intent (`~/codex/midicrt/midicrt.py:
+        987-989`)."""
+        if not show_fps:
+            return ""
+        now = time.monotonic()
+        last_t = state["_fps_last_t"]
+        frame_dt = (now - last_t) if last_t is not None else None
+        state["_fps_last_t"] = now
+        return chrome.format_fps(1.0 / frame_dt if frame_dt and frame_dt > 0 else None)
+
     on_event = _make_page_switcher(client, state, fps)
     # Phase 8 Task 6 (help overlay): shared with `_input_loop`'s background
     # thread the SAME way `state["keymap"]` is -- see `_dispatch_evdev_key`'s
@@ -1902,7 +1964,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
                      keymap_hints_enabled=state["keymap_hints_enabled"],
                      overlay_active=overlay_state["active"], keymap_global=state["keymap_global"],
                      roster=state["roster"], polylimit_vm=state["polylimit_vm"],
-                     sysex_vm=state["sysex_vm"])
+                     sysex_vm=state["sysex_vm"], fps_text=_next_fps_text())
         surface.write_to_mmap(fb_mm, stride=stride)
         # Phase 8 Task 6: the overlay's on/off state changes on the INPUT
         # thread (a keypress), not through any of the drained topics below
@@ -2003,7 +2065,7 @@ def _run_device(client: EngineClient, inbox: queue.Queue, fb_path: str,
                              keymap_hints_enabled=state["keymap_hints_enabled"],
                              overlay_active=overlay_now, keymap_global=state["keymap_global"],
                              roster=state["roster"], polylimit_vm=state["polylimit_vm"],
-                             sysex_vm=state["sysex_vm"])
+                             sysex_vm=state["sysex_vm"], fps_text=_next_fps_text())
                 surface.write_to_mmap(fb_mm, stride=stride)
         return 0
     finally:
@@ -2021,6 +2083,11 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
     try:
         client.connect()
         page, topic = current_page_topic(client)
+        # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4): fetched
+        # ONCE here, before EITHER of the two paths below (`--out` and the
+        # real device loop both need it) -- boot-time-only, same contract
+        # as `keymap_hints_enabled`, see clients/base.py::fetch_show_fps.
+        show_fps = fetch_show_fps(client)
         client.subscribe([topic, *overlay_topics], max_rate=fps)
     except ClientError as exc:
         print(f"midicrt-fb: {exc}")
@@ -2081,6 +2148,12 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
             # global/page sections to draw.
             keymap_bundle = fetch_keymap_sections(client)
             surface = Surface(*OUT_SIZE)
+            # Phase 10 Task A: a single-shot capture has no frame-to-frame
+            # delta to measure -- `format_fps(None)` -> "fps:--", the same
+            # "no data yet" placeholder the live loop's own first frame
+            # shows, so `--out` still proves the readout's presence/
+            # position when `show_fps` is configured (e.g. for acceptance
+            # PNG evidence) without fabricating a number.
             _paint_frame(surface, page, vm, load_font(), status["vm"],
                          secondary["alerts_vm"], secondary["timesig_vm"],
                          beatprogress["beatflash_vm"], beatprogress["loopprogress_vm"],
@@ -2090,11 +2163,13 @@ def run(socket_path: str, fb_path: str, out_path: str | None,
                          overlay_active=show_overlay, keymap_global=keymap_bundle["global"],
                          roster=keymap_bundle.get("roster", []),
                          polylimit_vm=secondary["polylimit_vm"],
-                         sysex_vm=secondary["sysex_vm"])
+                         sysex_vm=secondary["sysex_vm"],
+                         fps_text=chrome.format_fps(None) if show_fps else "")
             surface.save_png(out_path)
             return 0
         keymap_bundle = fetch_keymap_sections(client)
-        return _run_device(client, inbox, fb_path, no_input, fps, page, topic, keymap_bundle)
+        return _run_device(client, inbox, fb_path, no_input, fps, page, topic, keymap_bundle,
+                           show_fps=show_fps)
     except ClientError as exc:
         print(f"midicrt-fb: {exc}")
         return 1

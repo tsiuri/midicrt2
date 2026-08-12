@@ -20,6 +20,7 @@ from midicrt.clients.base import (
     drain_latest,
     fetch_keymap,
     fetch_keymap_sections,
+    fetch_show_fps,
     switch_topic,
     wait_first_snapshot,
 )
@@ -734,6 +735,34 @@ def test_fetch_keymap_falls_back_to_default_when_server_predates_the_field():
             return {"data": {"current_page": "eventlog"}}   # no "keymap" key
 
     assert fetch_keymap(_OldServerClient()) == DEFAULT_KEYMAP
+
+
+async def test_fetch_show_fps_reads_the_real_engine_config_over_the_wire(tmp_path):
+    eng, srv, task = await make(tmp_path, show_fps=True)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    show_fps = await asyncio.to_thread(fetch_show_fps, client)
+    assert show_fps is True
+    await asyncio.to_thread(client.close)
+    eng.stop(); await task; await srv.close()
+
+
+async def test_fetch_show_fps_defaults_false_when_config_does_not_set_it(tmp_path):
+    eng, srv, task = await make(tmp_path)
+    client = EngineClient(srv.socket_path)
+    await asyncio.to_thread(client.connect)
+    show_fps = await asyncio.to_thread(fetch_show_fps, client)
+    assert show_fps is False
+    await asyncio.to_thread(client.close)
+    eng.stop(); await task; await srv.close()
+
+
+def test_fetch_show_fps_falls_back_to_false_when_server_predates_the_field():
+    class _OldServerClient:
+        def request(self, cmd):
+            return {"data": {"current_page": "eventlog"}}   # no "show_fps" key
+
+    assert fetch_show_fps(_OldServerClient()) is False
 
 
 async def test_fetch_keymap_sections_reads_global_and_page_sections(tmp_path):

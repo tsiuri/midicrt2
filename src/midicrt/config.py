@@ -227,6 +227,26 @@ class Config:
     # no new v1 knob to port here (v1 has no equivalent named-library
     # feature at all, see engine/sysex_store.py's own module docstring).
     sysex_dir: str | None = None
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4, "FPS
+    # readout in footer, right-aligned, config-gated"): a brand-NEW v2
+    # feature, not a v1 port -- v1's own fps readout (`~/codex/midicrt/
+    # midicrt.py:990-995`, `plugins/timeclock.py:73-79`) had no enable/
+    # disable knob at all, it was simply always computed and always shown
+    # inline on the timer row. This dataclass field is boot-time only,
+    # same "config.reload never live-applies this" contract as
+    # `keymap_hints_enabled`/`pagecycle_enabled`/`screensaver_enabled`
+    # above -- both clients fetch it ONCE at connect (`engine/server.py`'s
+    # `describe` response, mirroring how `keymap_hints_enabled` is
+    # surfaced there). Defaults `False` -- an opt-IN diagnostic, following
+    # `panic_on_crit`'s precedent (a NEW knob this task is free to pick
+    # any default for, since there is no prior v2 behavior to preserve),
+    # not `keymap_hints_enabled`'s default-ON precedent (which exists
+    # specifically to preserve an ALREADY-always-on v1 chrome element).
+    # fps itself is measured CLIENT-SIDE (each client's own frame-to-frame
+    # wall-clock delta, exactly like v1's `_frame_dt`) -- this flag only
+    # gates whether that measurement is ever rendered, the server has no
+    # fps figure of its own to report.
+    show_fps: bool = False
 
 
 def load(path: str | None = None) -> Config:

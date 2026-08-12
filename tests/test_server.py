@@ -123,6 +123,23 @@ async def test_hello_and_describe(tmp_path):
     assert d["data"]["keymap_global"] == eng.keymap_global
     assert d["data"]["keymap_page"] == eng.keymap_page
     assert d["data"]["keymap_hints_enabled"] is True
+    # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4): the
+    # `show_fps` config flag, surfaced the SAME way `keymap_hints_enabled`
+    # is -- see config.py's own field docstring for why this defaults
+    # False (an opt-in NEW diagnostic, unlike keymap_hints_enabled's
+    # default-on v1-restore).
+    assert d["data"]["show_fps"] is False
+    eng.stop(); await task; await srv.close()
+
+
+async def test_describe_reports_show_fps_true_when_configured(tmp_path):
+    eng, srv, task = await make(tmp_path, show_fps=True)
+    c = Client()
+    await c.connect(srv.socket_path)
+    await c.read_msgs(0.2)
+    await c.hello()
+    d = await c.request("describe")
+    assert d["data"]["show_fps"] is True
     eng.stop(); await task; await srv.close()
 
 

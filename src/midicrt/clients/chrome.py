@@ -50,6 +50,26 @@ def format_bpm(bpm: float | None) -> str:
     return "—" if bpm is None else f"{bpm:.1f}"
 
 
+def format_fps(fps: float | None) -> str:
+    """Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4): the
+    `show_fps`-gated footer readout. `fps` is a CLIENT-LOCAL measurement
+    (each client's own frame-to-frame wall-clock delta -- see clients/
+    tui.py's/clients/fb/app.py's own render-loop docstrings), never a
+    server-reported value, so this is pure text formatting with no VM
+    contract of its own to document, unlike `format_bpm` above.
+
+    `None` -> `"fps:--"` (no frame delta yet -- the very first frame of a
+    run, or a headless single-shot `--out` capture with nothing to measure
+    a delta against) -- same "no data yet" shape as `format_bpm`'s em-dash,
+    just v1's own literal text instead of a dash (`~/codex/midicrt/
+    midicrt.py:993`, `fps_status = f"fps:{1.0/_frame_dt:.1f}" if
+    _frame_dt > 0 else "fps:--"` -- this ports that exact "fps:X.X"/
+    "fps:--" formatting byte-for-byte, the one piece of v1's own fps
+    readout this task's new footer element reuses; PLACEMENT is new
+    design, per the task brief, not a v1 port)."""
+    return "fps:--" if fps is None else f"fps:{fps:.1f}"
+
+
 OVERLAY_ALERTS_TOPIC = "overlay.alerts"
 OVERLAY_TIMESIG_TOPIC = "overlay.timesig"
 

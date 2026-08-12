@@ -205,6 +205,13 @@ class ProtocolServer:
                 "keymap_global": self.engine.keymap_global,
                 "keymap_page": self.engine.keymap_page,
                 "keymap_hints_enabled": self.engine.config.keymap_hints_enabled,
+                # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4):
+                # the fps-readout config gate, surfaced the SAME additive,
+                # boot-time-only way `keymap_hints_enabled` above is --
+                # both clients fetch it once at connect (config.py's
+                # `show_fps` field docstring has the full precedent
+                # writeup).
+                "show_fps": self.engine.config.show_fps,
                 "engine_version": self.engine.status()["engine_version"],
                 "proto_version": proto.PROTO_VERSION,
             }))

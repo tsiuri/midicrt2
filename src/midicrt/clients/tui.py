@@ -86,6 +86,7 @@ from midicrt.clients.base import (
     dispatch_key,
     drain_latest,
     fetch_keymap_sections,
+    fetch_show_fps,
     switch_topic,
     wait_first_snapshot,
 )
@@ -1017,6 +1018,12 @@ def run_tui(socket_path: str) -> int:
         client.connect()
         page, topic = current_page_topic(client)
         keymap_bundle = fetch_keymap_sections(client)
+        # Phase 10 Task A (docs/demo-feedback-2026-08-12.md item 4): fetched
+        # ONCE here, same boot-time-only contract as keymap_bundle's own
+        # "hints_enabled" -- see clients/base.py::fetch_show_fps's own
+        # docstring for why this is a separate describe() field, not folded
+        # into keymap_bundle.
+        show_fps = fetch_show_fps(client)
         client.subscribe([topic, *overlay_topics], max_rate=_SUBSCRIBE_RATE)
     except ClientError as exc:
         print(f"midicrt tui: {exc}")
@@ -1038,7 +1045,17 @@ def run_tui(socket_path: str) -> int:
              "loopprogress_vm": dict(chrome.DEFAULT_LOOPPROGRESS_VM),
              "polylimit_vm": dict(chrome.DEFAULT_POLYLIMIT_VM),
              "sysex_vm": dict(chrome.DEFAULT_SYSEX_VM),
-             "learn_armed": False}
+             "learn_armed": False,
+             # Phase 10 Task A: "show_fps" is the boot-time config gate;
+             # "_fps_last_t" tracks the wall-clock time of the last ACTUAL
+             # repaint (not every loop iteration -- this client only
+             # repaints when `dirty`, see the render loop below) so the
+             # measured figure is the true draw cadence, matching v1's own
+             # `_frame_dt`-per-redraw intent (`~/codex/midicrt/midicrt.py:
+             # 987-989`) rather than a busier "how often did we poll"
+             # number this loop's own `term.inkey(timeout=0.05)` pacing
+             # would otherwise produce.
+             "show_fps": show_fps, "_fps_last_t": None}
 
     def on_event(msg: dict) -> None:
         if msg.get("kind") == "event" and msg.get("name") == "page_changed":
@@ -1196,6 +1213,24 @@ def run_tui(socket_path: str) -> int:
                             # is outstanding -- see _apply_learn_event's own
                             # docstring for why this has no display window.
                             status_line = _fit("LEARN: waiting for MIDI...", term.width)
+                        if state["show_fps"]:
+                            # Phase 10 Task A (docs/demo-feedback-2026-08-12.
+                            # md item 4): right-aligned into the status row's
+                            # spare width via the SAME merge `header_with_
+                            # hint` uses for the header's own keymap hint --
+                            # applied LAST, after the error/learn overrides
+                            # above, so the readout is always present
+                            # whenever show_fps is on, regardless of which
+                            # branch set status_line. Measured across actual
+                            # repaints only (see state["_fps_last_t"]'s own
+                            # comment at this state dict's construction).
+                            now = time.monotonic()
+                            last_t = state["_fps_last_t"]
+                            frame_dt = (now - last_t) if last_t is not None else None
+                            state["_fps_last_t"] = now
+                            fps = 1.0 / frame_dt if frame_dt and frame_dt > 0 else None
+                            status_line = chrome.header_with_hint(
+                                status_line, chrome.format_fps(fps), term.width)
                         secondary_line = render_secondary_row(
                             state["alerts_vm"], state["timesig_vm"], term.width,
                             polylimit_vm=state["polylimit_vm"], sysex_vm=state["sysex_vm"])
