@@ -1,5 +1,11 @@
 # midicrt2
 
+> ## ⚠️ DISCONTINUED (2026-09-20) — experimental branch, not the direction
+> midicrt2 was a ground-up rewrite experiment. The owner ultimately didn't like it:
+> **it is not planned, there was no cutover, and it is not maintained.** The CRT
+> visualizer is, and stays, **[midicrt](https://github.com/tsiuri/midicrt)** (v1),
+> which is developed by patching it in place. This repository is kept as a record.
+
 MIDI-CRT visualizer, v2: `midicrtd` engine daemon + fb/tui/web protocol clients.
 Design spec: `pivisualizer` project folder on motherbase
 (`~/projects/pivisualizer/docs/superpowers/specs/2026-08-06-midicrt2-design.md`).
