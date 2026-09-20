@@ -5,6 +5,9 @@
 > **it is not planned, there was no cutover, and it is not maintained.** The CRT
 > visualizer is, and stays, **[midicrt](https://github.com/tsiuri/midicrt)** (v1),
 > which is developed by patching it in place. This repository is kept as a record.
+>
+> **Fishing for something that was already built here?** Start with
+> [`PRIOR-ART-INDEX.md`](PRIOR-ART-INDEX.md) — a feature → file → doc map.
 
 MIDI-CRT visualizer, v2: `midicrtd` engine daemon + fb/tui/web protocol clients.
 Design spec: `pivisualizer` project folder on motherbase
